@@ -112,7 +112,7 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         self.removed: bool = False
         _default_mode = getattr(game, "default_deploy_mode", "symlink")
         self._deploy_mode_var = tk.StringVar(value=_default_mode)
-        self._symlink_plugins_var = tk.BooleanVar(value=False)
+        self._script_extender_swap_var = tk.BooleanVar(value=True)
         self._auto_deploy_var = tk.BooleanVar(value=False)
         self._archive_invalidation_var = tk.BooleanVar(value=True)
         self._profile_ini_files_var = tk.BooleanVar(value=False)
@@ -140,8 +140,8 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                 self._deploy_mode_var.set({
                     LinkMode.SYMLINK: "symlink",
                 }.get(mode_mapped, "hardlink"))
-            if hasattr(game, "symlink_plugins"):
-                self._symlink_plugins_var.set(game.symlink_plugins)
+            if hasattr(game, "script_extender_swap"):
+                self._script_extender_swap_var.set(game.script_extender_swap)
             if hasattr(game, "_staging_path") and game._staging_path is not None:
                 self._custom_staging = game._staging_path
                 self._set_staging(game._staging_path, status="configured")
@@ -387,10 +387,10 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                 fg_color=ACCENT, hover_color=ACCENT_HOV,
             ).pack(side="left", padx=(0, 20))
 
-        if hasattr(self._game, "symlink_plugins"):
+        if hasattr(self._game, "script_extender_swap"):
             ctk.CTkCheckBox(
-                body, text="Symlink plugin files (.esp / .esm / .esl)",
-                variable=self._symlink_plugins_var,
+                body, text="Swap launcher with script extender (rename game launcher and replace it with the script extender on deploy)",
+                variable=self._script_extender_swap_var,
                 font=FONT_NORMAL, text_color=TEXT_MAIN,
                 fg_color=ACCENT, hover_color=ACCENT_HOV,
             ).grid(row=17, column=0, sticky="w", padx=16, pady=(0, 8))
@@ -1270,8 +1270,8 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                 "copy":    LinkMode.SYMLINK,
             }.get(mode_str, LinkMode.HARDLINK)
             self._game.set_deploy_mode(mode)
-        if hasattr(self._game, "set_symlink_plugins"):
-            self._game.set_symlink_plugins(self._symlink_plugins_var.get())
+        if hasattr(self._game, "set_script_extender_swap"):
+            self._game.set_script_extender_swap(self._script_extender_swap_var.get())
         if hasattr(self._game, "set_staging_path"):
             self._game.set_staging_path(self._custom_staging)
         self._game.auto_deploy = self._auto_deploy_var.get()

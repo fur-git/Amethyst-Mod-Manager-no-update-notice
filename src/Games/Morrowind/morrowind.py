@@ -39,7 +39,6 @@ class Morrowind(BaseGame):
         self._prefix_path: Path | None = None
         self._deploy_mode: LinkMode = LinkMode.HARDLINK
         self._staging_path: Path | None = None
-        self._symlink_plugins: bool = False
         self.load_paths()
 
     # -----------------------------------------------------------------------
@@ -200,7 +199,6 @@ class Morrowind(BaseGame):
             raw_staging = data.get("staging_path", "")
             if raw_staging:
                 self._staging_path = Path(raw_staging)
-            self._symlink_plugins = data.get("symlink_plugins", False)
             self._validate_staging()
             if not self._prefix_path or not self._prefix_path.is_dir():
                 found = find_prefix(self.steam_id)
@@ -225,7 +223,6 @@ class Morrowind(BaseGame):
             "prefix_path":     str(self._prefix_path)  if self._prefix_path  else "",
             "deploy_mode":     mode_str,
             "staging_path":    str(self._staging_path) if self._staging_path else "",
-            "symlink_plugins": self._symlink_plugins,
         }
         self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -249,14 +246,6 @@ class Morrowind(BaseGame):
 
     def set_deploy_mode(self, mode: LinkMode) -> None:
         self._deploy_mode = mode
-        self.save_paths()
-
-    @property
-    def symlink_plugins(self) -> bool:
-        return self._symlink_plugins
-
-    def set_symlink_plugins(self, value: bool) -> None:
-        self._symlink_plugins = value
         self.save_paths()
 
     # -----------------------------------------------------------------------
@@ -292,7 +281,6 @@ class Morrowind(BaseGame):
         _sep_deploy    = load_separator_deploy_paths(profile_dir)
         _sep_entries   = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
-        _symlink_exts  = set(self.plugin_extensions) if self._symlink_plugins else None
         linked_mod, placed = deploy_filemap(
             filemap, data_dir, staging,
             mode=mode,
@@ -301,7 +289,6 @@ class Morrowind(BaseGame):
             per_mod_deploy_dirs=per_mod_deploy,
             log_fn=_log,
             progress_fn=progress_fn,
-            symlink_exts=_symlink_exts,
             core_dir=data_dir.parent / (data_dir.name + "_Core"),
         )
         _log(f"  Transferred {linked_mod} mod file(s).")

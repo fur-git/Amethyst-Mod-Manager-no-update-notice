@@ -284,6 +284,9 @@ class SkyrimSE(Fallout_3):
         _log = log_fn
         if self._game_path is None:
             return
+        if not self._script_extender_swap:
+            _log("  Script extender / launcher swap disabled — skipping.")
+            return
         skse = self._game_path / "skse64_loader.exe"
         if not skse.is_file():
             _log("  SKSE loader not found — skipping launcher swap.")
@@ -362,7 +365,6 @@ class SkyrimSE(Fallout_3):
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
-        _symlink_exts = set(self.plugin_extensions) if self._symlink_plugins else None
         linked_mod, placed = deploy_filemap(filemap, data_dir, staging,
                                             mode=mode,
                                             strip_prefixes=self.mod_folder_strip_prefixes,
@@ -370,7 +372,6 @@ class SkyrimSE(Fallout_3):
                                             per_mod_deploy_dirs=per_mod_deploy,
                                             log_fn=_log,
                                             progress_fn=progress_fn,
-                                            symlink_exts=_symlink_exts,
                                             exclude=custom_exclude or None,
                                             core_dir=data_dir.parent / (data_dir.name + "_Core"))
         _log(f"  Transferred {linked_mod} mod file(s).")

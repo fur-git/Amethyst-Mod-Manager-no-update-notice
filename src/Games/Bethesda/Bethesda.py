@@ -132,7 +132,7 @@ class Fallout_3(BaseGame):
         self._prefix_path: Path | None = None
         self._deploy_mode: LinkMode = LinkMode.HARDLINK
         self._staging_path: Path | None = None
-        self._symlink_plugins: bool = False
+        self._script_extender_swap: bool = True
         self._profile_ini_files: bool = False
         self.load_paths()
 
@@ -333,13 +333,13 @@ class Fallout_3(BaseGame):
         return _PROFILES_DIR / self.name / "mods"
 
     def _load_paths_extra(self, data: dict) -> None:
-        self._symlink_plugins = data.get("symlink_plugins", False)
+        self._script_extender_swap = data.get("script_extender_swap", True)
         self._profile_ini_files = data.get("profile_ini_files", False)
 
     def _save_paths_extra(self) -> dict:
         return {
-            "symlink_plugins":   self._symlink_plugins,
-            "profile_ini_files": self._profile_ini_files,
+            "script_extender_swap": self._script_extender_swap,
+            "profile_ini_files":    self._profile_ini_files,
         }
 
     def set_staging_path(self, path: "Path | str | None") -> None:
@@ -357,11 +357,11 @@ class Fallout_3(BaseGame):
         self.save_paths()
 
     @property
-    def symlink_plugins(self) -> bool:
-        return self._symlink_plugins
+    def script_extender_swap(self) -> bool:
+        return self._script_extender_swap
 
-    def set_symlink_plugins(self, value: bool) -> None:
-        self._symlink_plugins = value
+    def set_script_extender_swap(self, value: bool) -> None:
+        self._script_extender_swap = value
         self.save_paths()
 
     @property
@@ -557,6 +557,9 @@ class Fallout_3(BaseGame):
         _log = log_fn
         if self._game_path is None:
             return
+        if not self._script_extender_swap:
+            _log("  Script extender / launcher swap disabled — skipping.")
+            return
         se = self._game_path / self._script_extender_exe
         if not se.is_file():
             _log(f"  {self._script_extender_exe} not found — skipping launcher swap.")
@@ -638,7 +641,6 @@ class Fallout_3(BaseGame):
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
-        _symlink_exts = set(self.plugin_extensions) if self._symlink_plugins else None
         linked_mod, placed = deploy_filemap(filemap, data_dir, staging,
                                             mode=mode,
                                             strip_prefixes=self.mod_folder_strip_prefixes,
@@ -646,7 +648,6 @@ class Fallout_3(BaseGame):
                                             per_mod_deploy_dirs=per_mod_deploy,
                                             log_fn=_log,
                                             progress_fn=progress_fn,
-                                            symlink_exts=_symlink_exts,
                                             exclude=custom_exclude or None,
                                             core_dir=data_dir.parent / (data_dir.name + "_Core"))
         _log(f"  Transferred {linked_mod} mod file(s).")
