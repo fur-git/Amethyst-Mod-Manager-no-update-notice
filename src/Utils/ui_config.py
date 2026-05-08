@@ -19,6 +19,10 @@ _INI_AUTO = "auto"
 _DEFAULT_SCALE = 1.0
 _MIN_SCALE = 0.5
 _MAX_SCALE = 3.0
+# Auto-detection caps out lower than the manual ceiling: HiDPI/portal readings
+# can be over-eager (e.g. 4K TVs reporting 2.0) and the UI is still legible at
+# 1.5x. Users who want larger can still pick it manually.
+_AUTO_MAX_SCALE = 1.5
 
 _DEFAULT_FONT_FAMILY = "Noto Sans"
 _INI_FONT_OPTION = "font_family"
@@ -233,7 +237,7 @@ def get_screen_info() -> tuple[int, int, float]:
     # that path exists only for compositors that don't tell us their scale.
     portal = _get_portal_scale()
     if portal > 1.0:
-        scale = round(min(_MAX_SCALE, portal) * 20) / 20
+        scale = round(min(_AUTO_MAX_SCALE, portal) * 20) / 20
         return w, h, scale
 
     # Xft.dpi may already have been overridden to 96 (by a previous launch),
@@ -258,7 +262,7 @@ def get_screen_info() -> tuple[int, int, float]:
     # Flatpak / multi-monitor that a sub-1.0 result is almost always wrong —
     # users with a genuinely tiny screen can still pick one manually.
     if physical_h >= 1080:
-        scale = min(2.0, physical_h / 1080)
+        scale = min(_AUTO_MAX_SCALE, physical_h / 1080)
     else:
         scale = 1.0
     scale = round(scale * 20) / 20  # Snap to nearest 0.05
@@ -269,7 +273,8 @@ def detect_hidpi_scale() -> float:
     """Detect suggested UI scale from primary screen height.
 
     UI designed for Steam Deck (1280x800). Heights 800–1080 → 1.0.
-    Below 800 scales down; above 1080 scales up to 1.5.
+    Above 1080 scales up, capped at _AUTO_MAX_SCALE (1.5x) so 4K displays
+    don't get an over-eager auto-scale; manual selection can still go higher.
     """
     _, _, scale = get_screen_info()
     return scale
