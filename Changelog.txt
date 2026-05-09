@@ -8,6 +8,10 @@
 - Added a create backup option to the restore backup menu, This creates a backup without having to deploy
 - Collection installs now apply diff patches if supplied by the author
 - Collection installs will apply ini tweaks if provided, Use profile-specfic ini files needs to on for this to work
+- Updated libloot to 0.29.5
+- Downgraded flatpaks tk version to match the appimage and fix some scaling issues in tk9
+- Mods in locked separators now cannot be dragged out of them, Holding alt while dragging them will bypass this behaviour
+- Changing staging folder will now move files to the new staging folder.
 
 
 - v1.3.1

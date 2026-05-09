@@ -1219,6 +1219,15 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         if self._found_path is None:
             return
 
+        # Capture the staging root currently on disk, before any setters mutate
+        # it. We need this to offer a migration if the staging location changed.
+        old_profile_root: Optional[Path] = None
+        try:
+            if self._game.is_configured():
+                old_profile_root = self._game.get_profile_root()
+        except Exception:
+            old_profile_root = None
+
         # -- Hard-link cross-device validation --------------------------------
         mode_str = self._deploy_mode_var.get()
         if mode_str == "hardlink":
@@ -1283,6 +1292,23 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                 self._game.set_patch_version(int(self._patch_version_var.get()))
             except (TypeError, ValueError):
                 self._game.set_patch_version(8)
+
+        # If the staging root moved and the old root has content, offer to
+        # migrate the existing mods/profiles/overwrite tree before continuing.
+        new_profile_root: Optional[Path] = None
+        try:
+            new_profile_root = self._game.get_profile_root()
+        except Exception:
+            new_profile_root = None
+
+        if self._maybe_migrate_staging(old_profile_root, new_profile_root):
+            # Migration is running asynchronously; it will call _finalize_add
+            # once the worker thread is done.
+            return
+
+        self._finalize_add()
+
+    def _finalize_add(self) -> None:
         _create_profile_structure(self._game)
         self.result = self._found_path
 
@@ -1299,6 +1325,169 @@ class ReconfigureGamePanel(ctk.CTkFrame):
             threading.Thread(target=_install_components, daemon=True).start()
 
         self._on_done(self)
+
+    # ------------------------------------------------------------------
+    # Staging migration
+    # ------------------------------------------------------------------
+
+    def _maybe_migrate_staging(
+        self,
+        old_root: Optional[Path],
+        new_root: Optional[Path],
+    ) -> bool:
+        """If the staging root changed and has content, prompt + move it.
+
+        Returns True when migration is in progress (caller must not finalize
+        synchronously); False when no migration is needed and the caller
+        should proceed immediately.
+        """
+        if old_root is None or new_root is None:
+            return False
+        try:
+            if old_root.resolve() == new_root.resolve():
+                return False
+        except OSError:
+            if str(old_root) == str(new_root):
+                return False
+        if not old_root.is_dir():
+            return False
+
+        try:
+            children = [p for p in old_root.iterdir()]
+        except OSError:
+            children = []
+        if not children:
+            return False
+
+        from gui.ctk_components import CTkAlert, CTkProgressPopup
+
+        # Reuse the size/format helpers from status_bar so the alert text
+        # matches the existing download-cache migration prompt.
+        from gui.status_bar import _get_dir_size, _fmt_size
+
+        old_size = _get_dir_size(old_root)
+        alert = CTkAlert(
+            state="warning",
+            title="Move Mod Staging Files?",
+            body_text=(
+                f"The staging location for {self._game.name} has changed.\n\n"
+                f"Move {_fmt_size(old_size)} of mods, profiles and overwrite "
+                f"files from\n{old_root}\nto\n{new_root}?\n\n"
+                "Existing items at the destination are kept; only items not "
+                "already present at the new location are moved."
+            ),
+            btn1="Move",
+            btn2="Skip",
+            parent=self.winfo_toplevel(),
+            height=360,
+        )
+        choice = alert.get()
+        if choice != "Move":
+            # User chose to skip the move (or dismissed the alert). The new
+            # staging path is already saved; just continue without migrating.
+            return False
+
+        # Build a flat file list so we can drive a per-file progress bar.
+        files: list[Path] = []
+        try:
+            for p in old_root.rglob("*"):
+                if p.is_file() or p.is_symlink():
+                    files.append(p)
+        except OSError:
+            pass
+        total_files = len(files)
+
+        try:
+            new_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            app_log(f"Staging migration: could not create {new_root}: {exc}")
+            return False
+
+        popup = CTkProgressPopup(
+            self.winfo_toplevel(),
+            title="Moving Mod Staging Files",
+            label=f"0 / {total_files} files",
+            message=str(old_root),
+        )
+        popup.update_progress(0)
+
+        def _ui(fn, *args):
+            try:
+                self.after(0, lambda: fn(*args))
+            except Exception:
+                pass
+
+        def _worker():
+            import shutil
+            moved = 0
+            skipped = 0
+            failed = 0
+            done = 0
+            for src in files:
+                if popup.cancelled:
+                    break
+                try:
+                    rel = src.relative_to(old_root)
+                except ValueError:
+                    done += 1
+                    continue
+                dst = new_root / rel
+                try:
+                    if dst.exists():
+                        skipped += 1
+                    else:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(src), str(dst))
+                        moved += 1
+                except Exception as exc:
+                    failed += 1
+                    app_log(f"Staging migration: failed to move {src} → {dst}: {exc}")
+                done += 1
+                if total_files:
+                    progress = done / total_files
+                    label = f"{done} / {total_files} files"
+                    msg = str(src.parent)
+                    _ui(popup.update_progress, progress)
+                    _ui(popup.update_label, label)
+                    _ui(popup.update_message, msg)
+
+            # Best-effort: prune now-empty directories from the old root so a
+            # later "is this empty?" check returns true.
+            if not popup.cancelled:
+                try:
+                    for d in sorted(
+                        (p for p in old_root.rglob("*") if p.is_dir()),
+                        key=lambda p: len(p.parts),
+                        reverse=True,
+                    ):
+                        try:
+                            d.rmdir()
+                        except OSError:
+                            pass
+                    try:
+                        old_root.rmdir()
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+
+            def _done_on_ui():
+                try:
+                    popup.close_progress_popup()
+                except Exception:
+                    pass
+                summary = (
+                    f"{self._game.name}: moved {moved} file(s) to {new_root}"
+                    + (f", skipped {skipped}" if skipped else "")
+                    + (f", failed {failed}" if failed else "")
+                )
+                app_log(summary)
+                self._finalize_add()
+
+            _ui(_done_on_ui)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
 
     def _on_cancel(self):
         self.result = None
