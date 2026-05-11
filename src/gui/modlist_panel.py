@@ -7260,6 +7260,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                         normalize_folder_case=normalize_folder_case,
                         exclude_dirs=exclude_dirs,
                         log_fn=_log_thread_safe,
+                        root_folder_mods=root_folder_mods_snap,
                     )
                 count, conflict_map, overrides, overridden_by = build_filemap(
                     modlist_path, staging, output,

@@ -591,6 +591,7 @@ def rebuild_mod_index(
     normalize_folder_case: bool = True,
     exclude_dirs: frozenset[str] | None = None,
     log_fn: "Callable[[str], None] | None" = None,
+    root_folder_mods: set[str] | None = None,
 ) -> None:
     """Scan every mod folder under staging_root and rewrite the full index.
 
@@ -598,9 +599,16 @@ def rebuild_mod_index(
     rebuilds (enable/disable/reorder) use the cached index instead.
 
     The overwrite folder is also indexed under OVERWRITE_NAME.
+
+    root_folder_mods — names of mods marked root_folder=True. These are deployed
+    verbatim to the game root, so the global strip_prefixes (e.g. Bethesda's
+    ``Data``) must NOT be applied: a SKSE-style mod ships ``Data/Scripts/...``
+    plus loose ``.exe`` files at top level; stripping ``Data/`` would dump the
+    Scripts subtree at the game root instead of inside ``<game>/Data/``.
     """
     _strip = frozenset(s.lower() for s in strip_prefixes) if strip_prefixes else frozenset()
     _per_mod = per_mod_strip_prefixes or {}
+    _root_mods = root_folder_mods or set()
     _exts  = frozenset(e.lower() for e in allowed_extensions) if allowed_extensions else frozenset()
     _root  = frozenset()  # root_deploy_folders routing removed; param kept for compat
     _excl_dirs = exclude_dirs if exclude_dirs is not None else frozenset()
@@ -620,6 +628,8 @@ def rebuild_mod_index(
     scan_targets.append((OVERWRITE_NAME, overwrite_str))
 
     def _strip_for_mod(name: str) -> frozenset[str]:
+        if name in _root_mods:
+            return frozenset()
         mod_strip = _per_mod.get(name)
         if not mod_strip:
             return _strip
@@ -627,6 +637,8 @@ def rebuild_mod_index(
         return _strip | frozenset(s.lower() for s in segment_names)
 
     def _path_prefixes_for_mod(name: str) -> list[str]:
+        if name in _root_mods:
+            return []
         mod_strip = _per_mod.get(name)
         if not mod_strip:
             return []
@@ -783,6 +795,7 @@ def build_filemap(
             normalize_folder_case=normalize_folder_case,
             exclude_dirs=exclude_dirs,
             log_fn=log_fn,
+            root_folder_mods=root_folder_mods,
         )
         index = read_mod_index(index_path) or {}
 
