@@ -1,5 +1,6 @@
 - v1.3.3
 - Fixed plugins being disabled on manual collection installs
+- Added a filter by filetype to the modlist filters
 
 - v1.3.2
 - Reworked the download Tab

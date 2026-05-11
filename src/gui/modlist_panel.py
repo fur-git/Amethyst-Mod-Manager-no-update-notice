@@ -518,6 +518,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._filter_fomod_only: bool = False
         self._filter_has_bsa: bool = False
         self._filter_categories: frozenset[str] = frozenset()  # when non-empty, show only these categories
+        self._filter_filetypes: frozenset[str] = frozenset()   # when non-empty, show only mods containing these extensions
         self._filter_has_notes: bool = False
         self._disabled_plugins_map: dict[str, list[str]] = {}  # mod_name → [plugin, ...]
         self._excluded_mod_files_map: dict[str, list[str]] = {}  # mod_name → [rel_key, ...]
@@ -2737,6 +2738,18 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 lambda i: self._sep_block_has_category(i, allowed_cats),
             )
 
+        # Step 4g: filetype filter — frozenset of extensions (lowercase, with dot).
+        if self._filter_filetypes:
+            mods_set = self._get_mods_with_filetypes(self._filter_filetypes)
+            if not mods_set:
+                base = []
+            else:
+                base = self._apply_filter(
+                    base,
+                    lambda e: e.name in mods_set,
+                    lambda i: self._sep_block_has_filetypes(i, mods_set),
+                )
+
         # Step 5: apply column sort (visual only)
         if self._sort_column is not None:
             base = self._apply_column_sort(base)
@@ -3742,6 +3755,61 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         return self._sep_block_has_any(
             sep_idx,
             lambda e: (cats.get(e.name, "") or "") in allowed_categories,
+        )
+
+    def _read_mod_index_safe(self):
+        """Load the persisted mod index ({mod: (normal, root)}) or {} if unavailable."""
+        if self._filemap_path is None:
+            return {}
+        index_path = self._filemap_path.parent / "modindex.bin"
+        if not index_path.is_file():
+            return {}
+        try:
+            from Utils.filemap import read_mod_index
+            return read_mod_index(index_path) or {}
+        except Exception:
+            return {}
+
+    def _get_filetype_counts(self) -> dict[str, int]:
+        """Map extension (lowercase, with dot) → file count across all mods."""
+        from os.path import splitext
+        counts: dict[str, int] = {}
+        for _mod, (normal, root) in self._read_mod_index_safe().items():
+            for rel_key in normal:
+                ext = splitext(rel_key)[1]
+                if ext:
+                    counts[ext] = counts.get(ext, 0) + 1
+            for rel_key in root:
+                ext = splitext(rel_key)[1]
+                if ext:
+                    counts[ext] = counts.get(ext, 0) + 1
+        return counts
+
+    def _get_mods_with_filetypes(self, exts: frozenset[str]) -> set[str]:
+        """Set of mod names that contain at least one file with any of `exts`.
+
+        `exts` must be lowercase extensions with leading dot (e.g. {".esp"}).
+        """
+        from os.path import splitext
+        result: set[str] = set()
+        for mod, (normal, root) in self._read_mod_index_safe().items():
+            hit = False
+            for rel_key in normal:
+                if splitext(rel_key)[1] in exts:
+                    hit = True
+                    break
+            if not hit:
+                for rel_key in root:
+                    if splitext(rel_key)[1] in exts:
+                        hit = True
+                        break
+            if hit:
+                result.add(mod)
+        return result
+
+    def _sep_block_has_filetypes(self, sep_idx: int, mods_with_filetypes: set[str]) -> bool:
+        return self._sep_block_has_any(
+            sep_idx, lambda e: e.name in mods_with_filetypes,
         )
 
     def _on_mouse_drag(self, event):
