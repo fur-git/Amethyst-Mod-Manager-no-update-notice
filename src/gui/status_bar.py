@@ -1030,10 +1030,11 @@ class SettingsPanel(ctk.CTkFrame):
             font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
         ).pack(anchor="w", pady=(2, 0))
 
-        # Pre-release channel toggle is only meaningful for AppImage installs
-        # (Flatpak and AUR are managed externally and we can't auto-switch them).
+        # Pre-release channel toggle controls update *notifications*; AppImage
+        # and Flatpak both surface the latest beta when enabled. AUR is managed
+        # externally so the toggle is hidden there.
         # Dev mode forces it visible so source-checkout users can exercise it.
-        if (is_appimage() and not is_flatpak()) or load_dev_mode():
+        if is_appimage() or is_flatpak() or load_dev_mode():
             self._allow_prerelease_var = tk.BooleanVar(value=load_allow_prerelease())
             ctk.CTkCheckBox(
                 gen_sec, text="Use pre-release versions",
