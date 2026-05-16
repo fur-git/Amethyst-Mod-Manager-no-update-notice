@@ -32,6 +32,61 @@ LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, Optional[str]], None]
 
 
+def _make_ue5_conflict_key_fn(game, index_path: Path):
+    """Build a (mod_name, rel_key) → ck callback for UE5 conflict detection.
+
+    Uses _resolve_filemap_entries (whole-mod resolve) so include_siblings drag
+    is honoured. Per-entry _resolve_entry can't see siblings, which gives the
+    wrong destination for companion files like enabled.txt.
+
+    ``index_path`` must point at the ``modindex.bin`` that sits next to the
+    filemap being built (NOT next to modlist.txt, which lives in a profile
+    subfolder).
+    """
+    from Utils.filemap import read_mod_index
+
+    cache: dict[str, dict[str, str]] = {}
+    index = None
+
+    def _load(mod_name: str) -> dict[str, str]:
+        nonlocal index
+        if index is None:
+            try:
+                index = read_mod_index(index_path) or {}
+            except Exception:
+                index = {}
+        entry = index.get(mod_name)
+        if not entry:
+            return {}
+        normal, _ = entry
+        # Build (staged_rel, mod_name) pairs from the raw on-disk paths.
+        pairs = [(rel_str, mod_name) for _rk, rel_str in normal.items()]
+        try:
+            resolved = game._resolve_filemap_entries(pairs)
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for staged_rel, _mn, dest, final in resolved:
+            rk = staged_rel.replace("\\", "/").lower()
+            ck = (dest + "/" + final) if dest else final
+            out[rk] = ck
+        return out
+
+    def _ck(mod_name: str, rel_key: str) -> str:
+        m = cache.get(mod_name)
+        if m is None:
+            m = _load(mod_name)
+            cache[mod_name] = m
+        ck = m.get(rel_key)
+        if ck is not None:
+            return ck
+        # Fallback to per-entry resolution (rare — entry not in cached mod map).
+        dest, final = game._resolve_entry(rel_key)
+        return (dest + "/" + final) if dest else final
+
+    return _ck
+
+
 def _build_filemap_for_game(game, profile, *, log_fn: LogFn) -> None:
     """Rebuild filemap.txt + filemap_root.txt for *profile* of *game*.
 
@@ -58,11 +113,16 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn) -> None:
             and load_normalize_folder_case()
         )
         if isinstance(game, UE5Game):
-            def conflict_key_fn(rk: str, _g=game) -> str:
-                dest, final = _g._resolve_entry(rk)
-                return (dest + "/" + final) if dest else final
+            conflict_key_fn = _make_ue5_conflict_key_fn(
+                game, filemap_out.parent / "modindex.bin",
+            )
         else:
-            conflict_key_fn = getattr(game, "filemap_conflict_key_fn", None)
+            _legacy = getattr(game, "filemap_conflict_key_fn", None)
+            if _legacy is not None:
+                def conflict_key_fn(_mod: str, rk: str, _f=_legacy) -> str:
+                    return _f(rk)
+            else:
+                conflict_key_fn = None
 
         build_filemap(
             modlist_path, staging, filemap_out,

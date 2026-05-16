@@ -7193,14 +7193,18 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         conflict_ignore_fn  = set(self._conflict_ignore_filenames) if self._conflict_ignore_filenames else None
         exclude_dirs        = set(self._filemap_exclude_dirs) if self._filemap_exclude_dirs else None
         from Games.ue5_game import UE5Game as _UE5Game
+        from Utils.deploy_pipeline import _make_ue5_conflict_key_fn
         _captured_game = getattr(self, "_game", None)
         _conflict_key_fn = None
         if isinstance(_captured_game, _UE5Game):
-            def _conflict_key_fn(rel_key: str, _g=_captured_game) -> str:
-                dest, final = _g._resolve_entry(rel_key)
-                return (dest + "/" + final) if dest else final
+            _conflict_key_fn = _make_ue5_conflict_key_fn(
+                _captured_game, output.parent / "modindex.bin",
+            )
         elif _captured_game is not None:
-            _conflict_key_fn = getattr(_captured_game, "filemap_conflict_key_fn", None)
+            _legacy = getattr(_captured_game, "filemap_conflict_key_fn", None)
+            if _legacy is not None:
+                def _conflict_key_fn(_mod: str, rk: str, _f=_legacy) -> str:
+                    return _f(rk)
         # Pre-RTX detection: gather the source prefixes that indicate old-format mods
         # (e.g. "natives/x64/" for RE2/RE3/RE7).
         _prertx_prefixes: list[str] = []

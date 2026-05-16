@@ -735,7 +735,7 @@ def build_filemap(
     excluded_mod_files: dict[str, set[str]] | None = None,
     normalize_folder_case: bool = True,
     filemap_casing: str = FILEMAP_CASING_UPPER,
-    conflict_key_fn: "Callable[[str], str] | None" = None,
+    conflict_key_fn: "Callable[[str, str], str] | None" = None,
     exclude_dirs: frozenset[str] | None = None,
     log_fn: "Callable[[str], None] | None" = None,
     root_folder_mods: set[str] | None = None,
@@ -882,7 +882,7 @@ def build_filemap(
             # Effective-deploy-path conflict detection only applies to normal mods.
             # Root-flagged mods deploy verbatim to game_root, no conflict_key_fn transform.
             if not _is_root_mod and conflict_key_fn is not None:
-                ck = conflict_key_fn(rel_key).lower()
+                ck = conflict_key_fn(name, rel_key).lower()
                 prev_ck = conflict_winner.get(ck)
                 if prev_ck is not None and prev_ck != name:
                     prev_staged = conflict_staged.get(ck)
