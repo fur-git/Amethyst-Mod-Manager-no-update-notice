@@ -44,10 +44,13 @@ from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
 class PluginPanelIniMixin:
     """Ini/json/toml file list with filename search + content search."""
 
-    _INI_JSON_EXTENSIONS = frozenset({".ini", ".json", ".toml"})
+    _INI_JSON_EXTENSIONS = frozenset({
+        ".ini", ".json", ".toml", ".txt", ".cfg", ".conf", ".config",
+        ".yaml", ".yml", ".xml", ".log", ".md",
+    })
     _INI_CONTENT_SEARCH_EXTENSIONS = frozenset({
         ".ini", ".json", ".toml", ".txt", ".cfg", ".conf", ".config",
-        ".yaml", ".yml", ".xml",
+        ".yaml", ".yml", ".xml", ".log", ".md",
     })
 
     @staticmethod
@@ -83,6 +86,15 @@ class PluginPanelIniMixin:
             font=_theme.FONT_HEADER, corner_radius=4,
             command=self._on_search_ini_content,
         ).pack(side="left", padx=(0, 8), pady=2)
+
+        self._ini_filter_btn = ctk.CTkButton(
+            toolbar, text="Filters", width=72, height=26,
+            fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT,
+            font=_theme.FONT_HEADER, corner_radius=4,
+            command=self._toggle_ini_filter_panel,
+        )
+        self._ini_filter_btn.pack(side="left", padx=(0, 8), pady=2)
+        self._build_ini_filter_side_panel()
 
         # Content-filter status row (row 1) — hidden when no content filter is active
         self._ini_content_status_row = tk.Frame(tab, bg=BG_HEADER, highlightthickness=0)
@@ -221,6 +233,203 @@ class PluginPanelIniMixin:
         self._ini_content_query: str | None = None
         self._ini_content_matches: set[tuple[str, str]] | None = None
         self._ini_content_extra_entries: list[tuple[str, str, Path]] = []
+        self._ini_filter_extensions: set[str] = set()  # empty = no filter
+        self._ini_filter_panel_open: bool = False
+
+    def _build_ini_filter_side_panel(self) -> None:
+        """Build the Ini Files filter side panel — same pattern as the Data /
+        Downloads filter panels, sharing column 0 on the ModListPanel."""
+        mod_panel = getattr(self.winfo_toplevel(), "_mod_panel", None)
+        parent = mod_panel if mod_panel is not None else self
+        panel = ctk.CTkFrame(parent, fg_color=BG_PANEL, corner_radius=0, width=380)
+        panel.grid(row=0, column=0, rowspan=5, sticky="nsew")
+        panel.grid_propagate(False)
+        panel.grid_remove()
+        self._ini_filter_side_panel = panel
+
+        header = tk.Frame(panel, bg=BG_HEADER, height=scaled(36))
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+
+        tk.Label(
+            header, text="Ini Filters", bg=BG_HEADER, fg=TEXT_MAIN,
+            font=_theme.FONT_BOLD, anchor="w",
+        ).pack(side="left", padx=10, pady=6)
+
+        close_btn = tk.Label(
+            header, text="×", bg=BG_HEADER, fg=TEXT_DIM,
+            font=(_theme.FONT_FAMILY, 16, "bold"), cursor="hand2",
+        )
+        close_btn.pack(side="right", padx=8)
+        close_btn.bind("<Button-1>", lambda _e: self._close_ini_filter_panel())
+        close_btn.bind("<Enter>",    lambda _e: close_btn.configure(fg=TEXT_MAIN))
+        close_btn.bind("<Leave>",    lambda _e: close_btn.configure(fg=TEXT_DIM))
+
+        clear_btn = tk.Label(
+            header, text="Clear all", bg=BG_HEADER, fg=TEXT_DIM,
+            font=_theme.FONT_SMALL, cursor="hand2",
+        )
+        clear_btn.pack(side="right", padx=(0, 4))
+        clear_btn.bind("<Button-1>", lambda _e: self._clear_all_ini_filters())
+        clear_btn.bind("<Enter>",    lambda _e: clear_btn.configure(fg=TEXT_MAIN))
+        clear_btn.bind("<Leave>",    lambda _e: clear_btn.configure(fg=TEXT_DIM))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x")
+
+        scroll_frame = ctk.CTkScrollableFrame(
+            panel, fg_color="transparent", corner_radius=0,
+        )
+        scroll_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        self._ini_filter_scroll_frame = scroll_frame
+
+        ctk.CTkLabel(
+            scroll_frame, text="By file type",
+            font=_theme.FONT_BOLD, text_color=TEXT_MAIN, anchor="w",
+        ).pack(anchor="w", pady=(2, 4))
+
+        self._ifsp_filetype_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+        self._ifsp_filetype_frame.pack(anchor="w", fill="x", pady=(2, 0))
+        self._ifsp_filetype_vars = {}
+
+        self._bind_ini_filter_panel_scroll()
+
+    def _bind_ini_filter_panel_scroll(self) -> None:
+        scroll_frame = getattr(self, "_ini_filter_scroll_frame", None)
+        if not scroll_frame or not hasattr(scroll_frame, "_parent_canvas"):
+            return
+        step = 2
+
+        def _on_wheel(evt):
+            num = getattr(evt, "num", None)
+            delta = getattr(evt, "delta", 0) or 0
+            if num == 4 or delta > 0:
+                scroll_frame._parent_canvas.yview_scroll(-step, "units")
+            elif num == 5 or delta < 0:
+                scroll_frame._parent_canvas.yview_scroll(step, "units")
+            return "break"
+
+        _legacy = None if LEGACY_WHEEL_REDUNDANT else _on_wheel
+
+        def _bind_recursive(w):
+            if _legacy is not None:
+                w.bind("<Button-4>", _legacy)
+                w.bind("<Button-5>", _legacy)
+            for child in w.winfo_children():
+                _bind_recursive(child)
+
+        _bind_recursive(scroll_frame)
+
+    def _get_ini_filetype_counts(self) -> "dict[str, int]":
+        """Extension (lowercase, with dot) → count across the full ini entries list."""
+        counts: dict[str, int] = {}
+        for rel_path, _mod, _p in self._ini_files_entries:
+            ext = Path(rel_path).suffix.lower()
+            if ext:
+                counts[ext] = counts.get(ext, 0) + 1
+        return counts
+
+    def _refresh_ini_filter_filetype_list(self) -> None:
+        frame = self._ifsp_filetype_frame
+        if frame is None:
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        self._ifsp_filetype_vars.clear()
+        counts = self._get_ini_filetype_counts()
+        if not counts:
+            ctk.CTkLabel(
+                frame, text="(no files in Ini tab)",
+                font=_theme.FONT_SMALL, text_color=TEXT_DIM, anchor="w",
+            ).pack(anchor="w", pady=2)
+            self._bind_ini_filter_panel_scroll()
+            return
+        for ext, count in sorted(counts.items(), key=lambda kv: kv[0]):
+            var = tk.BooleanVar(value=ext in self._ini_filter_extensions)
+            self._ifsp_filetype_vars[ext] = var
+            ctk.CTkCheckBox(
+                frame,
+                text=f"{ext}  ({count:,})",
+                variable=var,
+                font=_theme.FONT_SMALL,
+                text_color=TEXT_MAIN,
+                fg_color=ACCENT,
+                hover_color=ACCENT_HOV,
+                border_color=BORDER,
+                checkmark_color="white",
+                command=self._on_ini_filter_panel_change,
+            ).pack(anchor="w", pady=2)
+        self._bind_ini_filter_panel_scroll()
+
+    def _on_ini_filter_panel_change(self) -> None:
+        self._ini_filter_extensions = {
+            ext for ext, v in self._ifsp_filetype_vars.items() if v.get()
+        }
+        self._update_ini_filter_btn_color()
+        self._apply_ini_search_filter()
+
+    def _clear_all_ini_filters(self) -> None:
+        self._ini_filter_extensions = set()
+        for v in self._ifsp_filetype_vars.values():
+            v.set(False)
+        self._update_ini_filter_btn_color()
+        self._apply_ini_search_filter()
+
+    def _toggle_ini_filter_panel(self) -> None:
+        if getattr(self, "_ini_filter_panel_open", False):
+            self._close_ini_filter_panel()
+        else:
+            self._open_ini_filter_panel()
+
+    def _open_ini_filter_panel(self) -> None:
+        mod_panel = getattr(self.winfo_toplevel(), "_mod_panel", None)
+        if mod_panel is None or self._ini_filter_side_panel is None:
+            return
+        # Mutual exclusion with the other filter panels that share column 0.
+        if getattr(mod_panel, "_filter_panel_open", False):
+            try:
+                mod_panel._close_filter_side_panel()
+            except Exception:
+                pass
+        if getattr(self, "_plugin_filter_panel_open", False):
+            try:
+                self._close_plugin_filter_panel()
+            except Exception:
+                pass
+        if getattr(self, "_data_filter_panel_open", False):
+            try:
+                self._close_data_filter_panel()
+            except Exception:
+                pass
+        app = self.winfo_toplevel()
+        dl_panel = getattr(app, "_downloads_panel", None)
+        if dl_panel is not None and getattr(dl_panel, "_filter_panel_open", False):
+            try:
+                dl_panel._close_filter_side_panel()
+            except Exception:
+                pass
+        self._ini_filter_panel_open = True
+        mod_panel.grid_columnconfigure(0, minsize=scaled(380))
+        self._ini_filter_side_panel.grid()
+        self._refresh_ini_filter_filetype_list()
+        self._update_ini_filter_btn_color()
+
+    def _close_ini_filter_panel(self) -> None:
+        mod_panel = getattr(self.winfo_toplevel(), "_mod_panel", None)
+        self._ini_filter_panel_open = False
+        if mod_panel is not None:
+            mod_panel.grid_columnconfigure(0, minsize=0)
+        if self._ini_filter_side_panel is not None:
+            self._ini_filter_side_panel.grid_remove()
+        self._update_ini_filter_btn_color()
+
+    def _update_ini_filter_btn_color(self) -> None:
+        btn = getattr(self, "_ini_filter_btn", None)
+        if btn is None:
+            return
+        if self._ini_filter_extensions:
+            btn.configure(fg_color=ACCENT_HOV, hover_color=ACCENT_HOV)
+        else:
+            btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOV)
 
     def _resolve_ini_file_path(self, rel_path: str, mod_name: str) -> Path | None:
         """Resolve full file path from filemap entry. Returns None if staging_root unknown.
@@ -360,6 +569,9 @@ class PluginPanelIniMixin:
             combined = list(entries) + list(extra)
             entries = [e for e in combined if (e[0], e[1]) in content_matches]
             entries.sort(key=lambda t: (t[0].lower(), t[1].lower()))
+        ext_filter = self._ini_filter_extensions
+        if ext_filter:
+            entries = [e for e in entries if Path(e[0]).suffix.lower() in ext_filter]
         if not query:
             self._ini_files_displayed = list(entries)
         else:

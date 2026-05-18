@@ -309,6 +309,8 @@ class ModListFilterPanelMixin:
             plugin_panel._close_plugin_filter_panel()
         if plugin_panel is not None and getattr(plugin_panel, "_data_filter_panel_open", False):
             plugin_panel._close_data_filter_panel()
+        if plugin_panel is not None and getattr(plugin_panel, "_ini_filter_panel_open", False):
+            plugin_panel._close_ini_filter_panel()
         self._filter_panel_open = True
         # Use scaled minsize so the panel isn't squeezed at higher UI scale.
         self.grid_columnconfigure(0, minsize=scaled(380))

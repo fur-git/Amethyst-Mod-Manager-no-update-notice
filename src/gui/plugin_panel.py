@@ -1880,6 +1880,8 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             mod_panel._close_filter_side_panel()
         if getattr(self, "_data_filter_panel_open", False):
             self._close_data_filter_panel()
+        if getattr(self, "_ini_filter_panel_open", False):
+            self._close_ini_filter_panel()
         self._plugin_filter_panel_open = True
         mod_panel.grid_columnconfigure(0, minsize=scaled(380))
         self._plugin_filter_side_panel.grid()

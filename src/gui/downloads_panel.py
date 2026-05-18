@@ -1697,6 +1697,16 @@ class DownloadsPanel:
                 plugin_panel._close_plugin_filter_panel()
             except Exception:
                 pass
+        if plugin_panel is not None and getattr(plugin_panel, "_data_filter_panel_open", False):
+            try:
+                plugin_panel._close_data_filter_panel()
+            except Exception:
+                pass
+        if plugin_panel is not None and getattr(plugin_panel, "_ini_filter_panel_open", False):
+            try:
+                plugin_panel._close_ini_filter_panel()
+            except Exception:
+                pass
         self._filter_panel_open = True
         if mod_panel is not None:
             mod_panel.grid_columnconfigure(0, minsize=scaled(380))
