@@ -28,6 +28,150 @@ from Utils.deploy_shared import (
 
 _CUSTOM_RULES_LOG_NAME = "custom_rules_deployed.txt"
 _CUSTOM_RULES_BACKUP_DIR = "custom_rules_backup"
+_CUSTOM_RULES_PREFIX_BACKUP_DIR = "custom_rules_prefix_backup"
+
+
+def _ext_match(filename: str, exts: list[str]) -> str | None:
+    """Return the longest extension in ``exts`` that ``filename`` ends with
+    (as ``.something``), or None. ``exts`` must be sorted longest-first.
+    """
+    for e in exts:
+        if filename.endswith(e) and len(filename) > len(e):
+            return e
+    return None
+
+
+def _name_match(filename: str, names: set[str]) -> bool:
+    """Match ``filename`` (lowercased) against ``names``. Glob characters
+    (``*``, ``?``, ``[seq]``) are honoured; plain entries match by equality.
+    """
+    for n in names:
+        if any(c in n for c in "*?["):
+            if fnmatch.fnmatchcase(filename, n):
+                return True
+        elif filename == n:
+            return True
+    return False
+
+
+def _match_single_rule(
+    rel_lower: str,
+    rule: "CustomRule", folders: set[str], exts: list[str], filenames: set[str],
+) -> tuple[int, str] | None:
+    """Check whether ``rel_lower`` matches a *single* rule.
+
+    Returns ``(strip_len, matched_ext)`` on a match, or None.
+    """
+    parts = rel_lower.split("/")
+    filename = parts[-1]
+    is_loose = len(parts) == 1
+    strip_len = -1
+    folder_hit = False
+    if folders:
+        for f in folders:
+            if "/" in f:
+                idx = rel_lower.find(f + "/")
+                if idx < 0 and rel_lower.endswith(f):
+                    idx = len(rel_lower) - len(f)
+                if idx >= 0 and (idx == 0 or rel_lower[idx - 1] == "/"):
+                    strip_len = idx
+                    folder_hit = True
+                    break
+            else:
+                for pi, seg in enumerate(parts[:-1]):
+                    if seg == f:
+                        strip_len = sum(len(parts[j]) + 1 for j in range(pi))
+                        folder_hit = True
+                        break
+                if folder_hit:
+                    break
+        if folder_hit and rule.loose_only and strip_len != 0:
+            return None
+    matched_ext = _ext_match(filename, exts) if exts else None
+    if folder_hit and (not exts or matched_ext is not None):
+        return strip_len, matched_ext or ""
+    if rule.loose_only and not is_loose:
+        return None
+    if matched_ext is not None and not folders and not filenames:
+        return -1, matched_ext
+    if filenames and _name_match(filename, filenames):
+        return -1, ""
+    return None
+
+
+def _normalise_rule(rule: "CustomRule") -> tuple["CustomRule", set[str], list[str], set[str]]:
+    """Return ``(rule, folders_lower, exts_sorted, filenames_lower)`` for a
+    single CustomRule — the form expected by ``_match_single_rule``."""
+    return (
+        rule,
+        {f.lower() for f in rule.folders},
+        sorted({e.lower() for e in rule.extensions}, key=len, reverse=True),
+        {n.lower() for n in rule.filenames},
+    )
+
+
+def compute_prefix_handled(
+    entries: list[tuple[str, str]], rules: list["CustomRule"],
+) -> tuple[set[str], list[tuple[str, str, "CustomRule", int, str]]]:
+    """Return ``(prefix_handled, prefix_primaries)`` — only the entries
+    claimed by ``to_prefix`` rules.
+
+    Non-prefix rules are evaluated alongside prefix rules to preserve correct
+    first-match ordering (so a non-prefix rule earlier in the list can prevent
+    a later prefix rule from claiming the same file), but their matches do
+    *not* appear in either return value. Callers (e.g. UE5 deploy) use the
+    returned set to skip prefix-routed files in their own placement pipeline
+    without disturbing files claimed by ordinary rules.
+    """
+    norm_rules = [_normalise_rule(r) for r in rules]
+    all_handled: set[str] = set()       # claimed by any rule (for ordering)
+    prefix_handled: set[str] = set()    # subset claimed by a to_prefix rule
+    prefix_primaries: list[tuple[str, str, "CustomRule", int, str]] = []
+    indexed = [(rel.replace("\\", "/"), mod, rel.replace("\\", "/").lower())
+               for rel, mod in entries]
+    for rule, folders, exts, filenames in norm_rules:
+        new_primary_keys: list[tuple[str, str, int]] = []
+        for rel_str, mod_name, rel_lower in indexed:
+            if rel_lower in all_handled:
+                continue
+            hit = _match_single_rule(rel_lower, rule, folders, exts, filenames)
+            if hit is None:
+                continue
+            strip_len, matched_ext = hit
+            all_handled.add(rel_lower)
+            if rule.to_prefix:
+                prefix_handled.add(rel_lower)
+                prefix_primaries.append((rel_str, mod_name, rule, strip_len, matched_ext))
+                new_primary_keys.append((rel_str, mod_name, strip_len))
+        if not rule.include_siblings or not new_primary_keys:
+            continue
+        drags: list[tuple[str, str, bool]] = []
+        for rel_str, mod_name, strip_len in new_primary_keys:
+            info = _sibling_container(rel_str, strip_len, mod_name)
+            if info is None:
+                continue
+            cont_path, _cont_name = info
+            drags.append((cont_path.lower(), mod_name, cont_path == ""))
+        drags.sort(key=lambda t: (0 if t[2] else 1, -len(t[0])))
+        seen_drags: set[tuple[str, str]] = set()
+        for cont_lower, mod_name, is_whole in drags:
+            key = (cont_lower, mod_name)
+            if key in seen_drags:
+                continue
+            seen_drags.add(key)
+            prefix_lower = cont_lower + "/" if cont_lower else ""
+            for sib_rel_str, sib_mod_name, sib_lower in indexed:
+                if sib_lower in all_handled:
+                    continue
+                if sib_mod_name != mod_name:
+                    continue
+                if not is_whole and not sib_lower.startswith(prefix_lower):
+                    continue
+                all_handled.add(sib_lower)
+                if rule.to_prefix:
+                    prefix_handled.add(sib_lower)
+                    prefix_primaries.append((sib_rel_str, sib_mod_name, rule, -2, ""))
+    return prefix_handled, prefix_primaries
 
 
 def _sibling_container(
@@ -66,6 +210,7 @@ def deploy_custom_rules(
     per_mod_strip_prefixes: dict[str, list[str]] | None = None,
     log_fn=None,
     progress_fn=None,
+    prefix_root: Path | None = None,
 ) -> set[str]:
     """Deploy filemap entries that match a CustomRule to their designated dirs.
 
@@ -91,6 +236,22 @@ def deploy_custom_rules(
     _log = _safe_log(log_fn)
     _strip = {p.lower() for p in strip_prefixes} if strip_prefixes else set()
     _per_mod_strip = per_mod_strip_prefixes or {}
+
+    def _rule_base(rule: CustomRule) -> Path | None:
+        """Return the root directory this rule's ``dest`` is resolved under,
+        or ``None`` if the rule requires a prefix and none is available."""
+        if rule.to_prefix:
+            return prefix_root
+        return game_root
+
+    # Drop rules that want the prefix but have none — otherwise they'd silently
+    # land at game_root, which is worse than skipping them.
+    skipped = [r for r in rules if r.to_prefix and prefix_root is None]
+    if skipped:
+        _log(f"  Skipping {len(skipped)} prefix-routed rule(s): no Proton prefix configured.")
+    rules = [r for r in rules if not (r.to_prefix and prefix_root is None)]
+    if not rules:
+        return set()
     overwrite_dir = staging_root.parent / "overwrite"
     _overwrite_str = str(overwrite_dir)
     _staging_str   = str(staging_root)
@@ -109,75 +270,6 @@ def deploy_custom_rules(
             ext_list,
             {n.lower() for n in rule.filenames},
         ))
-
-    def _ext_match(filename: str, exts: list[str]) -> str | None:
-        """Return the longest extension in ``exts`` that ``filename`` ends with
-        (as ``.something``), or None. ``exts`` must be sorted longest-first.
-        """
-        for e in exts:
-            if filename.endswith(e) and len(filename) > len(e):
-                return e
-        return None
-
-    def _name_match(filename: str, names: set[str]) -> bool:
-        """Match ``filename`` (lowercased) against the rule's filenames.
-        Glob characters (``*``, ``?``, ``[seq]``) are honoured so a rule can
-        target e.g. ``*.dekcns.json``; plain entries match by exact equality.
-        """
-        for n in names:
-            if any(c in n for c in "*?["):
-                if fnmatch.fnmatchcase(filename, n):
-                    return True
-            elif filename == n:
-                return True
-        return False
-
-    def _match_single_rule(
-        rel_lower: str,
-        rule: CustomRule, folders: set[str], exts: list[str], filenames: set[str],
-    ) -> tuple[int, str] | None:
-        """Check whether ``rel_lower`` matches a *single* rule.
-
-        Returns ``(strip_len, matched_ext)`` on a match, or None. Same
-        semantics as the old multi-rule ``_match_rule`` but for one rule —
-        used by the rule-ordered first pass so include_siblings drags from
-        an earlier rule can pre-empt primary matches for later rules.
-        """
-        parts = rel_lower.split("/")
-        filename = parts[-1]
-        is_loose = len(parts) == 1
-        strip_len = -1
-        folder_hit = False
-        if folders:
-            for f in folders:
-                if "/" in f:
-                    idx = rel_lower.find(f + "/")
-                    if idx < 0 and rel_lower.endswith(f):
-                        idx = len(rel_lower) - len(f)
-                    if idx >= 0 and (idx == 0 or rel_lower[idx - 1] == "/"):
-                        strip_len = idx
-                        folder_hit = True
-                        break
-                else:
-                    for pi, seg in enumerate(parts[:-1]):
-                        if seg == f:
-                            strip_len = sum(len(parts[j]) + 1 for j in range(pi))
-                            folder_hit = True
-                            break
-                    if folder_hit:
-                        break
-            if folder_hit and rule.loose_only and strip_len != 0:
-                return None
-        matched_ext = _ext_match(filename, exts) if exts else None
-        if folder_hit and (not exts or matched_ext is not None):
-            return strip_len, matched_ext or ""
-        if rule.loose_only and not is_loose:
-            return None
-        if matched_ext is not None and not folders and not filenames:
-            return -1, matched_ext
-        if filenames and _name_match(filename, filenames):
-            return -1, ""
-        return None
 
     def _match_rule(rel_lower: str) -> tuple[CustomRule, int, str] | None:
         """First-match-wins multi-rule lookup. Kept for backwards-compat;
@@ -236,7 +328,7 @@ def deploy_custom_rules(
             handled_lower.add(rel_lower)  # claim it anyway so later rules don't re-try
             return
         src = Path(src_str)
-        dest_base = game_root / rule.dest if rule.dest else game_root
+        _base = _rule_base(rule); dest_base = _base / rule.dest if rule.dest else _base
         container_info = _sibling_container(rel_str, strip_len, mod_name) \
             if rule.include_siblings else None
         if container_info is not None:
@@ -264,7 +356,7 @@ def deploy_custom_rules(
         ``dest/container_name/<rel-from-container>``.
         """
         prefix_lower = container_lower + "/" if container_lower else ""
-        dest_base = game_root / rule.dest if rule.dest else game_root
+        _base = _rule_base(rule); dest_base = _base / rule.dest if rule.dest else _base
         for sib_rel_str, sib_mod_name, sib_lower in all_entries:
             if sib_lower in handled_lower:
                 continue
@@ -372,7 +464,7 @@ def deploy_custom_rules(
                 _log(f"  WARN: source not found — {sib_rel_str} ({sib_mod_name})")
                 continue
             src = Path(src_str)
-            dest_base = game_root / rule.dest if rule.dest else game_root
+            _base = _rule_base(rule); dest_base = _base / rule.dest if rule.dest else _base
             if rule.flatten:
                 if strip_len >= 0:
                     kept = sib_rel_str[strip_len:].lstrip("/")
@@ -387,10 +479,16 @@ def deploy_custom_rules(
     if not tasks:
         return handled_lower
 
-    # Backup directory for vanilla files that will be overwritten
+    # Backup directories for vanilla files that will be overwritten.
+    # Game-root-routed files mirror under ``backup_dir``; prefix-routed files
+    # mirror under ``prefix_backup_dir`` so Restore knows which root to
+    # reconstruct each backup under.
     backup_dir = filemap_path.parent / _CUSTOM_RULES_BACKUP_DIR
+    prefix_backup_dir = filemap_path.parent / _CUSTOM_RULES_PREFIX_BACKUP_DIR
     if backup_dir.exists():
         shutil.rmtree(backup_dir)
+    if prefix_backup_dir.exists():
+        shutil.rmtree(prefix_backup_dir)
 
     # Create destination directories
     needed_dirs: set[Path] = {dst.parent for _, dst in tasks}
@@ -400,17 +498,36 @@ def deploy_custom_rules(
     placed_abs: list[str] = []
     total = len(tasks)
     _game_root = game_root
+    _prefix_root = prefix_root
+
+    def _pick_backup(dst: Path) -> tuple[Path, Path] | None:
+        """Return (backup_root, rel) for ``dst``, or None if it lives under
+        neither root."""
+        try:
+            return backup_dir, dst.relative_to(_game_root)
+        except ValueError:
+            pass
+        if _prefix_root is not None:
+            try:
+                return prefix_backup_dir, dst.relative_to(_prefix_root)
+            except ValueError:
+                pass
+        return None
 
     # Back up any vanilla files we are about to overwrite (must be serial).
     for src, dst in tasks:
         if dst.exists() and not dst.is_symlink():
-            try:
-                rel = dst.relative_to(_game_root)
-                bak = backup_dir / rel
-                bak.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(dst), str(bak))
-            except (ValueError, OSError) as e:
-                _log(f"  WARN: could not back up {dst}: {e}")
+            picked = _pick_backup(dst)
+            if picked is None:
+                _log(f"  WARN: could not back up {dst}: outside known roots")
+            else:
+                bak_root, rel = picked
+                try:
+                    bak = bak_root / rel
+                    bak.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(dst), str(bak))
+                except OSError as e:
+                    _log(f"  WARN: could not back up {dst}: {e}")
         elif dst.is_symlink():
             dst.unlink()
 
@@ -454,16 +571,23 @@ def restore_custom_rules(
     game_root: Path,
     rules: list[CustomRule],
     log_fn=None,
+    prefix_root: Path | None = None,
 ) -> int:
     """Remove files placed by deploy_custom_rules() and prune empty dest dirs.
 
     Reads filemap_path.parent / "custom_rules_deployed.txt", deletes every
     listed absolute path, then tries to rmdir each rule's destination directory
     (silently ignored if non-empty).  Returns the number of files removed.
+
+    ``prefix_root`` allows removing files placed by prefix-routed rules
+    (``to_prefix=True``) and restoring their backups from
+    ``custom_rules_prefix_backup``.
     """
+    del rules  # unused — log file is the source of truth for what was placed
     _log = _safe_log(log_fn)
     log_path = filemap_path.parent / _CUSTOM_RULES_LOG_NAME
     backup_dir = filemap_path.parent / _CUSTOM_RULES_BACKUP_DIR
+    prefix_backup_dir = filemap_path.parent / _CUSTOM_RULES_PREFIX_BACKUP_DIR
 
     if not log_path.is_file():
         return 0
@@ -472,26 +596,41 @@ def restore_custom_rules(
     removed = 0
     dirs_to_prune: set[Path] = set()
     _game_root_resolved = game_root.resolve()
+    _prefix_root_resolved = prefix_root.resolve() if prefix_root else None
     for abs_str in placed:
         p = Path(abs_str)
-        # Use the unresolved path for the under-root check so symlinks
-        # (whose targets live outside game_root) are not incorrectly blocked.
-        try:
-            p.relative_to(game_root)
-        except ValueError:
-            try:
-                p.resolve().relative_to(_game_root_resolved)
-            except ValueError:
-                _log(f"  SKIP: path traversal blocked — {abs_str}")
+        # Allow paths under either game_root or prefix_root. Try the
+        # unresolved path first so symlinks pointing outside the root are
+        # not incorrectly blocked.
+        under_root: Path | None = None
+        for root, root_resolved in (
+            (game_root, _game_root_resolved),
+            (prefix_root, _prefix_root_resolved),
+        ):
+            if root is None:
                 continue
+            try:
+                p.relative_to(root)
+                under_root = root
+                break
+            except ValueError:
+                try:
+                    p.resolve().relative_to(root_resolved)
+                    under_root = root
+                    break
+                except ValueError:
+                    continue
+        if under_root is None:
+            _log(f"  SKIP: path traversal blocked — {abs_str}")
+            continue
         if p.is_file() or p.is_symlink():
             p.unlink()
             removed += 1
-        # Collect parent dirs for pruning (stop at game_root, unresolved check)
+        # Collect parent dirs for pruning (stop at the matched root)
         parent = p.parent
-        while parent != game_root:
+        while parent != under_root:
             try:
-                parent.relative_to(game_root)
+                parent.relative_to(under_root)
             except ValueError:
                 break
             dirs_to_prune.add(parent)
@@ -499,9 +638,14 @@ def restore_custom_rules(
 
     # Restore backed-up vanilla files
     _restore_backup_dir(backup_dir, game_root, _log)
+    if prefix_root is not None:
+        _restore_backup_dir(prefix_backup_dir, prefix_root, _log)
 
-    # Prune empty subdirectories deepest-first; never touch game_root itself
-    _prune_empty_dirs(dirs_to_prune, stop_dirs={game_root})
+    # Prune empty subdirectories deepest-first; never touch either root itself
+    stop_dirs = {game_root}
+    if prefix_root is not None:
+        stop_dirs.add(prefix_root)
+    _prune_empty_dirs(dirs_to_prune, stop_dirs=stop_dirs)
 
     log_path.unlink()
     _log(f"  Custom rules restore: removed {removed} file(s).")
@@ -511,6 +655,7 @@ def restore_custom_rules(
 __all__ = [
     "_CUSTOM_RULES_LOG_NAME",
     "_CUSTOM_RULES_BACKUP_DIR",
+    "_CUSTOM_RULES_PREFIX_BACKUP_DIR",
     "deploy_custom_rules",
     "restore_custom_rules",
 ]

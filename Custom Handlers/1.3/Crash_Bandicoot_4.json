@@ -20,17 +20,49 @@
   "mod_install_as_is_if_no_match": false,
   "restore_before_deploy": true,
   "normalize_folder_case": true,
-  "wine_dll_overrides": {},
+  "filemap_casing": "upper",
+  "wine_dll_overrides": {
+    "dsound": "native,builtin"
+  },
   "custom_routing_rules": [
+    {
+      "dest": "drive_c/users/steamuser/AppData/Local/CrashBandicoot4/Saved/Config/WindowsNoEditor/",
+      "filenames": [
+        "Engine.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
+    },
+    {
+      "dest": "drive_c/users/steamuser/AppData/Local/CrashBandicoot4/Saved/Config/WindowsNoEditor/",
+      "filenames": [
+        "Scalability.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
+    },
     {
       "dest": "Content/Movies",
       "extensions": [
         ".mp4"
       ],
       "flatten": true
+    },
+    {
+      "dest": "Binaries/Win64",
+      "filenames": [
+        "dsound.dll"
+      ]
+    },
+    {
+      "dest": "Binaries/Win64",
+      "folders": [
+        "scripts"
+      ],
+      "flatten": true
     }
   ],
   "custom_frameworks": {},
-  "version": 2,
+  "version": 4,
   "editable": false
 }

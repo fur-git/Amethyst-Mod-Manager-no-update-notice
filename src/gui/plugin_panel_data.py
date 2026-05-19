@@ -520,10 +520,13 @@ class PluginPanelDataMixin:
                         pass
             # Use _resolve_filemap_entries so include_siblings drags same-mod
             # files under a matched container along to the rule's dest.
+            prefix_skip_dest = getattr(game, "_PREFIX_SKIP_DEST", None)
             winners: dict[str, tuple[int, str, str]] = {}
             for rel_path, mod_name, dest, final_rel in game._resolve_filemap_entries(
                 list(entries)
             ):
+                if prefix_skip_dest is not None and dest == prefix_skip_dest:
+                    continue
                 full_path = dest + "/" + final_rel if dest else final_rel
                 rank = priority_map.get(mod_name, 1 << 30)
                 existing = winners.get(full_path)
@@ -621,6 +624,10 @@ class PluginPanelDataMixin:
         # rule claims its container before a later rule can match a file
         # inside it. Mirrors deploy_custom_rules' rule-ordered first pass.
         sibling_overrides: dict[int, str] = {}
+        # Entries routed into the Proton/Wine prefix don't live under the game
+        # root, so they don't belong in the Data tab tree — collect them and
+        # filter at the end.
+        prefix_hidden: set[int] = set()
         from Utils.deploy_custom_rules import _sibling_container
         claimed: set[int] = set()
         for rule, folders, exts, filenames in _rules:
@@ -636,6 +643,8 @@ class PluginPanelDataMixin:
                 primary_rules[idx] = (rule, strip_len, matched_ext)
                 claimed.add(idx)
                 new_primary_idxs.append(idx)
+                if getattr(rule, "to_prefix", False):
+                    prefix_hidden.add(idx)
             if not getattr(rule, "include_siblings", False) or not new_primary_idxs:
                 continue
             # Build drag specs for this rule's primaries, then claim siblings.
@@ -675,6 +684,8 @@ class PluginPanelDataMixin:
                     sibling_overrides[sib_idx] = (cname + "/" + ric) if cname else ric
                     primary_rules[sib_idx] = (rule, -2, "")
                     claimed.add(sib_idx)
+                    if getattr(rule, "to_prefix", False):
+                        prefix_hidden.add(sib_idx)
 
         # Second pass: mark companions (same folder, same stem, companion ext)
         # with their primary's rule.
@@ -703,10 +714,14 @@ class PluginPanelDataMixin:
                 for c in companions:
                     if sib_name_lower.endswith(c) and len(sib_name_lower) > len(c):
                         primary_rules[sib_idx] = (rule, strip_len, c)
+                        if getattr(rule, "to_prefix", False):
+                            prefix_hidden.add(sib_idx)
                         break
 
         resolved = []
         for idx, (rel_path, mod_name) in enumerate(entries):
+            if idx in prefix_hidden:
+                continue
             rel_norm = normalised[idx]
             match = primary_rules.get(idx)
             if match is not None:

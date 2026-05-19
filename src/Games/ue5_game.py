@@ -55,6 +55,7 @@ from pathlib import Path
 
 from Games.base_game import BaseGame
 from Utils.deploy import LinkMode, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
+from Utils.deploy_custom_rules import deploy_custom_rules, restore_custom_rules, compute_prefix_handled
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
@@ -134,6 +135,8 @@ class UE5Rule:
 
 class UE5Game(BaseGame):
     """Abstract base for Unreal Engine 5 games with multi-target mod routing."""
+
+    _PREFIX_SKIP_DEST = "__prefix_skip__"
 
     def __init__(self) -> None:
         self._game_path: Path | None = None
@@ -524,6 +527,16 @@ class UE5Game(BaseGame):
             final_rel = rel_str.replace("\\", "/")
         return dest, final_rel
 
+    def _prefix_routing_rules(self) -> list:
+        """Subset of ``custom_routing_rules`` that target the Wine/Proton prefix.
+
+        These are handled by ``deploy_custom_rules`` (with ``prefix_root`` set)
+        before the UE5 manifest deploy runs, and are skipped by the manifest
+        pipeline via the ``_PREFIX_SKIP_DEST`` sentinel.
+        """
+        return [r for r in self.custom_routing_rules
+                if getattr(r, "to_prefix", False)]
+
     def _resolve_filemap_entries(
         self, entries: list[tuple[str, str]],
     ) -> list[tuple[str, str, str, str]]:
@@ -538,12 +551,30 @@ class UE5Game(BaseGame):
         ``include_siblings`` primary it overrides the resolution of every
         same-mod file under the same containing folder so they all land at
         ``dest/<container_name>/<rel-from-container>``.
+
+        Entries claimed by ``custom_routing_rules`` with ``to_prefix=True`` are
+        held out of UE5 rule resolution and re-appended with ``_PREFIX_SKIP_DEST``
+        so the deploy loop and data tab know to leave them alone (they're placed
+        separately by ``deploy_custom_rules`` with ``prefix_root`` set).
         """
+        prefix_rules = self._prefix_routing_rules()
+        prefix_handled: set[str] = set()
+        if prefix_rules:
+            prefix_handled, _ = compute_prefix_handled(
+                entries, self.custom_routing_rules,
+            )
+            core_entries = [
+                (sr, mn) for sr, mn in entries
+                if sr.replace("\\", "/").lower() not in prefix_handled
+            ]
+        else:
+            core_entries = entries
+
         # Default placement (no rule matches): default_dest + full path.
         default_dest = self.ue5_default_dest
         per_entry: list[tuple[str, str, str, str]] = [
             (sr, mn, default_dest, sr.replace("\\", "/"))
-            for sr, mn in entries
+            for sr, mn in core_entries
         ]
         claimed: set[int] = set()
 
@@ -556,7 +587,7 @@ class UE5Game(BaseGame):
         # pre-empts a later rule's primary match on the same files.
         for rule in self.ue5_routing_rules:
             new_primaries: list[tuple[int, list[str], bool]] = []
-            for i, (staged_rel, mod_name) in enumerate(entries):
+            for i, (staged_rel, mod_name) in enumerate(core_entries):
                 if i in claimed:
                     continue
                 hit = self._match_single_ue5_rule(staged_rel, rule)
@@ -593,7 +624,7 @@ class UE5Game(BaseGame):
                 continue
             drags: list[tuple[str, str, str, bool]] = []
             for pidx, dyn_strip, is_folder_match in new_primaries:
-                staged_rel, mod_name = entries[pidx]
+                staged_rel, mod_name = core_entries[pidx]
                 norm = staged_rel.replace("\\", "/")
                 info = self._sibling_container(norm, dyn_strip, is_folder_match, mod_name)
                 if info is None:
@@ -608,7 +639,7 @@ class UE5Game(BaseGame):
                     continue
                 seen_drags.add(key)
                 prefix_lower = cont_lower + "/" if cont_lower else ""
-                for i, (staged_rel, mod_name) in enumerate(entries):
+                for i, (staged_rel, mod_name) in enumerate(core_entries):
                     if i in claimed:
                         continue
                     if mod_name != primary_mod:
@@ -626,6 +657,13 @@ class UE5Game(BaseGame):
                     final_rel = (cname + "/" + rel_in_container) if cname else rel_in_container
                     per_entry[i] = (staged_rel, mod_name, rule.dest, final_rel)
                     claimed.add(i)
+
+        if prefix_handled:
+            for sr, mn in entries:
+                if sr.replace("\\", "/").lower() in prefix_handled:
+                    per_entry.append(
+                        (sr, mn, self._PREFIX_SKIP_DEST, sr.replace("\\", "/"))
+                    )
 
         return per_entry
 
@@ -968,6 +1006,20 @@ class UE5Game(BaseGame):
         staging = self.get_effective_mod_staging_path()
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
+
+        prefix_rules = self._prefix_routing_rules()
+        if prefix_rules:
+            _log("Routing prefix-bound files via custom rules ...")
+            deploy_custom_rules(
+                filemap, self._game_path, staging,
+                rules=prefix_rules,
+                mode=mode,
+                strip_prefixes=self.mod_folder_strip_prefixes,
+                per_mod_strip_prefixes=per_mod_strip,
+                log_fn=_log,
+                prefix_root=self.get_prefix_path(),
+            )
+
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries)
@@ -1009,6 +1061,7 @@ class UE5Game(BaseGame):
             )
         }
         resolved_by_dest: dict[str, tuple[int, str, str, str, Path, Path, bool, str]] = {}
+        prefix_skip_dest = getattr(self, "_PREFIX_SKIP_DEST", None)
         for staged_rel, mod_name in parsed:
             base_dir = per_mod_deploy.get(mod_name, game_path)
             in_custom_dir = base_dir != game_path
@@ -1019,6 +1072,10 @@ class UE5Game(BaseGame):
                 dest_file = dest_dir / final_rel
             else:
                 dest_rel, final_rel = rule_resolved[(staged_rel, mod_name)]
+                # Files routed into the Proton/Wine prefix are placed by
+                # deploy_custom_rules before this loop runs; skip them here.
+                if prefix_skip_dest is not None and dest_rel == prefix_skip_dest:
+                    continue
                 dest_dir = (base_dir / dest_rel) if dest_rel else base_dir
                 dest_file = dest_dir / final_rel
             key = str(dest_file)
@@ -1206,6 +1263,17 @@ class UE5Game(BaseGame):
         game_path = self.get_game_path()
         if game_path is None:
             raise RuntimeError("Game path is not configured.")
+
+        prefix_rules = self._prefix_routing_rules()
+        if prefix_rules:
+            filemap = self.get_effective_filemap_path()
+            if filemap.is_file():
+                _log("Restore: removing prefix-routed files ...")
+                restore_custom_rules(
+                    filemap, self._game_path,
+                    rules=prefix_rules, log_fn=_log,
+                    prefix_root=self.get_prefix_path(),
+                )
 
         manifest_path = self.get_profile_root() / _DEPLOYED_MANIFEST
         if not manifest_path.is_file():

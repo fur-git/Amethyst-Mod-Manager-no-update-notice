@@ -26,6 +26,7 @@ from pathlib import Path
 
 from Games.ue5_game import UE5Game, UE5Rule
 from Utils.config_paths import get_profiles_dir
+from Utils.deploy import CustomRule
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -85,6 +86,19 @@ class MarvelRivals(UE5Game):
     @property
     def frameworks(self) -> dict[str, str]:
         return {"UTOC Bypass": "Binaries/Win64/plugins/MarvelRivalsUTOCSignatureBypass.asi"}
+
+    @property
+    def custom_routing_rules(self) -> list[CustomRule]:
+        # Config tweaks ship inside mods as bare .ini files that must land in
+        # the player's Saved/Config/Windows folder under the Wine prefix, not
+        # at the game root.
+        cfg_dest = "drive_c/users/steamuser/AppData/Local/Marvel/Saved/Config/Windows"
+        return [
+            CustomRule(dest=cfg_dest, filenames=["Engine.ini"],
+                       flatten=True, to_prefix=True),
+            CustomRule(dest=cfg_dest, filenames=["Scalability.ini"],
+                       flatten=True, to_prefix=True),
+        ]
 
     # -----------------------------------------------------------------------
     # UE5 routing rules

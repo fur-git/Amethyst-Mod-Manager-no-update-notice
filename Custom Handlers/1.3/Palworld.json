@@ -34,22 +34,20 @@
   },
   "custom_routing_rules": [
     {
-      "dest": "Binaries/Win64/Mods",
-      "extensions": [
-        ".lua"
-      ]
+      "dest": "drive_c/users/steamuser/AppData/Local/Pal/Saved/Config/Windows",
+      "filenames": [
+        "Engine.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
     },
     {
-      "dest": "Binaries/Win64/Mods",
-      "extensions": [
-        ".modconfig.json"
-      ]
-    },
-    {
-      "dest": "Binaries/Win64/Mods",
-      "extensions": [
-        ".ini"
-      ]
+      "dest": "drive_c/users/steamuser/AppData/Local/Pal/Saved/Config/Windows",
+      "filenames": [
+        "Scalability.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
     },
     {
       "dest": "Content/Paks",
@@ -61,11 +59,33 @@
     {
       "dest": "Binaries/Win64/Mods",
       "filenames": [
+        "Main.lua"
+      ],
+      "include_siblings": true
+    },
+    {
+      "dest": "Binaries/Win64/Mods",
+      "filenames": [
         "enabled.txt"
-      ]
+      ],
+      "include_siblings": true
+    },
+    {
+      "dest": "Binaries/Win64/Mods",
+      "folders": [
+        "Scripts"
+      ],
+      "include_siblings": true
+    },
+    {
+      "dest": "Binaries/Win64/Mods",
+      "folders": [
+        "Shared"
+      ],
+      "flatten": true
     }
   ],
   "custom_frameworks": {},
-  "version": 3,
+  "version": 4,
   "editable": false
 }

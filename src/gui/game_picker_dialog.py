@@ -325,6 +325,13 @@ class GamePickerPanel(tk.Frame):
             fg_color="#2d7a2d", hover_color="#3a9a3a", text_color="white",
             command=self._on_define_custom_game,
         ).pack(side="left", padx=(12, 4), pady=10)
+        self._force_update_btn = ctk.CTkButton(
+            btn_bar, text="↻ Force Update Handlers",
+            width=190, height=30, font=FONT_BOLD,
+            fg_color=BG_HEADER, hover_color=ACCENT_HOV, text_color=TEXT_MAIN,
+            command=self._on_force_update_handlers,
+        )
+        self._force_update_btn.pack(side="left", padx=(4, 4), pady=10)
         ctk.CTkCheckBox(
             btn_bar, text="Show only installed",
             variable=self._show_installed_only,
@@ -702,6 +709,93 @@ class GamePickerPanel(tk.Frame):
     def _on_download_custom_handler(self):
         if self._show_download_custom_handler_fn:
             self._show_download_custom_handler_fn()
+
+    # ------------------------------------------------------------------
+    # Force update — redownload every compatible handler from GitHub
+    # ------------------------------------------------------------------
+
+    def _on_force_update_handlers(self):
+        """Redownload every compatible custom handler from the repo,
+        overwriting non-editable local copies."""
+        try:
+            self._force_update_btn.configure(state="disabled", text="Updating…")
+        except Exception:
+            pass
+        threading.Thread(target=self._force_update_handlers_worker, daemon=True).start()
+
+    def _force_update_handlers_worker(self):
+        import json as _json
+        from functools import partial as _partial
+        from Utils.gh_cache import fetch_text as _gh_fetch_text
+        from Utils.config_paths import get_custom_games_dir as _gcgd
+        from gui.dialogs import _list_compatible_handlers
+
+        # Force-fetch wrapper — bypass the gh_cache throttle so a manual
+        # "force update" really hits the network. ETag still applies, so a
+        # 304 stays free.
+        force_fetch = _partial(_gh_fetch_text, force=True)
+
+        downloaded = 0
+        failed = 0
+        try:
+            handlers = _list_compatible_handlers(force_fetch)
+            if handlers is None:
+                self.after(0, lambda: self._on_force_update_done(0, 0, "Unable to reach GitHub"))
+                return
+            for h in handlers:
+                filename = h.get("name", "")
+                download_url = h.get("download_url")
+                if not filename.endswith(".json") or not download_url:
+                    continue
+                try:
+                    raw = force_fetch(download_url, accept="*/*", timeout=15)
+                    if raw is None:
+                        failed += 1
+                        continue
+                    _json.loads(raw)  # validate
+                    local = _gcgd() / filename
+                    # Preserve user-edited handlers (devmode flips this flag).
+                    if local.is_file():
+                        try:
+                            existing = _json.loads(local.read_text(encoding="utf-8"))
+                            if isinstance(existing, dict) and existing.get("editable"):
+                                continue
+                        except Exception:
+                            pass
+                    local.write_text(raw, encoding="utf-8")
+                    downloaded += 1
+                except Exception:
+                    failed += 1
+            self.after(0, lambda: self._on_force_update_done(downloaded, failed, None))
+        except Exception as e:
+            self.after(0, lambda err=str(e): self._on_force_update_done(downloaded, failed, err))
+
+    def _on_force_update_done(self, downloaded: int, failed: int, err: str | None):
+        try:
+            self._force_update_btn.configure(
+                state="normal", text="↻ Force Update Handlers",
+            )
+            if err:
+                CTkAlert(
+                    state="warning", title="Force Update Handlers",
+                    body_text=err, btn1="OK", btn2="",
+                    parent=self.winfo_toplevel(),
+                )
+                return
+            msg = f"Updated {downloaded} handler(s)."
+            if failed:
+                msg += f" {failed} failed."
+            CTkAlert(
+                state="info", title="Force Update Handlers",
+                body_text=msg, btn1="OK", btn2="",
+                parent=self.winfo_toplevel(),
+            )
+        except Exception:
+            pass
+        try:
+            self.refresh()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Remote handler cards (fetched from GitHub)

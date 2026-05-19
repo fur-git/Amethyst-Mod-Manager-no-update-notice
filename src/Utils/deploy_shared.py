@@ -583,6 +583,14 @@ class CustomRule:
                  ``dest`` so files stay grouped.  Useful for mods like
                  ``PD2-AdvancedCrosshairs/mod.txt`` where matching
                  ``mod.txt`` should also bring the whole mod folder along.
+    to_prefix  — when True, ``dest`` is resolved relative to the game's
+                 Proton/Wine prefix root (the ``pfx/`` directory) instead
+                 of the game install root.  Use for files that belong
+                 inside the virtual Windows filesystem (e.g.
+                 ``drive_c/users/steamuser/AppData/...``).  Requires the
+                 caller to pass ``prefix_root`` to ``deploy_custom_rules``;
+                 rules with ``to_prefix=True`` are skipped when no prefix
+                 is available.
 
     Placement behaviour:
     - extension-only match: file placed as game_root/dest/<filename> (flat)
@@ -599,6 +607,7 @@ class CustomRule:
     companion_extensions: list[str] = field(default_factory=list)
     flatten: bool = False
     include_siblings: bool = False
+    to_prefix: bool = False
 
 
 def _default_core(deploy_dir: Path) -> Path:

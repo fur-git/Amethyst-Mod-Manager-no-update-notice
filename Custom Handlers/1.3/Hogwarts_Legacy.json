@@ -1,0 +1,126 @@
+{
+  "name": "Hogwarts Legacy",
+  "game_id": "Hogwarts_Legacy",
+  "exe_name": "Phoenix/Binaries/Win64/HogwartsLegacy.exe",
+  "deploy_type": "ue5",
+  "mod_data_path": "Phoenix",
+  "steam_id": "990080",
+  "nexus_game_domain": "hogwartslegacy",
+  "image_url": "https://cdn2.steamgriddb.com/icon/f7ac001183c880b1804279fee0cd08e7/32/256x256.png",
+  "mod_folder_strip_prefixes": [
+    "Phoenix",
+    "Binaries",
+    "Win64",
+    "Content",
+    "Paks",
+    "~mods",
+    "Mods"
+  ],
+  "conflict_ignore_filenames": [
+    "*read*.txt",
+    "*install*.txt",
+    "*.exe",
+    "*.md",
+    "*.png",
+    "*.html",
+    "*.bat"
+  ],
+  "mod_folder_strip_prefixes_post": [],
+  "mod_install_prefix": "",
+  "mod_required_top_level_folders": [
+    "~mods"
+  ],
+  "mod_auto_strip_until_required": true,
+  "mod_required_file_types": [],
+  "mod_install_as_is_if_no_match": true,
+  "restore_before_deploy": true,
+  "normalize_folder_case": true,
+  "filemap_casing": "upper",
+  "wine_dll_overrides": {
+    "version": "native,builtin"
+  },
+  "custom_routing_rules": [
+    {
+      "dest": "drive_c/users/steamuser/Appdata/Local/Hogwarts Legacy/Saved/Config/WindowsNoEditor",
+      "filenames": [
+        "input.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
+    },
+    {
+      "dest": "drive_c/users/steamuser/Appdata/Local/Hogwarts Legacy/Saved/Config/WindowsNoEditor",
+      "filenames": [
+        "Engine.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
+    },
+    {
+      "dest": "drive_c/users/steamuser/Appdata/Local/Hogwarts Legacy/Saved/Config/WindowsNoEditor",
+      "filenames": [
+        "Scalability.ini"
+      ],
+      "flatten": true,
+      "to_prefix": true
+    },
+    {
+      "dest": "Mods",
+      "extensions": [
+        ".uplugin"
+      ],
+      "include_siblings": true
+    },
+    {
+      "dest": "Content/Paks",
+      "folders": [
+        "LogicMods"
+      ],
+      "flatten": true
+    },
+    {
+      "dest": "Content/Paks/~mods",
+      "extensions": [
+        ".pak"
+      ],
+      "include_siblings": true
+    },
+    {
+      "dest": "Binaries/Win64",
+      "extensions": [
+        ".asi"
+      ],
+      "companion_extensions": [
+        ".ini"
+      ]
+    },
+    {
+      "dest": "Binaries/Win64/Mods",
+      "filenames": [
+        "main.lua"
+      ],
+      "include_siblings": true
+    },
+    {
+      "dest": "Binaries/Win64",
+      "filenames": [
+        "*UE4SS*.*"
+      ]
+    },
+    {
+      "dest": "Binaries/Win64/Mods",
+      "filenames": [
+        "mods.txt"
+      ]
+    },
+    {
+      "dest": "Binaries/Win64/Mods",
+      "folders": [
+        "shared"
+      ]
+    }
+  ],
+  "custom_frameworks": {},
+  "version": 1,
+  "editable": false
+}
