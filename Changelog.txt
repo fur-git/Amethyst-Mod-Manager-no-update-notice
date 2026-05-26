@@ -2,6 +2,8 @@
 - Tweaked Bethesda game routing rules to stop some dll files incorrectly being sent to the root folder
 - Fixed a bug where setting a mod to root folder install while a modlist is deployed would send it to the wrong location on next deploy
 - Reworked the clear cache setting, It now opens a menu to break down cache by game
+- Generated mods.txt files for ue5 games are now removed upon restoring.
+- checking a mod for updates now grabs the mods summary, This is displayed as a tooltip when hovering over the mod in the modlist panel. This can be disabled in the settings.
 
 - v1.3.5
 - Tweaked the separator settings menu/custom deploy locations

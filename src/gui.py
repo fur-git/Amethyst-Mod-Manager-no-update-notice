@@ -2144,11 +2144,17 @@ class App(ctk.CTk):
     def show_settings_panel(self):
         self._ensure_plugin_panel_visible()
         from gui.status_bar import SettingsPanel
+
+        def _on_done(p):
+            self._hide_plugin_overlay("_settings_panel")
+            if hasattr(self._mod_panel, "refresh_show_summary_tooltips"):
+                self._mod_panel.refresh_show_summary_tooltips()
+
         self._show_plugin_overlay(
             "_settings_panel",
             lambda: SettingsPanel(
                 self._plugin_panel_container,
-                on_done=lambda p: self._hide_plugin_overlay("_settings_panel"),
+                on_done=_on_done,
             ),
         )
 

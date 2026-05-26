@@ -917,6 +917,33 @@ def save_keep_fomod_archives(value: bool) -> None:
         parser.write(f)
 
 
+def load_show_summary_tooltips() -> bool:
+    """Return the show_summary_tooltips setting (default True)."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return True
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(path)
+        return parser.getboolean(_FILEMAP_SECTION, "show_summary_tooltips", fallback=True)
+    except Exception:
+        return True
+
+
+def save_show_summary_tooltips(value: bool) -> None:
+    """Persist the show_summary_tooltips setting to amethyst.ini."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = configparser.ConfigParser()
+    if path.is_file():
+        parser.read(path)
+    if _FILEMAP_SECTION not in parser:
+        parser[_FILEMAP_SECTION] = {}
+    parser[_FILEMAP_SECTION]["show_summary_tooltips"] = "true" if value else "false"
+    with path.open("w") as f:
+        parser.write(f)
+
+
 def load_rename_mod_after_install() -> bool:
     """Return the rename_mod_after_install setting (default False).
 

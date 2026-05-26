@@ -80,10 +80,14 @@ class TkTooltip:
     # Public API
     # ------------------------------------------------------------------
 
-    def show(self, x: int, y: int, text: str) -> None:
+    def show(self, x: int, y: int, text: str, *, side: str = "left") -> None:
         """Show the tooltip at screen coords (*x*, *y*).
 
-        Placement: to the left of the cursor (suits canvas column icons).
+        Placement: to the left of the cursor by default (suits canvas column
+        icons on the right side of a row). Pass ``side="right"`` to place it
+        to the right of the cursor — useful for columns near the left edge of
+        the window where a left-side tooltip would clip off-screen.
+
         If the same text is already shown and the cursor has moved less than
         *jitter* pixels, this is a no-op. If the text is already shown but the
         cursor moved further, the window is repositioned in place (no flicker).
@@ -99,12 +103,18 @@ class TkTooltip:
         if self._win is not None and self._text == text:
             self._trigger_x = x
             self._trigger_y = y
-            tip_w = self._win.winfo_reqwidth()
-            self._win.wm_geometry(f"+{x - tip_w - 4}+{y + 8}")
+            if side == "right":
+                self._win.wm_geometry(f"+{x + 12}+{y + 8}")
+            else:
+                tip_w = self._win.winfo_reqwidth()
+                self._win.wm_geometry(f"+{x - tip_w - 4}+{y + 8}")
             return
 
-        self._schedule(text, lambda tw: self._place_left_of(tw, x, y),
-                       immediate=self._win is not None)
+        if side == "right":
+            place = lambda tw: self._place_right_of(tw, x, y)
+        else:
+            place = lambda tw: self._place_left_of(tw, x, y)
+        self._schedule(text, place, immediate=self._win is not None)
         self._trigger_x = x
         self._trigger_y = y
 
@@ -209,6 +219,10 @@ class TkTooltip:
         """Position *tw* to the left of (*x*, *y*) in screen coordinates."""
         tip_w = tw.winfo_reqwidth()
         tw.wm_geometry(f"+{x - tip_w - 4}+{y + 8}")
+
+    def _place_right_of(self, tw: tk.Toplevel, x: int, y: int) -> None:
+        """Position *tw* to the right of (*x*, *y*) in screen coordinates."""
+        tw.wm_geometry(f"+{x + 12}+{y + 8}")
 
     def _place_clamped(
         self,

@@ -151,7 +151,7 @@ from gui.nexus_browser_overlay import NexusBrowserOverlay
 from gui.changelog_overlay import ChangelogOverlay
 from Nexus.nexus_meta import ensure_installed_stamp, read_meta, write_meta
 from Utils.config_paths import get_download_cache_dir, list_all_cache_dirs
-from Utils.ui_config import load_column_widths, load_column_order, load_normalize_folder_case, load_sort_state, save_sort_state, load_column_hidden
+from Utils.ui_config import load_column_widths, load_column_order, load_normalize_folder_case, load_sort_state, save_sort_state, load_column_hidden, load_show_summary_tooltips
 
 
 from gui.text_utils import truncate_text as _truncate_text_for_width, clear_truncate_cache as _clear_truncate_cache
@@ -396,6 +396,12 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         # Set of mod names that have a Nexus update available
         self._update_mods: set[str] = set()
+
+        # Lazy cache of mod_name → description (Nexus summary), loaded from meta.ini
+        # on first hover. Cleared whenever update info is recomputed (since the
+        # update checker is what backfills descriptions).
+        self._description_cache: dict[str, str] = {}
+        self._show_summary_tooltips: bool = load_show_summary_tooltips()
 
         # Set of mod names that have missing Nexus requirements
         self._missing_reqs: set[str] = set()
@@ -1387,6 +1393,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         if "_modlist_path" in results and results["_modlist_path"] != self._modlist_path:
             return  # Stale: user switched game before scan finished
         self._update_mods = results["update_mods"]
+        self._description_cache.clear()
         self._missing_reqs = results["missing_reqs"]
         self._missing_reqs_detail = results["missing_reqs_detail"]
         self._endorsed_mods = results["endorsed_mods"]
@@ -4052,6 +4059,33 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._redraw()
         self._update_info()
 
+    def refresh_show_summary_tooltips(self) -> None:
+        """Re-read the show_summary_tooltips setting from disk (live update)."""
+        self._show_summary_tooltips = load_show_summary_tooltips()
+        if not self._show_summary_tooltips:
+            self._tooltip.hide()
+
+    def _get_mod_description(self, mod_name: str) -> str:
+        """Return the cached Nexus summary for *mod_name*, or "" if none.
+
+        Reads ``meta.ini`` lazily on first request per mod; subsequent calls
+        hit the in-memory cache. Cache is cleared when the update checker
+        completes (the only thing that refreshes descriptions).
+        """
+        if mod_name in self._description_cache:
+            return self._description_cache[mod_name]
+        desc = ""
+        if self._staging_root is not None:
+            meta_path = self._staging_root / mod_name / "meta.ini"
+            if meta_path.is_file():
+                try:
+                    meta = read_meta(meta_path)
+                    desc = (meta.description or "").strip()
+                except Exception:
+                    desc = ""
+        self._description_cache[mod_name] = desc
+        return desc
+
     def _on_mouse_motion(self, event):
         """Update hover highlight as the mouse moves over the modlist."""
         if not self._entries or self._drag_idx >= 0:
@@ -4176,6 +4210,22 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     else:
                         tip = f"BSA conflict - {_conflict_label[bsa]}"
                     self._tooltip.show(event.x_root, event.y_root, tip)
+                    return
+
+        # Show tooltip with the Nexus summary when hovering over the name column.
+        if not self._show_summary_tooltips:
+            self._tooltip.hide()
+            return
+        name_slot = self._col_pos.get(1, 1)
+        name_col_start = self._COL_X[name_slot]
+        name_col_end = name_col_start + self._COL_W[name_slot]
+        if name_col_start <= x < name_col_end and 0 <= row < len(vis):
+            entry = self._entries[vis[row]]
+            if not entry.is_separator:
+                desc = self._get_mod_description(entry.name)
+                if desc:
+                    tip = (desc[:500] + "…") if len(desc) > 500 else desc
+                    self._tooltip.show(event.x_root, event.y_root, tip, side="right")
                     return
 
         # Show tooltip when hovering over the separator lock checkbox.

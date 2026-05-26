@@ -27,6 +27,7 @@ from Utils.ui_config import (
     load_normalize_folder_case, save_normalize_folder_case,
     load_clear_archive_after_install, save_clear_archive_after_install,
     load_keep_fomod_archives, save_keep_fomod_archives,
+    load_show_summary_tooltips, save_show_summary_tooltips,
     load_rename_mod_after_install, save_rename_mod_after_install,
     load_restore_on_close, save_restore_on_close,
     load_allow_prerelease, save_allow_prerelease,
@@ -838,6 +839,17 @@ class SettingsPanel(ctk.CTkFrame):
                      font=FONT_SMALL, text_color=TEXT_WARN, anchor="w",
                      ).pack(anchor="w", pady=(8, 0))
 
+        self._show_summary_tooltips_var = tk.BooleanVar(value=load_show_summary_tooltips())
+        ctk.CTkCheckBox(
+            ui_sec, text="Show mod summary tooltips", variable=self._show_summary_tooltips_var,
+            font=FONT_NORMAL, text_color=TEXT_MAIN,
+        ).pack(anchor="w", pady=(10, 0))
+        ctk.CTkLabel(
+            ui_sec,
+            text="Show the Nexus summary when hovering a mod name.",
+            font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
         self._update_slider_state()
 
         # ==== Downloads ====
@@ -1557,6 +1569,7 @@ class SettingsPanel(ctk.CTkFrame):
         save_normalize_folder_case(self._norm_case_var.get())
         save_clear_archive_after_install(self._clear_archive_var.get())
         save_keep_fomod_archives(self._keep_fomod_archives_var.get())
+        save_show_summary_tooltips(self._show_summary_tooltips_var.get())
         save_rename_mod_after_install(self._rename_after_install_var.get())
         save_restore_on_close(self._restore_on_close_var.get())
         if hasattr(self, "_allow_prerelease_var"):
@@ -1586,6 +1599,7 @@ class SettingsPanel(ctk.CTkFrame):
         save_normalize_folder_case(self._norm_case_var.get())
         save_clear_archive_after_install(self._clear_archive_var.get())
         save_keep_fomod_archives(self._keep_fomod_archives_var.get())
+        save_show_summary_tooltips(self._show_summary_tooltips_var.get())
         save_rename_mod_after_install(self._rename_after_install_var.get())
         save_restore_on_close(self._restore_on_close_var.get())
         if hasattr(self, "_allow_prerelease_var"):

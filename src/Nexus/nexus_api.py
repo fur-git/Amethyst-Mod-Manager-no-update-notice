@@ -197,6 +197,7 @@ class NexusModUpdateInfo:
     mod_id: int
     name: str
     version: str
+    summary: str = ""                       # short tagline shown on the mod page
     updated_at: Optional[datetime] = None   # when any file was last uploaded
     viewer_update_available: Optional[bool] = None  # Nexus-native flag (requires tracking)
     requirements: list["NexusModRequirement"] = field(default_factory=list)  # mod dependencies
@@ -1398,6 +1399,7 @@ class NexusAPI:
                     modId
                     name
                     version
+                    summary
                     updatedAt
                     viewerUpdateAvailable
                     modCategory { categoryId name }
@@ -1482,6 +1484,7 @@ class NexusAPI:
                         mod_id=mid,
                         name=n.get("name", "") or "",
                         version=n.get("version", "") or "",
+                        summary=n.get("summary", "") or "",
                         updated_at=updated_at,
                         viewer_update_available=None if vua is None else bool(vua),
                         requirements=reqs,
