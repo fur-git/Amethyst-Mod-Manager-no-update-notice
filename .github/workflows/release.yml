@@ -111,6 +111,17 @@ jobs:
     runs-on: ubuntu-latest
     container: ghcr.io/pkgforge-dev/archlinux:latest
     steps:
+      - name: Free disk space on runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - uses: actions/checkout@v4
 
       - name: Prepare anylinux container
@@ -164,11 +175,18 @@ jobs:
           name: libloot-cp314
           path: src/LOOT/
 
+      - name: Disk space before build
+        run: df -h && du -sh /tmp 2>/dev/null || true
+
       - name: Build AppImage
         env:
           ANYLINUX_LIB: '1'
           MM_USE_PKGBUILD: '1'
-        run: bash src/appimage/make-appimage.sh
+        run: bash -x src/appimage/make-appimage.sh
+
+      - name: Disk space after build
+        if: always()
+        run: df -h && du -sh /tmp/amethyst-mm-build 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
