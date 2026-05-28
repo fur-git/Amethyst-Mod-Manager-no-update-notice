@@ -178,6 +178,18 @@ jobs:
       - name: Disk space before build
         run: df -h && du -sh /tmp 2>/dev/null || true
 
+      - name: Work around quick-sharun girepository-1.0 hook bug
+        # quick-sharun's post-deploy hook runs:
+        #   find /usr/lib/* | grep girepository-1.0 | grep -v /usr/lib/girepository-1.0
+        # If the grep pipeline returns zero matches, pipefail+set-e abort the
+        # build silently. Drop a dummy .typelib whose path contains the
+        # substring "girepository-1.0" but NOT "/usr/lib/girepository-1.0",
+        # so the pipeline yields one entry and the hook proceeds to copy it.
+        run: |
+          mkdir -p /usr/lib/qs-stub-girepository-1.0
+          # Empty typelib — quick-sharun just copies it into the AppDir.
+          : > /usr/lib/qs-stub-girepository-1.0/Stub-1.0.typelib
+
       - name: Build AppImage
         env:
           ANYLINUX_LIB: '1'
