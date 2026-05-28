@@ -2771,9 +2771,12 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         filemap_path_str = self._get_filemap_path()
         if filemap_path_str:
             fm_path = Path(filemap_path_str)
-            if fm_path.is_file():
+            # Root-flagged mods land in filemap_root.txt, not filemap.txt.
+            for fm in (fm_path, fm_path.parent / "filemap_root.txt"):
+                if not fm.is_file():
+                    continue
                 try:
-                    with fm_path.open(encoding="utf-8") as f:
+                    with fm.open(encoding="utf-8") as f:
                         for line in f:
                             if "\t" not in line:
                                 continue
