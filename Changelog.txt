@@ -1,3 +1,6 @@
+- v1.3.7
+- Reworked Archive Invalidation for some bethesda games, Uses a dummy bsa file to make the gamebryo engine load loose files
+
 - v1.3.6
 - Tweaked Bethesda game routing rules to stop some dll files incorrectly being sent to the root folder
 - Fixed a bug where setting a mod to root folder install while a modlist is deployed would send it to the wrong location on next deploy

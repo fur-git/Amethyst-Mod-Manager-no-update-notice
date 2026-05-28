@@ -298,6 +298,13 @@ class SkyrimSE(Fallout_3):
     _MYGAMES_SUBPATH = Path("Skyrim Special Edition")
     _MYGAMES_SUBPATH_GOG = Path("Skyrim Special Edition GOG")
     _ARCHIVE_INI_FILENAME = "Skyrim.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "SkyrimPrefs.ini"
+    # SSE engine doesn't need the dummy-BSA trick: bUseLooseFiles defaults true
+    # and the engine prefers loose files over archived assets without timestamp
+    # gymnastics. MO2's game_skyrimSE plugin omits a BSAInvalidation feature
+    # entirely — we match that. Only the bInvalidateOlderFiles INI key is set.
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
 
     @property
     def _script_extender_exe(self) -> str:

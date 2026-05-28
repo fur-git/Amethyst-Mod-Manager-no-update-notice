@@ -382,8 +382,22 @@ class Fallout_3(BaseGame):
     _MYGAMES_SUBPATH = Path("Fallout3")
     _MYGAMES_SUBPATH_GOG = Path("Fallout3 GOG")
     _ARCHIVE_INI_FILENAME = "FALLOUT.ini"
+    # Per-game Prefs INI. When set, archive invalidation writes the same keys
+    # to both the primary INI and the Prefs INI so the Prefs file can't silently
+    # override what we wrote — the engine reads both and the Prefs value wins
+    # when present in both. Set to None on subclasses without a Prefs INI.
+    _ARCHIVE_PREFS_INI_FILENAME: "str | None" = "FalloutPrefs.ini"
     archive_invalidation_enabled = True
     _archive_invalidation_extra_keys: tuple[tuple[str, str], ...] = ()
+
+    # MO2-style dummy-BSA invalidation. When _invalidation_bsa_name is set, the
+    # apply step writes an empty BSA into the game's Data folder, prepends it to
+    # SArchiveList, and empties SInvalidationFile (disabling the legacy .txt
+    # codepath). When None, only the bInvalidateOlderFiles INI key is touched.
+    # BA2-based games (Fallout 4, Starfield) must override with None.
+    _invalidation_bsa_name: "str | None" = "Fallout - Invalidation.bsa"
+    _invalidation_bsa_version: "int | None" = 0x68
+    _invalidation_archive_list_key: str = "SArchiveList"
 
     @property
     def _script_extender_exe(self) -> str:
@@ -460,11 +474,25 @@ class Fallout_3(BaseGame):
     _MYGAMES_SUBPATH_GOG: Path | None = None
 
     def _get_archive_ini_path(self) -> "Path | None":
-        """Return the full path to the game INI used for archive invalidation."""
+        """Return the primary INI used for archive invalidation (back-compat)."""
         mygames = self._mygames_path()
         if mygames is None:
             return None
         return mygames / self._ARCHIVE_INI_FILENAME
+
+    def _get_archive_ini_paths(self) -> list[Path]:
+        """Return every INI that needs the invalidation keys written.
+
+        Includes the primary Fallout.ini-style INI and, when set, the Prefs INI
+        in the same directory. Empty when the prefix is unconfigured.
+        """
+        mygames = self._mygames_path()
+        if mygames is None:
+            return []
+        paths = [mygames / self._ARCHIVE_INI_FILENAME]
+        if self._ARCHIVE_PREFS_INI_FILENAME:
+            paths.append(mygames / self._ARCHIVE_PREFS_INI_FILENAME)
+        return paths
 
     def _mygames_paths(self) -> list[Path]:
         """Return every My Games folder for this game inside the prefix.
@@ -544,40 +572,136 @@ class Fallout_3(BaseGame):
                         _log(f"  Restored {target.name} from .bak")
 
     def apply_archive_invalidation(self, log_fn) -> None:
-        """Set bInvalidateOlderFiles=1 in the game INI so loose files win."""
+        """Set bInvalidateOlderFiles=1 in every managed game INI so loose files win.
+
+        When ``_invalidation_bsa_name`` is set (MO2-style), also write a dummy
+        BSA into the game's Data folder, prepend it to ``SArchiveList``, and
+        empty ``SInvalidationFile`` to disable the legacy .txt codepath.
+
+        Writes to both Fallout.ini and FalloutPrefs.ini (or the per-game
+        equivalents) because the engine reads both at launch and the Prefs
+        value wins when a key appears in both — leaving Prefs unmanaged would
+        silently override what we wrote to the primary INI.
+        """
         _log = log_fn
-        if not self.archive_invalidation_enabled or not self.archive_invalidation:
+        if not self.archive_invalidation_enabled:
             return
-        ini_path = self._get_archive_ini_path()
-        if ini_path is None:
+        # AI toggled off in the GUI: ensure on-disk state matches by running
+        # the revert path. Idempotent — if nothing was previously applied the
+        # helpers no-op. Without this, turning AI off and re-deploying would
+        # leave the dummy BSA and INI keys in place.
+        if not self.archive_invalidation:
+            self.revert_archive_invalidation(_log)
+            return
+        ini_paths = self._get_archive_ini_paths()
+        if not ini_paths:
             _log("  WARN: Prefix path not set — skipping archive invalidation.")
             return
 
-        ini_path.parent.mkdir(parents=True, exist_ok=True)
-        _set_ini_key(ini_path, "Archive", "bInvalidateOlderFiles", "1")
-        for key, value in self._archive_invalidation_extra_keys:
-            if _read_ini_key(ini_path, "Archive", key) is not None:
-                _log(f"  {key} already set in {ini_path.name} — leaving as-is.")
-                continue
-            _set_ini_key(ini_path, "Archive", key, value)
-        _log(f"  Archive invalidation enabled in {ini_path.name}.")
+        self._write_dummy_bsa_file(_log)
+        for ini_path in ini_paths:
+            ini_path.parent.mkdir(parents=True, exist_ok=True)
+            _set_ini_key(ini_path, "Archive", "bInvalidateOlderFiles", "1")
+            for key, value in self._archive_invalidation_extra_keys:
+                if _read_ini_key(ini_path, "Archive", key) is not None:
+                    continue
+                _set_ini_key(ini_path, "Archive", key, value)
+            self._apply_dummy_bsa_invalidation_ini(ini_path)
+
+        names = ", ".join(p.name for p in ini_paths)
+        _log(f"  Archive invalidation enabled in {names}.")
 
     def revert_archive_invalidation(self, log_fn) -> None:
-        """Remove bInvalidateOlderFiles from the game INI."""
+        """Remove the invalidation keys from every managed game INI.
+
+        Also undoes the MO2-style dummy-BSA setup when ``_invalidation_bsa_name``
+        is set: removes the BSA from ``SArchiveList`` in each INI, restores
+        ``SInvalidationFile`` to its default, and deletes the dummy file.
+
+        Not gated on the current ``archive_invalidation`` setting — revert cleans
+        whatever artifacts are present so toggling the setting and re-deploying
+        leaves a consistent on-disk state.
+        """
         _log = log_fn
-        if not self.archive_invalidation_enabled or not self.archive_invalidation:
+        if not self.archive_invalidation_enabled:
             return
-        ini_path = self._get_archive_ini_path()
-        if ini_path is None or not ini_path.is_file():
+        ini_paths = [p for p in self._get_archive_ini_paths() if p.is_file()]
+        if not ini_paths:
             return
 
-        _set_ini_key(ini_path, "Archive", "bInvalidateOlderFiles", None)
-        for key, value in self._archive_invalidation_extra_keys:
-            current = _read_ini_key(ini_path, "Archive", key)
-            if current is None or current != value:
-                continue
-            _set_ini_key(ini_path, "Archive", key, None)
-        _log(f"  Archive invalidation reverted in {ini_path.name}.")
+        for ini_path in ini_paths:
+            self._revert_dummy_bsa_invalidation_ini(ini_path)
+            _set_ini_key(ini_path, "Archive", "bInvalidateOlderFiles", None)
+            for key, value in self._archive_invalidation_extra_keys:
+                current = _read_ini_key(ini_path, "Archive", key)
+                if current is None or current != value:
+                    continue
+                _set_ini_key(ini_path, "Archive", key, None)
+
+        self._delete_dummy_bsa_file(_log)
+        names = ", ".join(p.name for p in ini_paths)
+        _log(f"  Archive invalidation reverted in {names}.")
+
+    def _write_dummy_bsa_file(self, _log) -> None:
+        """Write the dummy BSA into the game's Data folder, if configured."""
+        bsa_name = self._invalidation_bsa_name
+        bsa_version = self._invalidation_bsa_version
+        if bsa_name is None or bsa_version is None:
+            return
+        if self._game_path is None:
+            _log("  WARN: Game path not set — skipping dummy BSA write.")
+            return
+        from Utils.bsa_invalidation import write_dummy_bsa
+        try:
+            write_dummy_bsa(self._game_path / "Data" / bsa_name, bsa_version)
+        except OSError as exc:
+            _log(f"  WARN: Could not write {bsa_name}: {exc}")
+
+    def _delete_dummy_bsa_file(self, _log) -> None:
+        """Remove the dummy BSA from the game's Data folder, if present."""
+        bsa_name = self._invalidation_bsa_name
+        if bsa_name is None or self._game_path is None:
+            return
+        bsa_path = self._game_path / "Data" / bsa_name
+        if not bsa_path.is_file():
+            return
+        try:
+            bsa_path.unlink()
+            _log(f"  Removed dummy {bsa_name}.")
+        except OSError as exc:
+            _log(f"  WARN: Could not remove {bsa_name}: {exc}")
+
+    def _apply_dummy_bsa_invalidation_ini(self, ini_path: Path) -> None:
+        """MO2-style INI edits for one INI: SArchiveList[0] + SInvalidationFile=''."""
+        bsa_name = self._invalidation_bsa_name
+        if bsa_name is None:
+            return
+        from Utils.bsa_invalidation import ensure_in_archive_list
+        key = self._invalidation_archive_list_key
+        current = _read_ini_key(ini_path, "Archive", key) or ""
+        updated = ensure_in_archive_list(current, bsa_name)
+        if updated != current:
+            _set_ini_key(ini_path, "Archive", key, updated)
+        _set_ini_key(ini_path, "Archive", "SInvalidationFile", "")
+
+    def _revert_dummy_bsa_invalidation_ini(self, ini_path: Path) -> None:
+        """Undo dummy-BSA INI edits for one INI. The dummy file itself is removed
+        once per game dir by :meth:`_delete_dummy_bsa_file`."""
+        bsa_name = self._invalidation_bsa_name
+        if bsa_name is None:
+            return
+        from Utils.bsa_invalidation import remove_from_archive_list
+        key = self._invalidation_archive_list_key
+        current = _read_ini_key(ini_path, "Archive", key)
+        if current is not None:
+            updated = remove_from_archive_list(current, bsa_name)
+            if updated != current:
+                _set_ini_key(ini_path, "Archive", key, updated or None)
+        # Restore the engine default so a future deactivation doesn't leave
+        # SInvalidationFile permanently empty.
+        if _read_ini_key(ini_path, "Archive", "SInvalidationFile") == "":
+            _set_ini_key(ini_path, "Archive", "SInvalidationFile",
+                         "ArchiveInvalidation.txt")
 
     def swap_launcher(self, log_fn) -> None:
         """Replace the game launcher with the script extender if present."""
@@ -879,6 +1003,11 @@ class Fallout_NV(Fallout_3):
     _MYGAMES_SUBPATH = Path("FalloutNV")
     _MYGAMES_SUBPATH_GOG = Path("FalloutNV GOG")
     _ARCHIVE_INI_FILENAME = "Fallout.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "FalloutPrefs.ini"
+
+    # MO2-style dummy-BSA invalidation (matches FalloutNVBSAInvalidation).
+    _invalidation_bsa_name = "Fallout - Invalidation.bsa"
+    _invalidation_bsa_version = 0x68
 
     @property
     def _script_extender_exe(self) -> str:
@@ -982,7 +1111,11 @@ class Fallout_4(Fallout_3):
     _MYGAMES_SUBPATH = Path("Fallout4")
     _MYGAMES_SUBPATH_GOG = Path("Fallout4 GOG")
     _ARCHIVE_INI_FILENAME = "Fallout4.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "Fallout4Prefs.ini"
     _archive_invalidation_extra_keys = (("sResourceDataDirsFinal", ""),)
+    # BA2-based — no dummy BSA, only the bInvalidateOlderFiles INI key.
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
 
     @property
     def _script_extender_exe(self) -> str:
@@ -1072,7 +1205,11 @@ class Fallout_4VR(Fallout_3):
     _APPDATA_SUBPATH = Path("drive_c/users/steamuser/AppData/Local/Fallout4VR")
     _MYGAMES_SUBPATH = Path("Fallout4VR")
     _ARCHIVE_INI_FILENAME = "Fallout4.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "Fallout4Prefs.ini"
     _archive_invalidation_extra_keys = (("sResourceDataDirsFinal", ""),)
+    # BA2-based — no dummy BSA.
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
 
     @property
     def _script_extender_exe(self) -> str:
@@ -1156,47 +1293,29 @@ class Oblivion(Fallout_3):
     _APPDATA_SUBPATH = Path("drive_c/users/steamuser/AppData/Local/Oblivion")
     _APPDATA_SUBPATH_GOG = Path("drive_c/users/steamuser/AppData/Local/Oblivion GOG")
     _PLUGINS_TXT_FILENAME = "Plugins.txt"
-    archive_invalidation_enabled = False
+    _ARCHIVE_INI_FILENAME = "Oblivion.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "OblivionPrefs.ini"
+    # MO2-style dummy-BSA invalidation (Oblivion engine: bsa version 0x67).
+    _invalidation_bsa_name = "Oblivion - Invalidation.bsa"
+    _invalidation_bsa_version = 0x67
 
     @property
     def _script_extender_exe(self) -> str:
         return "obse_loader.exe"
 
-    def apply_archive_invalidation(self, log_fn) -> None:
-        """Generate ArchiveInvalidation.txt listing all deployed .dds paths."""
-        _log = log_fn
-        if not self.archive_invalidation:
-            return
-        if self._game_path is None:
-            _log("  WARN: Game path not set — skipping archive invalidation.")
-            return
-        filemap = self.get_effective_filemap_path()
-        if not filemap.is_file():
-            _log("  WARN: filemap.txt not found — skipping archive invalidation.")
-            return
-
-        dds_paths: list[str] = []
-        for line in filemap.read_text(encoding="utf-8").splitlines():
-            if not line or line.startswith("#"):
-                continue
-            rel_path = line.split("\t", 1)[0]
-            if rel_path.lower().endswith(".dds"):
-                dds_paths.append(rel_path.replace("\\", "/"))
-
-        out = self._game_path / "ArchiveInvalidation.txt"
-        out.write_text("\n".join(dds_paths) + "\n", encoding="utf-8")
-        _log(f"  Wrote {len(dds_paths)} .dds path(s) to ArchiveInvalidation.txt.")
-
-    def revert_archive_invalidation(self, log_fn) -> None:
-        """Delete ArchiveInvalidation.txt."""
-        if not self.archive_invalidation:
-            return
+    def _delete_dummy_bsa_file(self, _log) -> None:
+        """Also clean up any legacy ArchiveInvalidation.txt left from the
+        pre-migration codepath."""
+        super()._delete_dummy_bsa_file(_log)
         if self._game_path is None:
             return
-        out = self._game_path / "ArchiveInvalidation.txt"
-        if out.is_file():
-            out.unlink()
-            log_fn("  Removed ArchiveInvalidation.txt.")
+        legacy = self._game_path / "ArchiveInvalidation.txt"
+        if legacy.is_file():
+            try:
+                legacy.unlink()
+                _log("  Removed legacy ArchiveInvalidation.txt.")
+            except OSError:
+                pass
 
 
 class Skyrim(Fallout_3):
@@ -1289,6 +1408,9 @@ class Skyrim(Fallout_3):
     _MYGAMES_SUBPATH = Path("Skyrim")
     _MYGAMES_SUBPATH_GOG = Path("Skyrim GOG")
     _ARCHIVE_INI_FILENAME = "Skyrim.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "SkyrimPrefs.ini"
+    _invalidation_bsa_name = "Skyrim - Invalidation.bsa"
+    _invalidation_bsa_version = 0x68
 
     @property
     def _script_extender_exe(self) -> str:
@@ -1394,6 +1516,10 @@ class SkyrimVR(Fallout_3):
     _APPDATA_SUBPATH = Path("drive_c/users/steamuser/AppData/Local/Skyrim VR")
     _MYGAMES_SUBPATH = Path("Skyrim VR")
     _ARCHIVE_INI_FILENAME = "Skyrim.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "SkyrimPrefs.ini"
+    # Runs on the SSE engine fork — same reasoning as SkyrimSE (no dummy BSA).
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
 
     @property
     def _script_extender_exe(self) -> str:
@@ -1496,6 +1622,10 @@ class Starfield(Fallout_3):
     _APPDATA_SUBPATH = Path("drive_c/users/steamuser/AppData/Local/Starfield")
     _MYGAMES_SUBPATH = Path("Starfield")
     _ARCHIVE_INI_FILENAME = "Starfield.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "StarfieldPrefs.ini"
+    # BA2-based — no dummy BSA.
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
 
     @property
     def _script_extender_exe(self) -> str:
@@ -1638,6 +1768,9 @@ class Enderal(Fallout_3):
     _MYGAMES_SUBPATH = Path("Enderal")
     _MYGAMES_SUBPATH_GOG = Path("Enderal GOG")
     _ARCHIVE_INI_FILENAME = "Skyrim.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "SkyrimPrefs.ini"
+    _invalidation_bsa_name = "Skyrim - Invalidation.bsa"
+    _invalidation_bsa_version = 0x68
 
     @property
     def _script_extender_exe(self) -> str:
@@ -1708,6 +1841,10 @@ class EnderalSE(Fallout_3):
     _MYGAMES_SUBPATH = Path("Enderal Special Edition")
     _MYGAMES_SUBPATH_GOG = Path("Enderal Special Edition GOG")
     _ARCHIVE_INI_FILENAME = "Skyrim.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "SkyrimPrefs.ini"
+    # SSE-engine: see SkyrimSE — no dummy-BSA needed.
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
 
     @property
     def _script_extender_exe(self) -> str:
