@@ -338,9 +338,16 @@ def resolve_files(config: ModuleConfig,
                             options.append((fi.priority, fi.source_path,
                                             fi.destination_path, fi.is_folder))
 
-    # Conditional file installs — evaluated against final flag state
+    # Conditional file installs — evaluated against final flag state.
+    # version_pass=True: unevaluable engine/game version gates
+    # (gameDependency, foseDependency, nvseDependency, …) are treated as
+    # satisfied, matching MO2/Vortex — we can't know the user's script-extender
+    # version, so we install the gated payload rather than silently dropping it.
+    # Without this, stepless FOMODs whose entire payload sits in
+    # <conditionalFileInstalls> behind a version gate would install 0 files.
     for pattern in config.conditional_file_installs:
-        if evaluate_dependency(pattern.dependency, flag_state, inst_files, active_files):
+        if evaluate_dependency(pattern.dependency, flag_state, inst_files,
+                               active_files, version_pass=True):
             for fi in pattern.files:
                 conditional.append((fi.priority, fi.source_path,
                                     fi.destination_path, fi.is_folder))

@@ -666,12 +666,21 @@ def _resolve_direct_files(extract_dir: str) -> list[tuple[str, str, bool]]:
     """
     For a non-FOMOD archive, return every file as a (src, dst, is_folder)
     tuple where src and dst are both relative to the archive root.
+
+    A top-level ``fomod/`` folder is skipped: it holds installer metadata
+    (ModuleConfig.xml, script.cs, info.xml, screenshots) — not game content.
+    This matters for scripted (C#) FOMODs like older Nexus ``.fomod`` packages
+    which we can't run as a wizard and fall through to a plain install; without
+    this the whole fomod/ folder would deploy into the game's Data dir as junk.
     """
     result = []
     root = Path(extract_dir)
     for entry in root.rglob("*"):
         if entry.is_file():
             rel = str(entry.relative_to(root))
+            first = rel.replace("\\", "/").split("/", 1)[0]
+            if first.lower() == "fomod":
+                continue
             result.append((rel, rel, False))
     return result
 
