@@ -159,13 +159,15 @@ from gui.tk_tooltip import TkTooltip
 
 
 def _copy_fomod_choice(src_profile_dir: Path, dst_profile_dir: Path, mod_name: str) -> None:
-    """Copy a mod's saved FOMOD choice JSON from one profile to another, if present."""
-    src = src_profile_dir / "fomod" / f"{mod_name}.json"
-    if not src.is_file():
-        return
-    dst_dir = dst_profile_dir / "fomod"
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src), str(dst_dir / f"{mod_name}.json"))
+    """Copy a mod's saved installer choice JSON (FOMOD or BAIN) from one profile
+    to another, if present."""
+    for sub in ("fomod", "bain"):
+        src = src_profile_dir / sub / f"{mod_name}.json"
+        if not src.is_file():
+            continue
+        dst_dir = dst_profile_dir / sub
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst_dir / f"{mod_name}.json"))
 
 
 def _scan_meta_flags_impl(entries: list, mods_dir: Path) -> dict:

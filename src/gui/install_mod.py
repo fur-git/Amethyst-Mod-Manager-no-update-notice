@@ -937,6 +937,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                              game, mod_panel=None,
                              on_installed=None,
                              fomod_auto_selections: "dict | None" = None,
+                             bain_auto_selections: "dict | None" = None,
                              prebuilt_meta=None,
                              disable_extract: bool = False,
                              profile_dir=None,
@@ -1720,11 +1721,37 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     except (OSError, ValueError):
                         saved_selections = None
 
+            def _save_bain_selection(result):
+                """Persist BAIN selection to both the global config sidecar and
+                the active profile's bain/ folder (mirrors FOMOD)."""
+                if game_name and sel_path is not None:
+                    try:
+                        with open(sel_path, "w", encoding="utf-8") as f:
+                            json.dump(result, f, indent=2)
+                    except OSError:
+                        pass
+                pdir = getattr(game, "_active_profile_dir", None)
+                if pdir:
+                    try:
+                        pbain = Path(pdir) / "bain"
+                        pbain.mkdir(parents=True, exist_ok=True)
+                        with open(pbain / f"{mod_name}.json", "w",
+                                  encoding="utf-8") as f:
+                            json.dump(result, f, indent=2)
+                    except OSError:
+                        pass
+
             default_names = [p.name for p in bain_subpkgs if p.default_selected]
-            if headless:
-                # Collection / non-interactive install: keep prior choices if we
-                # have them, otherwise use the per-package defaults (00-prefixed
-                # core packages only).
+            if bain_auto_selections is not None:
+                # Workshop / collection install: apply the exported choices and
+                # skip the interactive picker entirely.
+                selected = bain_auto_selections.get("selected", [])
+                _save_bain_selection(bain_auto_selections)
+                log_fn("BAIN: applying exported selection automatically.")
+            elif headless:
+                # Collection / non-interactive install with no exported choices:
+                # keep prior choices if we have them, otherwise use the per-
+                # package defaults (00-prefixed core packages only).
                 selected = (saved_selections or {}).get("selected") or default_names
                 log_fn("BAIN: non-interactive install — using "
                        + ("saved" if saved_selections else "default")
@@ -1780,12 +1807,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     return
 
                 selected = dialog_result.get("selected", [])
-                if game_name and sel_path is not None:
-                    try:
-                        with open(sel_path, "w", encoding="utf-8") as f:
-                            json.dump(dialog_result, f, indent=2)
-                    except OSError:
-                        pass
+                _save_bain_selection(dialog_result)
 
             file_list = resolve_bain_files(bain_subpkgs, set(selected))
             is_bain_install = True

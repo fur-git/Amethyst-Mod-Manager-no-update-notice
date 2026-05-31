@@ -2564,6 +2564,7 @@ class CollectionDetailDialog(tk.Frame):
         schema_file_id_to_install_type: dict[int, str] = {}  # file_id → details.type (e.g. "dinput")
         schema_file_id_to_phase: dict[int, int] = {}    # file_id → phase (0 = earliest)
         fomod_by_file_id: dict[int, dict] = {}   # file_id → saved_selections dict
+        bain_by_file_id: dict[int, dict] = {}    # file_id → bain selection dict
         # First pass: collect raw logicalFilename values to detect duplicates
         _raw_logical: dict[int, str] = {}   # file_id → raw logicalFilename from source
         _raw_name: dict[int, str] = {}      # file_id → schema mod name
@@ -2612,6 +2613,8 @@ class CollectionDetailDialog(tk.Frame):
                     fomod_by_file_id[fid] = _fomod_choices_from_collection(choices)
                 elif choices.get("type") == "fomod_selections":
                     fomod_by_file_id[fid] = choices["selections"]
+                elif choices.get("type") == "bain_selections":
+                    bain_by_file_id[fid] = choices["selections"]
 
         # Sort the mods list by topo position (0 = highest priority);
         # mods without a position come last (preserving their original order).
@@ -3074,6 +3077,7 @@ class CollectionDetailDialog(tk.Frame):
 
             archive_path = str(result.file_path)
             auto_fomod = fomod_by_file_id.get(mod.file_id)
+            auto_bain = bain_by_file_id.get(mod.file_id)
 
             # Build prebuilt metadata so no extra API calls are needed.
             # Prefer the mod_id from collection.json (source.modId) over the
@@ -3122,6 +3126,7 @@ class CollectionDetailDialog(tk.Frame):
                 folder_name = install_mod_from_archive(
                     archive_path, self, self._log, self._game,
                     fomod_auto_selections=auto_fomod,
+                    bain_auto_selections=auto_bain,
                     prebuilt_meta=_pmeta,
                     profile_dir=profile_dir,
                     headless=True,
@@ -3367,6 +3372,7 @@ class CollectionDetailDialog(tk.Frame):
                     _current_phase = _this_phase
                     _def_archive = str(_def_result.file_path)
                     _def_auto_fomod = fomod_by_file_id.get(_def_mod.file_id)
+                    _def_auto_bain = bain_by_file_id.get(_def_mod.file_id)
                     try:
                         _def_mod_id = schema_file_id_to_mod_id.get(_def_mod.file_id, 0) or _def_mod.mod_id
                         _def_pmeta = build_meta_from_download(
@@ -3396,6 +3402,7 @@ class CollectionDetailDialog(tk.Frame):
                         _def_folder = install_mod_from_archive(
                             _def_archive, self, self._log, self._game,
                             fomod_auto_selections=_def_auto_fomod,
+                            bain_auto_selections=_def_auto_bain,
                             prebuilt_meta=_def_pmeta,
                             profile_dir=profile_dir,
                             headless=True,
@@ -4891,6 +4898,7 @@ class CollectionDetailDialog(tk.Frame):
         schema_file_id_to_domain: dict[int, str] = {}
         schema_file_id_to_phase: dict[int, int] = {}
         fomod_by_file_id: dict[int, dict] = {}
+        bain_by_file_id: dict[int, dict] = {}
 
         _raw_logical: dict[int, str] = {}
         _raw_name: dict[int, str] = {}
@@ -4944,6 +4952,8 @@ class CollectionDetailDialog(tk.Frame):
                     fomod_by_file_id[fid] = _fomod_choices_from_collection(choices)
                 elif choices.get("type") == "fomod_selections":
                     fomod_by_file_id[fid] = choices["selections"]
+                elif choices.get("type") == "bain_selections":
+                    bain_by_file_id[fid] = choices["selections"]
 
         def _sort_key(m):
             return schema_file_id_to_pos.get(m.file_id, len(schema_mods))
@@ -5264,6 +5274,7 @@ class CollectionDetailDialog(tk.Frame):
                 folder_name = install_mod_from_archive(
                     str(archive_path), self, self._log, self._game,
                     fomod_auto_selections=fomod_by_file_id.get(mod.file_id),
+                    bain_auto_selections=bain_by_file_id.get(mod.file_id),
                     prebuilt_meta=_pmeta,
                     profile_dir=profile_dir,
                     headless=True,
