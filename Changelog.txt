@@ -7,6 +7,7 @@
 - When updating a mod, if the name of the new mod has changed a prompt now appears to delete the old mod and the new mod is installed to the position of the old one.
 - The missing requirements menu separates required/optional mods by keywords in their description
 - Added support for Bain type mods
+- Tweaked d3dcompiler_47 installer to install more up to date version
 
 - v1.3.6
 - Tweaked Bethesda game routing rules to stop some dll files incorrectly being sent to the root folder
