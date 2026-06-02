@@ -32,6 +32,47 @@ from Utils.deploy_shared import (
 )
 
 
+class CoreBackupConflictError(RuntimeError):
+    """Raised when move_to_core would overwrite a good vanilla backup with a
+    deploy dir that still contains mod files — a sign of an interrupted or
+    overlapping deploy. Aborting here protects the vanilla files."""
+
+
+def _dir_has_deployed_mod_files(deploy_dir: Path, limit: int = 4096) -> bool:
+    """Return True if deploy_dir contains files that look like deployed mod
+    files (symlinks, or regular files with st_nlink > 1, i.e. hardlinks).
+
+    Vanilla game files are plain regular files with a single link, so a Data/
+    that contains symlinks/hardlinks has mods deployed into it. We cap the walk
+    at *limit* files so this stays cheap on huge install dirs.
+    """
+    seen = 0
+    stack = [str(deploy_dir)]
+    while stack:
+        cur = stack.pop()
+        try:
+            it = os.scandir(cur)
+        except OSError:
+            continue
+        with it:
+            for de in it:
+                try:
+                    if de.is_dir(follow_symlinks=False):
+                        stack.append(de.path)
+                        continue
+                    if de.is_symlink():
+                        return True
+                    st = de.stat(follow_symlinks=False)
+                    if st.st_nlink > 1:
+                        return True
+                except OSError:
+                    continue
+                seen += 1
+                if seen >= limit:
+                    return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — back up the game install directory
 # ---------------------------------------------------------------------------
@@ -55,6 +96,18 @@ def move_to_core(
     core_dir = core_dir or _default_core(deploy_dir)
 
     if core_dir.exists():
+        # Integrity guard: a pre-existing core_dir means a prior deploy backed
+        # up the vanilla files here. If the current deploy_dir still contains
+        # deployed mod files (symlinks/hardlinks), then restore_data_core never
+        # ran (or was interrupted by an overlapping deploy) and deploy_dir is
+        # NOT vanilla. Overwriting the good backup with this polluted dir would
+        # permanently destroy the vanilla files. Abort instead.
+        if deploy_dir.is_dir() and _dir_has_deployed_mod_files(deploy_dir):
+            raise CoreBackupConflictError(
+                f"Refusing to overwrite vanilla backup {core_dir.name}/: "
+                f"{deploy_dir.name}/ still contains deployed mod files "
+                f"(interrupted or overlapping deploy?). Run Restore, then deploy again."
+            )
         _log(f"  {core_dir.name} already exists — removing old backup first.")
         shutil.rmtree(core_dir)
 

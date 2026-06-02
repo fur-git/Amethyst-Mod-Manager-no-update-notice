@@ -144,6 +144,90 @@ class ModListNexusActionsMixin:
     def _abstain_selected_mods(self, targets: list[tuple]) -> None:
         self._vote_selected_mods(targets, endorse=False)
 
+    def _prompt_remove_previous_version(self, old_mod_name: str,
+                                        new_mod_name: str,
+                                        _attempt: int = 0) -> None:
+        """After Change Version installs a differently-named mod, offer to
+        remove the previous version. Same-mod-id files may also be optional
+        variants, so removal must be opt-in.
+
+        On Remove, the new mod inherits the old mod's modlist position so the
+        user doesn't have to re-find where it belonged."""
+        # The new mod is added by install via reload_after_install, which is
+        # scheduled after this callback fires. Wait for it to appear.
+        new_idx = next((i for i, e in enumerate(self._entries)
+                        if not e.is_separator and e.name == new_mod_name), -1)
+        if new_idx < 0 and _attempt < 40:
+            self.after(50, lambda: self._prompt_remove_previous_version(
+                old_mod_name, new_mod_name, _attempt + 1))
+            return
+        old_idx = next((i for i, e in enumerate(self._entries)
+                        if not e.is_separator and e.name == old_mod_name), -1)
+        if old_idx < 0:
+            return
+        alert = CTkAlert(
+            state="info",
+            title="Remove previous version?",
+            body_text=(
+                f"'{new_mod_name}' was installed as a new mod (different folder name) "
+                f"because it did not replace '{old_mod_name}'.\n\n"
+                f"Remove the previous version '{old_mod_name}'?\n\n"
+                "The new mod will take the previous version's position in the modlist.\n\n"
+                "Choose Keep if this is an optional/alternative variant rather than "
+                "a replacement."
+            ),
+            btn1="Remove",
+            btn2="Keep",
+            parent=self.winfo_toplevel(),
+        )
+        if alert.get() != "Remove":
+            return
+        # Re-resolve after the dialog: indices may have changed during wait_window.
+        old_idx = next((i for i, e in enumerate(self._entries)
+                        if not e.is_separator and e.name == old_mod_name), -1)
+        if old_idx < 0:
+            return
+        new_idx = next((i for i, e in enumerate(self._entries)
+                        if not e.is_separator and e.name == new_mod_name), -1)
+        # Mirror the old mod's enabled state onto the new one — a disabled
+        # mod swapped to a different version should stay disabled, and vice
+        # versa, so the user doesn't have to re-toggle after the swap.
+        if new_idx >= 0:
+            old_entry = self._entries[old_idx]
+            new_entry = self._entries[new_idx]
+            if new_entry.enabled != old_entry.enabled:
+                new_entry.enabled = old_entry.enabled
+                new_var = self._check_vars[new_idx]
+                if new_var is not None:
+                    new_var.set(old_entry.enabled)
+        if new_idx >= 0 and new_idx != old_idx:
+            self._reposition_entry(new_idx, old_idx)
+            # The pop+insert may have shifted old_idx by one.
+            old_idx = next((i for i, e in enumerate(self._entries)
+                            if not e.is_separator and e.name == old_mod_name), -1)
+            if old_idx < 0:
+                return
+        self._remove_mod(old_idx, skip_confirm=True)
+
+    def _reposition_entry(self, src: int, dst: int) -> None:
+        """Move `_entries[src]` (and its parallel `_check_vars` slot) so that
+        afterwards the moved entry occupies the slot the entry at `dst`
+        originally held. Caches/state are invalidated; persistence is left to
+        the subsequent `_remove_mod` call which already saves and rebuilds."""
+        if src == dst or not (0 <= src < len(self._entries)) or not (0 <= dst < len(self._entries)):
+            return
+        entry = self._entries.pop(src)
+        var = self._check_vars.pop(src)
+        # After pop, indices > src shift down by one.
+        insert_at = dst - 1 if src < dst else dst
+        self._entries.insert(insert_at, entry)
+        self._check_vars.insert(insert_at, var)
+        self._sel_idx = -1
+        if isinstance(getattr(self, "_sel_set", None), set):
+            self._sel_set.clear()
+        self._compute_bundle_groups()
+        self._invalidate_derived_caches()
+
     def _update_nexus_mod(self, mod_name: str) -> None:
         """Show the mod files overlay so the user can pick which file to install."""
         app = self.winfo_toplevel()
@@ -302,7 +386,11 @@ class ModListNexusActionsMixin:
                                   status_bar.set_progress(d, t, p, title="Extracting"))
 
                 def _install_worker():
-                    def _cleanup(is_fomod: bool = False):
+                    def _cleanup(is_fomod: bool = False,
+                                 installed_mod_name: str | None = None):
+                        if installed_mod_name and installed_mod_name != mod_name:
+                            app.after(0, lambda new=installed_mod_name:
+                                      mod_panel._prompt_remove_previous_version(mod_name, new))
                         from Utils.ui_config import (
                             load_clear_archive_after_install,
                             load_keep_fomod_archives,

@@ -464,12 +464,18 @@ def check_for_updates(
                     else None
                 )
 
-                # Backfill meta.version from the installed file record when missing.
-                # This is the whole reason we made the REST call.
+                # Backfill meta.version from the installed file record.
+                # The file record on Nexus is authoritative — meta.ini's
+                # version field is often stale because it was parsed from
+                # the archive filename at install time (which lags behind
+                # the actual upload version, e.g. archive "...-1-0-33-..."
+                # for file 1.0.34). Overwriting with the file's true
+                # version prevents false "update available" flags when
+                # installed_file_id already equals the latest file id.
                 version_backfilled = False
-                if installed_file and not meta.version:
+                if installed_file:
                     _vf = installed_file.version or installed_file.mod_version or ""
-                    if _vf:
+                    if _vf and meta.version != _vf:
                         meta.version = _vf
                         version_backfilled = True
 
@@ -503,6 +509,23 @@ def check_for_updates(
                         [f for f in files if (f.category_name or "").strip().upper() == target_cat]
                         if target_cat else []
                     )
+
+                # When we can identify the installed file, further restrict
+                # comparison to files sharing its display name — same Nexus
+                # "slot"/variant. Otherwise a mod page like Engine Fixes,
+                # which ships both "Engine Fixes - Main File" and
+                # "Engine Fixes - SKSE64 Preloader" under MAIN, would flag
+                # the Preloader as updated whenever the Main File bumps,
+                # even though the Preloader itself hasn't changed.
+                # Only apply this narrowing if the installed file's name
+                # actually matches at least one file in the current list —
+                # otherwise the file may have been renamed and we should
+                # fall back to the broader category set.
+                if cat_matches and installed_file and installed_file.name:
+                    name_in_cat = [f for f in cat_matches
+                                   if f.name == installed_file.name]
+                    if name_in_cat:
+                        cat_matches = name_in_cat
 
                 if cat_matches:
                     latest = max(cat_matches, key=lambda f: f.uploaded_timestamp)

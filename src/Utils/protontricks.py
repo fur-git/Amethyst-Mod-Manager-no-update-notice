@@ -6,6 +6,7 @@ and winetricks via the bundled copy in the manager's tools folder.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -21,6 +22,16 @@ from Utils.app_log import safe_log as _safe_log
 
 _WINETRICKS_URL = "https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks"
 _CABEXTRACT_URL = "https://archlinux.org/packages/extra/x86_64/cabextract/download/"
+
+# d3dcompiler_47: prebuilt DLLs from Mozilla's fxc2 repo (Windows 8.1 SDK redist).
+# The winetricks/protontricks d3dcompiler_47 verb installs an older Win7-era DLL
+# that lacks SM5.x extended typed UAV loads, which makes Community Shaders / ENB
+# fail to compile with "error X3676: typed UAV loads are only allowed for
+# single-component 32-bit element types". The fxc2 8.1 build supports it.
+_D3DCOMPILER_47_64_URL = "https://github.com/mozilla/fxc2/raw/master/dll/d3dcompiler_47.dll"
+_D3DCOMPILER_47_64_SHA256 = "4432bbd1a390874f3f0a503d45cc48d346abc3a8c0213c289f4b615bf0ee84f3"
+_D3DCOMPILER_47_32_URL = "https://github.com/mozilla/fxc2/raw/master/dll/d3dcompiler_47_32.dll"
+_D3DCOMPILER_47_32_SHA256 = "2ad0d4987fc4624566b190e747c9d95038443956ed816abfd1e2d389b5ec0851"
 
 _DEPS_FILE = "amethyst_deps.json"
 
@@ -253,6 +264,61 @@ def _install_via_protontricks(
         return False
 
 
+def _download_verified(url: str, sha256: str, log_fn: Callable[[str], None]) -> bytes | None:
+    """Download *url* and return its bytes if the SHA-256 matches, else None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except Exception as exc:
+        log_fn(f"Download failed for {url}: {exc}")
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != sha256:
+        log_fn(f"Checksum mismatch for {url} (got {digest}).")
+        return None
+    return data
+
+
+def _install_d3dcompiler_47_fxc2(prefix_path: Path, log_fn: Callable[[str], None]) -> bool:
+    """Drop the Mozilla fxc2 (Win 8.1 SDK) d3dcompiler_47 DLLs into the prefix.
+
+    64-bit → system32, 32-bit → syswow64 — the standard Wine wow64 layout.
+    This is the build that supports SM5.x extended typed UAV loads, which the
+    winetricks verb's older DLL does not (causes shader error X3676).
+    """
+    win = prefix_path / "drive_c" / "windows"
+    sys32 = win / "system32"
+    syswow64 = win / "syswow64"
+    if not sys32.is_dir():
+        log_fn(f"Prefix has no system32 dir at {sys32}.")
+        return False
+
+    log_fn("Installing d3dcompiler_47 (Mozilla fxc2, Win 8.1 SDK) …")
+    data64 = _download_verified(_D3DCOMPILER_47_64_URL, _D3DCOMPILER_47_64_SHA256, log_fn)
+    if data64 is None:
+        return False
+    try:
+        (sys32 / "d3dcompiler_47.dll").write_bytes(data64)
+    except OSError as exc:
+        log_fn(f"Failed to write d3dcompiler_47.dll to system32: {exc}")
+        return False
+
+    # 32-bit DLL is best-effort: only matters if the prefix has a syswow64.
+    if syswow64.is_dir():
+        data32 = _download_verified(_D3DCOMPILER_47_32_URL, _D3DCOMPILER_47_32_SHA256, log_fn)
+        if data32 is not None:
+            try:
+                (syswow64 / "d3dcompiler_47.dll").write_bytes(data32)
+            except OSError as exc:
+                log_fn(f"Failed to write 32-bit d3dcompiler_47.dll to syswow64: {exc}")
+
+    from Utils.deploy_wine_dll import apply_wine_dll_overrides
+    apply_wine_dll_overrides(prefix_path, {"d3dcompiler_47": "native"}, log_fn=log_fn)
+    log_fn("d3dcompiler_47 installed (fxc2).")
+    return True
+
+
 def install_d3dcompiler_47(
     steam_id: str,
     log_fn: Callable[[str], None] | None = None,
@@ -260,9 +326,11 @@ def install_d3dcompiler_47(
 ) -> bool:
     """Install d3dcompiler_47 into the game's Proton prefix.
 
-    Uses system protontricks when available; falls back to bundled
-    winetricks against *prefix_path* otherwise. Records success in the
-    prefix's amethyst_deps.json so other wizards can skip the step.
+    Prefers dropping the Mozilla fxc2 (Win 8.1 SDK) DLL directly, which supports
+    SM5.x extended typed UAV loads (the winetricks verb installs an older DLL
+    that fails to compile Community Shaders / ENB with error X3676). Falls back
+    to protontricks/winetricks only if the direct install can't run. Records
+    success in the prefix's amethyst_deps.json so other wizards can skip it.
     """
     _log = _safe_log(log_fn)
     prefix = Path(prefix_path) if prefix_path else None
@@ -270,6 +338,13 @@ def install_d3dcompiler_47(
     def _mark():
         if prefix and prefix.is_dir():
             mark_dep_installed(prefix, D3D_DEP_KEY)
+
+    if prefix and prefix.is_dir():
+        if _install_d3dcompiler_47_fxc2(prefix, _log):
+            _mark()
+            return True
+        _log("fxc2 install failed — falling back to protontricks/winetricks "
+             "(note: that DLL may not support Community Shaders / ENB).")
 
     if steam_id and _get_protontricks_cmd(steam_id) is not None:
         if _install_via_protontricks(steam_id, "d3dcompiler_47", _log):

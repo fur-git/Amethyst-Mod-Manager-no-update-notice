@@ -119,23 +119,29 @@ class PluginPanelArchiveMixin:
         style = ttk.Style()
         style.theme_use("default")
         use_default_indicator = _is_flatpak_sandbox()
+        indicator_elem = "Treeitem.indicator"
         if not use_default_indicator:
             from gui.ctk_components import ICON_PATH as _ICON_PATH, _load_icon_image as _load_iim
-            _im_open = _load_iim(_ICON_PATH.get("arrow"))
-            _im_close = _im_open.rotate(90)
-            _im_empty = PilImage.new("RGB", (15, 15), BG_DEEP)
-            _img_open_arc = ImageTk.PhotoImage(_im_open, name="img_open_arc", size=(15, 15))
-            _img_close_arc = ImageTk.PhotoImage(_im_close, name="img_close_arc", size=(15, 15))
-            _img_empty_arc = ImageTk.PhotoImage(_im_empty, name="img_empty_arc", size=(15, 15))
-            self._arc_arrow_images = (_img_open_arc, _img_close_arc, _img_empty_arc)
-            try:
-                style.element_create("Treeitem.arcindicator", "image", "img_close_arc",
-                    ("user1", "img_open_arc"), ("user2", "img_empty_arc"),
-                    sticky="w", width=15, height=15)
-            except Exception:
-                pass
+            existing_imgs = set(tk.image_names())
+            if "img_open_arc" not in existing_imgs:
+                _im_open = _load_iim(_ICON_PATH.get("arrow"))
+                _im_close = _im_open.rotate(90)
+                _im_empty = PilImage.new("RGB", (15, 15), BG_DEEP)
+                _img_open_arc = ImageTk.PhotoImage(_im_open, name="img_open_arc", size=(15, 15))
+                _img_close_arc = ImageTk.PhotoImage(_im_close, name="img_close_arc", size=(15, 15))
+                _img_empty_arc = ImageTk.PhotoImage(_im_empty, name="img_empty_arc", size=(15, 15))
+                self._arc_arrow_images = (_img_open_arc, _img_close_arc, _img_empty_arc)
+            if "Treeitem.arcindicator" not in style.element_names():
+                try:
+                    style.element_create("Treeitem.arcindicator", "image", "img_close_arc",
+                        ("user1", "img_open_arc"), ("user2", "img_empty_arc"),
+                        sticky="w", width=15, height=15)
+                    indicator_elem = "Treeitem.arcindicator"
+                except Exception:
+                    pass
+            else:
+                indicator_elem = "Treeitem.arcindicator"
         try:
-            indicator_elem = "Treeitem.indicator" if use_default_indicator else "Treeitem.arcindicator"
             style.layout("Archive.Treeview.Item", [
                 ("Treeitem.padding", {"sticky": "nsew", "children": [
                     (indicator_elem, {"side": "left", "sticky": "nsew"}),

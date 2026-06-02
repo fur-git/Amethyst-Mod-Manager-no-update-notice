@@ -79,6 +79,14 @@ class TopBar(ctk.CTkFrame):
         self._show_mewgenics_deploy_choice_fn = show_mewgenics_deploy_choice_fn
         self._two_rows: bool | None = None  # unknown until first configure
         self._auto_deploy_in_progress: bool = False
+        # Deploy serialization: a deploy MUST never overlap another deploy or
+        # the Data_Core vanilla backup can be destroyed (restore wipes Data and
+        # moves Data_Core back; a concurrent move_to_core then rmtree's the
+        # real backup). _deploy_running gates this; _deploy_rerun_pending
+        # coalesces requests that arrive mid-deploy into exactly one re-run.
+        self._deploy_running: bool = False
+        self._deploy_rerun_pending: bool = False
+        self._deploy_rerun_args: tuple | None = None
 
         # ── Content area (above separator) ───────────────────────────────────
         # _row1 holds game/profile selectors; _row2 holds action buttons.
@@ -900,16 +908,35 @@ class TopBar(ctk.CTkFrame):
 
         self._run_deploy(game, profile)
 
-    def _run_deploy(self, game, profile, on_complete=None):
+    def _run_deploy(self, game, profile, on_complete=None, silent=False):
         """Execute the deploy worker thread for *game* / *profile*.
 
         If *on_complete* is given, it is called on the main thread after a
         successful deploy (skipped on error/cancel). Used by Run EXE to chain
         a launch onto the same deploy flow.
+
+        *silent* suppresses the status-bar progress UI (used by auto-deploy so
+        rapid mod toggles don't flash a progress bar). Log lines still flow.
+
+        Deploys are serialized: if one is already running, this request is
+        coalesced — the latest args are remembered and exactly one re-run is
+        fired after the current deploy finishes (so the final mod state is
+        always deployed without overlapping deploys, which can destroy the
+        Data_Core backup).
         """
+        if self._deploy_running:
+            self._deploy_rerun_pending = True
+            self._deploy_rerun_args = (game, profile, on_complete, silent)
+            # The auto-deploy entry path (gui.py) sets _auto_deploy_in_progress
+            # right before calling us, expecting our deploy's rebuild to clear
+            # it. Since we're coalescing instead of deploying, no such rebuild
+            # happens — clear it now so a future auto-deploy isn't swallowed.
+            self._auto_deploy_in_progress = False
+            return
         if not confirm_deploy_appdata(self.winfo_toplevel(), game):
             self._log("Deploy: cancelled — AppData folder missing.")
             return
+        self._deploy_running = True
         app = self.winfo_toplevel()
         root_folder_enabled = (
             app._mod_panel._root_folder_enabled
@@ -925,6 +952,8 @@ class TopBar(ctk.CTkFrame):
                 self.after(0, lambda m=msg: self._log(m))
 
             def _progress(done: int, total: int, phase: str | None = None):
+                if silent:
+                    return
                 self.after(0, lambda d=done, t=total, p=phase: status_bar.set_progress(d, t, p))
 
             # CET prompt must run on the main thread; block the worker until done.
@@ -956,12 +985,35 @@ class TopBar(ctk.CTkFrame):
                 self.after(0, lambda: self._set_deploy_buttons_enabled(True))
                 self.after(0, self._reload_mod_panel)
                 self.after(0, self._update_profile_menu_color)
-                self.after(1500, status_bar.clear_progress)
+                if not silent:
+                    self.after(1500, status_bar.clear_progress)
                 if success and on_complete is not None:
                     self.after(0, on_complete)
+                self.after(0, self._on_deploy_finished)
 
         self._set_deploy_buttons_enabled(False)
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_deploy_finished(self):
+        """Main-thread: clear the deploy lock and fire one coalesced re-run.
+
+        Runs after every deploy worker (success or failure). If mod state
+        changed while the deploy was in flight, a single re-deploy is started
+        with the latest args so the on-disk state matches the final mod list.
+        """
+        self._deploy_running = False
+        if self._deploy_rerun_pending:
+            self._deploy_rerun_pending = False
+            args = self._deploy_rerun_args
+            self._deploy_rerun_args = None
+            if args is not None:
+                game, profile, on_complete, silent = args
+                # The re-deploy's own _reload_mod_panel will trigger a filemap
+                # rebuild whose _on_filemap_rebuilt would otherwise start a
+                # fresh auto-deploy. Set the guard so that rebuild is swallowed,
+                # matching the gui.py auto-deploy entry path.
+                self._auto_deploy_in_progress = True
+                self._run_deploy(game, profile, on_complete=on_complete, silent=silent)
 
     def _on_restore(self):
         game = _gh._GAMES.get(self._game_var.get())

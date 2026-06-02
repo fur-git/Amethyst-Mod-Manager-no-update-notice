@@ -1358,7 +1358,9 @@ class App(ctk.CTk):
             elif (_auto_game and _auto_game.is_configured()
                     and getattr(_auto_game, "auto_deploy", False)):
                 self._topbar._auto_deploy_in_progress = True
-                self._topbar._run_deploy(_auto_game, self._topbar._profile_var.get())
+                self._topbar._run_deploy(
+                    _auto_game, self._topbar._profile_var.get(), silent=True
+                )
 
         # Wrap so the splash is dismissed after the very first filemap rebuild,
         # then restore the original callback for all subsequent calls.

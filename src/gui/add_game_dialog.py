@@ -465,6 +465,20 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         self._add_btn.pack(side="right", padx=4, pady=10)
 
         if self._game.is_configured():
+            self._reset_loc_btn = ctk.CTkButton(
+                btn_bar, text="Reset Locations", width=scaled(140), height=scaled(30),
+                font=FONT_NORMAL, fg_color=BG_HEADER, hover_color=BG_HOVER,
+                text_color=TEXT_MAIN, command=self._on_reset_locations
+            )
+            self._reset_loc_btn.pack(side="right", padx=4, pady=10)
+            self._help_tooltip.attach(
+                self._reset_loc_btn,
+                "Re-scan for the game install and Proton/Wine prefix. Use this if "
+                "you moved the game or prefix — the new locations will be detected "
+                "and applied when you Save.",
+                offset_x=scaled(12), offset_y=scaled(12),
+            )
+
             self._remove_btn = ctk.CTkButton(
                 btn_bar, text="Remove Instance", width=scaled(140), height=scaled(30),
                 font=FONT_BOLD, fg_color=RED_BTN, hover_color=RED_HOV,
@@ -1115,6 +1129,18 @@ class ReconfigureGamePanel(ctk.CTkFrame):
             text="Default location will be used.", text_color=TEXT_DIM
         )
 
+    def _on_reset_locations(self):
+        # Re-detect game install and prefix from scratch — used when the user
+        # has moved the game and/or prefix. Clearing _found_prefix forces the
+        # prefix scan to re-run after the game scan completes. The Save button
+        # applies the newly-detected paths.
+        self._found_prefix = None
+        self._prefix_status_label.configure(
+            text="Scanning for prefix…", text_color=TEXT_WARN
+        )
+        self._set_prefix_text("")
+        self._start_scan()
+
     def _on_remove(self):
         from Utils.config_paths import get_game_config_path
         from Utils.deploy import restore_root_folder
@@ -1167,10 +1193,13 @@ class ReconfigureGamePanel(ctk.CTkFrame):
 
         if paths_json.is_file():
             paths_json.unlink(missing_ok=True)
-            try:
-                paths_json.parent.rmdir()
-            except OSError:
-                pass
+
+        # Remove the entire per-game config dir (paths.json plus
+        # fomod_selections, bain_selections, etc.) under
+        # ~/.config/AmethystModManager/games/<game_name>/.
+        game_config_dir = paths_json.parent
+        if game_config_dir.is_dir():
+            shutil.rmtree(game_config_dir, ignore_errors=True)
 
         self.result = None
         self.removed = True

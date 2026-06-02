@@ -104,6 +104,25 @@ class SkyrimSE(Fallout_3):
         return "skyrimse"
 
     @property
+    def wine_dll_overrides(self) -> dict[str, str]:
+        # native,builtin for the XAudio2/X3DAudio/XACT family: a pure-native
+        # xaudio2_7 access-violates on the audio thread under Proton (crash in
+        # XAudio2_7.dll touching BSXAudio2GameSound), so prefer native but fall
+        # back to Wine's builtin (wired to winepulse). d3dcompiler_47 stays
+        # native — we install the Mozilla fxc2 build that supports SM5.x typed
+        # UAV loads (Community Shaders / ENB; see install_d3dcompiler_47).
+        overrides = {
+            "winmm": "native,builtin",
+            "version": "native,builtin",
+            "d3dcompiler_47": "native",
+        }
+        for n in range(8):
+            overrides[f"xaudio2_{n}"] = "native,builtin"
+        for n in range(8):
+            overrides[f"x3daudio1_{n}"] = "native,builtin"
+        return overrides
+
+    @property
     def frameworks(self) -> dict[str, str]:
         return {"Script Extender": "skse64_loader.exe"}
 

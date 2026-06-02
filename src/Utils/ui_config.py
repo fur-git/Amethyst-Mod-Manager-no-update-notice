@@ -412,6 +412,7 @@ def _seed_first_run_defaults(path: Path) -> None:
         if _COLUMNS_SECTION not in parser:
             parser[_COLUMNS_SECTION] = {}
         parser[_COLUMNS_SECTION]["hidden"] = ",".join(str(x) for x in _FIRST_RUN_HIDDEN_COLUMNS)
+        parser[_COLUMNS_SECTION]["introduced"] = ",".join(str(x) for x in _FIRST_RUN_HIDDEN_COLUMNS)
         with path.open("w") as f:
             parser.write(f)
     except Exception:
@@ -491,7 +492,7 @@ _DEFAULT_MAX_EXTRACT_WORKERS = 4
 _FIRST_RUN_DOWNLOAD_ORDER = "smallest"
 _FIRST_RUN_MAX_CONCURRENT = 8
 _FIRST_RUN_MAX_EXTRACT_WORKERS = 8
-_FIRST_RUN_HIDDEN_COLUMNS = [2, 5]  # category, installed
+_FIRST_RUN_HIDDEN_COLUMNS = [2, 5, 8]  # category, installed, size
 
 
 def load_collection_settings() -> dict:
@@ -622,7 +623,7 @@ def save_column_widths(widths: dict[int, int]) -> None:
         parser.write(f)
 
 
-_DEFAULT_COL_ORDER = [2, 3, 4, 5, 6, 7]  # category, flags, conflicts, installed, priority, version
+_DEFAULT_COL_ORDER = [2, 3, 4, 5, 6, 7, 8]  # category, flags, conflicts, installed, priority, version, size
 
 
 def load_column_order() -> list[int]:
@@ -668,7 +669,12 @@ def save_column_order(order: list[int]) -> None:
 
 
 def load_column_hidden() -> set[int]:
-    """Load hidden column indices from amethyst.ini. Returns set of data col indices."""
+    """Load hidden column indices from amethyst.ini. Returns set of data col indices.
+
+    Columns added after a user's first run are folded into their saved hidden set
+    once (tracked via the `introduced` key) so new optional columns like Size
+    default to hidden for existing installs too, without re-hiding columns the
+    user has since chosen to show."""
     path = get_ui_config_path()
     if not path.is_file():
         return set()
@@ -676,11 +682,32 @@ def load_column_hidden() -> set[int]:
         parser = configparser.ConfigParser()
         parser.read(path)
         raw = parser.get(_COLUMNS_SECTION, "hidden", fallback=None)
-        if not raw:
+        if raw is None:
             return set()
-        return {int(x) for x in raw.split(",") if x.strip()}
+        hidden = {int(x) for x in raw.split(",") if x.strip()}
+        # One-time migration: hide any newly-introduced default-hidden column.
+        intro_raw = parser.get(_COLUMNS_SECTION, "introduced", fallback="")
+        introduced = {int(x) for x in intro_raw.split(",") if x.strip()}
+        new_defaults = set(_FIRST_RUN_HIDDEN_COLUMNS) - introduced
+        if new_defaults:
+            hidden |= new_defaults
+            _save_columns_hidden_and_introduced(path, hidden, introduced | set(_FIRST_RUN_HIDDEN_COLUMNS))
+        return hidden
     except Exception:
         return set()
+
+
+def _save_columns_hidden_and_introduced(path: Path, hidden: set[int], introduced: set[int]) -> None:
+    """Persist both the hidden set and the introduced marker together."""
+    parser = configparser.ConfigParser()
+    if path.is_file():
+        parser.read(path)
+    if _COLUMNS_SECTION not in parser:
+        parser[_COLUMNS_SECTION] = {}
+    parser[_COLUMNS_SECTION]["hidden"] = ",".join(str(x) for x in sorted(hidden))
+    parser[_COLUMNS_SECTION]["introduced"] = ",".join(str(x) for x in sorted(introduced))
+    with path.open("w") as f:
+        parser.write(f)
 
 
 def save_column_hidden(hidden: set[int]) -> None:

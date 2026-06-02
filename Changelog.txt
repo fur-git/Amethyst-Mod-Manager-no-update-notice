@@ -1,5 +1,17 @@
 - v1.3.7
 - Reworked Archive Invalidation for some bethesda games, Uses a dummy bsa file to make the gamebryo engine load loose files
+- Fixed a bug where removing the root folder install flag from a mod after deploying would send the mod to overwrite when restoring.
+- Fixed arrows not appearing in the archive tab treeview
+- Tweaked the update checker to reduce rare false positives
+- The change version menu now highlights name matched files to make them more visible
+- When updating a mod, if the name of the new mod has changed a prompt now appears to delete the old mod and the new mod is installed to the position of the old one.
+- The missing requirements menu separates required/optional mods by keywords in their description
+- Added support for Bain type mods
+- Tweaked d3dcompiler_47 installer to install more up to date version
+- Fix for auto deploy removing game files when multiple deploy functions are called at the same time
+- Added sideload_apps/library.json as a install location for games installed within heroic
+- Tools in the proton menu use the proton version set in heroic's gameconfig files instead of falling back to a random version.
+- Added a size column to the modlist panel, Hidden by default
 
 - v1.3.6
 - Tweaked Bethesda game routing rules to stop some dll files incorrectly being sent to the root folder

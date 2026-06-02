@@ -1061,6 +1061,18 @@ class ProtonToolsPanel(ctk.CTkFrame):
         compat_data = _resolve_compat_data(prefix_path)
 
         if proton_script is None:
+            # Heroic-managed prefixes have no Steam CompatToolMapping, but the
+            # exact Proton build is recorded in GamesConfig/<app>.json — use it.
+            try:
+                from Utils.heroic_finder import find_heroic_proton_for_prefix
+                proton_script = find_heroic_proton_for_prefix(prefix_path)
+            except Exception:
+                proton_script = None
+            if proton_script is not None:
+                self._log(f"Proton Tools: using Heroic-configured Proton "
+                          f"{proton_script.parent.name}.")
+
+        if proton_script is None:
             preferred_runner = _read_prefix_runner(compat_data)
             proton_script = find_any_installed_proton(preferred_runner)
             if proton_script is None:
@@ -5020,7 +5032,7 @@ class MissingReqsPanel(ctk.CTkFrame):
         list_frame.grid_columnconfigure(0, weight=1)
         self._canvas = tk.Canvas(
             list_frame, bg=BG_DEEP, bd=0, highlightthickness=0,
-            yscrollincrement=1, takefocus=0,
+            takefocus=0,
         )
         vsb = tk.Scrollbar(list_frame, orient="vertical", command=self._canvas.yview,
                            bg=_theme.BG_SEP, troughcolor=BG_DEEP, activebackground=ACCENT,
@@ -5080,17 +5092,68 @@ class MissingReqsPanel(ctk.CTkFrame):
         if not missing_list:
             self._status_var.set("No missing requirements (list is empty).")
             return
-        self._populate(missing_list)
+        required = []
+        optional = []
+        other = []
+        required_kw = ("required", "hard requirement")
+        optional_kw = ("optional", "not needed", "not required")
+        for r in missing_list:
+            note_l = (r.notes or "").lower()
 
-    def _populate(self, missing_list):
+            def _earliest(text, keywords):
+                best = -1
+                for k in keywords:
+                    i = 0
+                    while True:
+                        j = text.find(k, i)
+                        if j == -1:
+                            break
+                        if k == "required" and j >= 4 and text[j - 4:j] == "not ":
+                            i = j + 1
+                            continue
+                        if best == -1 or j < best:
+                            best = j
+                        break
+                return best
+
+            req_pos = _earliest(note_l, required_kw)
+            opt_pos = _earliest(note_l, optional_kw)
+            if req_pos == -1 and opt_pos == -1:
+                other.append(r)
+            elif opt_pos == -1 or (req_pos != -1 and req_pos < opt_pos):
+                required.append(r)
+            else:
+                optional.append(r)
+        self._populate(
+            required + other + optional,
+            section_counts=[
+                ("Required", len(required)),
+                ("Other", len(other)),
+                ("Optional", len(optional)),
+            ],
+        )
+
+    def _populate(self, missing_list, section_counts=None):
         self._status_lbl.pack_forget()
         ROW_H = scaled(56)
+        HDR_H = scaled(24)
         BTN_W = scaled(70)
         VIEW_W = scaled(56)
         BTN_H = scaled(28)
         NAME_PAD = scaled(10)
         canvas = self._canvas
         canvas_w = [600]
+        if section_counts is None:
+            section_counts = [("", len(missing_list))]
+        nonempty_sections = [(n, c) for n, c in section_counts if c > 0]
+        show_headers = len(nonempty_sections) >= 1
+        header_at = {}
+        if show_headers:
+            idx = 0
+            for name, count in section_counts:
+                if count > 0:
+                    header_at[idx] = name
+                    idx += count
 
         def _on_resize(ev):
             canvas_w[0] = max(ev.width, 200)
@@ -5108,7 +5171,19 @@ class MissingReqsPanel(ctk.CTkFrame):
             btn_left = cw - 2 * BTN_W - scaled(16)
             name_max_px = max(btn_left - NAME_PAD - scaled(8), 20)
             y = 0
+
+            def _draw_header(label, y_pos):
+                canvas.create_rectangle(0, y_pos, cw, y_pos + HDR_H, fill=BG_PANEL, outline="")
+                canvas.create_text(
+                    NAME_PAD, y_pos + HDR_H // 2,
+                    text=label, anchor="w",
+                    font=FONT_BOLD, fill=TEXT_MAIN,
+                )
+                return y_pos + HDR_H
+
             for i, req in enumerate(missing_list):
+                if i in header_at:
+                    y = _draw_header(header_at[i], y)
                 y_top = y
                 notes = (req.notes or "").strip() or "No notes"
                 title = req.mod_name + (" (External)" if req.is_external else "")

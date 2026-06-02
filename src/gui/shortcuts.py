@@ -286,8 +286,13 @@ def _select_all_in_separator(app):
     elif sel_idx >= 0:
         anchor_idx = sel_idx
 
+    # When separators are hidden by the active filter, scoping to a single
+    # separator block makes no sense (the user can't see the blocks) — select
+    # every visible mod across the whole list instead.
+    hide_separators = bool(getattr(panel, "_filter_hide_separators", 0))
+
     sep_idx = -1
-    if anchor_idx >= 0 and anchor_idx < len(entries):
+    if not hide_separators and anchor_idx >= 0 and anchor_idx < len(entries):
         e = entries[anchor_idx]
         if e.is_separator:
             sep_idx = anchor_idx
@@ -302,10 +307,11 @@ def _select_all_in_separator(app):
     else:
         start = 0
     end = len(entries)
-    for i in range(start, len(entries)):
-        if entries[i].is_separator:
-            end = i
-            break
+    if not hide_separators:
+        for i in range(start, len(entries)):
+            if entries[i].is_separator:
+                end = i
+                break
 
     visible_indices = getattr(panel, "_visible_indices", None)
     if visible_indices:

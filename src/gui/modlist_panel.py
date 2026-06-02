@@ -159,17 +159,53 @@ from gui.tk_tooltip import TkTooltip
 
 
 def _copy_fomod_choice(src_profile_dir: Path, dst_profile_dir: Path, mod_name: str) -> None:
-    """Copy a mod's saved FOMOD choice JSON from one profile to another, if present."""
-    src = src_profile_dir / "fomod" / f"{mod_name}.json"
-    if not src.is_file():
-        return
-    dst_dir = dst_profile_dir / "fomod"
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src), str(dst_dir / f"{mod_name}.json"))
+    """Copy a mod's saved installer choice JSON (FOMOD or BAIN) from one profile
+    to another, if present."""
+    for sub in ("fomod", "bain"):
+        src = src_profile_dir / sub / f"{mod_name}.json"
+        if not src.is_file():
+            continue
+        dst_dir = dst_profile_dir / sub
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst_dir / f"{mod_name}.json"))
 
 
-def _scan_meta_flags_impl(entries: list, mods_dir: Path) -> dict:
-    """Pure scan over meta.ini; returns dict of results. Safe to run in thread."""
+def _dir_size_bytes(path: Path) -> int:
+    """Recursively sum file sizes under path (bytes). Safe to run in a thread."""
+    total = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total += _dir_size_bytes(Path(entry.path))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _format_size(num_bytes: int) -> str:
+    """Format a byte count as a short KB/MB/GB string."""
+    if num_bytes <= 0:
+        return ""
+    kb = num_bytes / 1024
+    if kb < 1024:
+        return f"{kb:.0f} KB"
+    mb = kb / 1024
+    if mb < 1024:
+        return f"{mb:.1f} MB"
+    return f"{mb / 1024:.2f} GB"
+
+
+def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = False) -> dict:
+    """Pure scan over meta.ini; returns dict of results. Safe to run in thread.
+
+    Folder sizes are only walked when compute_sizes is set (Size column visible),
+    since walking every mod tree is expensive and fires on many GUI events."""
     update_mods: set[str] = set()
     missing_reqs: set[str] = set()
     missing_reqs_detail: dict[str, list[str]] = {}
@@ -178,7 +214,10 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path) -> dict:
     install_datetimes: dict[str, datetime] = {}
     category_names: dict[str, str] = {}
     mod_versions: dict[str, str] = {}
+    mod_sizes: dict[str, str] = {}
+    mod_size_bytes: dict[str, int] = {}
     fomod_mods: set[str] = set()
+    bain_mods: set[str] = set()
     root_folder_mods: set[str] = set()
     collection_bundled_mods: set[str] = set()
     collection_patched_mods: set[str] = set()
@@ -186,7 +225,13 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path) -> dict:
     for entry in entries:
         if entry.is_separator:
             continue
-        meta_path = mods_dir / entry.name / "meta.ini"
+        mod_dir = mods_dir / entry.name
+        if compute_sizes:
+            size_bytes = _dir_size_bytes(mod_dir)
+            if size_bytes > 0:
+                mod_size_bytes[entry.name] = size_bytes
+                mod_sizes[entry.name] = _format_size(size_bytes)
+        meta_path = mod_dir / "meta.ini"
         if not meta_path.is_file():
             continue
         try:
@@ -220,6 +265,8 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path) -> dict:
                 mod_versions[entry.name] = meta.version
             if meta.is_fomod:
                 fomod_mods.add(entry.name)
+            if meta.is_bain:
+                bain_mods.add(entry.name)
             if meta.root_folder:
                 root_folder_mods.add(entry.name)
             if meta.from_collection_bundled:
@@ -237,7 +284,10 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path) -> dict:
         "install_datetimes": install_datetimes,
         "category_names": category_names,
         "mod_versions": mod_versions,
+        "mod_sizes": mod_sizes,
+        "mod_size_bytes": mod_size_bytes,
         "fomod_mods": fomod_mods,
+        "bain_mods": bain_mods,
         "root_folder_mods": root_folder_mods,
         "collection_bundled_mods": collection_bundled_mods,
         "collection_patched_mods": collection_patched_mods,
@@ -428,7 +478,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._install_dates: dict[str, str] = {}
         self._category_names: dict[str, str] = {}
         self._mod_versions: dict[str, str] = {}
+        self._mod_sizes: dict[str, str] = {}
+        self._mod_size_bytes: dict[str, int] = {}
         self._fomod_mods: set[str] = set()
+        self._bain_mods: set[str] = set()
         # Set of mod names flagged for root-level (engine) deployment
         self._root_folder_mods: set[str] = set()
         # Set of mod names that own at least one file matched by a custom
@@ -529,6 +582,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._filter_has_disabled_files: int = 0
         self._filter_has_updates: int = 0
         self._filter_fomod_only: int = 0
+        self._filter_bain_only: int = 0
         self._filter_has_bsa: int = 0
         self._filter_categories: frozenset[str] = frozenset()         # include-only categories
         self._filter_categories_exclude: frozenset[str] = frozenset() # categories to hide
@@ -596,6 +650,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._pool_install_text: list[int] = []      # text canvas item ids (install date)
         self._pool_priority_text: list[int] = []     # text canvas item ids (priority)
         self._pool_version_text: list[int] = []      # text canvas item ids (version)
+        self._pool_size_text: list[int] = []         # text canvas item ids (size)
         self._pool_sep_icon: list[int] = []          # image canvas item ids (collapse arrow)
         self._pool_sep_line_l: list[int] = []        # line canvas item ids (separator left line)
         self._pool_sep_line_r: list[int] = []        # line canvas item ids (separator right line)
@@ -936,23 +991,24 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         menu_btn_pad = scaled(22)
         x0, x1 = scaled(4), scaled(32)
         hidden = self._col_hidden
-        # Number of visible cols among 2..7 (name col 1 is always visible)
+        # Number of visible cols among 2..8 (name col 1 is always visible)
         visible_data_cols = [dc for dc in self._col_order if dc not in hidden]
         n_visible = len(visible_data_cols)
         # gaps: between name and col2, between subsequent visible cols, and before scrollbar
         avail = canvas_w - x1 - gap * (n_visible + 1) - scroll_gap - menu_btn_pad
 
-        # Default proportional widths keyed by data-col index (1=name, 2=cat, 3=flags, 4=conf, 5=inst, 6=prio, 7=version)
+        # Default proportional widths keyed by data-col index (1=name, 2=cat, 3=flags, 4=conf, 5=inst, 6=prio, 7=version, 8=size)
         data_defaults = {
-            1: max(scaled(80), avail - scaled(int((130 + 56 + 95 + 100 + 72 + 90) * scale))),
+            1: max(scaled(80), avail - scaled(int((130 + 56 + 95 + 100 + 72 + 90 + 80) * scale))),
             2: scaled(int(130 * scale)),
             3: scaled(int(56 * scale)),
             4: scaled(int(95 * scale)),
             5: scaled(int(100 * scale)),
             6: scaled(int(72 * scale)),
             7: scaled(int(90 * scale)),
+            8: scaled(int(80 * scale)),
         }
-        data_mins = {1: scaled(120), 2: scaled(95), 3: scaled(70), 4: scaled(95), 5: scaled(95), 6: scaled(80), 7: scaled(80)}
+        data_mins = {1: scaled(120), 2: scaled(95), 3: scaled(70), 4: scaled(95), 5: scaled(95), 6: scaled(80), 7: scaled(80), 8: scaled(75)}
 
         ov = self._col_w_override
         # Width per visible data col (name col 1 always included)
@@ -974,7 +1030,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # widths[0] = name (slot 1), widths[1..n_visible] = visible cols (slots 2..n_visible+1),
         # remaining entries are 0 for dead/hidden slots.
         widths = []
-        for i in range(7):
+        for i in range(8):
             slot = i + 1  # _COL_W slot index
             if slot < len(slot_data):
                 widths.append(data_widths.get(slot_data[slot], 0))
@@ -992,15 +1048,15 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             xs.append(xs[-1] + widths[i] + gap)
         # Pad remaining slots (for hidden cols) with a far off-screen sentinel
         off_x = -99999
-        while len(xs) < 8:
+        while len(xs) < 9:
             xs.append(off_x)
 
         # Hidden col slots: assign them slot indices past the visible ones, off-screen.
         for k, dc in enumerate(self._col_order):
             if dc in hidden:
                 slot = n_visible + 2  # shared off-screen slot (width 0, x off_x)
-                if slot >= 8:
-                    slot = 7
+                if slot >= 9:
+                    slot = 8
                 self._col_pos[dc] = slot
 
         self._COL_X = xs
@@ -1011,9 +1067,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._last_col_right = xs[n_visible + 1] if n_visible > 0 else (x1 + widths[0])
 
     # Static sort key names by data-col index
-    _DATA_COL_SORT_KEYS = {1: "name", 2: "category", 3: "flags", 4: "conflicts", 5: "installed", 6: "priority", 7: "version"}
+    _DATA_COL_SORT_KEYS = {1: "name", 2: "category", 3: "flags", 4: "conflicts", 5: "installed", 6: "priority", 7: "version", 8: "size"}
     # Static titles by data-col index
-    _DATA_COL_TITLES = {0: "", 1: "Mod Name", 2: "Category", 3: "Flags", 4: "Conflicts", 5: "Installed", 6: "Priority", 7: "Version"}
+    _DATA_COL_TITLES = {0: "", 1: "Mod Name", 2: "Category", 3: "Flags", 4: "Conflicts", 5: "Installed", 6: "Priority", 7: "Version", 8: "Size"}
 
     def _update_header(self, canvas_w: int):
         try:
@@ -1023,10 +1079,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         # Build slot-ordered metadata using only visible cols.
         visible = [dc for dc in self._col_order if dc not in self._col_hidden]
-        slot_data_cols = [0, 1] + visible + [0] * (6 - len(visible))
-        titles  = [self._DATA_COL_TITLES.get(slot_data_cols[i], "") for i in range(8)]
+        slot_data_cols = [0, 1] + visible + [0] * (7 - len(visible))
+        titles  = [self._DATA_COL_TITLES.get(slot_data_cols[i], "") for i in range(9)]
         x_pos   = self._COL_X
-        anchors = ["center", "center", "center", "center", "center", "center", "center", "center"]
+        anchors = ["center"] * 9
         widths  = self._COL_W
         for i, (title, x, anc, w) in enumerate(zip(titles, x_pos, anchors, widths)):
             dc = slot_data_cols[i]
@@ -1040,7 +1096,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                         pass
                 continue
             sort_key = self._DATA_COL_SORT_KEYS.get(dc)
-            is_movable = dc in (2, 3, 4, 5, 6, 7)
+            is_movable = dc in (2, 3, 4, 5, 6, 7, 8)
             display = title
             if sort_key and sort_key == self._sort_column:
                 arrow = " ▲" if self._sort_ascending else " ▼"
@@ -1356,7 +1412,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
     def _scan_meta_flags(self):
         """Single pass over meta.ini: update, missing_reqs, endorsed, install_dates (sync)."""
-        results = _scan_meta_flags_impl(self._entries, self._staging_root)
+        results = _scan_meta_flags_impl(self._entries, self._staging_root,
+                                        compute_sizes=8 not in self._col_hidden)
         self._apply_meta_results(results)
 
     def _scan_meta_flags_async(self):
@@ -1375,7 +1432,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._install_datetimes.clear()
             self._category_names.clear()
             self._mod_versions.clear()
+            self._mod_sizes.clear()
+            self._mod_size_bytes.clear()
             self._fomod_mods.clear()
+            self._bain_mods.clear()
             self._vis_dirty = True
             self._mod_to_sep_idx = None
             return
@@ -1386,9 +1446,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         mods_dir = self._staging_root
         modlist_path = self._modlist_path
         call_threadsafe = self._call_threadsafe
+        compute_sizes = 8 not in self._col_hidden
 
         def _worker():
-            results = _scan_meta_flags_impl(entries, mods_dir)
+            results = _scan_meta_flags_impl(entries, mods_dir, compute_sizes)
             results["_modlist_path"] = modlist_path
             call_threadsafe(lambda: self._apply_meta_results(results))
 
@@ -1409,7 +1470,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._install_datetimes = results["install_datetimes"]
         self._category_names = results.get("category_names", {})
         self._mod_versions = results.get("mod_versions", {})
+        self._mod_sizes = results.get("mod_sizes", {})
+        self._mod_size_bytes = results.get("mod_size_bytes", {})
         self._fomod_mods = results.get("fomod_mods", set())
+        self._bain_mods = results.get("bain_mods", set())
         self._root_folder_mods = results.get("root_folder_mods", set())
         self._root_rule_mods = self._compute_root_rule_mods()
         self._collection_bundled_mods = results.get("collection_bundled_mods", set())
@@ -1543,6 +1607,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             # Version text
             ver_id = c.create_text(0, -200, text="", anchor="center", fill="",
                                    font=(_theme.FONT_FAMILY, _theme.FS10), state="hidden")
+            # Size text
+            size_id = c.create_text(0, -200, text="", anchor="center", fill="",
+                                    font=(_theme.FONT_FAMILY, _theme.FS10), state="hidden")
             # Separator collapse icon
             sep_icon_id = c.create_image(0, -200, anchor="center", state="hidden")
             # Separator decorative lines (left and right of label).
@@ -1575,6 +1642,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._pool_install_text.append(inst_id)
             self._pool_priority_text.append(prio_id)
             self._pool_version_text.append(ver_id)
+            self._pool_size_text.append(size_id)
             self._pool_sep_icon.append(sep_icon_id)
             self._pool_sep_line_l.append(sep_line_l)
             self._pool_sep_line_r.append(sep_line_r)
@@ -1760,7 +1828,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         "_pool_conflict_icon1", "_pool_conflict_icon2",
         "_pool_bsa_dot1", "_pool_bsa_dot2", "_pool_bsa_sep",
         "_pool_category_text", "_pool_install_text",
-        "_pool_priority_text", "_pool_version_text",
+        "_pool_priority_text", "_pool_version_text", "_pool_size_text",
         "_pool_sep_icon", "_pool_sep_line_l", "_pool_sep_line_r",
         "_pool_sep_badge",
         "_pool_cb_rect", "_pool_cb_mark",
@@ -1932,6 +2000,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         _cp5 = _col_pos.get(5, 5); _INST_X = _COL_X[_cp5]; _INST_W = _COL_W[_cp5]
         _cp6 = _col_pos.get(6, 6); _PRIO_X = _COL_X[_cp6]; _PRIO_W = _COL_W[_cp6]
         _cp7 = _col_pos.get(7, 7); _VER_X  = _COL_X[_cp7]; _VER_W  = _COL_W[_cp7]
+        _cp8 = _col_pos.get(8, 8); _SIZE_X = _COL_X[_cp8]; _SIZE_W = _COL_W[_cp8]
 
         # Hoist Path.home() and frequently-used scaled() constants out of the per-row loop.
         _home = Path.home()
@@ -2278,6 +2347,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     c.itemconfigure(self._pool_install_text[s], state="hidden")
                     c.itemconfigure(self._pool_priority_text[s], state="hidden")
                     c.itemconfigure(self._pool_version_text[s], state="hidden")
+                    c.itemconfigure(self._pool_size_text[s], state="hidden")
 
                     # Pool check widget — hidden for separators
                     c.itemconfigure(self._pool_cb_rect[s], state="hidden")
@@ -2529,6 +2599,17 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                                         fill=TEXT_DIM, font=ver_font, state="normal")
                     else:
                         c.itemconfigure(self._pool_version_text[s], state="hidden")
+
+                    # Size text
+                    size_text = self._mod_sizes.get(entry.name, "")
+                    if size_text:
+                        size_cx = _SIZE_X + _SIZE_W // 2
+                        c.coords(self._pool_size_text[s], size_cx, y_mid)
+                        c.itemconfigure(self._pool_size_text[s],
+                                        text=size_text, anchor="center",
+                                        fill=TEXT_DIM, font=_FONT_SMALL, state="normal")
+                    else:
+                        c.itemconfigure(self._pool_size_text[s], state="hidden")
 
                     # Enable/disable control (canvas-drawn)
                     # Bundle variants → radio circle (● / ○); normal mods → checkbox
@@ -2893,6 +2974,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         ("_filter_fomod_only", None,
          lambda s, _ms: (lambda e: e.name in s._fomod_mods),
          lambda s, _ms: s._sep_block_has_fomod),
+        ("_filter_bain_only", None,
+         lambda s, _ms: (lambda e: e.name in s._bain_mods),
+         lambda s, _ms: s._sep_block_has_bain),
         ("_filter_has_bsa", lambda s: s._get_mods_with_bsa(),
          lambda s, ms: (lambda e: e.name in ms),
          lambda s, ms: (lambda i: s._sep_block_has_bsa(i, ms))),
@@ -3145,6 +3229,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                         parts.append((1, tok.lower()))
                 return (0, tuple(parts))
             return _version_key
+        elif col == "size":
+            return lambda i: self._mod_size_bytes.get(self._entries[i].name, 0)
         else:
             return lambda i: i
 
@@ -3826,6 +3912,11 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
     def _sep_block_has_fomod(self, sep_idx: int) -> bool:
         return self._sep_block_has_any(
             sep_idx, lambda e: e.name in self._fomod_mods,
+        )
+
+    def _sep_block_has_bain(self, sep_idx: int) -> bool:
+        return self._sep_block_has_any(
+            sep_idx, lambda e: e.name in self._bain_mods,
         )
 
     def _get_mods_with_bsa(self) -> set[str]:
@@ -5188,7 +5279,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             "deploy_paths": deploy_paths_changed,
         }
 
-    def _remove_mod(self, idx: int):
+    def _remove_mod(self, idx: int, skip_confirm: bool = False):
         if not (0 <= idx < len(self._entries)):
             return
         entry = self._entries[idx]
@@ -5207,30 +5298,34 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 self._variant_name_of(i) or self._entries[i].name
                 for i in sorted(bundle_indices)
             )
-            alert = CTkAlert(
-                state="warning",
-                title="Remove Bundle",
-                body_text=(
-                    f"Remove all variants of bundle '{bundle_name}'?\n\n"
-                    f"Variants: {variant_labels}\n\n"
-                    "This will delete all variant folders and cannot be undone."
-                ),
-                btn1="Remove",
-                btn2="Cancel",
-                parent=self.winfo_toplevel(),
-            )
+            if not skip_confirm:
+                alert = CTkAlert(
+                    state="warning",
+                    title="Remove Bundle",
+                    body_text=(
+                        f"Remove all variants of bundle '{bundle_name}'?\n\n"
+                        f"Variants: {variant_labels}\n\n"
+                        "This will delete all variant folders and cannot be undone."
+                    ),
+                    btn1="Remove",
+                    btn2="Cancel",
+                    parent=self.winfo_toplevel(),
+                )
+                if alert.get() != "Remove":
+                    return
         else:
             bundle_indices = [idx]
-            alert = CTkAlert(
-                state="warning",
-                title="Remove Mod",
-                body_text=f"Are you sure you want to remove '{entry.name}'?\n\nThis will delete the mod folder and cannot be undone.",
-                btn1="Remove",
-                btn2="Cancel",
-                parent=self.winfo_toplevel(),
-            )
-        if alert.get() != "Remove":
-            return
+            if not skip_confirm:
+                alert = CTkAlert(
+                    state="warning",
+                    title="Remove Mod",
+                    body_text=f"Are you sure you want to remove '{entry.name}'?\n\nThis will delete the mod folder and cannot be undone.",
+                    btn1="Remove",
+                    btn2="Cancel",
+                    parent=self.winfo_toplevel(),
+                )
+                if alert.get() != "Remove":
+                    return
         # Delete staging folders and drop from index — process highest index first
         # so earlier indices remain valid while popping.
         removed_names: list[str] = []
@@ -5522,12 +5617,14 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # rebuilt on reload, so just migrate the current snapshot).
         for s in (self._update_mods, self._missing_reqs, self._ignored_missing_reqs,
                   self._endorsed_mods, self._prertx_mods, self._fomod_mods,
+                  self._bain_mods,
                   self._collection_bundled_mods, self._collection_patched_mods):
             if old_name in s:
                 s.discard(old_name)
                 s.add(new_name)
         for d in (self._missing_reqs_detail, self._install_dates,
-                  self._install_datetimes, self._category_names, self._mod_versions):
+                  self._install_datetimes, self._category_names, self._mod_versions,
+                  self._mod_sizes, self._mod_size_bytes):
             if old_name in d:
                 d[new_name] = d.pop(old_name)
 
@@ -7038,7 +7135,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._rebuild_filemap()
             self._scan_missing_reqs_flags()
             self._update_enable_disable_all_btn()
-            self._redraw()
+            # Skip the synchronous _redraw here. The Tk BooleanVar already
+            # updated the checkbox visually for instant click feedback;
+            # conflict-highlight repaints happen in _done after the filemap
+            # rebuild finishes (which is when they become accurate).
             self._update_info()
 
     def _sync_plugins_for_toggle(self, mod_name: str, now_enabled: bool) -> None:
@@ -7556,11 +7656,20 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 base_conflict_map  = dict(conflict_map)
                 base_overrides     = {k: set(v) for k, v in overrides.items()}
                 base_overridden_by = {k: set(v) for k, v in overridden_by.items()}
-                self.after(0, lambda: _done(count,
-                                             base_conflict_map, base_overrides, base_overridden_by,
-                                             bsa_conflict_map, bsa_overrides, bsa_overridden_by,
-                                             loose_over_bsa, bsa_over_loose,
-                                             None, prertx_mods))
+                # Compute root-rule mods here (off main thread) — was ~930 ms
+                # of main-thread time on large modlists (read_mod_index + scan).
+                try:
+                    worker_root_rule_mods = self._compute_root_rule_mods()
+                except Exception:
+                    worker_root_rule_mods = set()
+                def _done_wrapped():
+                    self._root_rule_mods = worker_root_rule_mods
+                    _done(count,
+                          base_conflict_map, base_overrides, base_overridden_by,
+                          bsa_conflict_map, bsa_overrides, bsa_overridden_by,
+                          loose_over_bsa, bsa_over_loose,
+                          None, prertx_mods)
+                self.after(0, _done_wrapped)
             except Exception as exc:
                 self.after(0, lambda e=exc: _done(0, {}, {}, {}, {}, {}, {}, {}, {}, e, set()))
 
@@ -7591,10 +7700,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 self._prertx_mods   = prertx_mods
                 self._apply_loose_bsa_fold(loose_over_bsa, bsa_over_loose)
                 self._log(f"Filemap updated: {count} file(s).")
-            # Refresh the auto-detected root-rule flag set now that the index
-            # is guaranteed to exist / be current (handles first-install where
-            # the meta scan ran before the index was written).
-            self._root_rule_mods = self._compute_root_rule_mods()
+            # Root-rule mod set was already computed in the worker thread
+            # (see worker_root_rule_mods) and assigned to self._root_rule_mods
+            # in _done_wrapped, before this function ran.
             self._vis_dirty = True  # conflict filters depend on conflict_map
             self._mod_to_sep_idx = None
             self._redraw()

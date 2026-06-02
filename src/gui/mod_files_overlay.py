@@ -35,6 +35,10 @@ _COL_SIZE     = scaled(72)
 _COL_BUTTONS  = scaled(160)
 _INSTALLED_BG = "#1a3320"
 _INSTALLED_FG = "#4caf50"
+_MATCH_BG = "#3a2a14"
+_MATCH_FG = "#ff9a3c"
+_OLD_MATCH_BG = "#3a1818"
+_OLD_MATCH_FG = "#e05a5a"
 
 
 class ModFilesOverlay(tk.Frame):
@@ -252,12 +256,49 @@ class ModFilesOverlay(tk.Frame):
             key=lambda f: (_ORDER.get((f.category_name or "").upper(), 9), -(f.uploaded_timestamp or 0)),
         )
 
+        # Newest file whose display name matches the installed file's display
+        # name (same Nexus "slot"/variant) — helps the user spot the right entry
+        # when a page lists many same-mod-id variants (e.g. one Main + many
+        # Optional patches). Prefer the installed file's name over the local
+        # folder name because the user may have renamed the mod on install.
+        installed_file = next(
+            (f for f in files
+             if self._installed_file_id > 0 and f.file_id == self._installed_file_id),
+            None,
+        )
+        target = _normalize_match(
+            (installed_file.name or installed_file.file_name)
+            if installed_file else self._mod_name
+        )
+        match_id = -1
+        old_match_ids: set[int] = set()
+        if target:
+            name_matches = [f for f in files
+                            if _normalize_match(f.name or "") == target]
+            if name_matches:
+                newest = max(name_matches, key=lambda f: f.uploaded_timestamp or 0)
+                match_id = newest.file_id
+                old_match_ids = {f.file_id for f in name_matches
+                                 if f.file_id != match_id}
+
         for row_idx, f in enumerate(files):
             # grid row 0 is the header, data starts at 1
             grid_row = row_idx + 1
             is_installed = (self._installed_file_id > 0 and f.file_id == self._installed_file_id)
-            bg = _INSTALLED_BG if is_installed else (BG_ROW if row_idx % 2 == 0 else BG_ROW_ALT)
-            name_fg = _INSTALLED_FG if is_installed else TEXT_MAIN
+            is_match = (not is_installed and match_id > 0 and f.file_id == match_id)
+            is_old_match = (not is_installed and not is_match and f.file_id in old_match_ids)
+            if is_installed:
+                bg = _INSTALLED_BG
+                name_fg = _INSTALLED_FG
+            elif is_match:
+                bg = _MATCH_BG
+                name_fg = _MATCH_FG
+            elif is_old_match:
+                bg = _OLD_MATCH_BG
+                name_fg = _OLD_MATCH_FG
+            else:
+                bg = BG_ROW if row_idx % 2 == 0 else BG_ROW_ALT
+                name_fg = TEXT_MAIN
             name_text = (f.name or f.file_name) + ("  ✓" if is_installed else "")
 
             # File name
@@ -323,6 +364,25 @@ class ModFilesOverlay(tk.Frame):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _normalize_match(s: str) -> str:
+    """Casefold and collapse whitespace/punctuation so that names like
+    'Cargo Reconsidered - Watchtower' and 'Cargo Reconsidered  -  Watchtower'
+    compare equal. Returns '' for empty input."""
+    if not s:
+        return ""
+    out = []
+    prev_sep = True
+    for ch in s.casefold():
+        if ch.isalnum():
+            out.append(ch)
+            prev_sep = False
+        else:
+            if not prev_sep:
+                out.append(" ")
+                prev_sep = True
+    return "".join(out).strip()
+
 
 def _fmt_size(n_bytes: int) -> str:
     if not n_bytes:

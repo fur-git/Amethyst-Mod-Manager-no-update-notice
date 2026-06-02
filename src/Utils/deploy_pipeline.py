@@ -21,6 +21,10 @@ from Utils.deploy import (
     load_per_mod_strip_prefixes,
     restore_root_folder,
 )
+from Utils.deploy_shared import (
+    _FILEMAP_SNAPSHOT_NAME,
+    _write_deploy_snapshot,
+)
 from Utils.filemap import build_filemap
 from Utils.profile_backup import create_backup
 from Utils.profile_state import read_excluded_mod_files
@@ -264,6 +268,15 @@ def run_deploy_pipeline(
             )
             if rf_count:
                 log_fn(f"Root-flagged mods: {rf_count} file(s) deployed to game root.")
+
+            snapshot_path = (
+                game.get_effective_filemap_path().parent / _FILEMAP_SNAPSHOT_NAME
+            )
+            if snapshot_path.is_file():
+                try:
+                    _write_deploy_snapshot(Path(game_root), snapshot_path, log_fn=log_fn)
+                except Exception as exc:
+                    log_fn(f"WARN: could not refresh deploy snapshot: {exc}")
 
         # Launcher swap last so SE/SKSE/etc. dlls are present first.
         if hasattr(game, "swap_launcher"):

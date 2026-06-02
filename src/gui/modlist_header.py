@@ -32,8 +32,8 @@ class ModListHeaderColumnsMixin:
     """Header column resize, reorder, and show/hide menu for ModListPanel."""
 
     # _COL_W slot indices: 0=checkbox, 1=name, 2=cat, 3=flags, 4=conflicts,
-    # 5=installed, 6=priority, 7=version.
-    _COL_MIN_W = {1: 120, 2: 95, 3: 70, 4: 95, 5: 95, 6: 80, 7: 80}
+    # 5=installed, 6=priority, 7=version, 8=size.
+    _COL_MIN_W = {1: 120, 2: 95, 3: 70, 4: 95, 5: 95, 6: 80, 7: 80, 8: 75}
 
     def _slot_to_data_col(self, slot: int) -> int:
         """Convert a _COL_W/X slot index to the data-col index it currently holds."""
@@ -160,8 +160,10 @@ class ModListHeaderColumnsMixin:
 
     def _toggle_column_hidden(self, dc: int) -> None:
         """Toggle a column's visibility and persist."""
+        became_visible = False
         if dc in self._col_hidden:
             self._col_hidden.discard(dc)
+            became_visible = True
         else:
             # Don't allow hiding every non-name column; keep at least one visible.
             if len(self._col_hidden) + 1 >= len(self._col_order):
@@ -171,6 +173,10 @@ class ModListHeaderColumnsMixin:
         self._layout_columns(self._canvas_w)
         self._update_header(self._canvas_w)
         self._redraw()
+        # Size column (8) folder sizes are only computed when visible — trigger a
+        # rescan now so values populate the first time the column is enabled.
+        if became_visible and dc == 8 and not self._mod_sizes:
+            self._scan_meta_flags_async()
 
     # ------------------------------------------------------------------
     # Column reorder drag (header label drag-to-move)
@@ -218,7 +224,7 @@ class ModListHeaderColumnsMixin:
         for k, lbl in enumerate(self._header_labels):
             slot = k
             dc = slot_data_cols[slot] if slot < len(slot_data_cols) else 0
-            is_movable = dc in (2, 3, 4, 5, 6, 7)
+            is_movable = dc in (2, 3, 4, 5, 6, 7, 8)
             if is_movable and slot == target_slot:
                 lbl.configure(bg=BG_SELECT_BAR)
             else:

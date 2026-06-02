@@ -22,7 +22,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from Nexus.nexus_meta import read_meta
-from Utils.config_paths import get_fomod_selections_path
+from Utils.config_paths import get_fomod_selections_path, get_bain_selections_path
 from Utils.plugins import read_plugins
 from Utils.portal_filechooser import pick_save_file
 from gui.ctk_components import CTkAlert
@@ -960,21 +960,28 @@ class WorkshopDialog(tk.Frame):
 
             if row["has_fomod"] and row.get("fomod_export", True) and game_name:
                 # Prefer the profile-local copy so manifest exports stay
-                # profile-specific even if the global fomod settings differ.
-                fomod_path = None
+                # profile-specific even if the global installer settings differ.
+                # A mod is either BAIN or FOMOD — pick the right sidecar + type.
+                if row.get("has_bain"):
+                    sub_dir, choices_type, path_fn = (
+                        "bain", "bain_selections", get_bain_selections_path)
+                else:
+                    sub_dir, choices_type, path_fn = (
+                        "fomod", "fomod_selections", get_fomod_selections_path)
+                choices_path = None
                 if profile_dir:
-                    candidate = Path(profile_dir) / "fomod" / f"{row['name']}.json"
+                    candidate = Path(profile_dir) / sub_dir / f"{row['name']}.json"
                     if candidate.is_file():
-                        fomod_path = candidate
-                if fomod_path is None:
-                    fomod_path = get_fomod_selections_path(game_name, row["name"])
-                if fomod_path.is_file():
+                        choices_path = candidate
+                if choices_path is None:
+                    choices_path = path_fn(game_name, row["name"])
+                if choices_path.is_file():
                     try:
-                        with fomod_path.open("r", encoding="utf-8") as fh:
-                            fomod_data = json.load(fh)
+                        with choices_path.open("r", encoding="utf-8") as fh:
+                            choices_data = json.load(fh)
                         mod_entry["choices"] = {
-                            "type":        "fomod_selections",
-                            "selections":  fomod_data,
+                            "type":        choices_type,
+                            "selections":  choices_data,
                         }
                     except Exception:
                         pass
@@ -1158,6 +1165,13 @@ class WorkshopDialog(tk.Frame):
                 profile_dir
                 and (Path(profile_dir) / "fomod" / f"{entry.name}.json").is_file()
             )
+            has_bain = bool(
+                profile_dir
+                and (Path(profile_dir) / "bain" / f"{entry.name}.json").is_file()
+            )
+            # A mod is only ever FOMOD or BAIN; the single "Fomod" column toggles
+            # export of whichever installer choices the mod has.
+            has_installer = has_fomod or has_bain
 
             self._all_rows.append({
                 "name":             entry.name,
@@ -1169,8 +1183,9 @@ class WorkshopDialog(tk.Frame):
                 "ver_label":        ver_label,
                 "ver_options":      [{"label": ver_label, "name": "", "size_bytes": 0}],
                 "optional":         False,
-                "has_fomod":        has_fomod,
-                "fomod_export":     has_fomod,
+                "has_fomod":        has_installer,
+                "has_bain":         has_bain,
+                "fomod_export":     has_installer,
                 "versions_fetched": False,
                 "size_bytes":       0,
                 "source":           "nexus",
