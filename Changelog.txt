@@ -1,4 +1,5 @@
 - v1.3.8
+- Added support for Dragon Age: Origins
 - Tweak to steam finder to use libraryfolder.vdf if present
 - Potential fix for proton related tools crashing due to proton run not working for the configured prefix
 - Added some additional/more verbose logging when deploying
