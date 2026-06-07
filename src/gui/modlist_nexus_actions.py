@@ -25,7 +25,7 @@ from Utils.xdg import open_url
 from gui.ctk_components import CTkAlert, CTkNotification
 from gui.game_helpers import _GAMES
 from gui.install_mod import install_mod_from_archive
-from gui.mod_files_overlay import ModFilesOverlay
+from gui.mod_files_overlay import ModFilesOverlay, resolve_latest_name_match
 from Nexus.nexus_download import delete_archive_and_sidecar
 from Nexus.nexus_meta import build_meta_from_download, read_meta, write_meta
 from Nexus.nexus_update_checker import check_for_updates
@@ -321,8 +321,18 @@ class ModListNexusActionsMixin:
         meta_path: Path,
         game,
         file_id: int,
+        on_done=None,
+        auto_overwrite_name: str = "",
     ) -> None:
-        """Download a specific Nexus file and install it."""
+        """Download a specific Nexus file and install it.
+
+        *on_done*, if given, is called on the Tk thread once the install
+        finishes (success or failure) — used to chain sequential batch updates.
+
+        *auto_overwrite_name*, if given, forces the install into that mod folder
+        (``preferred_name``) and auto-confirms Replace-All, so Quick Update
+        never raises the "Mod Already Exists" / "Remove previous version"
+        dialogs for an already-confirmed name match."""
         app = self.winfo_toplevel()
         log_fn = self._log
         mod_panel = self
@@ -348,6 +358,8 @@ class ModListNexusActionsMixin:
                     open_url(files_url)
                     log_fn("Nexus: Premium required for direct download.")
                     log_fn("Nexus: Opened files page — click \"Download with Mod Manager\" there.")
+                    if on_done is not None:
+                        on_done()
 
                 app.after(0, _fallback)
                 return
@@ -364,6 +376,8 @@ class ModListNexusActionsMixin:
             except Exception as exc:
                 app.after(0, lambda e=exc: log_fn(f"Nexus: Could not fetch mod info — {e}"))
                 app.after(0, lambda: mod_panel.hide_download_progress(cancel=cancel_event))
+                if on_done is not None:
+                    app.after(0, on_done)
                 return
 
             result = downloader.download_file(
@@ -388,7 +402,11 @@ class ModListNexusActionsMixin:
                 def _install_worker():
                     def _cleanup(is_fomod: bool = False,
                                  installed_mod_name: str | None = None):
-                        if installed_mod_name and installed_mod_name != mod_name:
+                        # Quick Update forces the install into the existing folder
+                        # (auto_overwrite_name), so there is never a separate
+                        # previous version to offer to remove.
+                        if (not auto_overwrite_name and installed_mod_name
+                                and installed_mod_name != mod_name):
                             app.after(0, lambda new=installed_mod_name:
                                       mod_panel._prompt_remove_previous_version(mod_name, new))
                         from Utils.ui_config import (
@@ -421,16 +439,20 @@ class ModListNexusActionsMixin:
                             prebuilt_meta=prebuilt,
                             on_installed=_cleanup,
                             progress_fn=_extract_progress,
+                            preferred_name=auto_overwrite_name,
+                            overwrite_existing=True if auto_overwrite_name else None,
                             clear_progress_fn=lambda: app.after(
                                 0, status_bar.clear_progress
                             ) if status_bar is not None else None,
                         )
+                        app.after(0, mod_panel._scan_update_flags)
+                        app.after(0, mod_panel._redraw)
+                        log_fn(f"Nexus: {mod_name} updated successfully.")
                     finally:
                         if status_bar is not None:
                             app.after(0, status_bar.clear_progress)
-                    app.after(0, mod_panel._scan_update_flags)
-                    app.after(0, mod_panel._redraw)
-                    log_fn(f"Nexus: {mod_name} updated successfully.")
+                        if on_done is not None:
+                            app.after(0, on_done)
 
                 def _install():
                     try:
@@ -448,10 +470,103 @@ class ModListNexusActionsMixin:
                 def _fail():
                     mod_panel.hide_download_progress(cancel=cancel_event)
                     log_fn(f"Nexus: Update download failed — {result.error}")
+                    if on_done is not None:
+                        on_done()
 
                 app.after(0, _fail)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _quick_update_mods(self, mod_names: list[str]) -> None:
+        """Auto-install the latest name-matched version for each update-flagged
+        mod. Mods whose latest file isn't a name match (the orange-highlighted
+        file in Change Version) are skipped — the user must update them manually."""
+        app = self.winfo_toplevel()
+        if getattr(app, "_nexus_api", None) is None:
+            self._warn_nexus_login_required()
+            return
+        game = self._game
+        if game is None or not game.is_configured():
+            self._log("Nexus: No configured game selected.")
+            return
+        # Defensive: only mods that actually have an update pending.
+        targets = [m for m in mod_names if m in self._update_mods]
+        if not targets:
+            self._log("Nexus: No mods with a pending update to quick-update.")
+            return
+
+        api = app._nexus_api
+        log_fn = self._log
+        staging_root = self._staging_root
+        mod_panel = self
+        # Plan: resolve each mod's name-matched file_id up front (network), then
+        # install the matched ones sequentially on the Tk thread.
+        self._log(f"Nexus: Quick Update — checking {len(targets)} mod(s)...")
+
+        def _resolve_worker():
+            queue: list[tuple] = []   # (mod_name, game_domain, meta, meta_path, file_id)
+            skipped = 0
+            for mod_name in targets:
+                meta_path = staging_root / mod_name / "meta.ini"
+                if not meta_path.is_file():
+                    continue
+                try:
+                    meta = read_meta(meta_path)
+                except Exception as exc:
+                    app.after(0, lambda m=mod_name, e=exc:
+                              log_fn(f"Nexus: {m} — could not read metadata ({e}), skipped."))
+                    skipped += 1
+                    continue
+                if not meta.mod_id:
+                    skipped += 1
+                    continue
+                game_domain = meta.game_domain or game.nexus_game_domain
+                try:
+                    files = api.get_mod_files(game_domain, meta.mod_id).files
+                except Exception as exc:
+                    app.after(0, lambda m=mod_name, e=exc:
+                              log_fn(f"Nexus: {m} — could not fetch files ({e}), skipped."))
+                    skipped += 1
+                    continue
+                fid, _old = resolve_latest_name_match(files, meta.file_id, mod_name)
+                if fid <= 0 or fid == meta.file_id:
+                    app.after(0, lambda m=mod_name:
+                              log_fn(f"Nexus: {m} — no name-matched update, skipped."))
+                    skipped += 1
+                    continue
+                queue.append((mod_name, game_domain, meta, meta_path, fid))
+
+            def _start():
+                self._quick_update_run(queue, skipped)
+
+            app.after(0, _start)
+
+        threading.Thread(target=_resolve_worker, daemon=True).start()
+
+    def _quick_update_run(self, queue: list[tuple], skipped: int) -> None:
+        """Sequentially install the resolved name-matched files, one at a time."""
+        total = len(queue)
+
+        def _next(index: int):
+            if index >= total:
+                self._log(
+                    f"Nexus: Quick Update — {total} updated, "
+                    f"{skipped} skipped (no name match)."
+                )
+                return
+            mod_name, game_domain, meta, meta_path, file_id = queue[index]
+            self._download_and_install_nexus_file(
+                mod_name=mod_name,
+                game_domain=game_domain,
+                meta=meta,
+                meta_path=meta_path,
+                game=self._game,
+                file_id=file_id,
+                on_done=lambda: _next(index + 1),
+                auto_overwrite_name=mod_name,
+            )
+
+        _next(0)
 
     def _reinstall_mod(self, mod_name: str, archive_path: Path) -> None:
         """Reinstall a mod from its recorded installation archive."""

@@ -1008,21 +1008,25 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                         _preserved_endorsed = bool(read_meta(_existing_meta_path).endorsed)
                     except Exception:
                         pass
-                replace_dialog = _prompt_replace_dialog(
-                    parent_window, mod_name,
-                    game.get_effective_mod_staging_path(), suggestions)
-                if replace_dialog is None or replace_dialog.result == "cancel":
-                    log_fn(f"Install cancelled — '{mod_name}' already exists.")
-                    return
-                if replace_dialog.result == "rename":
-                    mod_name = replace_dialog.new_name
-                    dest_root = game.get_effective_mod_staging_path() / mod_name
-                    was_existing_mod = False
-                elif replace_dialog.result == "all":
-                    def _force_remove(func, path, _exc):
-                        os.chmod(path, 0o700)
-                        func(path)
+                def _force_remove(func, path, _exc):
+                    os.chmod(path, 0o700)
+                    func(path)
+                if overwrite_existing:
+                    # Auto Replace-All (Quick Update / collection overwrite).
                     shutil.rmtree(dest_root, onexc=_force_remove)
+                else:
+                    replace_dialog = _prompt_replace_dialog(
+                        parent_window, mod_name,
+                        game.get_effective_mod_staging_path(), suggestions)
+                    if replace_dialog is None or replace_dialog.result == "cancel":
+                        log_fn(f"Install cancelled — '{mod_name}' already exists.")
+                        return
+                    if replace_dialog.result == "rename":
+                        mod_name = replace_dialog.new_name
+                        dest_root = game.get_effective_mod_staging_path() / mod_name
+                        was_existing_mod = False
+                    elif replace_dialog.result == "all":
+                        shutil.rmtree(dest_root, onexc=_force_remove)
             dest_root.mkdir(parents=True, exist_ok=True)
             archive_filename = os.path.basename(archive_path)
             dest_file = dest_root / archive_filename
@@ -2049,12 +2053,15 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     _preserved_endorsed = bool(read_meta(_existing_meta_path).endorsed)
                 except Exception:
                     pass
-            if headless and overwrite_existing:
-                # Append-with-overwrite: delete the existing folder and reinstall cleanly.
+            if overwrite_existing:
+                # Auto Replace-All: delete the existing folder and reinstall
+                # cleanly. Used by collection installs (headless) and by Quick
+                # Update, where the name match is already confirmed so the
+                # "Mod Already Exists" dialog would be pure friction.
                 def _force_remove(func, path, _exc):
                     func(path)
                 shutil.rmtree(dest_root, onexc=_force_remove)
-                log_fn(f"Collection install: removed existing '{mod_name}' for overwrite reinstall.")
+                log_fn(f"Install: removed existing '{mod_name}' for overwrite reinstall.")
             elif headless and overwrite_existing is None:
                 # In headless (collection new-profile) installs, a pre-existing folder
                 # means the mod was already installed (e.g. two collection entries share

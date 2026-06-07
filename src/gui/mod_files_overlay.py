@@ -259,27 +259,9 @@ class ModFilesOverlay(tk.Frame):
         # Newest file whose display name matches the installed file's display
         # name (same Nexus "slot"/variant) — helps the user spot the right entry
         # when a page lists many same-mod-id variants (e.g. one Main + many
-        # Optional patches). Prefer the installed file's name over the local
-        # folder name because the user may have renamed the mod on install.
-        installed_file = next(
-            (f for f in files
-             if self._installed_file_id > 0 and f.file_id == self._installed_file_id),
-            None,
-        )
-        target = _normalize_match(
-            (installed_file.name or installed_file.file_name)
-            if installed_file else self._mod_name
-        )
-        match_id = -1
-        old_match_ids: set[int] = set()
-        if target:
-            name_matches = [f for f in files
-                            if _normalize_match(f.name or "") == target]
-            if name_matches:
-                newest = max(name_matches, key=lambda f: f.uploaded_timestamp or 0)
-                match_id = newest.file_id
-                old_match_ids = {f.file_id for f in name_matches
-                                 if f.file_id != match_id}
+        # Optional patches).
+        match_id, old_match_ids = resolve_latest_name_match(
+            files, self._installed_file_id, self._mod_name)
 
         for row_idx, f in enumerate(files):
             # grid row 0 is the header, data starts at 1
@@ -364,6 +346,38 @@ class ModFilesOverlay(tk.Frame):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def resolve_latest_name_match(files, installed_file_id: int,
+                              fallback_name: str) -> tuple[int, set[int]]:
+    """Resolve the file the Change Version window highlights orange.
+
+    Returns ``(match_id, old_match_ids)`` where ``match_id`` is the newest file
+    whose display name matches the installed file's name (or *fallback_name* if
+    the installed file isn't in the list), or ``-1`` when there is no name match.
+    ``old_match_ids`` are the other same-name files (the red "old match" rows)."""
+    installed_file = next(
+        (f for f in files
+         if installed_file_id > 0 and f.file_id == installed_file_id),
+        None,
+    )
+    # Prefer the installed file's name over the local folder name because the
+    # user may have renamed the mod on install.
+    target = _normalize_match(
+        (installed_file.name or installed_file.file_name)
+        if installed_file else fallback_name
+    )
+    match_id = -1
+    old_match_ids: set[int] = set()
+    if target:
+        name_matches = [f for f in files
+                        if _normalize_match(f.name or "") == target]
+        if name_matches:
+            newest = max(name_matches, key=lambda f: f.uploaded_timestamp or 0)
+            match_id = newest.file_id
+            old_match_ids = {f.file_id for f in name_matches
+                             if f.file_id != match_id}
+    return match_id, old_match_ids
+
 
 def _normalize_match(s: str) -> str:
     """Casefold and collapse whitespace/punctuation so that names like

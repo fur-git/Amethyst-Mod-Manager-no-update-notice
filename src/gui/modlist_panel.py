@@ -4650,6 +4650,19 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # Multi-select Root Folder + Note targets.
         root_folder_enable_multi: list[str] = []
         root_folder_disable_multi: list[str] = []
+        # Quick Update targets — update-flagged mods only; premium-gated in the
+        # populator (non-premium users can't direct-download).
+        is_premium = bool(getattr(self.winfo_toplevel(), "_nexus_is_premium", False))
+        quick_update_names: list[str] = []
+        if is_multi:
+            quick_update_names = [
+                entries[i].name for i in toggleable
+                if entries[i].name in self._update_mods
+            ]
+        elif (is_real_mod and ctx_meta is not None and ctx_meta.mod_id > 0
+              and mod_name in self._update_mods):
+            quick_update_names = [mod_name]
+
         note_multi_names: list[str] = []
         note_multi_remove_names: list[str] = []
         if is_multi:
@@ -4683,6 +4696,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             root_folder_disable_multi=root_folder_disable_multi,
             note_multi_names=note_multi_names,
             note_multi_remove_names=note_multi_remove_names,
+            is_premium=is_premium, quick_update_names=quick_update_names,
         )
 
     def _resolve_nexus_domain(self, meta) -> str:
@@ -4877,6 +4891,13 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             urls_cap = list(c.nexus_urls)
             menu.add_command(f"Open on Nexus ({len(urls_cap)})",
                 lambda u=urls_cap: self._open_nexus_pages(u))
+
+        # Quick Update (premium only) — auto-install latest name-matched version
+        if c.is_premium and c.quick_update_names:
+            n = len(c.quick_update_names)
+            qu_label = "Quick Update" if n == 1 else f"Quick Update ({n})"
+            menu.add_command(qu_label,
+                lambda mns=list(c.quick_update_names): self._quick_update_mods(mns))
 
         # Reinstall Mod
         if (c.is_real_mod and not c.is_multi

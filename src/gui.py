@@ -293,6 +293,7 @@ class App(ctk.CTk):
         self._nexus_api: NexusAPI | None = None
         self._nexus_downloader: NexusDownloader | None = None
         self._nexus_username: str | None = None
+        self._nexus_is_premium: bool = False
         # Installs that arrived while a modal dialog had the grab are deferred
         # here and replayed once the modal closes.
         self._nxm_install_queue: list = []
@@ -448,6 +449,7 @@ class App(ctk.CTk):
         # Reset any existing client so a stale session can't persist after credentials are cleared
         self._nexus_api = None
         self._nexus_downloader = None
+        self._nexus_is_premium = False
         # Legacy personal API keys are no longer used — clear any stored key on startup
         clear_api_key()
         key = load_api_key()
@@ -459,6 +461,7 @@ class App(ctk.CTk):
                 try:
                     user = self._nexus_api.validate()
                     self._nexus_username = user.name
+                    self._nexus_is_premium = user.is_premium
                 except Exception:
                     self._nexus_username = None
                 self.call_threadsafe(self._update_window_title)
@@ -487,6 +490,10 @@ class App(ctk.CTk):
                             self._nexus_username = (
                                 data.get("name") or data.get("preferred_username") or data.get("sub")
                             )
+                            try:
+                                self._nexus_is_premium = self._nexus_api.validate().is_premium
+                            except Exception:
+                                self._nexus_is_premium = False
                         except Exception:
                             self._nexus_username = None
                         self.call_threadsafe(self._update_window_title)
@@ -495,6 +502,7 @@ class App(ctk.CTk):
                 self._nexus_api = None
                 self._nexus_downloader = None
                 self._nexus_username = None
+                self._nexus_is_premium = False
                 # Update title synchronously when key is absent / cleared
                 self.after(0, self._update_window_title)
 
