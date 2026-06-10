@@ -171,3 +171,28 @@ def remove_from_archive_list(list_str: str | None, bsa_name: str) -> str:
     items = _split_archive_list(list_str)
     lname = bsa_name.lower()
     return _join_archive_list([s for s in items if s.lower() != lname])
+
+
+def append_to_archive_list(list_str: str | None, bsa_names: list[str]) -> str:
+    """Return SArchiveList with each of `bsa_names` appended at the end, deduped.
+
+    Used for FO3/FNV mod-provided BSAs: those engines only read files from BSAs
+    that appear in SArchiveList (plugin-name matching is unreliable), so every
+    deployed mod BSA must be listed. Appended (not prepended) so the dummy
+    invalidation BSA stays first. Idempotent and order-stable for names already
+    present.
+    """
+    items = _split_archive_list(list_str)
+    have = {s.lower() for s in items}
+    for name in bsa_names:
+        if name.lower() not in have:
+            items.append(name)
+            have.add(name.lower())
+    return _join_archive_list(items)
+
+
+def remove_many_from_archive_list(list_str: str | None, bsa_names: list[str]) -> str:
+    """Return SArchiveList with all case-insensitive copies of each name removed."""
+    items = _split_archive_list(list_str)
+    drop = {n.lower() for n in bsa_names}
+    return _join_archive_list([s for s in items if s.lower() not in drop])

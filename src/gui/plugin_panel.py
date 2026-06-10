@@ -2979,10 +2979,17 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         # otherwise disabling a mod still leaves its plugin in the panel,
         # because the hardlink in Data/ outlives its plugins.txt entry until
         # the next deploy.
+        # Plugin filenames that actually exist in Data/ this refresh. Used both
+        # to surface orphans and to prune loadorder.txt entries whose source
+        # plugin has since disappeared (e.g. a mod packed into a BSA so its
+        # loose .esp no longer deploys, or the mod was removed). Left as None
+        # when Data/ can't be scanned, so we don't prune on missing info.
+        present_lower: set[str] | None = None
         data_dir = self._game.get_vanilla_plugins_path() if self._game and hasattr(self._game, "get_vanilla_plugins_path") else None
         if data_dir and data_dir.is_dir() and self._plugin_extensions:
             exts_lower = {e.lower() for e in self._plugin_extensions}
             saved_lower = {n.lower() for n in saved_order}
+            present_lower = set()
             foreign = foreign_deployed_plugin_basenames(self._game)
             core_dir = data_dir.parent / (data_dir.name + "_Core")
             core_names: set[str] | None = None
@@ -2999,6 +3006,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                     if not entry.is_file() or entry.suffix.lower() not in exts_lower:
                         continue
                     low = entry.name.lower()
+                    present_lower.add(low)
                     if low in mod_map or low in self._vanilla_plugins or low in saved_lower:
                         continue
                     if low in foreign:
@@ -3024,6 +3032,13 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 if low in mod_map:
                     continue
                 if low in self._vanilla_plugins:
+                    continue
+                # Prune stale loadorder.txt entries: a disabled plugin only
+                # survives if its file still exists in Data/. If it's gone
+                # (mod removed, or packed into a BSA so the loose .esp no longer
+                # deploys), skip it — it then drops out of loadorder.txt via the
+                # sync below instead of lingering as a phantom panel row.
+                if present_lower is not None and low not in present_lower:
                     continue
                 disabled_entry = PluginEntry(name=name, enabled=False)
                 mod_map[low] = disabled_entry

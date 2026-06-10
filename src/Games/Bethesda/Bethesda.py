@@ -399,6 +399,15 @@ class Fallout_3(BaseGame):
     _invalidation_bsa_version: "int | None" = 0x68
     _invalidation_archive_list_key: str = "SArchiveList"
 
+    # FO3/FNV only: these engines read files only from BSAs listed in
+    # SArchiveList — a mod BSA named to match its plugin is NOT reliably
+    # auto-loaded (unlike Oblivion/Skyrim/FO4). When True, the invalidation step
+    # also appends every deployed mod-provided BSA to SArchiveList so its assets
+    # actually load. This Fallout_3 game class (and Fallout3_GOTY/Fallout_NV)
+    # need it True; the later-engine subclasses override it back to False.
+    # See geckwiki.com/index.php/BSA_Files.
+    _archive_list_needs_mod_bsas: bool = True
+
     @property
     def _script_extender_exe(self) -> str:
         return "fose_loader.exe"
@@ -598,6 +607,14 @@ class Fallout_3(BaseGame):
             _log("  WARN: Prefix path not set — skipping archive invalidation.")
             return
 
+        # FO3/FNV: resolve the mod-BSA delta once so every INI gets the same
+        # update and the tracking sidecar is written exactly once afterwards.
+        prev_mod_bsas: list[str] = []
+        new_mod_bsas: list[str] = []
+        if self._archive_list_needs_mod_bsas:
+            prev_mod_bsas = self._tracked_mod_bsas()
+            new_mod_bsas = self._deployed_mod_bsas()
+
         self._write_dummy_bsa_file(_log)
         for ini_path in ini_paths:
             ini_path.parent.mkdir(parents=True, exist_ok=True)
@@ -606,7 +623,14 @@ class Fallout_3(BaseGame):
                 if _read_ini_key(ini_path, "Archive", key) is not None:
                     continue
                 _set_ini_key(ini_path, "Archive", key, value)
-            self._apply_dummy_bsa_invalidation_ini(ini_path)
+            self._apply_dummy_bsa_invalidation_ini(
+                ini_path, prev_mod_bsas, new_mod_bsas)
+
+        if self._archive_list_needs_mod_bsas:
+            self._save_tracked_mod_bsas(new_mod_bsas)
+            if new_mod_bsas:
+                _log(f"  Registered {len(new_mod_bsas)} mod BSA(s) in "
+                     f"{self._invalidation_archive_list_key}.")
 
         names = ", ".join(p.name for p in ini_paths)
         _log(f"  Archive invalidation enabled in {names}.")
@@ -639,6 +663,8 @@ class Fallout_3(BaseGame):
                 _set_ini_key(ini_path, "Archive", key, None)
 
         self._delete_dummy_bsa_file(_log)
+        if self._archive_list_needs_mod_bsas:
+            self._save_tracked_mod_bsas([])
         names = ", ".join(p.name for p in ini_paths)
         _log(f"  Archive invalidation reverted in {names}.")
 
@@ -671,15 +697,31 @@ class Fallout_3(BaseGame):
         except OSError as exc:
             _log(f"  WARN: Could not remove {bsa_name}: {exc}")
 
-    def _apply_dummy_bsa_invalidation_ini(self, ini_path: Path) -> None:
+    def _apply_dummy_bsa_invalidation_ini(
+        self, ini_path: Path,
+        prev_mod_bsas: "list[str] | None" = None,
+        new_mod_bsas: "list[str] | None" = None,
+    ) -> None:
         """MO2-style INI edits for one INI: SArchiveList[0] + SInvalidationFile=''."""
         bsa_name = self._invalidation_bsa_name
         if bsa_name is None:
             return
-        from Utils.bsa_invalidation import ensure_in_archive_list
+        from Utils.bsa_invalidation import (
+            ensure_in_archive_list, append_to_archive_list,
+            remove_many_from_archive_list,
+        )
         key = self._invalidation_archive_list_key
         current = _read_ini_key(ini_path, "Archive", key) or ""
         updated = ensure_in_archive_list(current, bsa_name)
+        if self._archive_list_needs_mod_bsas:
+            # FO3/FNV: only BSAs listed here have their assets read. Drop the
+            # mod BSAs we previously appended, then re-append what's currently
+            # deployed — so removed mods don't leave stale entries. Lists are
+            # precomputed by the caller and the sidecar is written once there.
+            prev = self._tracked_mod_bsas() if prev_mod_bsas is None else prev_mod_bsas
+            mod_bsas = self._deployed_mod_bsas() if new_mod_bsas is None else new_mod_bsas
+            updated = remove_many_from_archive_list(updated, prev)
+            updated = append_to_archive_list(updated, mod_bsas)
         if updated != current:
             _set_ini_key(ini_path, "Archive", key, updated)
         _set_ini_key(ini_path, "Archive", "SInvalidationFile", "")
@@ -690,11 +732,16 @@ class Fallout_3(BaseGame):
         bsa_name = self._invalidation_bsa_name
         if bsa_name is None:
             return
-        from Utils.bsa_invalidation import remove_from_archive_list
+        from Utils.bsa_invalidation import (
+            remove_from_archive_list, remove_many_from_archive_list,
+        )
         key = self._invalidation_archive_list_key
         current = _read_ini_key(ini_path, "Archive", key)
         if current is not None:
             updated = remove_from_archive_list(current, bsa_name)
+            if self._archive_list_needs_mod_bsas:
+                updated = remove_many_from_archive_list(
+                    updated, self._tracked_mod_bsas())
             if updated != current:
                 _set_ini_key(ini_path, "Archive", key, updated or None)
         # Restore the engine default so a future deactivation doesn't leave
@@ -702,6 +749,131 @@ class Fallout_3(BaseGame):
         if _read_ini_key(ini_path, "Archive", "SInvalidationFile") == "":
             _set_ini_key(ini_path, "Archive", "SInvalidationFile",
                          "ArchiveInvalidation.txt")
+
+    # --- FO3/FNV mod-BSA registration -------------------------------------
+    # These engines read assets only from BSAs listed in SArchiveList, so every
+    # deployed mod BSA must be appended. We track what we added in a sidecar so
+    # revert/refresh can drop entries for mods that were since removed.
+
+    def _mod_bsa_tracking_path(self) -> "Path | None":
+        try:
+            return self.get_effective_filemap_path().parent / "managed_archives.txt"
+        except Exception:
+            return None
+
+    def _tracked_mod_bsas(self) -> list[str]:
+        """Mod BSA names we previously appended to SArchiveList, if any."""
+        path = self._mod_bsa_tracking_path()
+        if path is None or not path.is_file():
+            return []
+        try:
+            return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()]
+        except OSError:
+            return []
+
+    def _save_tracked_mod_bsas(self, names: list[str]) -> None:
+        path = self._mod_bsa_tracking_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(names) + ("\n" if names else ""),
+                            encoding="utf-8")
+        except OSError:
+            pass
+
+    def _deployed_mod_bsas(self) -> list[str]:
+        """Top-level .bsa/.ba2 files deployed by mods, from the active filemap.
+
+        Vanilla archives are already in the engine's default SArchiveList; we
+        only append archives that a mod actually deploys into Data/.
+        """
+        try:
+            filemap = self.get_effective_filemap_path()
+        except Exception:
+            return []
+        if not filemap.is_file():
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        try:
+            for line in filemap.read_text(encoding="utf-8").splitlines():
+                rel = line.split("\t", 1)[0].strip()
+                if not rel or "/" in rel or "\\" in rel:
+                    continue  # only top-level Data/ entries are loadable archives
+                low = rel.lower()
+                if not (low.endswith(".bsa") or low.endswith(".ba2")):
+                    continue
+                if low in seen:
+                    continue
+                seen.add(low)
+                names.append(rel)
+        except OSError:
+            return []
+        return self._order_mod_bsas_by_plugins(names)
+
+    def _plugin_load_order(self) -> list[str]:
+        """Lowercased plugin filenames in load order, from the active profile's
+        plugins.txt (top = loads first, bottom = loads last / wins). Strips the
+        star/asterisk activation prefix used by later games."""
+        if self._active_profile_dir is None:
+            return []
+        path = self._active_profile_dir / self._PLUGINS_TXT_FILENAME
+        if not path.is_file():
+            return []
+        order: list[str] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                name = line.strip()
+                if not name or name.startswith("#"):
+                    continue
+                if name.startswith("*"):
+                    name = name[1:].strip()
+                if name:
+                    order.append(name.lower())
+        except OSError:
+            return []
+        return order
+
+    def _order_mod_bsas_by_plugins(self, bsa_names: list[str]) -> list[str]:
+        """Order mod BSAs so the conflict winner follows plugin load order.
+
+        FO3/FNV resolve SArchiveList conflicts as *first listed wins*, while a
+        plugin lower in plugins.txt (loaded later) is meant to override earlier
+        ones. So the later-loading plugin's BSA must come first → SArchiveList
+        order is the reverse of plugin load order.
+
+        Each BSA maps to a plugin by name prefix: ``<plugin-stem>[ suffix].bsa``
+        hooks to ``<plugin-stem>.es[pml]``. BSAs with no matching enabled plugin
+        keep their relative order and sort after all matched ones.
+        """
+        order = self._plugin_load_order()
+        if not order:
+            return bsa_names
+        # plugin stem (no extension) -> load index
+        stem_rank: dict[str, int] = {}
+        for i, plugin in enumerate(order):
+            stem = plugin.rsplit(".", 1)[0]
+            stem_rank[stem] = i
+
+        def rank(bsa: str) -> int:
+            stem = bsa.rsplit(".", 1)[0].lower()
+            # longest matching plugin-stem prefix (handles "Name - Textures.bsa")
+            best = -1
+            for pstem, idx in stem_rank.items():
+                if stem == pstem or stem.startswith(pstem + " "):
+                    if idx > best:
+                        best = idx
+            return best
+
+        ranked = [(rank(b), i, b) for i, b in enumerate(bsa_names)]
+        # Matched BSAs first, by descending plugin index (later plugin wins →
+        # earlier in list); then unmatched (rank -1) in original order.
+        matched = sorted((t for t in ranked if t[0] >= 0),
+                         key=lambda t: (-t[0], t[1]))
+        unmatched = [t for t in ranked if t[0] < 0]
+        return [b for _, _, b in matched] + [b for _, _, b in unmatched]
 
     def swap_launcher(self, log_fn) -> None:
         """Replace the game launcher with the script extender if present."""
@@ -1016,6 +1188,7 @@ class Fallout_NV(Fallout_3):
 
 class Fallout_4(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
     supports_esl_flag = True
@@ -1124,6 +1297,7 @@ class Fallout_4(Fallout_3):
 
 class Fallout_4VR(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
     supports_esl_flag = True
@@ -1218,6 +1392,7 @@ class Fallout_4VR(Fallout_3):
 
 class Oblivion(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     vanilla_plugins = ["Oblivion.esm", "Update.esm"]
     vanilla_dlc_plugins = [
         "DLCShiveringIsles.esp", "Knights.esp",
@@ -1320,6 +1495,7 @@ class Oblivion(Fallout_3):
 
 class Skyrim(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     vanilla_plugins = ["Skyrim.esm", "Update.esm"]
     vanilla_dlc_plugins = [
         "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm",
@@ -1419,6 +1595,7 @@ class Skyrim(Fallout_3):
 
 class SkyrimVR(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
     supports_esl_flag = True
@@ -1727,6 +1904,7 @@ class Starfield(Fallout_3):
 
 class Enderal(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     vanilla_plugins = ["Skyrim.esm", "Update.esm", "Enderal - Forgotten Stories.esm"]
     vanilla_dlc_plugins = [
         "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm",
@@ -1797,6 +1975,7 @@ class Enderal(Fallout_3):
 
 class EnderalSE(Fallout_3):
 
+    _archive_list_needs_mod_bsas = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
     supports_esl_flag = True

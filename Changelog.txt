@@ -1,5 +1,6 @@
 - v1.3.9
 - Potential fix for ssl error causing nexus login to fail
+- Tweaked Fonv and Fo3 to add bsa files to SArchiveList based on 
 
 - v1.3.8
 - Added support for Dragon Age: Origins
