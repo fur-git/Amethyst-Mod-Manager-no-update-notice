@@ -24,7 +24,7 @@ from Utils.config_paths import get_download_cache_dir_for_game
 from Utils.xdg import open_url
 from gui.ctk_components import CTkAlert, CTkNotification
 from gui.game_helpers import _GAMES
-from gui.install_mod import install_mod_from_archive
+from gui.install_mod import install_mod_from_archive, _show_mod_notification
 from gui.mod_files_overlay import ModFilesOverlay, resolve_latest_name_match
 from Nexus.nexus_download import delete_archive_and_sidecar
 from Nexus.nexus_meta import build_meta_from_download, read_meta, write_meta
@@ -584,20 +584,29 @@ class ModListNexusActionsMixin:
         failed: list[tuple[str, str]] = []
         failed_lock = threading.Lock()
 
-        def _make_progress_slot(label: str):
-            """Create a download popup slot on the Tk thread; return its cancel event."""
-            holder: list = []
-            ready = threading.Event()
+        # One shared popup for the whole batch — per-download popups stack up
+        # fast with many mods. Progress is the aggregate byte count across all
+        # downloads; totals are seeded from the Nexus file sizes and corrected
+        # by each download's own reported total.
+        batch_cancel = mod_panel.get_download_cancel_event()
+        mod_panel.show_download_progress(
+            f"Quick Update: downloading {total} mod(s)", cancel=batch_cancel)
+        progress_lock = threading.Lock()
+        progress: dict[str, list[int]] = {}   # mod_name → [cur_bytes, total_bytes]
+        for _item in queue:
+            _fi = _item[4]
+            _size = 0
+            if _fi is not None:
+                _size = (getattr(_fi, "size_in_bytes", None)
+                         or (getattr(_fi, "size_kb", 0) or 0) * 1024 or 0)
+            progress[_item[0]] = [0, int(_size)]
 
-            def _mk():
-                ev = mod_panel.get_download_cancel_event()
-                mod_panel.show_download_progress(label, cancel=ev)
-                holder.append(ev)
-                ready.set()
-
-            app.after(0, _mk)
-            ready.wait()
-            return holder[0]
+        def _post_aggregate():
+            with progress_lock:
+                cur = sum(c for c, _t in progress.values())
+                tot = sum(t for _c, t in progress.values())
+            app.after(0, lambda c=cur, t=tot:
+                      mod_panel.update_download_progress(c, t, cancel=batch_cancel))
 
         def _extract_progress(done: int, total_b: int, phase: str | None = None):
             if status_bar is not None:
@@ -607,31 +616,42 @@ class ModListNexusActionsMixin:
         def _download_one(item):
             mod_name, game_domain, meta, file_id, file_info = item
             try:
-                cancel_event = _make_progress_slot(f"Updating: {mod_name}")
+                if batch_cancel.is_set():
+                    with failed_lock:
+                        failed.append((mod_name, "cancelled"))
+                    return
                 try:
                     mod_info = api.get_mod(game_domain, meta.mod_id)
                 except Exception as exc:
-                    app.after(0, lambda e=cancel_event:
-                              mod_panel.hide_download_progress(cancel=e))
                     with failed_lock:
                         failed.append((mod_name, f"could not fetch mod info ({exc})"))
                     return
+
+                def _on_progress(cur, tot, _m=mod_name):
+                    with progress_lock:
+                        slot = progress[_m]
+                        slot[0] = cur
+                        if tot:
+                            slot[1] = tot
+                    _post_aggregate()
+
                 result = downloader.download_file(
                     game_domain=game_domain,
                     mod_id=meta.mod_id,
                     file_id=file_id,
-                    progress_cb=lambda cur, tot: app.after(
-                        0, lambda c=cur, t=tot, e=cancel_event:
-                        mod_panel.update_download_progress(c, t, cancel=e)),
-                    cancel=cancel_event,
+                    progress_cb=_on_progress,
+                    cancel=batch_cancel,
                     dest_dir=get_download_cache_dir_for_game(getattr(game, "name", "") or ""),
                 )
-                app.after(0, lambda e=cancel_event:
-                          mod_panel.hide_download_progress(cancel=e))
                 if not (result.success and result.file_path):
                     with failed_lock:
                         failed.append((mod_name, f"download failed — {result.error}"))
                     return
+                with progress_lock:
+                    slot = progress[mod_name]
+                    slot[1] = slot[1] or slot[0]
+                    slot[0] = slot[1]
+                _post_aggregate()
                 try:
                     prebuilt = build_meta_from_download(
                         game_domain=game_domain,
@@ -660,6 +680,13 @@ class ModListNexusActionsMixin:
                 mod_name, result, prebuilt = item
                 app.after(0, lambda m=mod_name:
                           log_fn(f"Nexus: Installing update for {m}..."))
+                # One pooled progress popup for the whole batch — created on
+                # the first install, relabelled per mod, cleared after the
+                # sentinel. Per-mod create/destroy churn made popups lose
+                # their stacked position above the download popup.
+                if status_bar is not None:
+                    app.after(0, lambda m=mod_name: status_bar.set_progress(
+                        0, 0, phase=f"Installing {m}…", title="Quick Update"))
 
                 def _cleanup(is_fomod: bool = False,
                              installed_mod_name: str | None = None,
@@ -682,9 +709,7 @@ class ModListNexusActionsMixin:
                         progress_fn=_extract_progress,
                         preferred_name=mod_name,
                         overwrite_existing=True,
-                        clear_progress_fn=lambda: app.after(
-                            0, status_bar.clear_progress
-                        ) if status_bar is not None else None,
+                        suppress_notification=True,
                     )
                     updated += 1
                     app.after(0, lambda m=mod_name:
@@ -692,9 +717,8 @@ class ModListNexusActionsMixin:
                 except Exception as exc:
                     with failed_lock:
                         failed.append((mod_name, f"install failed ({exc})"))
-                finally:
-                    if status_bar is not None:
-                        app.after(0, status_bar.clear_progress)
+            if status_bar is not None:
+                app.after(0, status_bar.clear_progress)
             app.after(0, lambda n=updated:
                       self._quick_update_finish(n, failed, skipped))
 
@@ -702,6 +726,8 @@ class ModListNexusActionsMixin:
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=dl_workers) as pool:
                 list(pool.map(_download_one, queue))
+            app.after(0, lambda:
+                      mod_panel.hide_download_progress(cancel=batch_cancel))
             install_q.put(_SENTINEL)
 
         threading.Thread(target=_install_consumer, daemon=True).start()
@@ -718,22 +744,31 @@ class ModListNexusActionsMixin:
             f"Nexus: Quick Update — {updated} updated, "
             f"{len(skipped)} skipped (no name match), {len(failed)} failed."
         )
-        problems = skipped + failed
+        for name, reason in failed:
+            self._log(f"Nexus: Quick Update — {name}: {reason}")
+        app = self.winfo_toplevel()
+        if updated:
+            _show_mod_notification(
+                app, f"Quick Update: updated {updated} mod(s)")
+        problems = len(skipped) + len(failed)
         if not problems:
             return
-        lines = [f"• {name} — {reason}" for name, reason in problems[:12]]
-        if len(problems) > 12:
-            lines.append(f"…and {len(problems) - 12} more (see log).")
+        parts = []
+        if skipped:
+            parts.append(f"{len(skipped)} had no name-matched file")
+        if failed:
+            parts.append(f"{len(failed)} failed to download or install")
         CTkAlert(
             state="warning",
-            title="Quick Update: some mods need a manual update",
+            title="Quick Update",
             body_text=(
-                "These mods could not be quick-updated. Use Update → "
-                "Change Version on each to update manually:\n\n"
-                + "\n".join(lines)
+                f"{problems} mod(s) could not be quick-updated: "
+                + " and ".join(parts) + ".\n\n"
+                "See the log for the full list. Use Update → Change Version "
+                "on each mod to update it manually."
             ),
             btn1="OK", btn2="",
-            parent=self.winfo_toplevel(),
+            parent=app,
         )
 
     def _reinstall_mod(self, mod_name: str, archive_path: Path) -> None:

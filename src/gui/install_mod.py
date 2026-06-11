@@ -952,7 +952,8 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                              progress_fn=None,
                              clear_progress_fn=None,
                              defer_interactive_fomod: bool = False,
-                             defer_interactive_bain: bool = False) -> None:
+                             defer_interactive_bain: bool = False,
+                             suppress_notification: bool = False) -> None:
     """
     Extract archive to a temp directory, detect FOMOD, run the wizard if
     present, then copy the resolved files into the game's mod staging area.
@@ -1089,7 +1090,8 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                 prepend_mod(modlist_path, mod_name, enabled=True)
 
             log_fn(f"Added '{mod_name}' to modlist.")
-            _show_mod_notification(parent_window, f"Installed: {mod_name}")
+            if not suppress_notification:
+                _show_mod_notification(parent_window, f"Installed: {mod_name}")
 
             # Disable-extract path never runs a FOMOD installer.
             _fire_on_installed(on_installed, is_fomod=False,
@@ -2451,7 +2453,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     pass
             threading.Thread(target=_detect_meta, daemon=True).start()
 
-        if not headless:
+        if not headless and not suppress_notification:
             _show_mod_notification(parent_window, f"Installed: {mod_name}")
 
         _fire_on_installed(on_installed, is_fomod=is_fomod_install,

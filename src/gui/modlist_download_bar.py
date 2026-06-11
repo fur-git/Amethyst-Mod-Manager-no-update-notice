@@ -56,6 +56,13 @@ class ModListDownloadBarMixin:
             x = rx + rw - pw - margin
             p.geometry(f"+{x}+{y}")
             y -= gap
+        # The deploy/extract popup shares this corner — restack it on top.
+        status = getattr(root, "_status", None)
+        if status is not None:
+            try:
+                status._reposition_popup()
+            except Exception:
+                pass
 
     def get_download_cancel_event(self) -> threading.Event:
         """Create a new download slot with a popup; return its cancel event."""

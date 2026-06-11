@@ -519,11 +519,37 @@ class StatusBar(ctk.CTkFrame):
             self._toggle_log()
 
     def _reposition_popup(self, *_) -> None:
-        """Position the progress popup (CTkToplevel) at bottom-right."""
+        """Position the progress popup (CTkToplevel) at bottom-right, stacked
+        above any download popups occupying the same corner."""
         p = self._progress_popup
         if p is None or not p.winfo_exists():
             return
-        p._update_geometry()
+        try:
+            root = self.winfo_toplevel()
+            root.update_idletasks()
+            p.update_idletasks()
+            pw = p.winfo_width()
+            ph = p.winfo_height()
+            if pw <= 1:
+                pw = scaled(p.width)
+            if ph <= 1:
+                ph = scaled(p.height)
+            gap = scaled(8)
+            offset = 0
+            mod_panel = getattr(root, "_mod_panel", None)
+            for slot in getattr(mod_panel, "_dl_slots", None) or []:
+                q = slot.popup
+                if q.winfo_exists():
+                    h = q.winfo_height()
+                    if h <= 1:
+                        h = scaled(q.height)
+                    offset += h + gap
+            x = root.winfo_rootx() + root.winfo_width() - pw - scaled(25)
+            y = (root.winfo_rooty() + root.winfo_height() - ph - scaled(20)
+                 - offset)
+            p.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
 
     def set_progress(self, done: int, total: int, phase: str | None = None,
                      title: str = "Deploying") -> None:
@@ -537,6 +563,9 @@ class StatusBar(ctk.CTkFrame):
                 message=f"{done} / {total}",
             )
             self._progress_popup.update_position = self._reposition_popup
+            # _poll_visibility re-shows via _update_geometry — route that
+            # through our stacked positioning too.
+            self._progress_popup._update_geometry = self._reposition_popup
             self._progress_popup._configure_bid = root.bind("<Configure>", self._reposition_popup, add="+")
             self._reposition_popup()
         if total > 0:
