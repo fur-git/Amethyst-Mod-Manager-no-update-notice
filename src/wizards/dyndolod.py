@@ -11,12 +11,16 @@ Workflow
 1. Prompt the user to download DynDOLOD from Nexus Mods (manual download only).
 2. Auto-detect and extract the archive to Profiles/<game>/Applications/DynDOLOD/.
 3. Prompt the user to delete any previous output, then deploy the modlist.
-4. Run TexGenx64.exe or DynDOLODx64.exe via Proton with -d: and -o: flags.
+4. User picks the Proton version; the tool gets its own isolated prefix
+   (prefix_<ProtonName>/ next to the exe), independent of the game's Proton.
+5. Run TexGenx64.exe or DynDOLODx64.exe via Proton with -d: and -o: flags,
+   after seeding the game's Installed Path into the prefix registry,
+   symlinking the profile's plugins.txt into the prefix AppData and linking
+   the game prefix's My Games folder (xEdit-based tools need the game INI).
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import threading
@@ -94,7 +98,10 @@ def _flatten_subdirs(dest: Path, exe_name: str) -> None:
 # Base wizard — shared download/extract/deploy/run logic
 # ---------------------------------------------------------------------------
 
-class _DynDOLODBaseWizard(ctk.CTkFrame):
+from wizards._proton_prefix import ProtonPrefixStepMixin
+
+
+class _DynDOLODBaseWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
 
     _wizard_title  = ""          # overridden by subclasses
     _exe_name      = ""          # overridden by subclasses
@@ -103,6 +110,11 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
     _app_dir       = _APP_DIR    # overridden by subclasses
     _download_url  = _NEXUS_URL  # overridden by subclasses (unused by xLODGen)
     _archive_kw    = "dyndolod"  # keyword to find the archive in Downloads
+
+    _proton_step_title = "Step 5: Choose Proton Version"
+
+    def _proton_next_step(self):
+        self._show_step_run()
 
     def __init__(
         self,
@@ -118,6 +130,15 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
         self._game         = game
         self._log          = log_fn or (lambda msg: None)
         self._archive_path: Path | None = None
+
+        self._exe         = _tool_exe_path(game, self._exe_name, self._app_dir)
+        self._proton_name = ""
+        self._tool_exe_name     = self._exe_name
+        self._tool_display_name = self._wizard_title
+        self._exe_missing_text  = (
+            f"{self._exe_name} was not found.\n"
+            f"Please restart the wizard and install {self._app_dir} first."
+        )
 
         title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=40)
         title_bar.pack(fill="x")
@@ -156,44 +177,6 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
                 pass
         self.after(0, _apply)
 
-    def _get_proton_env(self):
-        from Utils.steam_finder import (
-            find_any_installed_proton,
-            find_proton_for_game,
-            find_steam_root_for_proton_script,
-        )
-
-        prefix_path = self._game.get_prefix_path()
-        if prefix_path is None or not prefix_path.is_dir():
-            return None, None, None
-
-        steam_id    = getattr(self._game, "steam_id", "")
-        from gui.plugin_panel import _resolve_compat_data, _read_prefix_runner
-        compat_data = _resolve_compat_data(prefix_path)
-        proton_script = find_proton_for_game(steam_id) if steam_id else None
-
-        if proton_script is None:
-            preferred_runner = _read_prefix_runner(compat_data)
-            proton_script = find_any_installed_proton(preferred_runner)
-            if proton_script is None:
-                return None, None, prefix_path
-
-        steam_root = find_steam_root_for_proton_script(proton_script)
-        if steam_root is None:
-            return None, None, prefix_path
-
-        env = os.environ.copy()
-        env["STEAM_COMPAT_DATA_PATH"]           = str(compat_data)
-        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
-        game_path = self._game.get_game_path()
-        if game_path:
-            env["STEAM_COMPAT_INSTALL_PATH"] = str(game_path)
-        if steam_id:
-            env.setdefault("SteamAppId",  steam_id)
-            env.setdefault("SteamGameId", steam_id)
-
-        return proton_script, env, prefix_path
-
     def _on_done(self):
         try:
             topbar = self.winfo_toplevel()._topbar
@@ -211,7 +194,7 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _show_step_download(self):
-        if _tool_exe_path(self._game, self._exe_name, self._app_dir) is not None:
+        if self._exe is not None:
             self._show_step_deploy()
             return
 
@@ -355,6 +338,7 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
                     f"{self._exe_name} not found after extraction.\n"
                     f"Check that the archive contains {self._exe_name}."
                 )
+            self._exe = exe
 
             self._set_label("_extract_status", f"Extracted {file_count} file(s).", color="#6bc76b")
             self.after(0, self._show_step_deploy)
@@ -394,7 +378,7 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
             btn_frame, text="Skip", width=100, height=36,
             font=FONT_BOLD,
             fg_color=BG_HEADER, hover_color="#3d3d3d", text_color=TEXT_DIM,
-            command=self._show_step_run,
+            command=self._show_step_proton,
         ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
@@ -435,7 +419,7 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
 
             if success:
                 self._set_label("_deploy_status", "Deploy complete.", color="#6bc76b")
-                self.after(0, self._show_step_run)
+                self.after(0, self._show_step_proton)
             else:
                 self._set_label("_deploy_status", "Deploy failed — see log.", color="#e06c6c")
 
@@ -444,18 +428,18 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
             self._log(f"DynDOLOD Wizard: deploy error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 5 — Run tool
+    # Step 6 — Run tool
     # ------------------------------------------------------------------
 
     def _show_step_run(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text=f"Step 5: Run {self._wizard_title}",
+            self._body, text=f"Step 6: Run {self._wizard_title}",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
-        exe = _tool_exe_path(self._game, self._exe_name, self._app_dir)
+        exe = self._exe
         if exe is None:
             ctk.CTkLabel(
                 self._body,
@@ -490,11 +474,12 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
         threading.Thread(target=lambda: self._do_run(exe), daemon=True).start()
 
     def _do_run(self, exe: Path):
-        proton_script, env, _prefix = self._get_proton_env()
+        proton_script, env, compat_data = self._get_tool_env()
         if proton_script is None:
             self._set_label(
                 "_run_status",
-                "Could not find Proton — check that the prefix is configured.",
+                f"Could not find Proton '{self._proton_name}' — "
+                "check that it is installed in Steam.",
                 color="#e06c6c",
             )
             return
@@ -508,9 +493,23 @@ class _DynDOLODBaseWizard(ctk.CTkFrame):
         output    = staging / self._output_dir
         output.mkdir(parents=True, exist_ok=True)
 
-        pfx = (_prefix / "pfx") if _prefix is not None else None
+        pfx = compat_data / "pfx"
         data_arg   = f'-d:{_to_wine_path(game_path / "Data", pfx)}'
         output_arg = f'-o:{_to_wine_path(output, pfx)}'
+
+        # xEdit-based tools read the game's Installed Path from the registry,
+        # the load order from plugins.txt in AppData and the game INIs from
+        # My Games — a fresh tool prefix has none of them.
+        from Utils.bethesda_registry import maybe_register_for_game
+        maybe_register_for_game(
+            prefix_dir=compat_data,
+            proton_script=proton_script,
+            env=env,
+            game=self._game,
+            log_fn=lambda msg: self._log(f"{self._tool_display_name} Wizard: {msg}"),
+        )
+        self._link_plugins_txt(pfx)
+        self._link_mygames(pfx)
 
         self._log(f"DynDOLOD Wizard: launching {exe} via Proton")
         self._log(f"  args: {data_arg}  {output_arg}  -sse")
@@ -578,7 +577,7 @@ class xLODGenWizard(_DynDOLODBaseWizard):
     # Override the manual download/locate/extract steps with auto-download from GitHub.
 
     def _show_step_download(self):
-        if _tool_exe_path(self._game, self._exe_name, self._app_dir) is not None:
+        if self._exe is not None:
             self._show_step_deploy()
             return
 
@@ -628,6 +627,7 @@ class xLODGenWizard(_DynDOLODBaseWizard):
 
             if not (dest / self._exe_name).is_file():
                 raise RuntimeError(f"{self._exe_name} not found after extraction.")
+            self._exe = dest / self._exe_name
 
             self._log(f"xLODGen Wizard: extracted {file_count} file(s).")
             self._set_label("_dl_status", f"Downloaded and extracted {tag}.", color="#6bc76b")

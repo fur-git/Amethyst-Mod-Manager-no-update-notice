@@ -6,16 +6,19 @@ Workflow
 --------
 1. Auto-download the latest PGPatcher release from GitHub and extract to
    Profiles/<game>/Applications/PGPatcher/.
-2. Install d3dcompiler_47 and .NET 8 into the game prefix (skipped if already done).
-3. Apply PGPatcher's config (bootstrap cfg/settings.json via exe_args_builder).
-4. Prompt the user to delete any previous PGPatcher output, then deploy the modlist.
-5. Run PGPatcher.exe via Proton.
+2. User picks the Proton version; PGPatcher gets its own isolated prefix
+   (prefix_<ProtonName>/ next to the exe), independent of the game's Proton.
+3. Install d3dcompiler_47 and .NET 8 into that prefix (skipped if already done).
+4. Apply PGPatcher's config (bootstrap cfg/settings.json via exe_args_builder).
+5. Prompt the user to delete any previous PGPatcher output, then deploy the modlist.
+6. Run PGPatcher.exe via Proton. Before launch the game's Installed Path is
+   seeded into the prefix registry (Skyrim only writes it to the game prefix on
+   first launch) and the profile's plugins.txt is symlinked into the prefix
+   AppData so PGPatcher can read the load order.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import subprocess
 import tempfile
 import threading
@@ -94,8 +97,22 @@ def _flatten_subdirs(dest: Path) -> None:
 # Wizard
 # ---------------------------------------------------------------------------
 
-class PGPatcherWizard(ctk.CTkFrame):
+from wizards._proton_prefix import ProtonPrefixStepMixin
+
+
+class PGPatcherWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
     """Step-by-step wizard to set up and run PGPatcher for Skyrim SE."""
+
+    _tool_exe_name      = _PATCHER_EXE
+    _tool_display_name  = "PGPatcher"
+    _proton_step_title  = "Step 2: Choose Proton Version"
+    _exe_missing_text   = (
+        f"{_PATCHER_EXE} was not found.\n"
+        "Please restart the wizard and download PGPatcher first."
+    )
+
+    def _proton_next_step(self):
+        self._show_step_deps()
 
     def __init__(
         self,
@@ -110,6 +127,8 @@ class PGPatcherWizard(ctk.CTkFrame):
         self._on_close_cb = on_close or (lambda: None)
         self._game        = game
         self._log         = log_fn or (lambda msg: None)
+        self._exe         = _patcher_exe_path(game)
+        self._proton_name = ""
 
         title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=40)
         title_bar.pack(fill="x")
@@ -163,51 +182,13 @@ class PGPatcherWizard(ctk.CTkFrame):
                 pass
         self.after(0, _apply)
 
-    def _get_proton_env(self):
-        from Utils.steam_finder import (
-            find_any_installed_proton,
-            find_proton_for_game,
-            find_steam_root_for_proton_script,
-        )
-
-        prefix_path = self._game.get_prefix_path()
-        if prefix_path is None or not prefix_path.is_dir():
-            return None, None, None
-
-        steam_id    = getattr(self._game, "steam_id", "")
-        from gui.plugin_panel import _resolve_compat_data, _read_prefix_runner
-        compat_data = _resolve_compat_data(prefix_path)
-        proton_script = find_proton_for_game(steam_id) if steam_id else None
-
-        if proton_script is None:
-            preferred_runner = _read_prefix_runner(compat_data)
-            proton_script = find_any_installed_proton(preferred_runner)
-            if proton_script is None:
-                return None, None, prefix_path
-
-        steam_root = find_steam_root_for_proton_script(proton_script)
-        if steam_root is None:
-            return None, None, prefix_path
-
-        env = os.environ.copy()
-        env["STEAM_COMPAT_DATA_PATH"]           = str(compat_data)
-        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
-        game_path = self._game.get_game_path()
-        if game_path:
-            env["STEAM_COMPAT_INSTALL_PATH"] = str(game_path)
-        if steam_id:
-            env.setdefault("SteamAppId",  steam_id)
-            env.setdefault("SteamGameId", steam_id)
-
-        return proton_script, env, prefix_path
-
     # ------------------------------------------------------------------
     # Step 1 — Auto-download PGPatcher from GitHub (skipped if already extracted)
     # ------------------------------------------------------------------
 
     def _show_step_download(self):
-        if _patcher_exe_path(self._game) is not None:
-            self._show_step_deps()
+        if self._exe is not None:
+            self._show_step_proton()
             return
 
         self._clear_body()
@@ -256,6 +237,7 @@ class PGPatcherWizard(ctk.CTkFrame):
             exe = dest / _PATCHER_EXE
             if not exe.is_file():
                 raise RuntimeError(f"{_PATCHER_EXE} not found after extraction.")
+            self._exe = exe
 
             self._log(f"PGPatcher Wizard: extracted {file_count} file(s).")
             self._set_label(
@@ -263,21 +245,21 @@ class PGPatcherWizard(ctk.CTkFrame):
                 f"Downloaded and extracted {tag}.",
                 color="#6bc76b",
             )
-            self.after(500, self._show_step_deps)
+            self.after(500, self._show_step_proton)
 
         except Exception as exc:
             self._set_label("_dl_status", f"Error: {exc}", color="#e06c6c")
             self._log(f"PGPatcher Wizard: download error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 4 — Install d3dcompiler_47 and .NET 8
+    # Step 3 — Install d3dcompiler_47 and .NET 8
     # ------------------------------------------------------------------
 
     def _show_step_deps(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 4: Install Dependencies",
+            self._body, text="Step 3: Install Dependencies",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
@@ -300,25 +282,29 @@ class PGPatcherWizard(ctk.CTkFrame):
         from Utils.config_paths import get_dotnet_cache_dir
         from Utils.protontricks import install_d3dcompiler_47
 
-        proton_script, env, prefix_path = self._get_proton_env()
+        self._set_label("_d3d_status", "Preparing PGPatcher's Wine prefix…")
+        proton_script, env, compat_data = self._get_tool_env()
 
-        if prefix_path is None:
+        if proton_script is None:
             self._set_label(
                 "_d3d_status",
-                "No Proton prefix configured for this game.\n"
-                "Configure the prefix in Game Settings, then reopen this wizard.",
+                f"Could not find Proton '{self._proton_name}' — "
+                "check that it is installed in Steam, then reopen this wizard.",
                 color="#e06c6c",
             )
             return
+
+        prefix_path = compat_data / "pfx"
 
         # --- d3dcompiler_47 ---
         if _is_dep_installed(prefix_path, _D3D_DEP_KEY):
             self._set_label("_d3d_status", "d3dcompiler_47 already installed — skipping.", color="#6bc76b")
         else:
             self._set_label("_d3d_status", "Installing d3dcompiler_47\u2026 (may take a minute)")
-            steam_id = str(getattr(self._game, "steam_id", "") or "")
+            # steam_id deliberately omitted: the protontricks fallback installs
+            # by app id into the game prefix, not this tool prefix.
             ok = install_d3dcompiler_47(
-                steam_id,
+                "",
                 log_fn=lambda msg: self._log(f"PGPatcher Wizard: {msg}"),
                 prefix_path=prefix_path,
             )
@@ -335,14 +321,6 @@ class PGPatcherWizard(ctk.CTkFrame):
             self.after(500, self._show_step_config)
             return
 
-        if proton_script is None:
-            self._set_label(
-                "_net8_status",
-                "Could not find Proton — check that the prefix is configured.",
-                color="#e06c6c",
-            )
-            return
-
         cache_path = get_dotnet_cache_dir() / _NET8_FILENAME
 
         try:
@@ -356,9 +334,9 @@ class PGPatcherWizard(ctk.CTkFrame):
 
             self._set_label(
                 "_net8_status",
-                "Installing .NET 8 into game prefix\u2026\n(this may take a few minutes)",
+                "Installing .NET 8 into PGPatcher's prefix\u2026\n(this may take a few minutes)",
             )
-            self._log("PGPatcher Wizard: launching .NET 8 installer in game prefix \u2026")
+            self._log("PGPatcher Wizard: launching .NET 8 installer in PGPatcher's prefix \u2026")
 
             proc = subprocess.run(
                 ["python3", str(proton_script), "run", str(cache_path), "/quiet", "/norestart"],
@@ -384,14 +362,14 @@ class PGPatcherWizard(ctk.CTkFrame):
             self._log(f"PGPatcher Wizard: .NET 8 install error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 5 — Apply PGPatcher config
+    # Step 4 — Apply PGPatcher config
     # ------------------------------------------------------------------
 
     def _show_step_config(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 5: Apply PGPatcher Config",
+            self._body, text="Step 4: Apply PGPatcher Config",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
@@ -432,14 +410,14 @@ class PGPatcherWizard(ctk.CTkFrame):
             self._log(f"PGPatcher Wizard: config error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 6 — Delete previous output, then deploy
+    # Step 5 — Delete previous output, then deploy
     # ------------------------------------------------------------------
 
     def _show_step_deploy(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 6: Deploy Modlist",
+            self._body, text="Step 5: Deploy Modlist",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
@@ -573,18 +551,18 @@ class PGPatcherWizard(ctk.CTkFrame):
             self._log(f"PGPatcher Wizard: deploy error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 7 — Run PGPatcher
+    # Step 6 — Run PGPatcher
     # ------------------------------------------------------------------
 
     def _show_step_run(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 7: Run PGPatcher",
+            self._body, text="Step 6: Run PGPatcher",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
-        exe = _patcher_exe_path(self._game)
+        exe = self._exe
         if exe is None:
             ctk.CTkLabel(
                 self._body,
@@ -619,14 +597,29 @@ class PGPatcherWizard(ctk.CTkFrame):
         threading.Thread(target=lambda: self._do_run(exe), daemon=True).start()
 
     def _do_run(self, exe: Path):
-        proton_script, env, prefix_path = self._get_proton_env()
+        proton_script, env, compat_data = self._get_tool_env()
         if proton_script is None:
             self._set_label(
                 "_run_status",
-                "Could not find Proton — check that the prefix is configured.",
+                f"Could not find Proton '{self._proton_name}' — "
+                "check that it is installed in Steam.",
                 color="#e06c6c",
             )
             return
+
+        # Seed the game's Installed Path into the prefix registry — Skyrim only
+        # writes it to the game prefix on first launch, so a fresh tool prefix
+        # never has it (idempotent, marker-guarded).
+        from Utils.bethesda_registry import maybe_register_for_game
+        maybe_register_for_game(
+            prefix_dir=compat_data,
+            proton_script=proton_script,
+            env=env,
+            game=self._game,
+            log_fn=lambda msg: self._log(f"PGPatcher Wizard: {msg}"),
+        )
+
+        self._link_plugins_txt(compat_data / "pfx")
 
         self._log(f"PGPatcher Wizard: launching {exe} via Proton")
         try:

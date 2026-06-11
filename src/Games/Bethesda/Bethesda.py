@@ -424,21 +424,25 @@ class Fallout_3(BaseGame):
 
     _PLUGINS_TXT_FILENAME = "plugins.txt"
 
-    def _plugins_txt_targets(self) -> list[Path]:
+    def _plugins_txt_targets(self, prefix_root: "Path | None" = None) -> list[Path]:
         """Return every in-prefix path where the game might expect plugins.txt.
 
         Steam and GOG builds use separate AppData folders. If both exist, we
         write to both so either build picks up the load order.
+
+        prefix_root overrides the game's own pfx/ dir — used for per-tool
+        Proton prefixes (PGPatcher etc.) that need the same layout.
         """
-        if self._prefix_path is None:
+        root = prefix_root if prefix_root is not None else self._prefix_path
+        if root is None:
             return []
         fname = self._PLUGINS_TXT_FILENAME
-        steam_dir = self._prefix_path / self._APPDATA_SUBPATH
+        steam_dir = root / self._APPDATA_SUBPATH
         targets: list[Path] = []
         if steam_dir.is_dir():
             targets.append(steam_dir / fname)
         if self._APPDATA_SUBPATH_GOG is not None:
-            gog_dir = self._prefix_path / self._APPDATA_SUBPATH_GOG
+            gog_dir = root / self._APPDATA_SUBPATH_GOG
             if gog_dir.is_dir():
                 targets.append(gog_dir / fname)
         if not targets:
@@ -450,10 +454,10 @@ class Fallout_3(BaseGame):
         targets = self._plugins_txt_targets()
         return targets[0] if targets else None
 
-    def _symlink_plugins_txt(self, profile: str, log_fn) -> None:
+    def _symlink_plugins_txt(self, profile: str, log_fn, prefix_root: "Path | None" = None) -> None:
         """Symlink the active profile's plugins.txt into the Proton prefix."""
         _log = log_fn
-        targets = self._plugins_txt_targets()
+        targets = self._plugins_txt_targets(prefix_root)
         if not targets:
             _log("  WARN: Prefix path not set — skipping plugins.txt symlink.")
             return

@@ -7,12 +7,17 @@ Workflow
 1. Prompt the user to download SSEEdit from Nexus Mods (manual download only).
 2. Auto-detect and extract the archive to Profiles/<game>/Applications/SSEEdit/.
 3. Deploy the modlist.
-4. Run SSEEdit64.exe via Proton with -d:<game>/Data.
+4. User picks the Proton version; SSEEdit gets its own isolated prefix
+   (prefix_<ProtonName>/ next to the exe), independent of the game's Proton.
+5. Run SSEEdit.exe via Proton with -d:<game>/Data, after seeding the game's
+   Installed Path into the prefix registry, symlinking the profile's
+   plugins.txt into the prefix AppData, linking the game prefix's My Games
+   folder (xEdit fatals without the game INI) and setting the per-app
+   WinXP compat flag in the tool prefix.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import threading
@@ -162,11 +167,19 @@ def _set_winxp_compat(prefix_path: Path, exe: Path, log_fn=None) -> None:
         _log(f"Warning: could not write user.reg: {exc}")
 
 
-class SSEEditWizard(ctk.CTkFrame):
+from wizards._proton_prefix import ProtonPrefixStepMixin
+
+
+class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
     """Step-by-step wizard to set up and run SSEEdit for Skyrim SE."""
 
     _wizard_title = "Run SSEEdit"
     _exe_name     = _EXE_NAME
+
+    _proton_step_title = "Step 5: Choose Proton Version"
+
+    def _proton_next_step(self):
+        self._show_step_run()
 
     def __init__(
         self,
@@ -182,6 +195,15 @@ class SSEEditWizard(ctk.CTkFrame):
         self._game        = game
         self._log         = log_fn or (lambda msg: None)
         self._archive_path: Path | None = None
+
+        self._exe         = _sseedit_exe_path(game, self._exe_name)
+        self._proton_name = ""
+        self._tool_exe_name     = self._exe_name
+        self._tool_display_name = self._wizard_title.removeprefix("Run ")
+        self._exe_missing_text  = (
+            f"{self._exe_name} was not found.\n"
+            "Please restart the wizard and install SSEEdit first."
+        )
 
         title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=40)
         title_bar.pack(fill="x")
@@ -219,44 +241,6 @@ class SSEEditWizard(ctk.CTkFrame):
             except Exception:
                 pass
         self.after(0, _apply)
-
-    def _get_proton_env(self):
-        from Utils.steam_finder import (
-            find_any_installed_proton,
-            find_proton_for_game,
-            find_steam_root_for_proton_script,
-        )
-
-        prefix_path = self._game.get_prefix_path()
-        if prefix_path is None or not prefix_path.is_dir():
-            return None, None, None
-
-        steam_id    = getattr(self._game, "steam_id", "")
-        from gui.plugin_panel import _resolve_compat_data, _read_prefix_runner
-        compat_data = _resolve_compat_data(prefix_path)
-        proton_script = find_proton_for_game(steam_id) if steam_id else None
-
-        if proton_script is None:
-            preferred_runner = _read_prefix_runner(compat_data)
-            proton_script = find_any_installed_proton(preferred_runner)
-            if proton_script is None:
-                return None, None, prefix_path
-
-        steam_root = find_steam_root_for_proton_script(proton_script)
-        if steam_root is None:
-            return None, None, prefix_path
-
-        env = os.environ.copy()
-        env["STEAM_COMPAT_DATA_PATH"]           = str(compat_data)
-        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
-        game_path = self._game.get_game_path()
-        if game_path:
-            env["STEAM_COMPAT_INSTALL_PATH"] = str(game_path)
-        if steam_id:
-            env.setdefault("SteamAppId",  steam_id)
-            env.setdefault("SteamGameId", steam_id)
-
-        return proton_script, env, prefix_path
 
     def _on_done(self):
         try:
@@ -419,6 +403,7 @@ class SSEEditWizard(ctk.CTkFrame):
                     f"{self._exe_name} not found after extraction.\n"
                     f"Check that the archive contains {self._exe_name}."
                 )
+            self._exe = exe
 
             self._set_label("_extract_status", f"Extracted {file_count} file(s).", color="#6bc76b")
             self.after(0, self._show_step_deploy)
@@ -449,7 +434,7 @@ class SSEEditWizard(ctk.CTkFrame):
             self._body, text="Skip", width=100, height=32,
             font=FONT_NORMAL,
             fg_color=BG_HEADER, hover_color="#3d3d3d", text_color=TEXT_DIM,
-            command=self._show_step_run,
+            command=self._show_step_proton,
         ).pack(side="bottom")
 
         from gui.dialogs import confirm_deploy_appdata
@@ -537,25 +522,25 @@ class SSEEditWizard(ctk.CTkFrame):
                 deploy_root_folder(target_rf, game_root, mode=deploy_mode, log_fn=_tlog)
 
             self._set_label("_deploy_status", "Deploy complete.", color="#6bc76b")
-            self.after(0, self._show_step_run)
+            self.after(0, self._show_step_proton)
 
         except Exception as exc:
             self._set_label("_deploy_status", f"Deploy error: {exc}", color="#e06c6c")
             self._log(f"SSEEdit Wizard: deploy error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 5 — Run SSEEdit
+    # Step 6 — Run SSEEdit
     # ------------------------------------------------------------------
 
     def _show_step_run(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 5: Run SSEEdit",
+            self._body, text=f"Step 6: {self._wizard_title}",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
-        exe = _sseedit_exe_path(self._game, self._exe_name)
+        exe = self._exe
         if exe is None:
             ctk.CTkLabel(
                 self._body,
@@ -590,11 +575,12 @@ class SSEEditWizard(ctk.CTkFrame):
         threading.Thread(target=lambda: self._do_run(exe), daemon=True).start()
 
     def _do_run(self, exe: Path):
-        proton_script, env, _prefix = self._get_proton_env()
+        proton_script, env, compat_data = self._get_tool_env()
         if proton_script is None:
             self._set_label(
                 "_run_status",
-                "Could not find Proton — check that the prefix is configured.",
+                f"Could not find Proton '{self._proton_name}' — "
+                "check that it is installed in Steam.",
                 color="#e06c6c",
             )
             return
@@ -604,12 +590,26 @@ class SSEEditWizard(ctk.CTkFrame):
             self._set_label("_run_status", "Game path not configured.", color="#e06c6c")
             return
 
-        prefix_path = self._game.get_prefix_path()
-        pfx = (prefix_path / "pfx") if prefix_path is not None else None
+        pfx = compat_data / "pfx"
         data_arg = f'-d:{_to_wine_path(game_path / "Data", pfx)}'
 
-        if prefix_path is not None:
-            _set_winxp_compat(prefix_path, exe, log_fn=self._log)
+        # xEdit reads the game's Installed Path from the registry — a fresh
+        # tool prefix never has it (idempotent, marker-guarded).
+        from Utils.bethesda_registry import maybe_register_for_game
+        maybe_register_for_game(
+            prefix_dir=compat_data,
+            proton_script=proton_script,
+            env=env,
+            game=self._game,
+            log_fn=lambda msg: self._log(f"{self._tool_display_name} Wizard: {msg}"),
+        )
+
+        # Load order + game INIs: xEdit reads plugins.txt from AppData and
+        # fatals when My Games/<Game>/*.ini is missing.
+        self._link_plugins_txt(pfx)
+        self._link_mygames(pfx)
+
+        _set_winxp_compat(compat_data, exe, log_fn=self._log)
 
         self._log(f"SSEEdit Wizard: launching {exe} via Proton with {data_arg}")
         try:
