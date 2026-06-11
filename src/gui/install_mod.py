@@ -1104,10 +1104,10 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
             log_fn(traceback.format_exc())
         return None
 
-    # Use /tmp (tmpfs) only when it has enough headroom for this archive plus a
-    # 512 MB safety margin.  A module-level lock + reservation counter prevents
-    # parallel workers from all racing to claim the same free space before any
-    # of them has started writing.
+    # Use the system temp dir (usually a tmpfs) only when it has enough
+    # headroom for this archive plus a 512 MB safety margin.  A module-level
+    # lock + reservation counter prevents parallel workers from all racing to
+    # claim the same free space before any of them has started writing.
     # We query the real uncompressed size from archive metadata so that archives
     # with extreme compression ratios (e.g. 700 MB → 8 GB texture mods) don't
     # overflow /tmp.  A fallback multiplier is used only when metadata is
@@ -1123,7 +1123,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
     _tmp_claimed = False
     with _tmp_space_lock:
         try:
-            _tmp_stat = os.statvfs("/tmp")
+            _tmp_stat = os.statvfs(tempfile.gettempdir())
             _tmp_free = _tmp_stat.f_frsize * _tmp_stat.f_bavail
             _tmp_headroom = 512 * 1024 * 1024  # keep 512 MB free in /tmp
             _use_tmp = _extract_size_estimate + _tmp_headroom + _tmp_space_reserved < _tmp_free
@@ -1378,7 +1378,10 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
             # ("Declared dictionary size is not supported") and rarfile
             # delegates to whatever backend it finds, which on sandboxed
             # installs is often bsdtar.  Native unrar handles every RAR
-            # variant, so try it first.
+            # variant, so try it first.  On Debian-family distros "unrar"
+            # may actually be unrar-free (no RAR5), so fall through to
+            # 7-Zip (official 7zz extracts RAR fine) and unar before the
+            # rarfile/bsdtar last resorts.
             _rar_done = False
             if shutil.which("unrar"):
                 log_fn("Extracting with unrar…")
@@ -1389,9 +1392,41 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                 )
                 if result.returncode != 0:
-                    log_fn(f"unrar failed ({result.stderr.strip()}), trying rarfile…")
+                    log_fn(f"unrar failed ({result.stderr.strip()}), trying 7z…")
                 else:
                     _rar_done = True
+            if not _rar_done:
+                _7z_rar_bin = (shutil.which("7zzs") or shutil.which("7zz")
+                               or shutil.which("7z") or shutil.which("7za"))
+                if _7z_rar_bin:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    os.makedirs(extract_dir, exist_ok=True)
+                    log_fn("Extracting with 7z…")
+                    if progress_fn is not None:
+                        progress_fn(0, 0, "Extracting…")
+                    result = subprocess.run(
+                        [_7z_rar_bin, "x", archive_path, f"-o{extract_dir}", "-y"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                    )
+                    if result.returncode == 0:
+                        _rar_done = True
+                    else:
+                        log_fn(f"7z failed ({result.stderr.strip()}), trying unar…")
+            if not _rar_done and shutil.which("unar"):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                os.makedirs(extract_dir, exist_ok=True)
+                log_fn("Extracting with unar…")
+                if progress_fn is not None:
+                    progress_fn(0, 0, "Extracting…")
+                result = subprocess.run(
+                    ["unar", "-force-overwrite", "-no-directory",
+                     "-output-directory", extract_dir, archive_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                if result.returncode == 0:
+                    _rar_done = True
+                else:
+                    log_fn(f"unar failed ({result.stderr.strip()}), trying rarfile…")
             if not _rar_done:
                 try:
                     import rarfile

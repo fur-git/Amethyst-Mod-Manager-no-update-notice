@@ -390,7 +390,7 @@ def _write_ini(path: Path, scale_str: str) -> None:
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION][_INI_OPTION] = scale_str
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -413,7 +413,7 @@ def _seed_first_run_defaults(path: Path) -> None:
             parser[_COLUMNS_SECTION] = {}
         parser[_COLUMNS_SECTION]["hidden"] = ",".join(str(x) for x in _FIRST_RUN_HIDDEN_COLUMNS)
         parser[_COLUMNS_SECTION]["introduced"] = ",".join(str(x) for x in _FIRST_RUN_HIDDEN_COLUMNS)
-        with path.open("w") as f:
+        with path.open("w", encoding="utf-8") as f:
             parser.write(f)
     except Exception:
         pass
@@ -464,7 +464,7 @@ def save_font_family(family: str) -> None:
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION][_INI_FONT_OPTION] = _font_family
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -550,7 +550,7 @@ def save_collection_settings(download_order: str, max_concurrent: int,
     parser[_COLLECTIONS_SECTION]["max_extract_workers"] = str(max(1, min(8, max_extract_workers)))
     parser[_COLLECTIONS_SECTION]["check_download_locations"] = "true" if check_download_locations else "false"
     parser[_COLLECTIONS_SECTION]["clear_archive_after_install"] = "true" if clear_archive_after_install else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -619,7 +619,7 @@ def save_column_widths(widths: dict[int, int]) -> None:
         parser[_COLUMNS_SECTION]["sort_column"] = existing_sort_col
     if existing_sort_asc is not None:
         parser[_COLUMNS_SECTION]["sort_ascending"] = existing_sort_asc
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -664,7 +664,7 @@ def save_column_order(order: list[int]) -> None:
     if _COLUMNS_SECTION not in parser:
         parser[_COLUMNS_SECTION] = {}
     parser[_COLUMNS_SECTION]["order"] = ",".join(str(x) for x in order)
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -706,7 +706,7 @@ def _save_columns_hidden_and_introduced(path: Path, hidden: set[int], introduced
         parser[_COLUMNS_SECTION] = {}
     parser[_COLUMNS_SECTION]["hidden"] = ",".join(str(x) for x in sorted(hidden))
     parser[_COLUMNS_SECTION]["introduced"] = ",".join(str(x) for x in sorted(introduced))
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -720,7 +720,7 @@ def save_column_hidden(hidden: set[int]) -> None:
     if _COLUMNS_SECTION not in parser:
         parser[_COLUMNS_SECTION] = {}
     parser[_COLUMNS_SECTION]["hidden"] = ",".join(str(x) for x in sorted(hidden))
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -753,7 +753,7 @@ def save_sort_state(sort_column: str | None, ascending: bool) -> None:
         parser[_COLUMNS_SECTION] = {}
     parser[_COLUMNS_SECTION]["sort_column"] = sort_column if sort_column is not None else "none"
     parser[_COLUMNS_SECTION]["sort_ascending"] = "true" if ascending else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -780,7 +780,7 @@ def save_window_geometry(geometry: str) -> None:
     if _WINDOW_SECTION not in parser:
         parser[_WINDOW_SECTION] = {}
     parser[_WINDOW_SECTION]["geometry"] = geometry
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -849,7 +849,7 @@ def save_normalize_folder_case(value: bool) -> None:
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["normalize_folder_case"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -882,7 +882,7 @@ def save_allow_prerelease(value: bool) -> None:
     if _UPDATES_SECTION not in parser:
         parser[_UPDATES_SECTION] = {}
     parser[_UPDATES_SECTION]["allow_prerelease"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -909,7 +909,7 @@ def save_clear_archive_after_install(value: bool) -> None:
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["clear_archive_after_install"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -940,7 +940,7 @@ def save_keep_fomod_archives(value: bool) -> None:
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["keep_fomod_archives"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -967,7 +967,7 @@ def save_show_summary_tooltips(value: bool) -> None:
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["show_summary_tooltips"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -997,7 +997,7 @@ def save_rename_mod_after_install(value: bool) -> None:
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["rename_mod_after_install"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1028,7 +1028,7 @@ def save_restore_on_close(value: bool) -> None:
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["restore_on_close"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1042,7 +1042,7 @@ def save_nexus_show_adult(value: bool) -> None:
     if _NEXUS_SECTION not in parser:
         parser[_NEXUS_SECTION] = {}
     parser[_NEXUS_SECTION]["show_adult"] = "true" if value else "false"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1075,7 +1075,7 @@ def save_heroic_config_path(value: str) -> None:
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
     parser[_PATHS_SECTION]["heroic_config_path"] = value.strip()
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1102,7 +1102,7 @@ def save_steam_libraries_vdf_path(value: str) -> None:
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
     parser[_PATHS_SECTION]["steam_libraries_vdf"] = value.strip()
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1133,7 +1133,7 @@ def save_default_staging_path(value: str) -> None:
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
     parser[_PATHS_SECTION]["default_staging_path"] = value.strip()
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1165,7 +1165,7 @@ def save_download_cache_path(value: str) -> None:
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
     parser[_PATHS_SECTION]["download_cache_path"] = value.strip()
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
 
 
@@ -1276,7 +1276,7 @@ def save_theme_color(key: str, value: str) -> None:
     if _THEME_SECTION not in parser:
         parser[_THEME_SECTION] = {}
     parser[_THEME_SECTION][key] = value
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)
     _theme_colors[key] = value
 
@@ -1327,5 +1327,5 @@ def save_appearance_mode(mode: str) -> None:
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION][_APPEARANCE_OPTION] = mode
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         parser.write(f)

@@ -89,6 +89,36 @@ def _in_flatpak() -> bool:
     return os.path.exists("/.flatpak-info")
 
 
+def xdg_download_dir() -> Path:
+    """Return the user's Downloads directory.
+
+    Desktops record localised user dirs ("Téléchargements", "Descargas", …)
+    in ~/.config/user-dirs.dirs but rarely export XDG_DOWNLOAD_DIR into the
+    environment, so check the env var first, then parse the file, then fall
+    back to ~/Downloads.
+    """
+    env = os.environ.get("XDG_DOWNLOAD_DIR")
+    if env:
+        return Path(env)
+    home = Path.home()
+    cfg_base = os.environ.get("XDG_CONFIG_HOME") or (home / ".config")
+    try:
+        for line in (Path(cfg_base) / "user-dirs.dirs").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line.startswith("XDG_DOWNLOAD_DIR="):
+                continue
+            raw = line.split("=", 1)[1].strip().strip('"')
+            raw = raw.replace("$HOME", str(home))
+            # A value of just "$HOME/" means the dir is disabled per the
+            # xdg-user-dirs spec — use the fallback instead.
+            if raw and Path(raw) != home:
+                return Path(raw)
+            break
+    except (OSError, UnicodeDecodeError):
+        pass
+    return home / "Downloads"
+
+
 def _spawn_watched(
     cmd: list[str],
     label: str,

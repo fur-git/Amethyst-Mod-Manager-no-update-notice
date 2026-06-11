@@ -330,7 +330,7 @@ def _migrate_legacy_key() -> str:
     if not p.is_file():
         return ""
     try:
-        key = p.read_text().strip()
+        key = p.read_text(encoding="utf-8").strip()
         if key:
             if _keyring_ok():
                 try:

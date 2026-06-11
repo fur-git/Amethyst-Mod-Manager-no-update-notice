@@ -339,7 +339,7 @@ def read_ignored_missing_requirements(profile_dir: Path, state: dict | None = No
     if legacy.is_file():
         try:
             return {
-                line.strip() for line in legacy.read_text().splitlines()
+                line.strip() for line in legacy.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             }
         except OSError:

@@ -870,7 +870,7 @@ class ReconfigureGamePanel(ctk.CTkFrame):
             skip_dirs = {"proc", "sys", "dev", "run", "snap"}
             roots: list[Path] = []
             try:
-                with open("/proc/mounts", "r") as f:
+                with open("/proc/mounts", "r", encoding="utf-8") as f:
                     for line in f:
                         parts = line.split()
                         if len(parts) < 3:

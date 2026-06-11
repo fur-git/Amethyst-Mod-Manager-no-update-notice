@@ -429,10 +429,10 @@ class NxmHandler:
                     else:
                         continue
 
-                existing = path.read_text() if path.exists() else ""
+                existing = path.read_text(encoding="utf-8") if path.exists() else ""
                 updated = cls._patch_mimeapps_content(existing)
                 if updated != existing:
-                    path.write_text(updated)
+                    path.write_text(updated, encoding="utf-8")
                     app_log(f"Updated nxm:// association in {path}")
             except OSError as exc:
                 app_log(f"Could not update {path}: {exc}")
@@ -593,7 +593,7 @@ class NxmHandler:
             try:
                 if not path.exists():
                     continue
-                lines = path.read_text().splitlines()
+                lines = path.read_text(encoding="utf-8").splitlines()
                 filtered = [
                     l for l in lines
                     if not (
@@ -638,7 +638,7 @@ class NxmHandler:
             "Categories=Game;\n"
         )
 
-        desktop_path.write_text(desktop_content)
+        desktop_path.write_text(desktop_content, encoding="utf-8")
         app_log(f"Wrote NXM .desktop file: {desktop_path}")
 
         # Also write to Flatpak exports dir so Flatpak-sandboxed browsers can
@@ -647,7 +647,7 @@ class NxmHandler:
         flatpak_path = cls._flatpak_desktop_path()
         if flatpak_path.parent.exists():
             try:
-                flatpak_path.write_text(desktop_content)
+                flatpak_path.write_text(desktop_content, encoding="utf-8")
                 app_log(f"Wrote NXM .desktop file to Flatpak exports: {flatpak_path}")
             except OSError as exc:
                 app_log(f"Could not write Flatpak .desktop file: {exc}")

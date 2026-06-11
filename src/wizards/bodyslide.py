@@ -517,7 +517,7 @@ class _BodySlideBaseWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             env.setdefault("LIBGL_DEBUG", "verbose")
             try:
                 log_path = Path(compat_data) / f"gl_trace_{self._tool_exe_name}.log"
-                gl_log = open(log_path, "w")
+                gl_log = open(log_path, "w", encoding="utf-8")
                 self._log(f"{self._wizard_title} Wizard: GL trace → {log_path}")
             except OSError as exc:
                 self._log(f"{self._wizard_title} Wizard: could not open GL trace log: {exc}")

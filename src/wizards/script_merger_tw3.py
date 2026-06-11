@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import customtkinter as ctk
 
-from Utils.xdg import open_url
+from Utils.xdg import open_url, xdg_download_dir
 from Utils.portal_filechooser import pick_file
 
 if TYPE_CHECKING:
@@ -90,7 +90,7 @@ def _find_merger_archive(downloads_dir: Path) -> Path | None:
 
 
 def _get_downloads_dir() -> Path:
-    return Path.home() / "Downloads"
+    return xdg_download_dir()
 
 
 class ScriptMergerWizard(ctk.CTkFrame):

@@ -178,7 +178,7 @@ def _run_installer(allow_prerelease: bool = False):
     try:
         subprocess.Popen(
             ["bash", "-c", cmd],
-            stdout=open(log_path, "w"),
+            stdout=open(log_path, "w", encoding="utf-8"),
             stderr=subprocess.STDOUT,
             start_new_session=True,
             env=clean_env,

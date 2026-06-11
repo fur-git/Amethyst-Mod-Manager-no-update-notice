@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import customtkinter as ctk
 
-from Utils.xdg import open_url
+from Utils.xdg import open_url, xdg_download_dir
 from Utils.portal_filechooser import pick_file
 
 if TYPE_CHECKING:
@@ -235,7 +235,7 @@ class VRAMrWizard(ctk.CTkFrame):
         self._scan_downloads()
 
     def _scan_downloads(self):
-        found = _find_archive(Path.home() / "Downloads")
+        found = _find_archive(xdg_download_dir())
         if found:
             self._archive_path = found
             self._locate_status.configure(text=f"Found: {found.name}", text_color="#6bc76b")

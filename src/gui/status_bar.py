@@ -97,7 +97,7 @@ def _get_orphaned_tmp_dirs() -> list:
         games_dir = get_config_dir() / "games"
         for paths_json in games_dir.rglob("paths.json"):
             try:
-                data = json.loads(paths_json.read_text())
+                data = json.loads(paths_json.read_text(encoding="utf-8"))
                 sp = data.get("staging_path", "")
                 if sp:
                     search_roots.append(Path(sp))

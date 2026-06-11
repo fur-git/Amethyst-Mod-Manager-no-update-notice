@@ -84,7 +84,7 @@ def delete_archive_and_sidecar(archive_path: Path) -> None:
 def _read_sidecar_file_id(archive: Path) -> int:
     """Return the file_id stored in the sidecar, or 0 if absent/unreadable."""
     try:
-        return int(_fileid_sidecar(archive).read_text().strip())
+        return int(_fileid_sidecar(archive).read_text(encoding="utf-8").strip())
     except Exception:
         return 0
 

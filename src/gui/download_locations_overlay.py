@@ -21,6 +21,7 @@ import customtkinter as ctk
 
 from Utils.config_paths import get_download_locations_path
 from Utils.portal_filechooser import pick_folder
+from Utils.xdg import xdg_download_dir
 
 from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
 from gui.theme import (
@@ -94,9 +95,8 @@ def _save_locations(locations: list[str]) -> None:
 
 
 def get_default_downloads_dir() -> Path:
-    """Return the system default Downloads folder (XDG_DOWNLOAD_DIR or ~/Downloads)."""
-    xdg = os.environ.get("XDG_DOWNLOAD_DIR")
-    return Path(xdg) if xdg else Path.home() / "Downloads"
+    """Return the system default Downloads folder (per xdg-user-dirs)."""
+    return xdg_download_dir()
 
 
 def is_default_downloads_disabled() -> bool:
