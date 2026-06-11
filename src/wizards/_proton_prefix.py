@@ -108,6 +108,50 @@ def save_saved_proton(game, exe_name: str, proton_name: str) -> None:
         pass
 
 
+def link_plugins_txt(game, pfx: Path, log_fn) -> None:
+    """Symlink the deployed profile's plugins.txt into a tool prefix.
+
+    No-op for games without the Bethesda plugins.txt machinery.
+    """
+    if not hasattr(game, "_symlink_plugins_txt"):
+        return
+    profile = ""
+    try:
+        profile = game.get_last_deployed_profile() or ""
+    except Exception:
+        pass
+    try:
+        game._symlink_plugins_txt(profile or "default", log_fn, prefix_root=pfx)
+    except Exception as exc:
+        log_fn(f"plugins.txt link failed: {exc}")
+
+
+def link_mygames(game, pfx: Path, log_fn) -> None:
+    """Symlink the game prefix's My Games/<Game> dir into a tool prefix.
+
+    Gives tools that read the game INIs (xEdit needs Skyrim.ini or it
+    exits with a fatal error) the same files the game itself uses.
+    """
+    game_pfx = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
+    docs = getattr(game, "_MYGAMES_DOCS", None)
+    sub  = getattr(game, "_MYGAMES_SUBPATH", None)
+    if game_pfx is None or docs is None or sub is None:
+        return
+    src = game_pfx / docs / sub
+    if not src.is_dir():
+        log_fn(f"game-prefix My Games folder not found ({src}) — skipping link.")
+        return
+    dst = pfx / docs / sub
+    if dst.is_symlink() or dst.exists():
+        return
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(src, target_is_directory=True)
+        log_fn(f"linked My Games → {dst}")
+    except OSError as exc:
+        log_fn(f"My Games link failed: {exc}")
+
+
 def shutdown_prefix_wineserver(proton_script: Path, compat_data: Path, log_fn=None) -> None:
     """Kill leftover wine processes still attached to a tool prefix.
 
@@ -192,55 +236,18 @@ class ProtonPrefixStepMixin:
         return proton_script, env, compat_data
 
     def _link_plugins_txt(self, pfx: Path):
-        """Symlink the deployed profile's plugins.txt into the tool prefix.
-
-        No-op for games without the Bethesda plugins.txt machinery.
-        """
-        game = self._game
-        if not hasattr(game, "_symlink_plugins_txt"):
-            return
-        profile = ""
-        try:
-            profile = game.get_last_deployed_profile() or ""
-        except Exception:
-            pass
-        try:
-            game._symlink_plugins_txt(
-                profile or "default",
-                lambda msg: self._log(f"{self._tool_display_name} Wizard: {msg}"),
-                prefix_root=pfx,
-            )
-        except Exception as exc:
-            self._log(f"{self._tool_display_name} Wizard: plugins.txt link failed: {exc}")
+        """Symlink the deployed profile's plugins.txt into the tool prefix."""
+        link_plugins_txt(
+            self._game, pfx,
+            lambda msg: self._log(f"{self._tool_display_name} Wizard: {msg}"),
+        )
 
     def _link_mygames(self, pfx: Path):
-        """Symlink the game prefix's My Games/<Game> dir into the tool prefix.
-
-        Gives tools that read the game INIs (xEdit needs Skyrim.ini or it
-        exits with a fatal error) the same files the game itself uses.
-        """
-        game = self._game
-        game_pfx = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
-        docs = getattr(game, "_MYGAMES_DOCS", None)
-        sub  = getattr(game, "_MYGAMES_SUBPATH", None)
-        if game_pfx is None or docs is None or sub is None:
-            return
-        src = game_pfx / docs / sub
-        if not src.is_dir():
-            self._log(
-                f"{self._tool_display_name} Wizard: game-prefix My Games folder "
-                f"not found ({src}) — skipping link."
-            )
-            return
-        dst = pfx / docs / sub
-        if dst.is_symlink() or dst.exists():
-            return
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.symlink_to(src, target_is_directory=True)
-            self._log(f"{self._tool_display_name} Wizard: linked My Games → {dst}")
-        except OSError as exc:
-            self._log(f"{self._tool_display_name} Wizard: My Games link failed: {exc}")
+        """Symlink the game prefix's My Games/<Game> dir into the tool prefix."""
+        link_mygames(
+            self._game, pfx,
+            lambda msg: self._log(f"{self._tool_display_name} Wizard: {msg}"),
+        )
 
     # ------------------------------------------------------------------
     # Choose Proton version step

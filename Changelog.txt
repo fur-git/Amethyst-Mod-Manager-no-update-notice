@@ -3,6 +3,7 @@
 - Tweaked Fonv and Fo3 to add bsa files to SArchiveList based on plugin load order
 - Bain installer now shows the name of the mod being installed
 - Some wizard tools have been reworked to allow the proton version used by the application to be selected instead of using the game's own version
+- Reworked the exe configure menu slightly
 
 - v1.3.8
 - Added support for Dragon Age: Origins

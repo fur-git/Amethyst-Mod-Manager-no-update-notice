@@ -978,15 +978,23 @@ class PluginPanelExeLauncherMixin:
                 env.setdefault("SteamAppId", steam_id)
                 env.setdefault("SteamGameId", steam_id)
 
-        if proton_override_name and getattr(game, "synthesis_registry_name", None):
-            from Utils.bethesda_registry import maybe_register_for_game
-            maybe_register_for_game(
-                prefix_dir=compat_data,
-                proton_script=proton_script,
-                env=env,
-                game=game,
-                log_fn=self._log,
-            )
+        if proton_override_name:
+            # Bethesda games: mirror the wizard-prefix setup so tools in the
+            # isolated prefix see the game path (registry), the deployed
+            # plugins.txt and the game's My Games INIs. All no-ops otherwise.
+            if getattr(game, "synthesis_registry_name", None):
+                from Utils.bethesda_registry import maybe_register_for_game
+                maybe_register_for_game(
+                    prefix_dir=compat_data,
+                    proton_script=proton_script,
+                    env=env,
+                    game=game,
+                    log_fn=self._log,
+                )
+            from wizards._proton_prefix import link_mygames, link_plugins_txt
+            pfx = compat_data / "pfx"
+            link_plugins_txt(game, pfx, lambda m: self._log(f"Run EXE: {m}"))
+            link_mygames(game, pfx, lambda m: self._log(f"Run EXE: {m}"))
 
         # Re-apply profile-specific output substitution at launch time so the
         # correct path is used even if the profile changed after the exe was

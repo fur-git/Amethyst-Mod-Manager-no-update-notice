@@ -71,7 +71,7 @@ from gui.theme import (
 import gui.theme as _theme
 from gui.path_utils import _to_wine_path
 from Utils.config_paths import get_exe_args_path, get_profile_exe_args_path, get_custom_game_images_dir, get_vcredist_cache_path, get_dotnet_cache_dir, get_custom_games_dir
-from Utils.exe_args_builder import EXE_PROFILES
+
 from gui.ctk_components import CTkAlert, CTkLoader, ICON_PATH
 from gui.tk_tooltip import TkTooltip
 from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
@@ -2574,8 +2574,7 @@ class ExeConfigPanel(ctk.CTkFrame):
             self._mods_path.parent / "overwrite" if self._mods_path else None
         )
 
-        self._game_flag_var = tk.StringVar(value="")
-        self._output_flag_var = tk.StringVar(value="")
+        self._is_pgpatcher = exe_path.name.lower() == "pgpatcher.exe"
         self._mod_var = tk.StringVar(value="")
         self._mod_entries: list[tuple[str, "Path"]] = self._load_mod_entries()
         self._mod_popup: "tk.Toplevel | None" = None
@@ -2614,9 +2613,6 @@ class ExeConfigPanel(ctk.CTkFrame):
 
         if self._initial_launch_mode is None:
             self._load_saved()
-            self._game_flag_var.trace_add("write", self._assemble)
-            self._output_flag_var.trace_add("write", self._assemble)
-            self._mod_var.trace_add("write", self._assemble)
 
     def _bind_wheel_to_body(self, root):
         """Forward mousewheel events from every child of the scrollable body
@@ -2669,91 +2665,73 @@ class ExeConfigPanel(ctk.CTkFrame):
         body_total_row = count(start=0)
 
         if not is_game_exe:
-            sec1 = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=6)
-            sec1.grid(row=next(body_total_row), column=0, sticky="ew", padx=12, pady=(12, 4))
-            sec1.grid_columnconfigure(1, weight=1)
+            sec_args = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=6)
+            sec_args.grid(row=next(body_total_row), column=0, sticky="ew", padx=12, pady=(12, 4))
+            sec_args.grid_columnconfigure(0, weight=1)
 
             ctk.CTkLabel(
-                sec1, text="Game path argument", font=FONT_BOLD,
-                text_color=TEXT_MAIN, anchor="w",
-            ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
-
-            ctk.CTkLabel(
-                sec1, text="Flag:", font=FONT_SMALL, text_color=TEXT_DIM, anchor="w",
-            ).grid(row=1, column=0, sticky="w", padx=(10, 4), pady=4)
-            ctk.CTkEntry(
-                sec1, textvariable=self._game_flag_var, font=FONT_SMALL,
-                fg_color=BG_HEADER, text_color=TEXT_MAIN, border_color=BORDER,
-                placeholder_text="e.g. --tesv:",
-            ).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=4)
-
-            wine_game = _to_wine_path(self._game_path) if self._game_path else "(game path not set)"
-            ctk.CTkLabel(
-                sec1, text=f"Path:  {wine_game}", font=FONT_SMALL,
-                text_color=TEXT_DIM, anchor="w", wraplength=560,
-            ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
-
-            sec2 = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=6)
-            sec2.grid(row=next(body_total_row), column=0, sticky="ew", padx=12, pady=4)
-            sec2.grid_columnconfigure(1, weight=1)
-
-            ctk.CTkLabel(
-                sec2, text="Output argument", font=FONT_BOLD,
-                text_color=TEXT_MAIN, anchor="w",
-            ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
-
-            ctk.CTkLabel(
-                sec2, text="Flag:", font=FONT_SMALL, text_color=TEXT_DIM, anchor="w",
-            ).grid(row=1, column=0, sticky="w", padx=(10, 4), pady=4)
-            ctk.CTkEntry(
-                sec2, textvariable=self._output_flag_var, font=FONT_SMALL,
-                fg_color=BG_HEADER, text_color=TEXT_MAIN, border_color=BORDER,
-                placeholder_text="e.g. --output:",
-            ).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=4)
-
-            ctk.CTkLabel(
-                sec2, text="Mod:", font=FONT_SMALL, text_color=TEXT_DIM, anchor="w",
-            ).grid(row=2, column=0, sticky="w", padx=(10, 4), pady=(0, 8))
-            mod_row = ctk.CTkFrame(sec2, fg_color="transparent")
-            mod_row.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(0, 8))
-            mod_row.grid_columnconfigure(0, weight=1)
-            _mod_placeholder = (
-                "PGPatcher (default)" if self._exe_path.name.lower() == "pgpatcher.exe"
-                else "search mods..."
-            )
-            self._mod_entry = ctk.CTkEntry(
-                mod_row, textvariable=self._mod_var, font=FONT_SMALL,
-                fg_color=BG_HEADER, text_color=TEXT_MAIN, border_color=BORDER,
-                placeholder_text=_mod_placeholder,
-            )
-            self._mod_entry.grid(row=0, column=0, sticky="ew")
-            self._mod_entry._entry.bind(
-                "<Control-a>",
-                lambda e: (self._mod_entry._entry.select_range(0, "end"),
-                           self._mod_entry._entry.icursor("end"), "break")[2],
-            )
-            ctk.CTkButton(
-                mod_row, text="\u25bc", width=28, font=FONT_SMALL,
-                fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT,
-                command=self._open_mod_popup,
-            ).grid(row=0, column=1, padx=(4, 0))
-            self._mod_var.trace_add("write", self._on_mod_typed)
-
-            sec3 = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=6)
-            sec3.grid(row=next(body_total_row), column=0, sticky="ew", padx=12, pady=4)
-            sec3.grid_columnconfigure(0, weight=1)
-
-            ctk.CTkLabel(
-                sec3, text="Final argument (editable)", font=FONT_BOLD,
+                sec_args, text="Launch arguments", font=FONT_BOLD,
                 text_color=TEXT_MAIN, anchor="w",
             ).grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+            ctk.CTkLabel(
+                sec_args,
+                text="Arguments passed to the exe. Use Wine paths for file "
+                     "arguments (e.g. Z:\\home\\...) \u2014 the buttons below insert them for you.",
+                font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left", wraplength=560,
+            ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
 
             self._final_box = ctk.CTkTextbox(
-                sec3, height=90, font=FONT_NORMAL,
+                sec_args, height=90, font=FONT_NORMAL,
                 fg_color=BG_HEADER, text_color=TEXT_MAIN, border_color=BORDER,
                 border_width=1, wrap="word",
             )
-            self._final_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+            self._final_box.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+
+            insert_row = ctk.CTkFrame(sec_args, fg_color="transparent")
+            insert_row.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+            insert_btn = dict(height=26, font=FONT_SMALL,
+                              fg_color=BG_HEADER, hover_color=BG_HOVER, text_color=TEXT_MAIN)
+            ctk.CTkButton(
+                insert_row, text="Insert game path", width=130,
+                command=self._insert_game_path, **insert_btn,
+            ).pack(side="left", padx=(0, 6))
+            self._insert_mod_btn = ctk.CTkButton(
+                insert_row, text="Insert mod path \u25bc", width=140,
+                command=self._open_mod_popup, **insert_btn,
+            )
+            self._insert_mod_btn.pack(side="left")
+
+            if self._is_pgpatcher:
+                sec_mod = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=6)
+                sec_mod.grid(row=next(body_total_row), column=0, sticky="ew", padx=12, pady=4)
+                sec_mod.grid_columnconfigure(1, weight=1)
+                ctk.CTkLabel(
+                    sec_mod, text="Output mod", font=FONT_BOLD,
+                    text_color=TEXT_MAIN, anchor="w",
+                ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
+                ctk.CTkLabel(
+                    sec_mod, text="Mod:", font=FONT_SMALL, text_color=TEXT_DIM, anchor="w",
+                ).grid(row=1, column=0, sticky="w", padx=(10, 4), pady=(0, 8))
+                mod_row = ctk.CTkFrame(sec_mod, fg_color="transparent")
+                mod_row.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(0, 8))
+                mod_row.grid_columnconfigure(0, weight=1)
+                self._mod_entry = ctk.CTkEntry(
+                    mod_row, textvariable=self._mod_var, font=FONT_SMALL,
+                    fg_color=BG_HEADER, text_color=TEXT_MAIN, border_color=BORDER,
+                    placeholder_text="PGPatcher (default)",
+                )
+                self._mod_entry.grid(row=0, column=0, sticky="ew")
+                self._mod_entry._entry.bind(
+                    "<Control-a>",
+                    lambda e: (self._mod_entry._entry.select_range(0, "end"),
+                               self._mod_entry._entry.icursor("end"), "break")[2],
+                )
+                ctk.CTkButton(
+                    mod_row, text="\u25bc", width=28, font=FONT_SMALL,
+                    fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT,
+                    command=self._open_mod_popup,
+                ).grid(row=0, column=1, padx=(4, 0))
+                self._mod_var.trace_add("write", self._on_mod_typed)
 
             # Proton version section
             sec_proton = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=6)
@@ -2775,7 +2753,9 @@ class ExeConfigPanel(ctk.CTkFrame):
                 sec_proton,
                 text="Use a specific Proton version with an isolated prefix next to\n"
                      "the exe, instead of the game's prefix. Useful for tools that\n"
-                     "don't work with the game's Proton version.",
+                     "don't work with the game's Proton version.\n"
+                     "For Bethesda games the game path (registry), plugins.txt and\n"
+                     "My Games INIs are set up in the prefix automatically at launch.",
                 font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
             ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
 
@@ -2790,6 +2770,10 @@ class ExeConfigPanel(ctk.CTkFrame):
             ctk.CTkButton(
                 btn_row, text="Run protontricks", width=140,
                 command=self._run_protontricks_in_prefix, **small_btn,
+            ).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(
+                btn_row, text="Open prefix folder", width=140,
+                command=self._open_prefix_folder, **small_btn,
             ).pack(side="left")
 
         if is_game_exe:
@@ -2902,10 +2886,11 @@ class ExeConfigPanel(ctk.CTkFrame):
         popup.configure(bg=BG_PANEL)
         self._mod_popup = popup
 
-        self._mod_entry.update_idletasks()
-        x = self._mod_entry.winfo_rootx()
-        y = self._mod_entry.winfo_rooty() + self._mod_entry.winfo_height() + 2
-        w = self._mod_entry.winfo_width() + 32
+        anchor = self._mod_entry if self._is_pgpatcher else self._insert_mod_btn
+        anchor.update_idletasks()
+        x = anchor.winfo_rootx()
+        y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+        w = max(anchor.winfo_width() + 32, 320)
         popup.geometry(f"{w}x300+{x}+{y}")
 
         scroll = ctk.CTkScrollableFrame(popup, fg_color=BG_PANEL, corner_radius=0)
@@ -2988,31 +2973,25 @@ class ExeConfigPanel(ctk.CTkFrame):
             btn.pack(fill="x", padx=4, pady=1)
 
     def _select_mod(self, name: str):
-        if self._mod_popup and self._mod_popup.winfo_exists():
-            self._mod_popup.destroy()
-            self._mod_popup = None
-        self._mod_var.set(name)
+        self._close_mod_popup()
+        if self._is_pgpatcher:
+            self._mod_var.set(name)
+            return
+        path = next((p for n, p in self._mod_entries if n == name), None)
+        if path is not None:
+            self._insert_arg_text(f'"{_to_wine_path(path)}"')
 
-    def _assemble(self, *_):
-        parts: list[str] = []
+    def _insert_game_path(self):
+        if self._game_path is None:
+            self._log("Configure: game path not set.")
+            return
+        self._insert_arg_text(f'"{_to_wine_path(self._game_path)}"')
 
-        game_flag = self._game_flag_var.get().strip()
-        if game_flag and self._game_path:
-            profile = EXE_PROFILES.get(self._exe_path.name)
-            suffix = profile.game_path_suffix if profile else ""
-            target = self._game_path / suffix if suffix else self._game_path
-            wine = _to_wine_path(target)
-            parts.append(f'{game_flag}"{wine}"')
-
-        out_flag = self._output_flag_var.get().strip()
-        selected = self._mod_var.get().strip()
-        if out_flag and selected:
-            path = next((p for n, p in self._mod_entries if n == selected), None)
-            if path:
-                parts.append(f'{out_flag}"{_to_wine_path(path)}"')
-
-        assembled = " ".join(parts)
-        self._set_final_text(assembled)
+    def _insert_arg_text(self, text: str):
+        existing = self._get_final_text()
+        if existing and not existing.endswith(" "):
+            text = " " + text
+        self._final_box.insert("end", text)
 
     def _set_final_text(self, text: str):
         self._final_box.delete("1.0", "end")
@@ -3021,41 +3000,8 @@ class ExeConfigPanel(ctk.CTkFrame):
     def _get_final_text(self) -> str:
         return self._final_box.get("1.0", "end").strip()
 
-    def _parse_saved_args(self, args: str):
-        segments = re.findall(r'(\S+?)"([^"]+)"', args)
-
-        game_wine = _to_wine_path(self._game_path).rstrip("\\") if self._game_path else None
-
-        for flag, quoted_path in segments:
-            normalised = quoted_path.rstrip("\\")
-
-            if game_wine and (normalised == game_wine
-                              or normalised.startswith(game_wine + "\\")):
-                self._game_flag_var.set(flag)
-                continue
-
-            matched = False
-            for name, path in self._mod_entries:
-                mod_wine = _to_wine_path(path).rstrip("\\")
-                if normalised == mod_wine or normalised.startswith(mod_wine + "\\"):
-                    self._output_flag_var.set(flag)
-                    self._mod_var.set(name)
-                    matched = True
-                    break
-
-            if not matched:
-                tail = normalised.rsplit("\\", 1)[-1] if "\\" in normalised else ""
-                if tail:
-                    self._output_flag_var.set(flag)
-                    for name, _path in self._mod_entries:
-                        if name == tail:
-                            self._mod_var.set(name)
-                            break
-                    else:
-                        self._mod_var.set(tail)
-
     def _load_saved(self):
-        if self._exe_path.name.lower() == "pgpatcher.exe":
+        if self._is_pgpatcher:
             # Output mod is stored separately; load it independently of saved_args.
             try:
                 data = json.loads(self._EXE_ARGS_FILE.read_text(encoding="utf-8"))
@@ -3065,16 +3011,7 @@ class ExeConfigPanel(ctk.CTkFrame):
             except (OSError, ValueError):
                 pass
         if self._saved_args:
-            self._parse_saved_args(self._saved_args)
-            # Re-assemble with current (profile-correct) paths if the output
-            # mod was resolved to an actual entry; otherwise keep the saved text
-            # so auto-configured args are never blanked out.
-            selected = self._mod_var.get()
-            path_found = any(n == selected for n, _ in self._mod_entries)
-            if path_found:
-                self._assemble()
-            else:
-                self._set_final_text(self._saved_args)
+            self._set_final_text(self._saved_args)
 
     def _get_selected_tool_env(self):
         selected = self._proton_var.get()
@@ -3095,7 +3032,27 @@ class ExeConfigPanel(ctk.CTkFrame):
                 game=self._game,
                 log_fn=self._log,
             )
+        from wizards._proton_prefix import link_mygames, link_plugins_txt
+        pfx = prefix_dir / "pfx"
+        link_plugins_txt(self._game, pfx, lambda m: self._log(f"Prefix tools: {m}"))
+        link_mygames(self._game, pfx, lambda m: self._log(f"Prefix tools: {m}"))
         return result
+
+    def _open_prefix_folder(self):
+        selected = self._proton_var.get()
+        if selected == "Game default":
+            self._log("Prefix tools: select a specific Proton version first.")
+            return
+        from Utils.steam_finder import find_any_installed_proton
+        proton_script = find_any_installed_proton(selected)
+        if proton_script is None:
+            self._log(f"Prefix tools: could not find Proton '{selected}'.")
+            return
+        prefix_dir = self._exe_path.parent / f"prefix_{proton_script.parent.name}"
+        if not prefix_dir.is_dir():
+            self._log("Prefix tools: no prefix exists yet for this version — run the exe once first.")
+            return
+        xdg_open(str(prefix_dir))
 
     def _run_exe_in_prefix(self):
         result = self._get_selected_tool_env()
@@ -3215,7 +3172,7 @@ class ExeConfigPanel(ctk.CTkFrame):
             except (OSError, ValueError):
                 data = {}
             data[self._exe_path.name] = final
-            if self._exe_path.name.lower() == "pgpatcher.exe":
+            if self._is_pgpatcher:
                 data["PGPatcher.exe:output_mod"] = self._mod_var.get().strip()
             try:
                 self._EXE_ARGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
