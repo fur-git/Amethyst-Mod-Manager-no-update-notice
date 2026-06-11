@@ -48,6 +48,12 @@ class OblivionRemastered(UE5Game):
         "AltarESPMain.esp", "AltarDeluxe.esp", "AltarESPLocal.esp",
     ]
 
+    # Data-folder mods (often ported from original Oblivion) can still be
+    # authored as BAIN packages, so keep the picker despite the UE5 base.
+    @property
+    def supports_bain(self) -> bool:
+        return True
+
     # -----------------------------------------------------------------------
     # Identity
     # -----------------------------------------------------------------------

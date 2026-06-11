@@ -107,14 +107,6 @@ class DragonAgeOrigins(BaseGame):
     def mod_install_as_is_if_no_match(self) -> bool:
         return True
 
-    # DAO mods are never BAIN packages. The Bethesda-centric BAIN heuristics
-    # misfire on ordinary loose override mods (a stray readme .txt or a
-    # coincidentally-named "Textures" folder is enough), so suppress the picker
-    # and let normalize_dao_mod / custom routing rules place the files.
-    @property
-    def supports_bain(self) -> bool:
-        return False
-
     @property
     def additional_install_logic(self) -> list:
         return [self._load_dao_module("dao_install").normalize_dao_mod]

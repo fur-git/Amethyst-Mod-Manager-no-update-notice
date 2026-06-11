@@ -386,15 +386,16 @@ class BaseGame(ABC):
     @property
     def supports_bain(self) -> bool:
         """
-        When True (the default), the installer runs BAIN (Wrye Bash bundled
-        archive) detection and shows the sub-package picker for archives that
-        look like a complex BAIN package.
+        When True, the installer runs BAIN (Wrye Bash bundled archive)
+        detection and shows the sub-package picker for archives that look
+        like a complex BAIN package.
 
-        Set to False for games whose mods are never authored as BAIN packages
-        (e.g. Dragon Age: Origins, whose loose override mods routinely trip the
-        Bethesda-centric heuristics by accident).
+        False by default: BAIN packages are only authored for Bethesda
+        games, and the Bethesda-centric heuristics misfire on other games'
+        loose mods (a stray readme .txt or a coincidentally-named "Textures"
+        folder is enough). Bethesda game handlers override this to True.
         """
-        return True
+        return False
 
     @property
     def collections_disabled(self) -> bool:

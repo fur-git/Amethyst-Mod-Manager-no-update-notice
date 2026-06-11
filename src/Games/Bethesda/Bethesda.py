@@ -132,6 +132,12 @@ class Fallout_3(BaseGame):
     ]
     synthesis_registry_name = "Fallout3"
 
+    # BAIN packages are authored for Bethesda games, so re-enable the
+    # sub-package picker that BaseGame disables by default.
+    @property
+    def supports_bain(self) -> bool:
+        return True
+
     def __init__(self):
         self._game_path: Path | None = None
         self._prefix_path: Path | None = None

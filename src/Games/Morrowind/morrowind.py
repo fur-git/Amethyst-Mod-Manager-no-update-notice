@@ -36,6 +36,10 @@ class Morrowind(BaseGame):
 
     vanilla_plugins = ["Morrowind.esm", "Tribunal.esm", "Bloodmoon.esm"]
 
+    @property
+    def supports_bain(self) -> bool:
+        return True
+
     def __init__(self):
         self._game_path: Path | None = None
         self._prefix_path: Path | None = None
