@@ -1171,7 +1171,11 @@ class ProtonToolsPanel(ctk.CTkFrame):
             log(f"Proton Tools: WARNING — Proton dir does not exist: {proton_dir}")
         wine_bin = None
         checked = []
-        for sub in ("files/bin/wine", "dist/bin/wine"):
+        # Prefer wine64: GE-Proton's `wine` is a 32-bit ELF whose missing
+        # /lib/ld-linux.so.2 interpreter makes exec fail with ENOENT on
+        # hosts without 32-bit glibc.
+        for sub in ("files/bin/wine64", "dist/bin/wine64",
+                    "files/bin/wine", "dist/bin/wine"):
             cand = proton_dir / sub
             checked.append(str(cand))
             if cand.is_file():
