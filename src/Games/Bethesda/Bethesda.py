@@ -433,13 +433,24 @@ class Fallout_3(BaseGame):
     # See geckwiki.com/index.php/BSA_Files.
     _archive_list_needs_mod_bsas: bool = True
 
+    # Engine-fix plugin whose FalloutCustom.ini support bypasses the vanilla
+    # 255-char SArchiveList read limit (settings applied in-memory, 16 KB
+    # buffer). FO3: Command Extender; FNV overrides with JIP LN NVSE (which
+    # additionally patches the vanilla Fallout.ini read).
+    _archive_list_fix_name: "str | None" = "Command Extender"
+    _archive_list_fix_path: "str | None" = "Data/FOSE/Plugins/CommandExtender.dll"
+    _CUSTOM_INI_FILENAME = "FalloutCustom.ini"
+
     @property
     def _script_extender_exe(self) -> str:
         return "fose_loader.exe"
 
     @property
     def frameworks(self) -> dict[str, str]:
-        return {"Script Extender": self._script_extender_exe}
+        fw = {"Script Extender": self._script_extender_exe}
+        if self._archive_list_fix_name and self._archive_list_fix_path:
+            fw[self._archive_list_fix_name] = self._archive_list_fix_path
+        return fw
 
     _PLUGINS_TXT_FILENAME = "plugins.txt"
 
@@ -641,6 +652,7 @@ class Fallout_3(BaseGame):
             new_mod_bsas = self._deployed_mod_bsas()
 
         self._write_dummy_bsa_file(_log)
+        longest_list = ""
         for ini_path in ini_paths:
             ini_path.parent.mkdir(parents=True, exist_ok=True)
             _set_ini_key(ini_path, "Archive", "bInvalidateOlderFiles", "1")
@@ -648,17 +660,58 @@ class Fallout_3(BaseGame):
                 if _read_ini_key(ini_path, "Archive", key) is not None:
                     continue
                 _set_ini_key(ini_path, "Archive", key, value)
-            self._apply_dummy_bsa_invalidation_ini(
+            written = self._apply_dummy_bsa_invalidation_ini(
                 ini_path, prev_mod_bsas, new_mod_bsas)
+            if len(written) > len(longest_list):
+                longest_list = written
 
         if self._archive_list_needs_mod_bsas:
             self._save_tracked_mod_bsas(new_mod_bsas)
             if new_mod_bsas:
                 _log(f"  Registered {len(new_mod_bsas)} mod BSA(s) in "
                      f"{self._invalidation_archive_list_key}.")
+            self._sync_archive_list_custom_ini(ini_paths, longest_list, _log)
 
         names = ", ".join(p.name for p in ini_paths)
         _log(f"  Archive invalidation enabled in {names}.")
+
+    def _sync_archive_list_custom_ini(
+        self, ini_paths: "list[Path]", list_str: str, _log,
+    ) -> None:
+        """Route an over-limit SArchiveList through FalloutCustom.ini, or warn.
+
+        Vanilla FO3/FNV read the key into a 255-char buffer; anything past
+        that is silently truncated mid-name. JIP LN NVSE (FNV) / Command
+        Extender (FO3) apply FalloutCustom.ini settings directly in memory
+        with a 16 KB buffer, bypassing the limit — so when the list is over
+        and the plugin is installed, mirror it there. Otherwise remove our
+        key so a stale FalloutCustom.ini value can't shadow the managed INIs
+        (those plugins apply it *after* the vanilla INIs load).
+        """
+        key = self._invalidation_archive_list_key
+        ini_dirs = {p.parent for p in ini_paths}
+        over = len(list_str) > 255
+        if over and self._archive_list_fix_installed():
+            for d in ini_dirs:
+                _set_ini_key(d / self._CUSTOM_INI_FILENAME, "Archive",
+                             key, list_str)
+            _log(f"  {key} is {len(list_str)} chars (engine limit 255) — "
+                 f"wrote full list to {self._CUSTOM_INI_FILENAME} "
+                 f"({self._archive_list_fix_name} installed).")
+            return
+        for d in ini_dirs:
+            custom_ini = d / self._CUSTOM_INI_FILENAME
+            if custom_ini.is_file():
+                _set_ini_key(custom_ini, "Archive", key, None)
+        if over:
+            fix = (f" Install {self._archive_list_fix_name} to fix this."
+                   if self._archive_list_fix_name else "")
+            _log(f"  WARN: {key} is {len(list_str)} characters — the engine "
+                 "reads only the first 255 and some mod BSAs will not load."
+                 f"{fix}")
+            self.add_deploy_warning(
+                f"{key} exceeds the engine's 255-character limit — some mod "
+                f"BSAs will not load.{fix}")
 
     def revert_archive_invalidation(self, log_fn) -> None:
         """Remove the invalidation keys from every managed game INI.
@@ -690,6 +743,11 @@ class Fallout_3(BaseGame):
         self._delete_dummy_bsa_file(_log)
         if self._archive_list_needs_mod_bsas:
             self._save_tracked_mod_bsas([])
+            for d in {p.parent for p in ini_paths}:
+                custom_ini = d / self._CUSTOM_INI_FILENAME
+                if custom_ini.is_file():
+                    _set_ini_key(custom_ini, "Archive",
+                                 self._invalidation_archive_list_key, None)
         names = ", ".join(p.name for p in ini_paths)
         _log(f"  Archive invalidation reverted in {names}.")
 
@@ -726,11 +784,12 @@ class Fallout_3(BaseGame):
         self, ini_path: Path,
         prev_mod_bsas: "list[str] | None" = None,
         new_mod_bsas: "list[str] | None" = None,
-    ) -> None:
-        """MO2-style INI edits for one INI: SArchiveList[0] + SInvalidationFile=''."""
+    ) -> str:
+        """MO2-style INI edits for one INI: SArchiveList[0] + SInvalidationFile=''.
+        Returns the archive list as written (for length checks)."""
         bsa_name = self._invalidation_bsa_name
         if bsa_name is None:
-            return
+            return ""
         from Utils.bsa_invalidation import (
             ensure_in_archive_list, append_to_archive_list,
             remove_many_from_archive_list,
@@ -750,6 +809,7 @@ class Fallout_3(BaseGame):
         if updated != current:
             _set_ini_key(ini_path, "Archive", key, updated)
         _set_ini_key(ini_path, "Archive", "SInvalidationFile", "")
+        return updated
 
     def _revert_dummy_bsa_invalidation_ini(self, ini_path: Path) -> None:
         """Undo dummy-BSA INI edits for one INI. The dummy file itself is removed
@@ -779,6 +839,23 @@ class Fallout_3(BaseGame):
     # These engines read assets only from BSAs listed in SArchiveList, so every
     # deployed mod BSA must be appended. We track what we added in a sidecar so
     # revert/refresh can drop entries for mods that were since removed.
+
+    def _archive_list_fix_installed(self) -> bool:
+        """True if the engine-fix plugin from `_archive_list_fix_path` is on
+        disk (case-insensitive walk from the game root)."""
+        if self._archive_list_fix_path is None or self._game_path is None:
+            return False
+        current = self._game_path
+        for part in Path(self._archive_list_fix_path).parts:
+            try:
+                entries = {e.name.lower(): e for e in current.iterdir()}
+            except OSError:
+                return False
+            match = entries.get(part.lower())
+            if match is None:
+                return False
+            current = match
+        return current.is_file()
 
     def _mod_bsa_tracking_path(self) -> "Path | None":
         try:
@@ -1126,6 +1203,9 @@ class Fallout_NV(Fallout_3):
 
     synthesis_registry_name = "FalloutNV"
 
+    _archive_list_fix_name = "JIP LN NVSE"
+    _archive_list_fix_path = "Data/NVSE/Plugins/jip_nvse.dll"
+
     vanilla_plugins = ["FalloutNV.esm"]
     vanilla_dlc_plugins = [
         "DeadMoney.esm", "HonestHearts.esm", "OldWorldBlues.esm",
@@ -1146,6 +1226,12 @@ class Fallout_NV(Fallout_3):
                     "github_api_url": "https://api.github.com/repos/xNVSE/NVSE/releases/latest",
                     "archive_keywords": ["nvse"],
                 },
+            ),
+            WizardTool(
+                id="fnv_4gb_patch",
+                label="Apply 4GB Patch",
+                description="Patch FalloutNV.exe to use 4 GB of memory (keeps a backup that can be restored).",
+                dialog_class_path="wizards.fnv_4gb_patch.Fnv4GbPatchWizard",
             ),
             WizardTool(
                 id="run_bethini_fonv",
@@ -1193,6 +1279,7 @@ class Fallout_NV(Fallout_3):
             CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
             CustomRule(dest="", filenames=["nvse_loader.exe"], flatten=True, loose_only=True),
             CustomRule(dest="", filenames=["nvse*.pdb"], flatten=True, loose_only=True),
+            CustomRule(dest="", filenames=["FNVpatch.exe"], flatten=True, loose_only=True),
             self._saves_routing_rule([".fos"]),
                 ]
 

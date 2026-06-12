@@ -589,6 +589,18 @@ class BaseGame(ABC):
         """
         return {}
 
+    def add_deploy_warning(self, message: str) -> None:
+        """Queue a user-facing warning for the GUI to toast after deploy."""
+        if not hasattr(self, "_deploy_user_warnings"):
+            self._deploy_user_warnings: list[str] = []
+        self._deploy_user_warnings.append(message)
+
+    def pop_deploy_warnings(self) -> list[str]:
+        """Return and clear queued deploy warnings."""
+        out = getattr(self, "_deploy_user_warnings", [])
+        self._deploy_user_warnings = []
+        return out
+
     def get_launch_command(self) -> "list[str] | None":
         """Return a native Linux command used to launch this game, bypassing Proton.
 

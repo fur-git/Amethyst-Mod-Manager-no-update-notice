@@ -990,6 +990,15 @@ class TopBar(ctk.CTkFrame):
                 self.after(0, lambda: self._set_deploy_buttons_enabled(True))
                 self.after(0, self._reload_mod_panel)
                 self.after(0, self._update_profile_menu_color)
+                # Shown even on silent auto-deploys — the log is hidden there,
+                # so the popup is the only way the user sees the warning.
+                _warns = game.pop_deploy_warnings()
+                if _warns:
+                    def _show_warns(body="\n\n".join(_warns)):
+                        CTkAlert(state="warning", title="Deploy Warning",
+                                 body_text=body, btn1="OK", btn2="",
+                                 parent=self.winfo_toplevel()).get()
+                    self.after(0, _show_warns)
                 if not silent:
                     self.after(1500, status_bar.clear_progress)
                 if success and on_complete is not None:
