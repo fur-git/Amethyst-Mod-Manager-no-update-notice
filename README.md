@@ -78,6 +78,8 @@ Download the .flatpak from [releases](https://github.com/ChrisDKN/Amethyst-Mod-M
 <tr><td>Spyro Reignited Trilogy</td><td></td><td>Payday 2</td><td></td></tr>
 <tr><td>Kingdom Hearts 3</td><td></td><td>7 Days to Die</td><td></td></tr>
 <tr><td>Darktide</td><td></td><td>Street Fighter 6</td><td></td></tr>
+<tr><td>Dragon Age Origins</td><td></td><td>Jagged Alliance 3</td><td></td></tr>
+<tr><td>X4 Foundations</td><td></td><td></td><td></td></tr>
 </table>
 
 - Amethyst has the ability to define custom games and is not limited to this list. The games in the Custom Handlers folder were made using this feature. See the Wiki for the guide
