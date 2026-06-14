@@ -545,7 +545,7 @@ def deploy_custom_rules(
             else:
                 tail = sib_rel_str
             for dest_base in _rule_dest_bases(rule):
-                tasks.append((src, dest_base / tail if tail else dest_base))
+                tasks.append((src, dest_base / tail if tail else dest_base, sib_mod_name))
             handled_lower.add(sib_lower)
 
     if not tasks:
