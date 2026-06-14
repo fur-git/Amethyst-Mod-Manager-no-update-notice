@@ -39,6 +39,7 @@ from gui.theme import (
     TEXT_DIM,
     TEXT_MAIN,
     TEXT_OK,
+    scaled,
 )
 from Utils.wine_dll_config import (
     load_wine_dll_overrides,
@@ -97,34 +98,29 @@ class WineDllOverridesPanel(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
 
         # ---- Title bar ---------------------------------------------------
-        title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=40)
+        title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=44)
         title_bar.grid(row=0, column=0, sticky="ew")
         title_bar.grid_propagate(False)
+        title_bar.grid_rowconfigure(0, weight=1)  # centre content vertically
         title_bar.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
             title_bar, text="← Back", width=70, height=28,
             font=FONT_BOLD, fg_color="transparent", hover_color=BG_HOVER,
             text_color=TEXT_MAIN, command=self._on_close,
-        ).grid(row=0, column=0, padx=(6, 4), pady=6, sticky="w")
+        ).grid(row=0, column=0, padx=(scaled(6), scaled(4)), sticky="w")
 
         ctk.CTkLabel(
             title_bar,
             text=f"Wine DLL Overrides — {self._game.name}",
             font=FONT_BOLD, text_color=TEXT_MAIN, anchor="w",
-        ).grid(row=0, column=1, padx=4, pady=8, sticky="w")
+        ).grid(row=0, column=1, padx=scaled(4), sticky="w")
 
         ctk.CTkButton(
             title_bar, text="✕", width=32, height=32, font=FONT_BOLD,
             fg_color="transparent", hover_color=BG_HOVER, text_color=TEXT_MAIN,
             command=self._on_close,
-        ).grid(row=0, column=2, padx=4, pady=4, sticky="e")
-
-        # ---- Column header -----------------------------------------------
-        hdr = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=28)
-        hdr.grid(row=0, column=0, sticky="ew", pady=(40, 0))
-        # We place this after title_bar using place to overlay correctly; instead
-        # use a separate row.
+        ).grid(row=0, column=2, padx=scaled(4), sticky="e")
 
         # ---- Scrollable override list ------------------------------------
         self._list_frame = ctk.CTkScrollableFrame(
@@ -136,14 +132,15 @@ class WineDllOverridesPanel(ctk.CTkFrame):
         # Build the column header inside the list frame header area
         col_hdr = ctk.CTkFrame(self._list_frame, fg_color=BG_PANEL, corner_radius=0, height=26)
         col_hdr.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        col_hdr.grid_rowconfigure(0, weight=1)
         col_hdr.grid_columnconfigure(0, weight=1)
         col_hdr.grid_columnconfigure(1, weight=0)
         col_hdr.grid_columnconfigure(2, weight=0)
         ctk.CTkLabel(col_hdr, text="DLL Name", font=FONT_SMALL, text_color=TEXT_DIM,
-                     anchor="w").grid(row=0, column=0, padx=(12, 4), pady=4, sticky="w")
+                     anchor="w").grid(row=0, column=0, padx=(scaled(12), scaled(4)), sticky="w")
         ctk.CTkLabel(col_hdr, text="Mode", font=FONT_SMALL, text_color=TEXT_DIM,
-                     anchor="w", width=140).grid(row=0, column=1, padx=4, pady=4, sticky="w")
-        ctk.CTkLabel(col_hdr, text="", width=36).grid(row=0, column=2, padx=4)
+                     anchor="w", width=140).grid(row=0, column=1, padx=scaled(4), sticky="w")
+        ctk.CTkLabel(col_hdr, text="", width=36).grid(row=0, column=2, padx=scaled(4))
 
         self._rows_container = ctk.CTkFrame(self._list_frame, fg_color="transparent", corner_radius=0)
         self._rows_container.grid(row=1, column=0, sticky="nsew")
@@ -155,6 +152,7 @@ class WineDllOverridesPanel(ctk.CTkFrame):
         add_frame = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=46)
         add_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(2, 0))
         add_frame.grid_propagate(False)
+        add_frame.grid_rowconfigure(0, weight=1)
         add_frame.grid_columnconfigure(0, weight=1)
         add_frame.grid_columnconfigure(1, weight=0)
 
@@ -163,26 +161,27 @@ class WineDllOverridesPanel(ctk.CTkFrame):
             font=FONT_NORMAL, fg_color=BG_DEEP, border_color=BORDER,
             text_color=TEXT_MAIN,
         )
-        self._dll_entry.grid(row=0, column=0, padx=(10, 6), pady=8, sticky="ew")
+        self._dll_entry.grid(row=0, column=0, padx=(scaled(10), scaled(6)), sticky="ew")
         self._dll_entry.bind("<Return>", lambda _: self._on_add())
 
         ctk.CTkButton(
             add_frame, text="+ Add", width=90, height=30, font=FONT_BOLD,
             fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT,
             command=self._on_add,
-        ).grid(row=0, column=1, padx=(0, 10), pady=8)
+        ).grid(row=0, column=1, padx=(0, scaled(10)))
 
         # ---- Save & Apply button -----------------------------------------
         save_frame = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=50)
         save_frame.grid(row=3, column=0, sticky="ew", pady=(2, 0))
         save_frame.grid_propagate(False)
+        save_frame.grid_rowconfigure(0, weight=1)
         save_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkButton(
             save_frame, text="Save & Apply", width=200, height=34, font=FONT_BOLD,
             fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT,
             command=self._on_save,
-        ).grid(row=0, column=0, padx=16, pady=8, sticky="e")
+        ).grid(row=0, column=0, padx=scaled(16), sticky="e")
 
     # ------------------------------------------------------------------
     # List rendering
@@ -199,29 +198,30 @@ class WineDllOverridesPanel(ctk.CTkFrame):
                 self._rows_container,
                 text="No DLL overrides configured.",
                 font=FONT_NORMAL, text_color=TEXT_DIM, anchor="center",
-            ).grid(row=0, column=0, pady=20, sticky="ew")
+            ).grid(row=0, column=0, pady=scaled(20), sticky="ew")
             return
 
         for idx, (dll, mode) in enumerate(sorted(self._overrides.items())):
             bg = BG_ROW if idx % 2 == 0 else BG_ROW_ALT
             row = ctk.CTkFrame(self._rows_container, fg_color=bg, corner_radius=4, height=34)
-            row.grid(row=idx, column=0, sticky="ew", padx=4, pady=1)
+            row.grid(row=idx, column=0, sticky="ew", padx=scaled(4), pady=scaled(1))
             row.grid_propagate(False)
+            row.grid_rowconfigure(0, weight=1)  # centre content vertically in the fixed-height row
             row.grid_columnconfigure(0, weight=1)
             row.grid_columnconfigure(1, weight=0)
             row.grid_columnconfigure(2, weight=0)
 
             ctk.CTkLabel(row, text=dll, font=FONT_NORMAL, text_color=TEXT_MAIN,
-                         anchor="w").grid(row=0, column=0, padx=(12, 4), pady=6, sticky="w")
+                         anchor="w").grid(row=0, column=0, padx=(scaled(12), scaled(4)), sticky="w")
             ctk.CTkLabel(row, text=mode, font=FONT_SMALL, text_color=TEXT_DIM,
-                         anchor="w", width=140).grid(row=0, column=1, padx=4, pady=6, sticky="w")
+                         anchor="w", width=140).grid(row=0, column=1, padx=scaled(4), sticky="w")
 
             dll_captured = dll
             ctk.CTkButton(
                 row, text="×", width=28, height=24, font=FONT_BOLD,
                 fg_color=RED_BTN, hover_color=RED_HOV, text_color="white",
                 command=lambda d=dll_captured: self._on_remove(d),
-            ).grid(row=0, column=2, padx=(4, 8), pady=5)
+            ).grid(row=0, column=2, padx=(scaled(4), scaled(8)))
 
     # ------------------------------------------------------------------
     # Actions
