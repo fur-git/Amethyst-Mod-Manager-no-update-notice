@@ -243,6 +243,12 @@ class SkyrimSE(Fallout_3):
                 dialog_class_path="wizards.sseedit.SSEEditQACWizard",
             ),
             WizardTool(
+                id="run_eslifier_skyrimse",
+                label="Run ESLifier",
+                description="Install ESLifier and flag/compact plugins into the light (ESL) space.",
+                dialog_class_path="wizards.eslifier.ESLifierWizard",
+            ),
+            WizardTool(
                 id="run_texgen_skyrimse",
                 label="Run TexGen",
                 description="Install DynDOLOD tools, deploy mods, and run TexGenx64.exe.",
