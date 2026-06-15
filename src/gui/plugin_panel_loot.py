@@ -31,6 +31,7 @@ from gui.loot_plugin_rules_overlay import LootPluginRulesOverlay
 from Utils.plugins import PluginEntry, write_plugins, write_loadorder
 from LOOT.loot_sorter import (
     sort_plugins as loot_sort,
+    find_overlapping_plugins as loot_find_overlaps,
     is_available as loot_available,
     write_loot_info as loot_write_info,
     read_loot_info as loot_read_info,
@@ -326,6 +327,119 @@ class PluginPanelLOOTMixin:
         threading.Thread(target=_worker, daemon=True).start()
 
     # ------------------------------------------------------------------
+    # Record overlap (which plugins conflict at the FormID level)
+    # ------------------------------------------------------------------
+
+    def _show_overlapping_plugins(self, plugin_name: str):
+        """Find and highlight plugins whose records overlap with `plugin_name`.
+
+        Requires a full libloot plugin load (record bodies), so it runs on a
+        background thread with a notification; results are highlighted in the
+        load-order list.
+        """
+        if not loot_available():
+            self._log("LOOT library not available — cannot check overlap.")
+            return
+        if not self._plugins_path or not self._plugin_entries:
+            return
+
+        app = self.winfo_toplevel()
+        game_name = app._topbar._game_var.get()
+        game = _GAMES.get(game_name)
+        if not game or not game.is_configured():
+            self._log(f"Game '{game_name}' is not configured.")
+            return
+        if not game.loot_sort_enabled:
+            self._log(f"LOOT is not supported for '{game_name}'.")
+            return
+
+        # Snapshot everything the worker needs — no Tk access from the thread.
+        plugin_names = [e.name for e in self._plugin_entries]
+        game_path = game.get_game_path()
+        staging_root = game.get_effective_mod_staging_path()
+        game_type_attr = game.loot_game_type
+        game_data_dir = (game.get_vanilla_plugins_path()
+                         if hasattr(game, "get_vanilla_plugins_path") else None)
+
+        from gui.ctk_components import CTkNotification
+        _notif = CTkNotification(
+            self.winfo_toplevel(),
+            state="info",
+            message=f"Checking record overlap for {plugin_name}...",
+        )
+
+        def _close_notif():
+            try:
+                if _notif.winfo_exists():
+                    _notif.destroy()
+            except Exception:
+                pass
+
+        def _worker():
+            try:
+                overlaps = loot_find_overlaps(
+                    target_plugin=plugin_name,
+                    plugin_names=plugin_names,
+                    game_name=game_name,
+                    game_path=game_path,
+                    staging_root=staging_root,
+                    log_fn=lambda m: self._safe_after(0, lambda msg=m: self._log(msg)),
+                    game_type_attr=game_type_attr,
+                    game_data_dir=game_data_dir,
+                )
+            except Exception as e:
+                self._safe_after(0, _close_notif)
+                self._safe_after(0, lambda err=e: self._log(f"Overlap check failed: {err}"))
+                return
+            self._safe_after(0, _close_notif)
+            self._safe_after(0, lambda ov=overlaps: self._apply_overlap_result(plugin_name, ov))
+
+        self._log(f"Checking record overlap for {plugin_name} (running in background)...")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_overlap_result(self, plugin_name: str, overlaps: list[str]):
+        from gui.ctk_components import CTkNotification
+        if not overlaps:
+            self._log(f"{plugin_name}: no record overlap with other plugins.")
+            _n = CTkNotification(
+                self.winfo_toplevel(), state="info",
+                message=f"{plugin_name}: no record overlap",
+            )
+            self.after(4000, lambda n=_n: n.winfo_exists() and n.destroy())
+            return
+
+        # Highlight the target + overlapping plugins in the load-order list.
+        names_lower = {plugin_name.lower(), *(o.lower() for o in overlaps)}
+        sel = {
+            i for i, e in enumerate(self._plugin_entries)
+            if e.name.lower() in names_lower
+        }
+        if sel:
+            self._psel_set = sel
+            self._sel_idx = min(sel)
+            # Scroll the first highlighted plugin into view (a couple of rows
+            # above it for context). yview_moveto takes a fraction of the total
+            # scroll height, which is len(entries) rows tall.
+            n = len(self._plugin_entries)
+            if n > 0:
+                frac = max(0, self._sel_idx - 2) / n
+                try:
+                    self._pcanvas.yview_moveto(frac)
+                except Exception:
+                    pass
+            self._predraw()
+
+        self._log(
+            f"{plugin_name} overlaps with {len(overlaps)} plugin(s): "
+            + ", ".join(overlaps)
+        )
+        _n = CTkNotification(
+            self.winfo_toplevel(), state="warning",
+            message=f"{plugin_name} overlaps {len(overlaps)} plugin(s) — highlighted in list",
+        )
+        self.after(5000, lambda n=_n: n.winfo_exists() and n.destroy())
+
+    # ------------------------------------------------------------------
     # LOOT tooltip — formatting, content gating, and requirement helpers
     # ------------------------------------------------------------------
 
@@ -422,6 +536,22 @@ class PluginPanelLOOTMixin:
                 if detail:
                     lines.append(f"    {detail}")
             sections.append("Dirty edits:\n" + "\n".join(lines))
+
+        # Bash Tags — current header tags plus masterlist add/remove suggestions.
+        tags = info.get("tags") or {}
+        if tags:
+            lines = []
+            cur = tags.get("current") or []
+            add = tags.get("add") or []
+            rem = tags.get("remove") or []
+            if cur:
+                lines.append("  Current: " + ", ".join(cur))
+            if add:
+                lines.append("  Suggested (add): " + ", ".join(f"+{t}" for t in add))
+            if rem:
+                lines.append("  Suggested (remove): " + ", ".join(f"-{t}" for t in rem))
+            if lines:
+                sections.append("Bash Tags:\n" + "\n".join(lines))
 
         return "\n\n".join(sections)
 
@@ -635,6 +765,15 @@ class PluginPanelLOOTMixin:
         """
         info = self._loot_info.get(plugin_name.lower())
         return bool(info and info.get("dirty"))
+
+    def _has_bash_tags(self, plugin_name: str) -> bool:
+        """True if the plugin has any current or suggested Bash Tags.
+
+        Drives the tag flag icon, shown separately from the generic LOOT-info
+        flag so Bash-tagged plugins are visually distinct.
+        """
+        info = self._loot_info.get(plugin_name.lower())
+        return bool(info and info.get("tags"))
 
     def _load_loot_messages(self) -> None:
         """Populate self._loot_info from <profile>/loot.json (if present)."""

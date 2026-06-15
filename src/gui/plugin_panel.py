@@ -582,6 +582,13 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             _img5 = PilImage.open(_loot_dirty_path).convert("RGBA").resize((_flag_icon_sz, _flag_icon_sz), PilImage.LANCZOS)
             self._loot_dirty_icon = ImageTk.PhotoImage(_img5)
 
+        # Bash Tags icon — shown when a plugin has current/suggested Bash Tags
+        self._loot_tag_icon: ImageTk.PhotoImage | None = None
+        _loot_tag_path = _ICONS_DIR / "tag.png"
+        if _loot_tag_path.is_file():
+            _img6 = PilImage.open(_loot_tag_path).convert("RGBA").resize((_flag_icon_sz, _flag_icon_sz), PilImage.LANCZOS)
+            self._loot_tag_icon = ImageTk.PhotoImage(_img6)
+
         # Lock icon
         self._icon_lock: ImageTk.PhotoImage | None = None
         _lock_path = _ICONS_DIR / "lock.png"
@@ -645,6 +652,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._pool_esl_badge: list[int] = []
         self._pool_loot_info: list[int | None] = []
         self._pool_loot_dirty: list[int | None] = []
+        self._pool_loot_tag: list[int | None] = []
         self._pool_bos_sp_badge: list[int] = []
         # lowercase plugin name -> full info dict persisted to loot.json:
         # {messages, requirements, incompatibilities, locations, dirty, clean}
@@ -2254,6 +2262,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             ("filter_esl_unsafe",      "ESL-unsafe plugins"),
             ("filter_userlist",        "Plugins managed by userlist.yaml"),
             ("filter_dirty",           "Dirty plugins (need cleaning)"),
+            ("filter_bash_tags",       "Bash-tagged plugins"),
             ("filter_bos_sp",          "BOS/SP-patched plugins [B/S badge]"),
             ("filter_bos_only",        "BOS-patched plugins [B badge]"),
             ("filter_sp_only",         "SkyPatcher-patched plugins [S badge]"),
@@ -2435,6 +2444,12 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                                            anchor="center", state="hidden")
         self._pool_loot_dirty.append(loot_dirty_id)
 
+        loot_tag_id: int | None = None
+        if self._loot_tag_icon:
+            loot_tag_id = c.create_image(0, -200, image=self._loot_tag_icon,
+                                         anchor="center", state="hidden")
+        self._pool_loot_tag.append(loot_tag_id)
+
         bos_sp_badge = c.create_text(0, -200, text="", anchor="center",
                                      fill="#c084fc",
                                      font=(_theme.FONT_FAMILY, _theme.FS11, "bold"),
@@ -2540,6 +2555,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 (fs.get("filter_esl_unsafe"),      name_lower in esl_unsafe),
                 (fs.get("filter_userlist"),        name_lower in userlist),
                 (fs.get("filter_dirty"),           self._has_dirty_edits(entry.name)),
+                (fs.get("filter_bash_tags"),       self._has_bash_tags(entry.name)),
                 (fs.get("filter_bos_sp"),          name_lower in bos_sp),
             )
             if not all(_tri(s, m) for s, m in checks):
@@ -3467,6 +3483,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 is_locked = bool(self._plugin_locks.get(entry.name, False))
                 has_loot = self._has_loot_tooltip_content(entry.name)
                 has_dirty = self._has_dirty_edits(entry.name)
+                has_tags = self._has_bash_tags(entry.name)
                 bos_sp_kind = self._bos_sp_plugins.get(name_lower, "")
                 has_bos_sp = bool(bos_sp_kind)
 
@@ -3489,6 +3506,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                     is_locked,
                     has_loot,
                     has_dirty,
+                    has_tags,
                     bos_sp_kind,
                 )
                 if _pool_last_state[s] == state_key and self._pool_data_idx[s] == actual_idx:
@@ -3520,7 +3538,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 c.itemconfigure(self._pool_idx_text[s], text=f"{actual_idx:03d}",
                                 fill=TEXT_DIM, state="normal")
 
-                active_flags = [f for f in [has_missing, has_late, has_vmm, has_ul, has_esl, has_loot, has_dirty, has_bos_sp] if f]
+                active_flags = [f for f in [has_missing, has_late, has_vmm, has_ul, has_esl, has_loot, has_dirty, has_tags, has_bos_sp] if f]
                 n_flags = len(active_flags)
                 # Pack flags tightly with a fixed gap, centered in the column.
                 pack_start = flags_center - (flag_gap * (n_flags - 1)) // 2 if n_flags else flags_center
@@ -3586,6 +3604,14 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                     else:
                         c.itemconfigure(loot_dirty_id, state="hidden")
 
+                loot_tag_id = self._pool_loot_tag[s] if s < len(self._pool_loot_tag) else None
+                if loot_tag_id is not None:
+                    if has_tags:
+                        c.coords(loot_tag_id, next(_flag_pos), y_mid)
+                        c.itemconfigure(loot_tag_id, state="normal")
+                    else:
+                        c.itemconfigure(loot_tag_id, state="hidden")
+
                 bos_sp_badge_id = self._pool_bos_sp_badge[s] if s < len(self._pool_bos_sp_badge) else None
                 if bos_sp_badge_id is not None:
                     if bos_sp_kind:
@@ -3646,6 +3672,8 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                     c.itemconfigure(self._pool_loot_info[s], state="hidden")
                 if s < len(self._pool_loot_dirty) and self._pool_loot_dirty[s] is not None:
                     c.itemconfigure(self._pool_loot_dirty[s], state="hidden")
+                if s < len(self._pool_loot_tag) and self._pool_loot_tag[s] is not None:
+                    c.itemconfigure(self._pool_loot_tag[s], state="hidden")
                 if s < len(self._pool_bos_sp_badge):
                     c.itemconfigure(self._pool_bos_sp_badge[s], state="hidden")
                 c.itemconfigure(self._pool_check_rects[s], state="hidden")
@@ -4644,6 +4672,11 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             elif plugin_name.lower() in self._userlist_plugins:
                 items.append(("Show userlist rules...",
                                lambda n=plugin_name: self._open_plugin_cycle_overlay(n)))
+
+            # Record overlap — full libloot load, runs in the background.
+            if getattr(self._game, "loot_sort_enabled", False):
+                items.append(("Show overlapping plugins...",
+                               lambda n=plugin_name: self._show_overlapping_plugins(n)))
 
             # LOOT locations (mod page / author links from the masterlist)
             loot_locs = (self._loot_info.get(plugin_name.lower(), {}).get("locations") or [])

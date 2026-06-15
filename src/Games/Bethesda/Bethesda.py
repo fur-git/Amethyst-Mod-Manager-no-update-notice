@@ -333,7 +333,45 @@ class Fallout_3(BaseGame):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="FO3Edit", id_suffix="fo3",
+                nexus_url="https://www.nexusmods.com/fallout3/mods/637?tab=files",
+            ),
         ]
+
+    @staticmethod
+    def _xedit_wizard_tools(
+        build: str, id_suffix: str, nexus_url: str, qac: bool = True
+    ) -> list[WizardTool]:
+        """Build the 'Run <xEdit>' (+ optional QAC) wizard entries for a game.
+
+        All Bethesda games share one parametrised xEdit wizard
+        (``wizards.sseedit``); only the exe name + Nexus page differ, supplied
+        via ``extra``.  Plugins xEdit creates/cleans are rescued generically by
+        the game's ``restore()`` (``restore_data_core`` with overwrite/staging),
+        so no per-game restore code is needed.
+        """
+        exe = f"{build}.exe"
+        tools = [
+            WizardTool(
+                id=f"run_{build.lower()}_{id_suffix}",
+                label=f"Run {build}",
+                description=f"Install {build}, deploy mods, and run {exe}.",
+                dialog_class_path="wizards.sseedit.SSEEditWizard",
+                extra={"xedit_exe": exe, "nexus_url": nexus_url, "display_name": build},
+            ),
+        ]
+        if qac:
+            tools.append(
+                WizardTool(
+                    id=f"run_{build.lower()}_qac_{id_suffix}",
+                    label=f"Run {build} QAC",
+                    description=f"Deploy mods and run {build}QuickAutoClean.exe.",
+                    dialog_class_path="wizards.sseedit.SSEEditQACWizard",
+                    extra={"xedit_exe": exe, "nexus_url": nexus_url, "display_name": build},
+                )
+            )
+        return tools
 
     # -----------------------------------------------------------------------
     # Paths
@@ -1288,6 +1326,10 @@ class Fallout3_GOTY(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="FO3Edit", id_suffix="fo3goty",
+                nexus_url="https://www.nexusmods.com/fallout3/mods/637?tab=files",
+            ),
         ]
 
 
@@ -1336,6 +1378,10 @@ class Fallout_NV(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="FNVEdit", id_suffix="fonv",
+                nexus_url="https://www.nexusmods.com/newvegas/mods/34703?tab=files",
             ),
         ]
 
@@ -1451,6 +1497,10 @@ class Fallout_4(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="FO4Edit", id_suffix="fo4",
+                nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
+            ),
         ]
 
     @property
@@ -1548,6 +1598,10 @@ class Fallout_4VR(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="FO4VREdit", id_suffix="fo4vr", qac=False,
+                nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
             ),
         ]
 
@@ -1651,6 +1705,10 @@ class Oblivion(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="TES4Edit", id_suffix="oblivion",
+                nexus_url="https://www.nexusmods.com/oblivion/mods/11536?tab=files",
             ),
         ]
 
@@ -1757,6 +1815,10 @@ class Skyrim(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="TES5Edit", id_suffix="skyrim",
+                nexus_url="https://www.nexusmods.com/skyrim/mods/25859?tab=files",
             ),
             WizardTool(
                 id="run_skygen_skyrim",
@@ -1869,6 +1931,10 @@ class SkyrimVR(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="TES5VREdit", id_suffix="skyrimvr", qac=False,
+                nexus_url="https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files",
             ),
             WizardTool(
                 id="run_skygen_skyrimvr",
@@ -1989,6 +2055,10 @@ class Starfield(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="SF1Edit", id_suffix="starfield",
+                nexus_url="https://www.nexusmods.com/starfield/mods/121?tab=files",
             ),
         ]
 
@@ -2226,6 +2296,10 @@ class Enderal(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="TES5Edit", id_suffix="enderal",
+                nexus_url="https://www.nexusmods.com/skyrim/mods/25859?tab=files",
+            ),
         ]
 
 class EnderalSE(Fallout_3):
@@ -2310,6 +2384,10 @@ class EnderalSE(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="SSEEdit", id_suffix="enderalse",
+                nexus_url="https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files",
             ),
         ]
 
