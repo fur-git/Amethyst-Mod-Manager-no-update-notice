@@ -1362,6 +1362,13 @@ def _write_deploy_snapshot(
     `\\tmtime_ns\\tsize` columns; _load_deploy_snapshot ignores anything past
     the first tab, so the trailing columns were dead cost (one extra stat
     per file) and have been dropped.  Old snapshots remain readable.
+
+    Symlinks are recorded too (not just regular files): a deploy places mod
+    files as symlinks, and on restore those paths are handed back to a vanilla
+    file (e.g. a custom-rules-routed vanilla restored from custom_rules_backup/).
+    If the deployed symlink path were omitted here, _move_runtime_files would
+    see the restored vanilla as a brand-new file and wrongly sweep it into
+    overwrite/.  Recording symlinks keeps every deploy-time path "known".
     """
     _log = _safe_log(log_fn)
     count = 0
@@ -1378,7 +1385,8 @@ def _write_deploy_snapshot(
                         for entry in it:
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
-                            elif entry.is_file(follow_symlinks=False):
+                            elif (entry.is_file(follow_symlinks=False)
+                                  or entry.is_symlink()):
                                 fh.write(entry.path[prefix_len:])
                                 fh.write("\n")
                                 count += 1
