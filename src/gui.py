@@ -2209,6 +2209,26 @@ class App(ctk.CTk):
     def hide_cache_manager_panel(self):
         self._hide_plugin_overlay("_cache_manager_panel")
 
+    def show_prefix_manager_panel(self):
+        self._ensure_plugin_panel_visible()
+        from gui.prefix_manager_overlay import PrefixManagerOverlay
+        active_game = ""
+        try:
+            active_game = self._topbar._game_var.get() or ""
+        except Exception:
+            active_game = ""
+        self._show_plugin_overlay(
+            "_prefix_manager_panel",
+            lambda: PrefixManagerOverlay(
+                self._plugin_panel_container,
+                on_close=lambda: self._hide_plugin_overlay("_prefix_manager_panel"),
+                active_game_name=active_game,
+            ),
+        )
+
+    def hide_prefix_manager_panel(self):
+        self._hide_plugin_overlay("_prefix_manager_panel")
+
     def _sync_custom_handlers(self):
         """Background-download every custom handler from GitHub, overwriting stale copies."""
         import json as _json
