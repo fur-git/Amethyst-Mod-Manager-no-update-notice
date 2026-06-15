@@ -12,6 +12,7 @@ PLUGIN_INFO = {
     "game_ids":     ["skyrim_se"],
     "all_games":    False,
     "dialog_class": "SkyrimSEOpenDocsDialog",
+    "category":     "Load Order & Config",
 }
 
 _RELATIVE_PATH = "drive_c/users/steamuser/My Documents/My Games/Skyrim Special Edition"

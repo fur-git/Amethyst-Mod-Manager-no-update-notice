@@ -35,6 +35,7 @@ PLUGIN_INFO = {
     "game_ids":     ["My_Summer_Car"],
     "all_games":    False,
     "dialog_class": "MSCLoaderWizard",
+    "category":     "Setup & Installers",
 }
 
 _NEXUS_URL       = "https://www.nexusmods.com/mysummercar/mods/147"

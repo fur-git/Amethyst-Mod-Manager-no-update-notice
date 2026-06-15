@@ -13,6 +13,10 @@ the standard wizard dialog signature::
         "game_ids":     ["skyrim_se"],      # list of supported game_ids
         "all_games":    False,              # True = show for every game
         "dialog_class": "MyToolDialog",     # class name in this file
+        "category":     "Patchers & Cleanup",  # optional: picker group header.
+                                                # Omit to auto-infer; a new name
+                                                # not in CATEGORY_ORDER is shown
+                                                # automatically, before "Other".
     }
 
     class MyToolDialog(ctk.CTkFrame):
@@ -149,6 +153,7 @@ def get_plugin_tools_for_game(game_id: str) -> list[WizardTool]:
                 label=plugin["label"],
                 description=plugin.get("description", ""),
                 dialog_class_path="",
+                category=plugin.get("category", ""),
                 extra={"_dialog_class": plugin["_resolved_class"]},
             ))
     return tools

@@ -55,6 +55,7 @@ PLUGIN_INFO = {
     ],
     "all_games":    False,
     "dialog_class": "RegisterGamePathDialog",
+    "category":     "Setup & Installers",
 }
 
 

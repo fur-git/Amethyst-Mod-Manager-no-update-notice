@@ -70,6 +70,7 @@ PLUGIN_INFO = {
     ],
     "all_games":    False,
     "dialog_class": "SynthesisWizard",
+    "category":     "Patchers & Cleanup",
 }
 
 

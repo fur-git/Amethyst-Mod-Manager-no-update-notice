@@ -64,6 +64,7 @@ class WizardTool:
     description: str = ""
     dialog_class_path: str = ""
     extra: dict = field(default_factory=dict)
+    category: str = ""  # optional grouping header in the wizard picker; inferred if empty
 
 
 class BaseGame(ABC):

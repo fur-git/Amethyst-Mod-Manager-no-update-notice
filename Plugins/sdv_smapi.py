@@ -40,6 +40,7 @@ PLUGIN_INFO = {
     "game_ids":     ["Stardew_Valley"],
     "all_games":    False,
     "dialog_class": "SmapiWizard",
+    "category":     "Setup & Installers",
 }
 
 _GITHUB_API_URL = "https://api.github.com/repos/Pathoschild/SMAPI/releases/latest"
