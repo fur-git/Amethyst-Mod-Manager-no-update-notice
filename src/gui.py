@@ -305,7 +305,7 @@ class App(ctk.CTk):
         # Process --nxm argument if the app was launched via protocol handler
         self._handle_nxm_argv()
         # Check for app update after a short delay (non-blocking)
-        self.after(2000, self._check_for_app_update)
+        # (forked: startup app-update auto-check disabled)
         # Wipe the GitHub cache when the app version changes so users on a
         # fresh build pick up updated handlers/plugins immediately instead of
         # waiting for the 1h throttle window to elapse.
