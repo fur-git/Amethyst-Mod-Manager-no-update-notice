@@ -141,8 +141,9 @@ class _FileChooserOverlay(tk.Frame):
 
         canvas = tk.Canvas(list_outer, bg=BORDER, bd=0, highlightthickness=0)
         canvas.grid(row=0, column=0, sticky="nsew")
-        vbar = tk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
-        vbar.grid(row=0, column=1, sticky="ns")
+        vbar = ctk.CTkScrollbar(list_outer, orientation="vertical", command=canvas.yview,
+                                width=14)
+        vbar.grid(row=0, column=1, sticky="ns", padx=(2, 0))
         canvas.configure(yscrollcommand=vbar.set)
 
         list_frame = tk.Frame(canvas, bg=BORDER)
@@ -222,20 +223,16 @@ class _FileChooserOverlay(tk.Frame):
             command=lambda: self._dismiss(None),
         ).pack(pady=(0, pad))
 
-        # Place + size the card. Compute desired height from header+rows+footer
-        # and clamp to the parent's available height so header and footer
-        # always remain visible — the list canvas absorbs the overflow.
-        row_h = scaled(34)
+        # Place + size the card. Fill the full available height of the parent
+        # (the modlist panel) so the card is as tall as it can be; the list
+        # canvas absorbs the extra space below the rows. Header and footer stay
+        # fixed via the grid weights, so they always remain visible.
         try:
             parent.update_idletasks()
             parent_h = parent.winfo_height() or scaled(600)
         except Exception:
             parent_h = scaled(600)
-        max_card_h = max(scaled(240), parent_h - margin)
-        # Estimate fixed chrome (header ~70px, footer ~60px, paddings).
-        chrome_h = scaled(70) + scaled(60) + pad * 2
-        desired_h = chrome_h + len(files) * row_h + scaled(8)
-        card_h = min(desired_h, max_card_h)
+        card_h = max(scaled(240), parent_h - margin)
         card.place(relx=0.5, rely=0.5, anchor="center",
                    width=card_w, height=card_h)
 
