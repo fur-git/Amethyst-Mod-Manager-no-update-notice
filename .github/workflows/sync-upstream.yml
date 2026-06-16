@@ -1,0 +1,56 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+# Scheduled workflows only run on the repo default branch (main).
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Scheduled workflows run on the repository default branch, so we
+          # keep whatever branch GitHub checked out.
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git fetch https://github.com/ChrisDKN/Amethyst-Mod-Manager.git upstream-main
+          if git merge-base --is-ancestor upstream-main HEAD; then
+            echo "Already up to date with upstream."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge upstream-main --no-edit -m "Merge upstream ChrisDKN/Amethyst-Mod-Manager"
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reapply no-update-notice patch
+        run: python3 scripts/apply_no_update_notice.py
+
+      - name: Commit fork patch if needed
+        id: patch
+        run: |
+          if git diff --quiet; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add src/gui.py
+          git commit -m "Reapply no-update-notice: disable startup app-update check"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push to main
+        if: steps.merge.outputs.merged == 'true' || steps.patch.outputs.committed == 'true'
+        run: git push origin "HEAD:${{ github.ref_name }}"
