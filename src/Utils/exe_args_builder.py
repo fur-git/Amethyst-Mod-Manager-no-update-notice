@@ -186,6 +186,34 @@ EXE_FILTER_DEFAULTS: frozenset[str] = frozenset({
     "mwse-launcher.exe",        # Morrowind MWSE
     
     "synthesis.exe", # Only works via the wizard menu
+
+    # ReSaver (Fallout 4 / Skyrim save editor) — only ReSavor.bat should be
+    # launched.  The folder also ships an older ReSaver.bat/.exe and a raw
+    # ReSavor.exe, none of which should appear in the dropdown.
+    "resaver.bat",
+    "resaver.exe",
+    "resavor.exe",
+
+    # Bundled JRE binaries (ReSaver and other Java tools ship a private jre/) —
+    # never launched directly by the user.
+    "jabswitch.exe",
+    "java.exe",
+    "java-rmi.exe",
+    "javaw.exe",
+    "jfr.exe",
+    "jjs.exe",
+    "keytool.exe",
+    "kinit.exe",
+    "klist.exe",
+    "ktab.exe",
+    "orbd.exe",
+    "pack200.exe",
+    "policytool.exe",
+    "rmid.exe",
+    "rmiregistry.exe",
+    "servertool.exe",
+    "tnameserv.exe",
+    "unpack200.exe",
 })
 
 # ---------------------------------------------------------------------------
