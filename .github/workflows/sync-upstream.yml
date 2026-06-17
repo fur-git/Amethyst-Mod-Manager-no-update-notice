@@ -17,8 +17,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Scheduled workflows run on the repository default branch, so we
-          # keep whatever branch GitHub checked out.
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -28,7 +28,7 @@ jobs:
       - name: Merge upstream main
         id: merge
         run: |
-          git fetch https://github.com/ChrisDKN/Amethyst-Mod-Manager.git upstream-main
+          git fetch https://github.com/ChrisDKN/Amethyst-Mod-Manager.git main:upstream-main
           if git merge-base --is-ancestor upstream-main HEAD; then
             echo "Already up to date with upstream."
             echo "merged=false" >> "$GITHUB_OUTPUT"
