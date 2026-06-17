@@ -650,19 +650,31 @@ class ReconfigureGamePanel(ctk.CTkFrame):
 
     def _prefix_scan_worker(self):
         steam_id = self._game.steam_id
+        # Localized/alternate editions (e.g. FNV's 22490) live under their own
+        # compatdata/<app_id> folder, so try every known App ID for this game.
+        alt_ids = [str(s) for s in getattr(self._game, "alt_steam_ids", []) if s]
         game_name = getattr(self._game, "name", repr(self._game))
-        app_log(f"[Add Game] Scanning for Proton prefix (app ID: {steam_id})")
-        found = find_prefix(steam_id)
+        app_log(
+            f"[Add Game] Scanning for Proton prefix (app IDs: "
+            f"{', '.join([steam_id, *alt_ids])})"
+        )
+        found = None
+        for sid in [steam_id, *alt_ids]:
+            found = find_prefix(sid)
+            if found:
+                break
         if found:
             app_log(f"[Add Game] Proton prefix found: {found}")
         else:
             from Utils.steam_finder import _STEAM_CANDIDATES
             checked = [
-                str(root / "steamapps" / "compatdata" / steam_id / "pfx")
+                str(root / "steamapps" / "compatdata" / sid / "pfx")
                 for root in _STEAM_CANDIDATES
+                for sid in [steam_id, *alt_ids]
             ]
             app_log(
-                f"[Add Game] Proton prefix not found for {game_name} (app ID: {steam_id}). "
+                f"[Add Game] Proton prefix not found for {game_name} "
+                f"(app IDs: {', '.join([steam_id, *alt_ids])}). "
                 f"Checked: {checked}"
             )
         try:

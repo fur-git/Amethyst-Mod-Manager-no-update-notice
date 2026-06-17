@@ -1362,6 +1362,13 @@ def _write_deploy_snapshot(
     `\\tmtime_ns\\tsize` columns; _load_deploy_snapshot ignores anything past
     the first tab, so the trailing columns were dead cost (one extra stat
     per file) and have been dropped.  Old snapshots remain readable.
+
+    Symlinks are recorded too (not just regular files): a deploy places mod
+    files as symlinks, and on restore those paths are handed back to a vanilla
+    file (e.g. a custom-rules-routed vanilla restored from custom_rules_backup/).
+    If the deployed symlink path were omitted here, _move_runtime_files would
+    see the restored vanilla as a brand-new file and wrongly sweep it into
+    overwrite/.  Recording symlinks keeps every deploy-time path "known".
     """
     _log = _safe_log(log_fn)
     count = 0
@@ -1378,7 +1385,8 @@ def _write_deploy_snapshot(
                         for entry in it:
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
-                            elif entry.is_file(follow_symlinks=False):
+                            elif (entry.is_file(follow_symlinks=False)
+                                  or entry.is_symlink()):
                                 fh.write(entry.path[prefix_len:])
                                 fh.write("\n")
                                 count += 1
@@ -1426,6 +1434,11 @@ def _move_runtime_files(
     Vanilla files (present in snapshot) are left untouched.
     Symlinks are skipped entirely.
 
+    Safety net: if the on-disk game root barely overlaps the snapshot (the
+    deploy path or sub-folder setting was changed while deployed, so restore
+    is walking a different directory than the snapshot describes), the move is
+    skipped entirely rather than wiping the whole folder into overwrite/.
+
     Returns the number of files moved.
     """
     _log = _safe_log(log_fn)
@@ -1437,9 +1450,17 @@ def _move_runtime_files(
     game_root_str = str(game_root)
     prefix_len = len(game_root_str) + 1
     overwrite_str = str(overwrite_dir)
-    made_dirs: set[str] = set()
-    emptied_dirs: set[Path] = set()
-    moved = 0
+
+    # Safety net: a deploy snapshot is taken of the game root resolved at deploy
+    # time.  If the game-path or sub-folder setting was changed while deployed,
+    # restore walks a *different* directory than the snapshot describes, so
+    # almost nothing matches `known` and every vanilla file would be wrongly
+    # classed as runtime-generated and moved to overwrite/ (wiping the game
+    # folder).  Compare the on-disk files against the snapshot first: if the
+    # overlap is implausibly low for a non-empty game root, the snapshot does
+    # not describe this directory — bail out rather than destroy the install.
+    candidate_rels: list[str] = []
+    matched_known = 0
     stack = [game_root_str]
     while stack:
         cur = stack.pop()
@@ -1451,20 +1472,51 @@ def _move_runtime_files(
                     elif entry.is_file(follow_symlinks=False):
                         rel = entry.path[prefix_len:]
                         if rel.lower() in known:
-                            continue
-                        dst = overwrite_str + "/" + rel
-                        if os.path.exists(dst):
-                            _log(f"  WARN: overwrite/{rel} already exists — skipping.")
-                            continue
-                        dst_dir = os.path.dirname(dst)
-                        if dst_dir not in made_dirs:
-                            os.makedirs(dst_dir, exist_ok=True)
-                            made_dirs.add(dst_dir)
-                        _move_crash_safe(entry.path, dst)
-                        emptied_dirs.add(Path(entry.path).parent)
-                        moved += 1
+                            matched_known += 1
+                        else:
+                            candidate_rels.append(rel)
         except OSError:
             pass
+
+    total_files = matched_known + len(candidate_rels)
+    # Require at least a 10% overlap with the snapshot before trusting it.  A
+    # genuine restore leaves nearly every vanilla file matching the snapshot
+    # (only a handful of runtime files differ), so real overlap is ~100%; a
+    # mismatched directory sits near 0%.  The 10% floor and the 20-file minimum
+    # avoid false alarms on tiny game roots while still catching the wholesale
+    # mismatch that the path-change bug produces.
+    _MIN_FILES_FOR_CHECK = 20
+    _MIN_OVERLAP = 0.10
+    if (total_files >= _MIN_FILES_FOR_CHECK
+            and matched_known / total_files < _MIN_OVERLAP):
+        _log(
+            "  WARN: deploy snapshot does not match the current game folder "
+            f"({matched_known}/{total_files} files known) — the game path or "
+            "sub-folder setting may have changed since deploy. Skipping "
+            "runtime-file move to avoid wiping the game folder into overwrite/. "
+            "Restore from a matching configuration if mod files remain."
+        )
+        return 0
+
+    made_dirs: set[str] = set()
+    emptied_dirs: set[Path] = set()
+    moved = 0
+    for rel in candidate_rels:
+        src_path = game_root_str + "/" + rel
+        dst = overwrite_str + "/" + rel
+        if os.path.exists(dst):
+            _log(f"  WARN: overwrite/{rel} already exists — skipping.")
+            continue
+        dst_dir = os.path.dirname(dst)
+        if dst_dir not in made_dirs:
+            os.makedirs(dst_dir, exist_ok=True)
+            made_dirs.add(dst_dir)
+        try:
+            _move_crash_safe(src_path, dst)
+        except OSError:
+            continue
+        emptied_dirs.add(Path(src_path).parent)
+        moved += 1
 
     # Prune any directories left empty after moving runtime files out
     if emptied_dirs:

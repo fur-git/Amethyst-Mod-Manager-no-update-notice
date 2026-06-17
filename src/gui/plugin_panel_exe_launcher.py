@@ -281,18 +281,29 @@ class PluginPanelExeLauncherMixin:
             labels = ["(no executables)", self._ADD_CUSTOM_SENTINEL]
         self._exe_menu.configure(values=labels)
         if exes:
-            self._exe_var.set(labels[0])
-            self._on_exe_selected(labels[0])
+            # Restore the last-used selection for this profile if it's still present;
+            # otherwise fall back to the first entry (the game/Play exe).
+            saved = self._load_selected_exe()
+            chosen = saved if saved in entry_labels else labels[0]
+            self._exe_var.set(chosen)
+            self._on_exe_selected(chosen, persist=False)
         else:
             self._exe_var.set("(no executables)")
         if select_after is not None:
             select_after(exes)
 
-    def _on_exe_selected(self, name: str):
-        """Called when the user selects an exe from the dropdown. Loads saved args if present."""
+    def _on_exe_selected(self, name: str, persist: bool = True):
+        """Called when the user selects an exe from the dropdown. Loads saved args if present.
+
+        *persist* is True for genuine user selections (from the dropdown command) and
+        False when restoring a saved selection during a list refresh, so the restore
+        doesn't trigger a redundant write.
+        """
         if name == self._ADD_CUSTOM_SENTINEL:
             self._add_custom_exe()
             return
+        if persist:
+            self._save_selected_exe(name)
         idx = self._exe_var_index()
         if idx < 0 or not self._exe_paths:
             self._exe_args_var.set("")
@@ -322,6 +333,22 @@ class PluginPanelExeLauncherMixin:
                 fg_color=ACCENT,
                 hover_color=ACCENT_HOV,
             )
+
+    def _load_selected_exe(self) -> "str | None":
+        """Return the exe dropdown label last selected for the active profile, or None."""
+        profile_dir = getattr(self, "_mod_files_profile_dir", None)
+        if profile_dir is None:
+            return None
+        from Utils.profile_state import read_selected_exe
+        return read_selected_exe(profile_dir)
+
+    def _save_selected_exe(self, label: str) -> None:
+        """Persist the exe dropdown selection to the active profile's profile_state.json."""
+        profile_dir = getattr(self, "_mod_files_profile_dir", None)
+        if profile_dir is None:
+            return
+        from Utils.profile_state import write_selected_exe
+        write_selected_exe(profile_dir, label)
 
     def _get_launch_mode_path(self) -> "Path | None":
         """Return path to ~/.config/AmethystModManager/games/<game>/exe_launch_mode.json."""
@@ -851,7 +878,7 @@ class PluginPanelExeLauncherMixin:
 
         if self._is_game_exe(exe_path):
             mode = self._load_launch_mode(exe_path.name)  # 'auto'|'steam'|'heroic'|'none'
-            steam_id = getattr(game, "steam_id", "")
+            steam_id = self._effective_steam_id(game)
             heroic_app_names = self._get_heroic_app_names_for_launch(game)
 
             if mode == "steam":
@@ -938,7 +965,7 @@ class PluginPanelExeLauncherMixin:
 
             compat_data = _resolve_compat_data(prefix_path)
 
-            steam_id = getattr(game, "steam_id", "")
+            steam_id = self._effective_steam_id(game)
             proton_script = find_proton_for_game(steam_id) if steam_id else None
             if proton_script is None:
                 # Read the runner name from the prefix's config_info so we use the
@@ -973,7 +1000,7 @@ class PluginPanelExeLauncherMixin:
         if game_path and not proton_override_name:
             env["STEAM_COMPAT_INSTALL_PATH"] = str(game_path)
         if not proton_override_name:
-            steam_id = getattr(game, "steam_id", "")
+            steam_id = self._effective_steam_id(game)
             if steam_id:
                 env.setdefault("SteamAppId", steam_id)
                 env.setdefault("SteamGameId", steam_id)
@@ -1111,6 +1138,15 @@ class PluginPanelExeLauncherMixin:
                 self._safe_after(0, lambda err=e: self._log(f"Run EXE error: {err}"))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _effective_steam_id(self, game) -> str:
+        """Return the App ID actually installed for *game*.
+
+        Resolves localized/alternate editions (e.g. FNV's 22490) via the game's
+        ``effective_steam_id()``, falling back to the plain ``steam_id``.
+        """
+        from Utils.steam_finder import game_steam_id
+        return game_steam_id(game)
 
     def _game_is_steam_install(self, game) -> bool:
         """Return True if the game folder lives inside a Steam library (steamapps/common)."""

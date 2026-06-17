@@ -12,7 +12,7 @@ from pathlib import Path
 
 from Games.Bethesda.Bethesda import Fallout_3
 from Games.base_game import WizardTool
-from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, cleanup_custom_deploy_dirs, restore_custom_rules, restore_data_core, move_to_core
+from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, restore_data_core, move_to_core
 from Utils.modlist import read_modlist
 
 
@@ -243,6 +243,12 @@ class SkyrimSE(Fallout_3):
                 dialog_class_path="wizards.sseedit.SSEEditQACWizard",
             ),
             WizardTool(
+                id="run_eslifier_skyrimse",
+                label="Run ESLifier",
+                description="Install ESLifier and flag/compact plugins into the light (ESL) space.",
+                dialog_class_path="wizards.eslifier.ESLifierWizard",
+            ),
+            WizardTool(
                 id="run_texgen_skyrimse",
                 label="Run TexGen",
                 description="Install DynDOLOD tools, deploy mods, and run TexGenx64.exe.",
@@ -401,6 +407,15 @@ class SkyrimSE(Fallout_3):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
+        # Separator overrides — loaded from the real profile_dir (modlist.txt /
+        # profile_state.json live there, not necessarily next to the filemap) and
+        # passed explicitly so shared-staging layouts get the right link modes.
+        _sep_deploy = load_separator_deploy_paths(profile_dir)
+        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
+        per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
+        per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
+        per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
+
         custom_rules = self.custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
@@ -411,20 +426,20 @@ class SkyrimSE(Fallout_3):
                 mode=mode,
                 strip_prefixes=self.mod_folder_strip_prefixes,
                 per_mod_strip_prefixes=per_mod_strip,
+                per_mod_link_modes=per_mod_modes,
                 log_fn=_log,
                 progress_fn=progress_fn,
                 prefix_root=self.get_prefix_path(),
+                raw_mods=per_mod_raw,
             )
 
         _log(f"Step 2: Transferring mod files into Data/ ({mode.name}) ...")
-        _sep_deploy = load_separator_deploy_paths(profile_dir)
-        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
-        per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
         linked_mod, placed = deploy_filemap(filemap, data_dir, staging,
                                             mode=mode,
                                             strip_prefixes=self.mod_folder_strip_prefixes,
                                             per_mod_strip_prefixes=per_mod_strip,
                                             per_mod_deploy_dirs=per_mod_deploy,
+                                            per_mod_link_modes=per_mod_modes,
                                             log_fn=_log,
                                             progress_fn=progress_fn,
                                             exclude=custom_exclude or None,
@@ -432,7 +447,8 @@ class SkyrimSE(Fallout_3):
         _log(f"  Transferred {linked_mod} mod file(s).")
 
         _log("Step 3: Filling gaps with vanilla files from Data_Core/ ...")
-        linked_core = deploy_core(data_dir, placed, mode=mode, log_fn=_log)
+        linked_core = deploy_core(data_dir, placed, mode=mode, log_fn=_log,
+                                  manifest_dir=filemap.parent)
         _log(f"  Transferred {linked_core} vanilla file(s).")
 
         _log("Step 4: Symlinking plugins.txt into Proton prefix ...")

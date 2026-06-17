@@ -575,6 +575,20 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             _img4 = PilImage.open(_loot_info_path).convert("RGBA").resize((_flag_icon_sz, _flag_icon_sz), PilImage.LANCZOS)
             self._loot_info_icon = ImageTk.PhotoImage(_img4)
 
+        # Dirty-edits icon — shown when a plugin has CRC-matched dirty info
+        self._loot_dirty_icon: ImageTk.PhotoImage | None = None
+        _loot_dirty_path = _ICONS_DIR / "brush.png"
+        if _loot_dirty_path.is_file():
+            _img5 = PilImage.open(_loot_dirty_path).convert("RGBA").resize((_flag_icon_sz, _flag_icon_sz), PilImage.LANCZOS)
+            self._loot_dirty_icon = ImageTk.PhotoImage(_img5)
+
+        # Bash Tags icon — shown when a plugin has current/suggested Bash Tags
+        self._loot_tag_icon: ImageTk.PhotoImage | None = None
+        _loot_tag_path = _ICONS_DIR / "tag.png"
+        if _loot_tag_path.is_file():
+            _img6 = PilImage.open(_loot_tag_path).convert("RGBA").resize((_flag_icon_sz, _flag_icon_sz), PilImage.LANCZOS)
+            self._loot_tag_icon = ImageTk.PhotoImage(_img6)
+
         # Lock icon
         self._icon_lock: ImageTk.PhotoImage | None = None
         _lock_path = _ICONS_DIR / "lock.png"
@@ -637,9 +651,11 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._pool_ul_dot: list[int] = []
         self._pool_esl_badge: list[int] = []
         self._pool_loot_info: list[int | None] = []
+        self._pool_loot_dirty: list[int | None] = []
+        self._pool_loot_tag: list[int | None] = []
         self._pool_bos_sp_badge: list[int] = []
         # lowercase plugin name -> full info dict persisted to loot.json:
-        # {messages, dirty, requirements, incompatibilities, locations}
+        # {messages, requirements, incompatibilities, locations, dirty, clean}
         self._loot_info: dict[str, dict] = {}
         self._esl_flagged_plugins: set[str] = set()  # lowercase plugin names with ESL flag set
         self._master_flag_plugins: set[str] = set()  # lowercase .esp names with the master header bit
@@ -704,7 +720,6 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._arc_search_var: tk.StringVar | None = None
 
         # "Show only conflicts" filter state (per-tab)
-        self._mf_only_conflicts_var: tk.BooleanVar | None = None
         self._data_only_conflicts_var: tk.BooleanVar | None = None
         self._arc_only_conflicts_var: tk.BooleanVar | None = None
 
@@ -784,6 +799,16 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
 
         for name in ("Plugins", "Mod Files", "Ini Files", "Data", "Downloads"):
             self._tabs.add(name)
+
+        # The "Ini Files" tab shows far more than .ini files (json, txt, cfg,
+        # yaml, xml, …), so present it as "Text Files" cosmetically while keeping
+        # "Ini Files" as the internal tab key used everywhere else.
+        try:
+            self._tabs._segmented_button._buttons_dict["Ini Files"].configure(
+                text="Text Files"
+            )
+        except (KeyError, AttributeError):
+            pass
 
         # Lazy-refresh flags: these tabs are expensive to rebuild on every
         # filemap change, so they are only rebuilt when their tab is selected.
@@ -951,6 +976,48 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         except Exception:
             return False
 
+    def _find_pack_trigger_plugin(self, mod_dir: Path, mod_name: str) -> Path | None:
+        """Return the real plugin in ``mod_dir`` (root) that an archive
+        packed for this mod should be named after, or None if the mod
+        ships no real plugin.
+
+        An archive only auto-loads when a same-stem plugin sits in the
+        load order.  Naming the archive after an existing plugin avoids
+        generating a redundant stub.  When the mod has several plugins
+        we prefer the one whose stem matches the mod folder, then fall
+        back to the first sorted by name (an archive can only be
+        triggered by ONE plugin name, so we must pick deterministically).
+
+        Stubs we generated ourselves are ignored — they aren't a real
+        plugin, and treating them as the trigger would defeat the point
+        of regenerating them.  Only the mod-folder root is scanned, to
+        match where the archive is written (the trigger plugin and the
+        archive must land in the same Data folder after deploy).
+        """
+        from Utils.bsa_writer import is_our_stub_plugin
+
+        exts = {e.lower() for e in (self._plugin_extensions or [".esp", ".esm", ".esl"])}
+        plugins: list[Path] = []
+        try:
+            for p in mod_dir.iterdir():
+                if not p.is_file() or p.suffix.lower() not in exts:
+                    continue
+                if is_our_stub_plugin(p):
+                    continue
+                plugins.append(p)
+        except OSError:
+            return None
+        if not plugins:
+            return None
+        # Prefer a plugin whose stem matches the mod folder name (case-
+        # insensitive); otherwise the first by name for determinism.
+        mod_lower = mod_name.lower()
+        plugins.sort(key=lambda p: p.name.lower())
+        for p in plugins:
+            if p.stem.lower() == mod_lower:
+                return p
+        return plugins[0]
+
     def _on_pack_bsa_click(self) -> None:
         """Pack the currently-selected mod's loose files into a BSA in that
         mod's folder. Runs on a background thread with a progress popup."""
@@ -1003,6 +1070,16 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             return
 
         archive_suffix = "." + kind
+
+        # The archive only auto-loads when a same-stem plugin sits in the
+        # load order.  If the mod already ships a real plugin we name the
+        # archive after *that* plugin's stem (not the mod folder) so the
+        # game mounts it without us having to stamp out a redundant stub.
+        # `archive_stem` falls back to the mod-folder name when the mod
+        # has no real plugin — in that case a stub is generated below.
+        existing_plugin = self._find_pack_trigger_plugin(mod_dir, mod_name)
+        archive_stem = existing_plugin.stem if existing_plugin is not None else mod_name
+
         # FO4 / FO4 VR's auto-loader only mounts a BA2 when its filename
         # follows the "<plugin_stem> - Main.ba2" / " - Textures.ba2"
         # convention.  Vanilla and every community mod ships with that
@@ -1023,12 +1100,12 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         # sibling there is OPTIONAL: a checkbox in _PackOptionsDialog
         # below decides.
         if kind == "ba2":
-            archive_path = mod_dir / f"{mod_name} - Main.ba2"
+            archive_path = mod_dir / f"{archive_stem} - Main.ba2"
             # archive_textures_path is set unconditionally for BA2; the
             # writer drops it if the mod has no DDS files.
-            archive_textures_path: Path | None = mod_dir / f"{mod_name} - Textures.ba2"
+            archive_textures_path: Path | None = mod_dir / f"{archive_stem} - Textures.ba2"
         else:
-            archive_path = mod_dir / f"{mod_name}{archive_suffix}"
+            archive_path = mod_dir / f"{archive_stem}{archive_suffix}"
             archive_textures_path = None  # may be set after the dialog
         # Show the options dialog: confirms the pack, surfaces the
         # overwrite warning if applicable, and lets the user opt into
@@ -1059,25 +1136,17 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         # For BSA, only allocate the textures sibling path if the user
         # ticked the "Separate textures archive" checkbox.
         if kind == "bsa" and split_textures:
-            archive_textures_path = mod_dir / f"{mod_name} - Textures.bsa"
+            archive_textures_path = mod_dir / f"{archive_stem} - Textures.bsa"
 
         # An archive only auto-loads if a same-named plugin sits in the
-        # load order.  If the mod already ships a real same-stem plugin
-        # (.esp/.esm/.esl) we leave it alone; otherwise we stamp out a
-        # minimal stub.  A previously-generated stub is replaced — its
-        # only purpose is to be the trigger file, and the format may
-        # have evolved between packs.
-        from Utils.bsa_writer import is_our_stub_plugin
-        existing_plugin = next(
-            (
-                mod_dir / f"{mod_name}{ext}"
-                for ext in (".esp", ".esm", ".esl")
-                if (mod_dir / f"{mod_name}{ext}").exists()
-            ),
-            None,
-        )
+        # load order.  `existing_plugin` (resolved above, used to pick
+        # `archive_stem`) is the mod's real trigger plugin when one
+        # exists — we leave it alone.  It already excludes stubs we've
+        # generated, so `None` covers both "no plugin at all" and "only
+        # a previous stub": either way we (re)stamp a minimal stub named
+        # after the mod folder (its format may have evolved between packs).
         stub_plugin_path: Path | None = None
-        if existing_plugin is None or is_our_stub_plugin(existing_plugin):
+        if existing_plugin is None:
             stub_plugin_path = mod_dir / f"{mod_name}.esp"
 
         # Files the user has disabled in the Mod Files tab — skip them
@@ -2245,6 +2314,8 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             ("filter_esl_safe",        "ESL-safe plugins"),
             ("filter_esl_unsafe",      "ESL-unsafe plugins"),
             ("filter_userlist",        "Plugins managed by userlist.yaml"),
+            ("filter_dirty",           "Dirty plugins (need cleaning)"),
+            ("filter_bash_tags",       "Bash-tagged plugins"),
             ("filter_bos_sp",          "BOS/SP-patched plugins [B/S badge]"),
             ("filter_bos_only",        "BOS-patched plugins [B badge]"),
             ("filter_sp_only",         "SkyPatcher-patched plugins [S badge]"),
@@ -2420,6 +2491,18 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                                           anchor="center", state="hidden")
         self._pool_loot_info.append(loot_info_id)
 
+        loot_dirty_id: int | None = None
+        if self._loot_dirty_icon:
+            loot_dirty_id = c.create_image(0, -200, image=self._loot_dirty_icon,
+                                           anchor="center", state="hidden")
+        self._pool_loot_dirty.append(loot_dirty_id)
+
+        loot_tag_id: int | None = None
+        if self._loot_tag_icon:
+            loot_tag_id = c.create_image(0, -200, image=self._loot_tag_icon,
+                                         anchor="center", state="hidden")
+        self._pool_loot_tag.append(loot_tag_id)
+
         bos_sp_badge = c.create_text(0, -200, text="", anchor="center",
                                      fill="#c084fc",
                                      font=(_theme.FONT_FAMILY, _theme.FS11, "bold"),
@@ -2524,6 +2607,8 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 (fs.get("filter_esl_safe"),        name_lower in esl_safe),
                 (fs.get("filter_esl_unsafe"),      name_lower in esl_unsafe),
                 (fs.get("filter_userlist"),        name_lower in userlist),
+                (fs.get("filter_dirty"),           self._has_dirty_edits(entry.name)),
+                (fs.get("filter_bash_tags"),       self._has_bash_tags(entry.name)),
                 (fs.get("filter_bos_sp"),          name_lower in bos_sp),
             )
             if not all(_tri(s, m) for s, m in checks):
@@ -2977,6 +3062,80 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             for k in (*normal.keys(), *root.keys()):
                 basenames.add(k.rsplit("/", 1)[-1])
         return basenames
+
+    def _script_extender_detected(self) -> bool:
+        """True if a script-extender framework loader is present in this profile.
+
+        Mirrors the framework-banner logic in `_refresh_framework_banners`: a
+        loader counts as installed if it sits in the game root, the Root_Folder
+        staging dir, the enabled filemap, or a disabled mod. Used by the LOOT
+        tooltip to suppress a "Requires (missing): Script Extender" line when the
+        extender is actually installed (e.g. deployed as a mod rather than
+        dropped in the game root).
+        """
+        if self._game is None:
+            return False
+        try:
+            frameworks: dict[str, str] = self._game.frameworks or {}
+        except Exception:
+            frameworks = {}
+        if not frameworks:
+            return False
+
+        # Restrict to script-extender loaders (frameworks may also hold things
+        # like ContentPatcher.dll that aren't script extenders).
+        se_exes = [
+            exe for label, exe in frameworks.items()
+            if "script extender" in label.lower()
+            or re.search(r"\b(sk?se(64|vr)?|f4se(vr)?|fose|nvse|obse|sfse|mwse)\b",
+                         exe.rsplit("/", 1)[-1].lower())
+        ]
+        if not se_exes:
+            return False
+
+        game_root: "Path | None" = None
+        try:
+            game_root = self._game.get_game_path() if hasattr(self._game, "get_game_path") else None
+        except Exception:
+            pass
+        root_folder: "Path | None" = None
+        try:
+            root_folder = self._game.get_effective_root_folder_path()
+        except Exception:
+            pass
+
+        filemap_path_str = self._get_filemap_path()
+        staged_keys: set[str] = set()
+        if filemap_path_str:
+            fm_path = Path(filemap_path_str)
+            for fm in (fm_path, fm_path.parent / "filemap_root.txt"):
+                if not fm.is_file():
+                    continue
+                try:
+                    with fm.open(encoding="utf-8") as f:
+                        for line in f:
+                            if "\t" not in line:
+                                continue
+                            rel_path = line.split("\t", 1)[0].replace("\\", "/")
+                            staged_keys.add(rel_path.lower())
+                except OSError:
+                    pass
+
+        rf_allowed = getattr(self._game, "root_folder_deploy_enabled", True)
+        disabled_basenames = self._framework_disabled_basenames(filemap_path_str)
+
+        for exe in se_exes:
+            exe_path = Path(exe)
+            if game_root is not None and _file_exists_ci(game_root, exe_path):
+                return True
+            if rf_allowed and root_folder is not None and _file_exists_ci(root_folder, exe_path):
+                return True
+            if self._framework_exe_in_staged(exe, staged_keys):
+                return True
+            exe_basename = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if exe_basename and exe_basename in disabled_basenames:
+                return True
+        return False
 
     def _refresh_plugins_tab(self) -> None:
         """Reload plugin entries from plugins.txt and redraw."""
@@ -3450,6 +3609,8 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 is_vanilla = name_lower in self._vanilla_plugins
                 is_locked = bool(self._plugin_locks.get(entry.name, False))
                 has_loot = self._has_loot_tooltip_content(entry.name)
+                has_dirty = self._has_dirty_edits(entry.name)
+                has_tags = self._has_bash_tags(entry.name)
                 bos_sp_kind = self._bos_sp_plugins.get(name_lower, "")
                 has_bos_sp = bool(bos_sp_kind)
 
@@ -3471,6 +3632,8 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                     is_vanilla,
                     is_locked,
                     has_loot,
+                    has_dirty,
+                    has_tags,
                     bos_sp_kind,
                 )
                 if _pool_last_state[s] == state_key and self._pool_data_idx[s] == actual_idx:
@@ -3502,7 +3665,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 c.itemconfigure(self._pool_idx_text[s], text=f"{actual_idx:03d}",
                                 fill=TEXT_DIM, state="normal")
 
-                active_flags = [f for f in [has_missing, has_late, has_vmm, has_ul, has_esl, has_loot, has_bos_sp] if f]
+                active_flags = [f for f in [has_missing, has_late, has_vmm, has_ul, has_esl, has_loot, has_dirty, has_tags, has_bos_sp] if f]
                 n_flags = len(active_flags)
                 # Pack flags tightly with a fixed gap, centered in the column.
                 pack_start = flags_center - (flag_gap * (n_flags - 1)) // 2 if n_flags else flags_center
@@ -3559,6 +3722,22 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                         c.itemconfigure(loot_info_id, state="normal")
                     else:
                         c.itemconfigure(loot_info_id, state="hidden")
+
+                loot_dirty_id = self._pool_loot_dirty[s] if s < len(self._pool_loot_dirty) else None
+                if loot_dirty_id is not None:
+                    if has_dirty:
+                        c.coords(loot_dirty_id, next(_flag_pos), y_mid)
+                        c.itemconfigure(loot_dirty_id, state="normal")
+                    else:
+                        c.itemconfigure(loot_dirty_id, state="hidden")
+
+                loot_tag_id = self._pool_loot_tag[s] if s < len(self._pool_loot_tag) else None
+                if loot_tag_id is not None:
+                    if has_tags:
+                        c.coords(loot_tag_id, next(_flag_pos), y_mid)
+                        c.itemconfigure(loot_tag_id, state="normal")
+                    else:
+                        c.itemconfigure(loot_tag_id, state="hidden")
 
                 bos_sp_badge_id = self._pool_bos_sp_badge[s] if s < len(self._pool_bos_sp_badge) else None
                 if bos_sp_badge_id is not None:
@@ -3618,6 +3797,10 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                     c.itemconfigure(self._pool_esl_badge[s], state="hidden")
                 if s < len(self._pool_loot_info) and self._pool_loot_info[s] is not None:
                     c.itemconfigure(self._pool_loot_info[s], state="hidden")
+                if s < len(self._pool_loot_dirty) and self._pool_loot_dirty[s] is not None:
+                    c.itemconfigure(self._pool_loot_dirty[s], state="hidden")
+                if s < len(self._pool_loot_tag) and self._pool_loot_tag[s] is not None:
+                    c.itemconfigure(self._pool_loot_tag[s], state="hidden")
                 if s < len(self._pool_bos_sp_badge):
                     c.itemconfigure(self._pool_bos_sp_badge[s], state="hidden")
                 c.itemconfigure(self._pool_check_rects[s], state="hidden")
@@ -4616,6 +4799,11 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             elif plugin_name.lower() in self._userlist_plugins:
                 items.append(("Show userlist rules...",
                                lambda n=plugin_name: self._open_plugin_cycle_overlay(n)))
+
+            # Record overlap — full libloot load, runs in the background.
+            if getattr(self._game, "loot_sort_enabled", False):
+                items.append(("Show overlapping plugins...",
+                               lambda n=plugin_name: self._show_overlapping_plugins(n)))
 
             # LOOT locations (mod page / author links from the masterlist)
             loot_locs = (self._loot_info.get(plugin_name.lower(), {}).get("locations") or [])

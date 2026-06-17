@@ -14,7 +14,7 @@ from pathlib import Path
 
 from Games.base_game import BaseGame, WizardTool
 from Utils.atomic_write import write_atomic_text
-from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, cleanup_custom_deploy_dirs, restore_custom_rules, move_to_core, restore_data_core
+from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, move_to_core, restore_data_core
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
@@ -333,7 +333,45 @@ class Fallout_3(BaseGame):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="FO3Edit", id_suffix="fo3",
+                nexus_url="https://www.nexusmods.com/fallout3/mods/637?tab=files",
+            ),
         ]
+
+    @staticmethod
+    def _xedit_wizard_tools(
+        build: str, id_suffix: str, nexus_url: str, qac: bool = True
+    ) -> list[WizardTool]:
+        """Build the 'Run <xEdit>' (+ optional QAC) wizard entries for a game.
+
+        All Bethesda games share one parametrised xEdit wizard
+        (``wizards.sseedit``); only the exe name + Nexus page differ, supplied
+        via ``extra``.  Plugins xEdit creates/cleans are rescued generically by
+        the game's ``restore()`` (``restore_data_core`` with overwrite/staging),
+        so no per-game restore code is needed.
+        """
+        exe = f"{build}.exe"
+        tools = [
+            WizardTool(
+                id=f"run_{build.lower()}_{id_suffix}",
+                label=f"Run {build}",
+                description=f"Install {build}, deploy mods, and run {exe}.",
+                dialog_class_path="wizards.sseedit.SSEEditWizard",
+                extra={"xedit_exe": exe, "nexus_url": nexus_url, "display_name": build},
+            ),
+        ]
+        if qac:
+            tools.append(
+                WizardTool(
+                    id=f"run_{build.lower()}_qac_{id_suffix}",
+                    label=f"Run {build} QAC",
+                    description=f"Deploy mods and run {build}QuickAutoClean.exe.",
+                    dialog_class_path="wizards.sseedit.SSEEditQACWizard",
+                    extra={"xedit_exe": exe, "nexus_url": nexus_url, "display_name": build},
+                )
+            )
+        return tools
 
     # -----------------------------------------------------------------------
     # Paths
@@ -1121,6 +1159,17 @@ class Fallout_3(BaseGame):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
+        # Per-separator deploy overrides. Loaded here (from the real profile_dir,
+        # which is where modlist.txt / profile_state.json live — the filemap may
+        # sit at the shared-staging profile root instead) and passed explicitly
+        # to both Step 0 and Step 2 so the self-load fallbacks in those functions
+        # don't have to guess the profile dir from filemap_path.parent.
+        _sep_deploy = load_separator_deploy_paths(profile_dir)
+        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
+        per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
+        per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
+        per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
+
         custom_rules = self.custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
@@ -1131,6 +1180,8 @@ class Fallout_3(BaseGame):
                 mode=mode,
                 strip_prefixes=self.mod_folder_strip_prefixes,
                 per_mod_strip_prefixes=per_mod_strip,
+                per_mod_link_modes=per_mod_modes,
+                raw_mods=per_mod_raw,
                 log_fn=_log,
                 progress_fn=progress_fn,
                 prefix_root=self.get_prefix_path(),
@@ -1141,14 +1192,12 @@ class Fallout_3(BaseGame):
         _log("  Backed up existing files → Data_Core/.")
 
         _log(f"Step 2: Transferring mod files into Data/ ({mode.name}) ...")
-        _sep_deploy = load_separator_deploy_paths(profile_dir)
-        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
-        per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
         linked_mod, placed = deploy_filemap(filemap, data_dir, staging,
                                             mode=mode,
                                             strip_prefixes=self.mod_folder_strip_prefixes,
                                             per_mod_strip_prefixes=per_mod_strip,
                                             per_mod_deploy_dirs=per_mod_deploy,
+                                            per_mod_link_modes=per_mod_modes,
                                             log_fn=_log,
                                             progress_fn=progress_fn,
                                             exclude=custom_exclude or None,
@@ -1156,7 +1205,8 @@ class Fallout_3(BaseGame):
         _log(f"  Transferred {linked_mod} mod file(s).")
 
         _log("Step 3: Filling gaps with vanilla files from Data_Core/ ...")
-        linked_core = deploy_core(data_dir, placed, mode=mode, log_fn=_log)
+        linked_core = deploy_core(data_dir, placed, mode=mode, log_fn=_log,
+                                  manifest_dir=filemap.parent)
         _log(f"  Transferred {linked_core} vanilla file(s).")
 
         _log("Step 4: Symlinking plugins.txt into Proton prefix ...")
@@ -1277,6 +1327,10 @@ class Fallout3_GOTY(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="FO3Edit", id_suffix="fo3goty",
+                nexus_url="https://www.nexusmods.com/fallout3/mods/637?tab=files",
+            ),
         ]
 
 
@@ -1326,6 +1380,10 @@ class Fallout_NV(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="FNVEdit", id_suffix="fonv",
+                nexus_url="https://www.nexusmods.com/newvegas/mods/34703?tab=files",
+            ),
         ]
 
     @property
@@ -1343,6 +1401,13 @@ class Fallout_NV(Fallout_3):
     @property
     def steam_id(self) -> str:
         return "22380"
+
+    @property
+    def alt_steam_ids(self) -> list[str]:
+        # 22490 is the Polish/Czech/Russian localized edition of FNV, which is
+        # a separate Steam app sharing the same install/prefix layout. Owners of
+        # that edition must launch through 22490, not 22380.
+        return ["22490"]
 
     @property
     def nexus_game_domain(self) -> str:
@@ -1432,6 +1497,10 @@ class Fallout_4(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="FO4Edit", id_suffix="fo4",
+                nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
             ),
         ]
 
@@ -1530,6 +1599,10 @@ class Fallout_4VR(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="FO4VREdit", id_suffix="fo4vr", qac=False,
+                nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
             ),
         ]
 
@@ -1633,6 +1706,10 @@ class Oblivion(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="TES4Edit", id_suffix="oblivion",
+                nexus_url="https://www.nexusmods.com/oblivion/mods/11536?tab=files",
             ),
         ]
 
@@ -1739,6 +1816,10 @@ class Skyrim(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="TES5Edit", id_suffix="skyrim",
+                nexus_url="https://www.nexusmods.com/skyrim/mods/25859?tab=files",
             ),
             WizardTool(
                 id="run_skygen_skyrim",
@@ -1851,6 +1932,10 @@ class SkyrimVR(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="TES5VREdit", id_suffix="skyrimvr", qac=False,
+                nexus_url="https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files",
             ),
             WizardTool(
                 id="run_skygen_skyrimvr",
@@ -1971,6 +2056,10 @@ class Starfield(Fallout_3):
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
+            ),
+            *self._xedit_wizard_tools(
+                build="SF1Edit", id_suffix="starfield",
+                nexus_url="https://www.nexusmods.com/starfield/mods/121?tab=files",
             ),
         ]
 
@@ -2208,6 +2297,10 @@ class Enderal(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="TES5Edit", id_suffix="enderal",
+                nexus_url="https://www.nexusmods.com/skyrim/mods/25859?tab=files",
+            ),
         ]
 
 class EnderalSE(Fallout_3):
@@ -2293,4 +2386,266 @@ class EnderalSE(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            *self._xedit_wizard_tools(
+                build="SSEEdit", id_suffix="enderalse",
+                nexus_url="https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files",
+            ),
         ]
+
+
+class Fallout_76(Fallout_3):
+    """Fallout 76 — a BA2-based Bethesda game with NO plugin system.
+
+    The live game blocks .esp/.esm plugins, so there is no plugins.txt, no load
+    order, and no LOOT/Synthesis. Mods load exclusively via the comma-separated
+    ``sResourceArchive2List`` key in ``Fallout76Custom.ini`` (My Games/Fallout 76).
+    We auto-sync that key from the deployed mod .ba2 files on every deploy/restore,
+    mirroring the Vortex FO76 extension. The Archive tab (gated on archive_extensions)
+    surfaces the deployed BA2s.
+    """
+
+    # No plugin system at all — empty plugin_extensions disables the Plugins tab,
+    # load-order tracking, master logic, ESL flags, and orphan-plugin scanning.
+    plugins_use_star_prefix = True
+    plugins_include_vanilla = False
+    supports_esl_flag = False
+    vanilla_plugins: list[str] = []
+    vanilla_dlc_plugins: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "Fallout 76"
+
+    @property
+    def game_id(self) -> str:
+        return "Fallout76"
+
+    @property
+    def exe_name(self) -> str:
+        return "Fallout76.exe"
+
+    @property
+    def steam_id(self) -> str:
+        return "1151340"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        return "fallout76"
+
+    @property
+    def plugin_extensions(self) -> list[str]:
+        # FO76 has no plugin system — disable all plugin tracking.
+        return []
+
+    @property
+    def loot_sort_enabled(self) -> bool:
+        return False
+
+    @property
+    def loot_game_type(self) -> str:
+        return ""
+    
+    @property
+    def conflict_ignore_filenames(self) -> set[str]:
+        return {"info.xml","*read*.txt","*.jpg","*.png","Fallout76Custom.ini"}
+
+    @property
+    def archive_extensions(self) -> frozenset[str]:
+        return frozenset({".ba2"})
+
+    @property
+    def custom_routing_rules(self) -> list:
+        from Utils.deploy import CustomRule
+        return [
+            CustomRule(dest="", filenames=["dxgi.dll"], flatten=True),
+            CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
+            self._saves_routing_rule([".fos"]),
+        ]
+
+    _APPDATA_SUBPATH = Path("drive_c/users/steamuser/AppData/Local/Fallout76")
+    _APPDATA_SUBPATH_GOG = None
+    _MYGAMES_SUBPATH = Path("Fallout 76")
+    _MYGAMES_SUBPATH_GOG = None
+    _ARCHIVE_INI_FILENAME = "Fallout76.ini"
+    _ARCHIVE_PREFS_INI_FILENAME = "Fallout76Prefs.ini"
+    _CUSTOM_INI_FILENAME = "Fallout76Custom.ini"
+    # BA2-based — no dummy BSA, only the sResourceArchive2List sync below.
+    _invalidation_bsa_name = None
+    _invalidation_bsa_version = None
+    # We manage the archive list ourselves (see apply/revert below), so leave the
+    # inherited FO3/FNV mod-BSA append path off.
+    _archive_list_needs_mod_bsas = False
+    _archive_list_fix_name = None
+    _archive_list_fix_path = None
+    _invalidation_archive_list_key = "sResourceArchive2List"
+
+    # No plugins.txt — FO76 doesn't read one.
+    def _plugins_txt_targets(self, prefix_root: "Path | None" = None) -> list[Path]:
+        return []
+
+    def _symlink_plugins_txt(self, profile: str, log_fn, prefix_root: "Path | None" = None) -> None:
+        return
+
+    def _remove_plugins_txt_symlink(self, log_fn) -> None:
+        return
+
+    @property
+    def wizard_tools(self) -> list[WizardTool]:
+        # No SE / Wrye Bash / BethINI — none apply to FO76.
+        return self._base_wizard_tools()
+
+    @property
+    def frameworks(self) -> dict[str, str]:
+        # FO76 has no script extender — skip framework detection entirely.
+        return {}
+    
+    @property
+    def reshade_dll(self) -> str:
+        return ""
+
+    @property
+    def reshade_arch(self) -> int:
+        return 64
+
+    # -- Non-whitelisted DLL handling --------------------------------------
+    # FO76's anti-cheat refuses to launch if unexpected *.dll files sit in the
+    # game root. A mod that ships a stray DLL there would brick the game, so on
+    # deploy we rename any non-whitelisted root DLL to <name>.dll.nwmode and on
+    # restore we rename it back. Mirrors Fo76ini's RenameAddedDLLs/RestoreAddedDLLs.
+    # Whitelist = the DLLs the vanilla game ships with (lower-cased for matching).
+    _FO76_DLL_WHITELIST = frozenset({
+        "bink2w64.dll", "chrome_elf.dll", "concrt140.dll", "d3dcompiler_43.dll",
+        "d3dcompiler_46.dll", "d3dcompiler_47.dll", "libcef.dll", "libegl.dll",
+        "libglesv2.dll", "msvcp140.dll", "ortp_x64.dll", "steam_api64.dll",
+        "vccorlib140.dll", "vcruntime140.dll", "vivoxsdk_x64.dll", "dxgi.dll", 
+        "vivoxsdk.dll", "xaudio2_9redist.dll"
+    })
+
+    def _rename_non_whitelisted_dlls(self, log_fn) -> None:
+        """Rename non-whitelisted root *.dll → *.dll.nwmode so FO76 will launch."""
+        if self._game_path is None:
+            return
+        try:
+            entries = list(self._game_path.iterdir())
+        except OSError:
+            return
+        for dll in entries:
+            # Case-insensitive .dll match — the prefix FS is case-preserving and
+            # mods may ship MyMod.DLL etc.
+            if not dll.is_file() or not dll.name.lower().endswith(".dll"):
+                continue
+            if dll.name.lower() in self._FO76_DLL_WHITELIST:
+                continue
+            target = dll.with_name(dll.name + ".nwmode")
+            try:
+                if target.exists():
+                    dll.unlink()  # a prior .nwmode already holds the original
+                    log_fn(f"  Removed duplicate non-whitelisted DLL: {dll.name}")
+                else:
+                    dll.rename(target)
+                    log_fn(f"  Renamed non-whitelisted DLL: {dll.name} → {target.name}")
+            except OSError as exc:
+                log_fn(f"  WARN: could not rename {dll.name}: {exc}")
+
+    def _restore_non_whitelisted_dlls(self, log_fn) -> None:
+        """Rename *.dll.nwmode back to *.dll on restore."""
+        if self._game_path is None:
+            return
+        try:
+            entries = list(self._game_path.iterdir())
+        except OSError:
+            return
+        for nw in entries:
+            if not nw.is_file() or not nw.name.lower().endswith(".nwmode"):
+                continue
+            original = nw.with_name(nw.name[: -len(".nwmode")])
+            try:
+                if original.exists():
+                    nw.unlink()  # original was re-added during deploy — drop the stash
+                    log_fn(f"  Removed stale {nw.name} ({original.name} present)")
+                else:
+                    nw.rename(original)
+                    log_fn(f"  Restored DLL: {nw.name} → {original.name}")
+            except OSError as exc:
+                log_fn(f"  WARN: could not restore {nw.name}: {exc}")
+
+    def swap_launcher(self, log_fn) -> None:
+        # FO76 has no SE launcher to swap — repurpose this post-deploy hook to
+        # quarantine non-whitelisted DLLs (game files are all in place by now).
+        self._rename_non_whitelisted_dlls(log_fn)
+
+    def _restore_launcher(self, log_fn) -> None:
+        # Undo the DLL quarantine on restore (mirrors swap_launcher above).
+        self._restore_non_whitelisted_dlls(log_fn)
+
+    # -- sResourceArchive2List sync ----------------------------------------
+    # FO76's only load mechanism. We keep the enabled mods' .ba2 filenames in
+    # Fallout76Custom.ini's sResourceArchive2List, preserving any user-added
+    # entries, and remove them again on restore. The set of "ours" is tracked in
+    # managed_archives.txt so removed mods don't leave stale entries.
+
+    _FO76_CUSTOM_INI_DEFAULTS = (
+        ("sResourceDataDirsFinal", "STRINGS\\"),
+        ("bInvalidateOlderFiles", "1"),
+    )
+
+    def _fo76_custom_ini_paths(self) -> list[Path]:
+        return [d / self._CUSTOM_INI_FILENAME
+                for d in {p.parent for p in self._get_archive_ini_paths()}]
+
+    def apply_archive_invalidation(self, log_fn) -> None:
+        _log = log_fn
+        if not self.archive_invalidation_enabled:
+            return
+        if not self.archive_invalidation:
+            self.revert_archive_invalidation(_log)
+            return
+        custom_inis = self._fo76_custom_ini_paths()
+        if not custom_inis:
+            _log("  WARN: Prefix path not set — skipping FO76 archive sync.")
+            return
+
+        from Utils.bsa_invalidation import (
+            append_to_archive_list, remove_many_from_archive_list,
+        )
+        key = self._invalidation_archive_list_key
+        prev = self._tracked_mod_bsas()
+        new = self._deployed_mod_bsas()
+        for ini in custom_inis:
+            ini.parent.mkdir(parents=True, exist_ok=True)
+            # Seed the Vortex-style defaults only when absent (don't clobber
+            # user edits to these keys).
+            for k, v in self._FO76_CUSTOM_INI_DEFAULTS:
+                if _read_ini_key(ini, "Archive", k) is None:
+                    _set_ini_key(ini, "Archive", k, v)
+            current = _read_ini_key(ini, "Archive", key) or ""
+            # Drop the .ba2 entries we previously added, then re-add what's
+            # deployed now — user-added entries (never in the sidecar) survive.
+            updated = remove_many_from_archive_list(current, prev)
+            updated = append_to_archive_list(updated, new)
+            if updated != current:
+                _set_ini_key(ini, "Archive", key, updated)
+        self._save_tracked_mod_bsas(new)
+        names = ", ".join(i.name for i in custom_inis)
+        _log(f"  Synced {len(new)} mod BA2(s) into {key} ({names}).")
+
+    def revert_archive_invalidation(self, log_fn) -> None:
+        _log = log_fn
+        if not self.archive_invalidation_enabled:
+            return
+        custom_inis = [i for i in self._fo76_custom_ini_paths() if i.is_file()]
+        if not custom_inis:
+            return
+        from Utils.bsa_invalidation import remove_many_from_archive_list
+        key = self._invalidation_archive_list_key
+        tracked = self._tracked_mod_bsas()
+        for ini in custom_inis:
+            current = _read_ini_key(ini, "Archive", key)
+            if current is None:
+                continue
+            updated = remove_many_from_archive_list(current, tracked)
+            if updated != current:
+                _set_ini_key(ini, "Archive", key, updated or None)
+        self._save_tracked_mod_bsas([])
+        names = ", ".join(i.name for i in custom_inis)
+        _log(f"  Removed managed BA2 entries from {key} ({names}).")

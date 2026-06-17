@@ -1,19 +1,27 @@
 """
 sseedit.py
-Wizard for running SSEEdit with Skyrim Special Edition.
+Wizard for running xEdit (SSEEdit / FO4Edit / FNVEdit / FO3Edit / TES4Edit /
+TES5Edit / SF1Edit ...) with a Bethesda game.
 
 Workflow
 --------
-1. Prompt the user to download SSEEdit from Nexus Mods (manual download only).
-2. Auto-detect and extract the archive to Profiles/<game>/Applications/SSEEdit/.
+1. Prompt the user to download the matching xEdit build from Nexus Mods
+   (manual download only).
+2. Auto-detect and extract the archive to Profiles/<game>/Applications/<dir>/.
 3. Deploy the modlist.
-4. User picks the Proton version; SSEEdit gets its own isolated prefix
+4. User picks the Proton version; xEdit gets its own isolated prefix
    (prefix_<ProtonName>/ next to the exe), independent of the game's Proton.
-5. Run SSEEdit.exe via Proton with -d:<game>/Data, after seeding the game's
+5. Run <xEdit>.exe via Proton with -d:<game>/Data, after seeding the game's
    Installed Path into the prefix registry, symlinking the profile's
    plugins.txt into the prefix AppData, linking the game prefix's My Games
    folder (xEdit fatals without the game INI) and setting the per-app
    WinXP compat flag in the tool prefix.
+
+Plugins that xEdit creates or cleans are not handled here: they are rescued by
+the game's ``restore()`` (which calls ``restore_data_core`` with ``overwrite_dir``
++ ``staging_root``) on the next deploy. That logic is generic to every Bethesda
+game, so this wizard only needs the per-game exe name + Nexus URL, supplied via
+the ``WizardTool.extra`` kwargs below (with SSEEdit defaults for back-compat).
 """
 
 from __future__ import annotations
@@ -43,27 +51,29 @@ from gui.theme import (
 
 _NEXUS_URL   = "https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files&file_id=495506"
 _EXE_NAME         = "SSEEdit.exe"
-_EXE_NAME_QAC     = "SSEEditQuickAutoClean.exe"
 _APP_DIR          = "SSEEdit"
 
 
-def _get_applications_dir(game: "BaseGame") -> Path:
-    return game.get_mod_staging_path().parent / "Applications" / _APP_DIR
+def _get_applications_dir(game: "BaseGame", app_dir: str = _APP_DIR) -> Path:
+    return game.get_mod_staging_path().parent / "Applications" / app_dir
 
 
-def _sseedit_exe_path(game: "BaseGame", exe_name: str = _EXE_NAME) -> Path | None:
-    p = _get_applications_dir(game) / exe_name
+def _sseedit_exe_path(
+    game: "BaseGame", exe_name: str = _EXE_NAME, app_dir: str = _APP_DIR
+) -> Path | None:
+    p = _get_applications_dir(game, app_dir) / exe_name
     return p if p.is_file() else None
 
 
-def _find_archive(downloads_dir: Path) -> Path | None:
+def _find_archive(downloads_dir: Path, name_hint: str = "sseedit") -> Path | None:
     if not downloads_dir.is_dir():
         return None
+    hint = name_hint.lower()
     candidates = [
         p for p in downloads_dir.iterdir()
         if p.is_file()
         and p.suffix.lower() in {".zip", ".7z", ".rar"}
-        and "sseedit" in p.name.lower()
+        and hint in p.name.lower()
     ]
     if not candidates:
         return None
@@ -167,14 +177,92 @@ def _set_winxp_compat(prefix_path: Path, exe: Path, log_fn=None) -> None:
         _log(f"Warning: could not write user.reg: {exc}")
 
 
+def _xedit_settings_ext(xedit_name: str) -> str:
+    """Derive the xEdit viewsettings extension from the build name.
+
+    xEdit names its per-game settings file ``Plugins.<mode>viewsettings``
+    where ``<mode>`` is the build name minus the trailing ``Edit``, lowercased:
+      FO4Edit  -> fo4   (Plugins.fo4viewsettings)
+      SSEEdit  -> sse   (Plugins.sseviewsettings)
+      TES4Edit -> tes4  (Plugins.tes4viewsettings)
+      SF1Edit  -> sf1   (Plugins.sf1viewsettings)
+    """
+    name = xedit_name
+    if name.lower().endswith("edit"):
+        name = name[: -len("edit")]
+    return name.lower()
+
+
+def _seed_xedit_viewsettings(game: "BaseGame", pfx: Path, xedit_name: str, log_fn=None) -> None:
+    """Pre-create the xEdit viewsettings file so the first-run messages
+    ("What's New" + developer message) never appear in a fresh tool prefix.
+
+    A fresh prefix has no ``Plugins.<mode>viewsettings`` next to the game's
+    AppData/Local data dir, so xEdit shows its nag dialogs every time the
+    prefix is recreated. Seeding the gate keys suppresses them:
+
+      [Options]          ShowTip=0            — no Tip of the Day on startup
+      [WhatsNew]         Version=<very high>  — newer than any running build
+      [DeveloperMessage] LastShownOn=<far-future Delphi date serial>
+
+    ``LastShownOn`` is a Delphi ``TDateTime`` integer (days since 1899-12-30);
+    xEdit re-shows the message when it is older than today, so we write a
+    date well in the future. Skips if a settings file already exists (the
+    user's real layout/preferences must win).
+    """
+    _log = log_fn or (lambda _: None)
+
+    subpath = getattr(game, "_APPDATA_SUBPATH", None)
+    if subpath is None:
+        return
+    data_dir = pfx / subpath
+    ext = _xedit_settings_ext(xedit_name)
+    settings_file = data_dir / f"Plugins.{ext}viewsettings"
+
+    if settings_file.exists():
+        return  # real settings already present — don't clobber
+
+    # Far-future Delphi date serial (1899-12-30 epoch) so the developer
+    # message stays dismissed: 2099-01-01 -> 72686.
+    last_shown = 72686
+    content = (
+        "[Options]\r\n"
+        "ShowTip=0\r\n"
+        "\r\n"
+        "[WhatsNew]\r\n"
+        "Version=99999999\r\n"
+        "\r\n"
+        "[DeveloperMessage]\r\n"
+        f"LastShownOn={last_shown}\r\n"
+        "Version=99999999\r\n"
+    )
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        write_atomic_text(settings_file, content)
+        _log(f"seeded {settings_file.name} to suppress first-run messages")
+    except OSError as exc:
+        _log(f"could not seed {settings_file.name}: {exc}")
+
+
 from wizards._proton_prefix import ProtonPrefixStepMixin, shutdown_prefix_wineserver
 
 
 class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
-    """Step-by-step wizard to set up and run SSEEdit for Skyrim SE."""
+    """Step-by-step wizard to set up and run an xEdit build for a Bethesda game.
+
+    Per-game configuration is supplied via ``WizardTool.extra`` kwargs:
+      ``xedit_exe``     — exe name, e.g. ``"FO4Edit.exe"`` (default SSEEdit.exe)
+      ``nexus_url``     — Nexus download page for the matching xEdit build
+      ``app_dir``       — extraction subfolder under Applications/ (default exe stem)
+      ``display_name``  — short name shown in the UI (default exe stem)
+    When omitted, the SSEEdit defaults below are used (back-compat for Skyrim SE).
+    """
 
     _wizard_title = "Run SSEEdit"
     _exe_name     = _EXE_NAME
+
+    # QAC subclasses set this to the QuickAutoClean exe suffix; None = full xEdit.
+    _qac          = False
 
     _proton_step_title = "Step 5: Choose Proton Version"
 
@@ -188,6 +276,10 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         log_fn=None,
         *,
         on_close=None,
+        xedit_exe: str | None = None,
+        nexus_url: str | None = None,
+        app_dir: str | None = None,
+        display_name: str | None = None,
         **_kwargs,
     ):
         super().__init__(parent, fg_color=BG_DEEP, corner_radius=0)
@@ -196,13 +288,26 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         self._log         = log_fn or (lambda msg: None)
         self._archive_path: Path | None = None
 
-        self._exe         = _sseedit_exe_path(game, self._exe_name)
+        # Resolve per-game config from kwargs, falling back to SSEEdit defaults.
+        base_exe = xedit_exe or self._exe_name
+        self._exe_name = (
+            base_exe[: -len(".exe")] + "QuickAutoClean.exe"
+            if self._qac and base_exe.lower().endswith(".exe")
+            else base_exe
+        )
+        self._nexus_url   = nexus_url or _NEXUS_URL
+        self._app_dir     = app_dir or base_exe.removesuffix(".exe")
+        short = display_name or base_exe.removesuffix(".exe")
+        self._xedit_name        = short  # build name w/o QAC, e.g. "FO4Edit"
+        self._tool_display_name = short + (" QAC" if self._qac else "")
+        self._wizard_title      = "Run " + self._tool_display_name
+
+        self._exe         = _sseedit_exe_path(game, self._exe_name, self._app_dir)
         self._proton_name = ""
         self._tool_exe_name     = self._exe_name
-        self._tool_display_name = self._wizard_title.removeprefix("Run ")
         self._exe_missing_text  = (
             f"{self._exe_name} was not found.\n"
-            "Please restart the wizard and install SSEEdit first."
+            f"Please restart the wizard and install {short} first."
         )
 
         title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=40)
@@ -255,25 +360,25 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
                 pass
 
     # ------------------------------------------------------------------
-    # Step 1 — Download SSEEdit (skipped if already extracted)
+    # Step 1 — Download xEdit (skipped if already extracted)
     # ------------------------------------------------------------------
 
     def _show_step_download(self):
-        if _sseedit_exe_path(self._game, self._exe_name) is not None:
+        if _sseedit_exe_path(self._game, self._exe_name, self._app_dir) is not None:
             self._show_step_deploy()
             return
 
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 1: Download SSEEdit",
+            self._body, text=f"Step 1: Download {self._xedit_name}",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
         ctk.CTkLabel(
             self._body,
             text=(
-                "Click the button below to open the SSEEdit page on Nexus Mods.\n\n"
+                f"Click the button below to open the {self._xedit_name} page on Nexus Mods.\n\n"
                 "Download the archive manually (do NOT use the Mod Manager\n"
                 "download button), then click Next."
             ),
@@ -284,7 +389,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             self._body, text="Open Download Page", width=220, height=36,
             font=FONT_BOLD,
             fg_color="#da8e35", hover_color="#e5a04a", text_color="white",
-            command=lambda: open_url(_NEXUS_URL),
+            command=lambda: open_url(self._nexus_url),
         ).pack(pady=(0, 20))
 
         ctk.CTkButton(
@@ -332,7 +437,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         self._scan_downloads()
 
     def _scan_downloads(self):
-        found = _find_archive(Path.home() / "Downloads")
+        found = _find_archive(Path.home() / "Downloads", self._xedit_name)
         if found:
             self._archive_path = found
             self._locate_status.configure(text=f"Found: {found.name}", text_color="#6bc76b")
@@ -341,7 +446,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             self._archive_path = None
             self._locate_status.configure(
                 text=(
-                    "SSEEdit archive not found in Downloads.\n"
+                    f"{self._xedit_name} archive not found in Downloads.\n"
                     "Make sure you downloaded it, then press Try Again,\n"
                     "or use Browse to select it manually."
                 ),
@@ -355,7 +460,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
                 self._locate_status.configure(text=f"Selected: {path.name}", text_color="#6bc76b")
                 self.after(300, self._show_step_extract)
 
-        pick_file("Select the SSEEdit archive", lambda p: self.after(0, lambda: _on_picked(p)))
+        pick_file(f"Select the {self._xedit_name} archive", lambda p: self.after(0, lambda: _on_picked(p)))
 
     # ------------------------------------------------------------------
     # Step 3 — Extract archive
@@ -365,7 +470,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 3: Extract SSEEdit",
+            self._body, text=f"Step 3: Extract {self._xedit_name}",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
@@ -385,15 +490,15 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             if archive is None or not archive.is_file():
                 raise RuntimeError("Archive not found.")
 
-            dest = _get_applications_dir(self._game)
+            dest = _get_applications_dir(self._game, self._app_dir)
             dest.mkdir(parents=True, exist_ok=True)
 
             self._set_label("_extract_status", f"Extracting {archive.name}\u2026")
-            self._log(f"SSEEdit Wizard: extracting {archive.name} \u2192 {dest}")
+            self._log(f"{self._tool_display_name} Wizard: extracting {archive.name} \u2192 {dest}")
 
             paths = _extract_archive(archive, dest)
             file_count = len([p for p in paths if p.is_file()])
-            self._log(f"SSEEdit Wizard: extracted {file_count} file(s).")
+            self._log(f"{self._tool_display_name} Wizard: extracted {file_count} file(s).")
 
             _flatten_subdirs(dest, self._exe_name)
 
@@ -410,7 +515,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
 
         except Exception as exc:
             self._set_label("_extract_status", f"Error: {exc}", color="#e06c6c")
-            self._log(f"SSEEdit Wizard: extract error: {exc}")
+            self._log(f"{self._tool_display_name} Wizard: extract error: {exc}")
 
     # ------------------------------------------------------------------
     # Step 4 — Deploy modlist
@@ -527,10 +632,10 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
 
         except Exception as exc:
             self._set_label("_deploy_status", f"Deploy error: {exc}", color="#e06c6c")
-            self._log(f"SSEEdit Wizard: deploy error: {exc}")
+            self._log(f"{self._tool_display_name} Wizard: deploy error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 6 — Run SSEEdit
+    # Step 6 — Run xEdit
     # ------------------------------------------------------------------
 
     def _show_step_run(self):
@@ -545,10 +650,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         if exe is None:
             ctk.CTkLabel(
                 self._body,
-                text=(
-                    f"{self._exe_name} was not found.\n"
-                    "Please restart the wizard and install SSEEdit first."
-                ),
+                text=self._exe_missing_text,
                 font=FONT_NORMAL, text_color="#e06c6c", justify="center",
             ).pack(pady=(0, 16))
             ctk.CTkButton(
@@ -560,7 +662,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             return
 
         self._run_status = ctk.CTkLabel(
-            self._body, text="Launching SSEEdit\u2026",
+            self._body, text=f"Launching {self._tool_display_name}\u2026",
             font=FONT_NORMAL, text_color=TEXT_DIM, justify="center", wraplength=460,
         )
         self._run_status.pack(pady=(0, 12))
@@ -610,9 +712,17 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         self._link_plugins_txt(pfx)
         self._link_mygames(pfx)
 
+        # Suppress xEdit's first-run nag dialogs (What's New + developer
+        # message) which reappear every time this tool prefix is recreated.
+        _seed_xedit_viewsettings(
+            self._game, pfx, self._xedit_name,
+            log_fn=lambda msg: self._log(f"{self._tool_display_name} Wizard: {msg}"),
+        )
+
         _set_winxp_compat(compat_data, exe, log_fn=self._log)
 
-        self._log(f"SSEEdit Wizard: launching {exe} via Proton with {data_arg}")
+        name = self._tool_display_name
+        self._log(f"{name} Wizard: launching {exe} via Proton with {data_arg}")
         try:
             proc = subprocess.Popen(
                 ["python3", str(proton_script), "run", str(exe), data_arg],
@@ -623,25 +733,26 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             )
             self._set_label(
                 "_run_status",
-                "SSEEdit is running.\nClose it when you are done, then click Done.",
+                f"{name} is running.\nClose it when you are done, then click Done.",
                 color="#6bc76b",
             )
             self.after(0, lambda: self._done_btn.configure(state="normal"))
             proc.wait()
             shutdown_prefix_wineserver(
                 proton_script, compat_data,
-                log_fn=lambda m: self._log(f"SSEEdit Wizard: {m}"),
+                log_fn=lambda m: self._log(f"{name} Wizard: {m}"),
             )
-            self._log("SSEEdit Wizard: SSEEdit closed.")
-            self._set_label("_run_status", "SSEEdit finished.", color="#6bc76b")
+            self._log(f"{name} Wizard: {name} closed.")
+            self._set_label("_run_status", f"{name} finished.", color="#6bc76b")
             self.after(0, self._on_done)
         except Exception as exc:
             self._set_label("_run_status", f"Launch error: {exc}", color="#e06c6c")
-            self._log(f"SSEEdit Wizard: launch error: {exc}")
+            self._log(f"{name} Wizard: launch error: {exc}")
 
 
 class SSEEditQACWizard(SSEEditWizard):
-    """Variant of SSEEditWizard that runs SSEEditQuickAutoClean.exe."""
+    """Variant that runs the QuickAutoClean exe for whatever xEdit build the
+    game configures (SSEEditQuickAutoClean.exe, FO4EditQuickAutoClean.exe, ...).
+    """
 
-    _wizard_title = "Run SSEEdit QAC"
-    _exe_name     = _EXE_NAME_QAC
+    _qac = True

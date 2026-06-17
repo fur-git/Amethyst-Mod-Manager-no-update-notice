@@ -162,6 +162,83 @@ def _load_deploy_stats(stats_path: Path) -> "dict[str, tuple[int, int]]":
     return stats
 
 
+# Records the relative paths deploy_core() placed as vanilla gap-fill files.
+# Needed for the symlink-mode xEdit rescue: when vanilla files are deployed as
+# symlinks into Data_Core/, an external tool (e.g. FO4Edit Quick Auto Clean)
+# launched against Data/ can reach through the symlink and destroy/replace the
+# Data_Core/ copy.  Once the core copy is gone, restore_data_core can no longer
+# tell the edited plugin was vanilla from core_lower alone, so it would wrongly
+# treat it as a runtime-created file and bury it in overwrite/.  This sidecar
+# lets restore recognise such files and put the edited plugin back in Data/.
+_VANILLA_DEPLOYED_NAME = "vanilla_deployed.txt"
+
+
+def _write_vanilla_deployed(path: Path, rels: "list[str]", log_fn=None) -> None:
+    """Atomically write the vanilla gap-fill manifest (one rel path per line)."""
+    try:
+        with atomic_writer(path, "w") as fh:
+            fh.write("# vanilla_deployed v1\n")
+            for rel in rels:
+                fh.write(rel.replace("\\", "/") + "\n")
+    except OSError as exc:
+        _safe_log(log_fn)(f"  WARN: could not write vanilla manifest: {exc}")
+
+
+def _load_vanilla_deployed(path: Path) -> "set[str]":
+    """Read the vanilla gap-fill manifest into a set of lowercased rel paths."""
+    rels: set[str] = set()
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                rel = line.rstrip("\n").replace("\\", "/")
+                if rel:
+                    rels.add(rel.lower())
+    except OSError:
+        pass
+    return rels
+
+
+# Plugin file extensions whose in-place edits (e.g. via xEdit / Quick Auto
+# Clean) we want to surface on the mod row.  When restore_data_core moves a
+# *modified* plugin back into its owning mod folder, it tags that mod's
+# meta.ini so the GUI can show a "contains an xEdit-modified plugin" flag.
+_PLUGIN_EXTS = (".esp", ".esm", ".esl")
+
+
+def _tag_mod_xedit_modified(mod_dir: Path, plugin_name: str) -> None:
+    """Record *plugin_name* in the mod's ``meta.ini`` under
+    ``[General] xeditModifiedPlugins`` (a semicolon-separated list).
+
+    Called when an externally-edited plugin is moved back into this mod's
+    staging folder during restore, so the modlist can flag the mod as
+    containing a plugin modified in xEdit.  Preserves all other meta.ini
+    content and is idempotent (a plugin already listed is not duplicated)."""
+    import configparser
+    meta = mod_dir / "meta.ini"
+    cp = configparser.ConfigParser()
+    if meta.is_file():
+        try:
+            cp.read(str(meta), encoding="utf-8")
+        except Exception:
+            cp = configparser.ConfigParser()
+    if not cp.has_section("General"):
+        cp.add_section("General")
+    existing = cp["General"].get("xeditModifiedPlugins", "")
+    names = [n.strip() for n in existing.split(";") if n.strip()]
+    # Case-insensitive de-dup (plugin filesystem names are case-insensitive).
+    lower = {n.lower() for n in names}
+    if plugin_name.lower() not in lower:
+        names.append(plugin_name)
+    cp["General"]["xeditModifiedPlugins"] = ";".join(names)
+    try:
+        with open(meta, "w", encoding="utf-8") as fh:
+            cp.write(fh)
+    except Exception:
+        pass
+
+
 def _tree_has_files(root: Path) -> bool:
     """Early-exit check: does *root* contain at least one file anywhere?"""
     stack = [str(root)]
@@ -449,7 +526,18 @@ def deploy_filemap(
         # Mods whose separator opted into "merge folders" are skipped here so
         # their top-level folders are merged with the target instead of
         # wholesale-replaced; per-file backup-and-replace still applies.
-        if is_custom_task and "/" in dst_rel and mod_name not in _per_merge:
+        #
+        # The wholesale-replace is only safe to apply when the folder will be
+        # dir-symlinked afterwards (symlink-effective mode): the symlink covers
+        # every file under the folder, including any a custom routing rule
+        # deployed there (Step 0). Under hardlink/copy there is no symlink to
+        # repopulate it, and custom-routed files are excluded from the per-file
+        # deploy — wiping the folder would silently lose them. So for non-symlink
+        # modes we skip the wholesale-replace and let per-file backup-and-replace
+        # handle each file, leaving co-located custom-routed files intact.
+        _eff_mode = override_mode if override_mode is not None else mode
+        if is_custom_task and "/" in dst_rel and mod_name not in _per_merge \
+                and _eff_mode is LinkMode.SYMLINK:
             _top = dst_rel.split("/", 1)[0]
             _custom_top_roots.setdefault(_eff_s, set()).add(_top)
             _key = (_eff_s, _top.lower())
@@ -809,6 +897,7 @@ def deploy_core(
     mode: LinkMode = LinkMode.HARDLINK,
     log_fn=None,
     progress_fn=None,
+    manifest_dir: Path | None = None,
 ) -> int:
     """Transfer files from core_dir into deploy_dir for any path not already
     covered by a mod.
@@ -817,6 +906,11 @@ def deploy_core(
     already_placed — lowercased rel paths already placed by deploy_filemap()
     core_dir       — vanilla backup directory; defaults to Data_Core/ sibling
     progress_fn    — optional callable(done: int, total: int)
+    manifest_dir   — directory to write vanilla_deployed.txt into (the profile
+                     root, alongside filemap.txt). When None the manifest is
+                     skipped — pass it for games whose Data/ is symlink-deployed
+                     so restore_data_core can rescue externally-edited vanilla
+                     files (see _VANILLA_DEPLOYED_NAME).
     Returns the number of files transferred.
     """
     _log = _safe_log(log_fn)
@@ -873,25 +967,41 @@ def deploy_core(
         return (actual, dst_str, None) if err is None else (None, dst_str, err)
 
     mode_counts: dict[LinkMode, int] = {}
+    _deploy_plen = len(_deploy_dir_str) + 1
+    # Vanilla files placed as symlinks point straight into Data_Core/.  An
+    # external tool editing Data/ (e.g. xEdit) can follow the symlink and
+    # mangle the core copy, so we record these paths for the restore-side
+    # rescue.  Hardlink/copy placements own an independent inode and don't
+    # need recording (restore's core_lower/inode checks already cover them).
+    _vanilla_symlinked: list[str] = []
     _t_core_transfer = _time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=_deploy_workers()) as pool:
-        for actual, rel_str, exc in pool.map(_do_core, resolved_tasks):
+        for actual, dst_str, exc in pool.map(_do_core, resolved_tasks):
             done_count += 1
             if actual is not None:
                 linked += 1
                 mode_counts[actual] = mode_counts.get(actual, 0) + 1
+                if actual == LinkMode.SYMLINK:
+                    _vanilla_symlinked.append(dst_str[_deploy_plen:])
             else:
                 if getattr(exc, "errno", None) == errno.ENOSPC:
                     pool.shutdown(wait=True, cancel_futures=True)
                     _log(f"  ERROR: game drive is full — aborting deploy "
-                         f"(failed at {rel_str}). Free up space, then run "
+                         f"(failed at {dst_str}). Free up space, then run "
                          f"Restore and deploy again.")
                     raise OSError(errno.ENOSPC,
-                                  f"Game drive full while deploying {rel_str}")
-                _log(f"  WARN: could not transfer {rel_str}: {exc}")
+                                  f"Game drive full while deploying {dst_str}")
+                _log(f"  WARN: could not transfer {dst_str}: {exc}")
             if progress_fn is not None:
                 progress_fn(done_count, total)
     print(f"  [TIMER] deploy_core — transfer {total} files: {_time.perf_counter() - _t_core_transfer:.3f}s")
+
+    # The manifest must land in the profile root (beside filemap.txt) where
+    # restore_data_core looks for it — NOT next to deploy_dir, which lives in
+    # the game install.  Only written when the caller opts in via manifest_dir.
+    if manifest_dir is not None:
+        _write_vanilla_deployed(
+            manifest_dir / _VANILLA_DEPLOYED_NAME, _vanilla_symlinked, log_fn=log_fn)
 
     _report_mode_breakdown(_log, mode_counts, mode)
 
@@ -1016,6 +1126,13 @@ def restore_data_core(
                         modindex_rel_to_mods.setdefault(rel_key, []).append(_mod_name)
         except Exception:
             pass
+        # Vanilla files deployed as symlinks into core_dir.  If such a file was
+        # edited in place by an external tool (xEdit), the tool may have
+        # destroyed core_dir's copy via the symlink, so it won't be in
+        # core_lower anymore.  This manifest lets us still recognise it as
+        # edited vanilla and put it back in deploy_dir instead of overwrite/.
+        vanilla_symlinked = _load_vanilla_deployed(
+            overwrite_dir.parent / _VANILLA_DEPLOYED_NAME)
         # Deploy-time stat record — a regular file still matching its entry is
         # exactly what we deployed, so the staging side (or nothing, if the
         # mod was replaced/removed since) owns the data and the copy in
@@ -1101,6 +1218,26 @@ def restore_data_core(
                                     pass
                             continue
                         continue  # vanilla file — will be restored from core
+                    if rel_lower in vanilla_symlinked:
+                        # Symlink-mode vanilla file edited in place by an external
+                        # tool: the symlink let the tool reach through and destroy
+                        # core_dir's copy, so it's no longer in core_lower.  The
+                        # regular file now sitting here IS the edited vanilla
+                        # plugin — move it into core_dir at its rel path so the
+                        # rmtree+rename below restores it to deploy_dir rather
+                        # than burying it in overwrite/.
+                        core_dst = _core_str + "/" + rel_str
+                        try:
+                            os.makedirs(os.path.dirname(core_dst), exist_ok=True)
+                            os.replace(src_str, core_dst)
+                            rescued += 1
+                            rescued_edited_vanilla += 1
+                            # Keep core_path in sync so the len()-based restore
+                            # count below includes this re-added file.
+                            core_path[rel_lower] = core_dst
+                        except OSError:
+                            pass
+                        continue
                     # Check if we would skip as a known mod file
                     in_filemap = rel_lower in filemap_lower
                     in_modindex = rel_lower in modindex_lower
@@ -1152,6 +1289,14 @@ def restore_data_core(
                                 _move_crash_safe(src_str, staging_path)
                                 rescued += 1
                                 rescued_to_mod += 1
+                                # The on-disk file differed from staging (the
+                                # size/mtime match above would have skipped it),
+                                # so it was edited in place by an external tool.
+                                # Flag the mod if it's a plugin (e.g. xEdit).
+                                if (target_mod != _OVERWRITE_NAME
+                                        and rel_str.lower().endswith(_PLUGIN_EXTS)):
+                                    _tag_mod_xedit_modified(
+                                        _staging / target_mod, os.path.basename(rel_str))
                                 continue
                             # xEdit orphan: staging missing — put file back in original mod or overwrite
                             target_mod = (
@@ -1168,6 +1313,13 @@ def restore_data_core(
                                     rescued_to_mod += 1
                                 _move_crash_safe(src_str, dst_str)
                                 rescued += 1
+                                # Staging source was missing (xEdit deleted the
+                                # original on close) — the rescued file is the
+                                # edited plugin.  Flag the owning mod.
+                                if (target_mod != _OVERWRITE_NAME
+                                        and rel_str.lower().endswith(_PLUGIN_EXTS)):
+                                    _tag_mod_xedit_modified(
+                                        _staging / target_mod, os.path.basename(rel_str))
                                 continue
                         else:
                             continue  # no staging check — skip as before

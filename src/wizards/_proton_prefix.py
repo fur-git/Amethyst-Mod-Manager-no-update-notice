@@ -299,7 +299,7 @@ class ProtonPrefixStepMixin:
             ).pack(side="bottom")
             return
 
-        from Utils.steam_finder import find_proton_for_game, list_installed_proton
+        from Utils.steam_finder import find_proton_for_game, game_steam_id, list_installed_proton
         versions = [p.parent.name for p in list_installed_proton()]
         if not versions:
             ctk.CTkLabel(
@@ -332,7 +332,7 @@ class ProtonPrefixStepMixin:
         # Default: saved per-exe override, else the game's own Proton version.
         saved = load_saved_proton(self._game, self._tool_exe_name)
         if not saved:
-            steam_id = getattr(self._game, "steam_id", "")
+            steam_id = game_steam_id(self._game)
             script = find_proton_for_game(steam_id) if steam_id else None
             if script is not None:
                 saved = script.parent.name

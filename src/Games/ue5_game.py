@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from Games.base_game import BaseGame
-from Utils.deploy import LinkMode, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
+from Utils.deploy import LinkMode, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, expand_separator_link_modes, _resolve_nocase, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
 from Utils.deploy_custom_rules import deploy_custom_rules, restore_custom_rules, compute_prefix_handled
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
@@ -241,6 +241,50 @@ class UE5Game(BaseGame):
     def ue5_default_dest(self) -> str:
         """Destination for files that match no rule.  Defaults to game root."""
         return ""
+
+    def reshade_install_subdir(self, game_path: "Path") -> "Path | None":
+        """ReShade must sit next to the real rendering binary, which in Unreal
+        Engine games lives under ``<Project>/Binaries/Win64/`` rather than the
+        bootstrap launcher at the game root (the official ReShade installer
+        follows the launcher's embedded ``IDI_EXEC_FILE`` resource to find it).
+
+        Locate the ``Binaries/Win64`` folder that holds the shipping exe and
+        return it relative to *game_path*.  Falls back to the base behaviour
+        (parent of :attr:`exe_name`) if the layout can't be found on disk.
+        """
+        if game_path is not None and Path(game_path).is_dir():
+            root = Path(game_path)
+            candidates: list[Path] = []
+            # get_game_path() already resolves to the UE project root, so
+            # Binaries/Win64 usually sits directly under it; allow a couple of
+            # nesting levels in case a handler points at the install root.
+            for pattern in ("Binaries/Win64", "*/Binaries/Win64", "*/*/Binaries/Win64"):
+                for win64 in root.glob(pattern):
+                    if win64.is_dir():
+                        candidates.append(win64)
+                if candidates:
+                    break
+
+            def _has_shipping_exe(d: Path) -> bool:
+                try:
+                    return any(p.name.lower().endswith("-shipping.exe") for p in d.iterdir())
+                except OSError:
+                    return False
+
+            # Prefer a Win64 folder that actually contains a *-Shipping.exe.
+            best = next((c for c in candidates if _has_shipping_exe(c)), None)
+            if best is None and candidates:
+                best = min(candidates, key=lambda p: len(p.parts))
+            if best is not None:
+                try:
+                    return best.relative_to(root)
+                except ValueError:
+                    return best
+
+        # Disk probe failed (game not installed yet, etc.). UE projects always
+        # render from Binaries/Win64 relative to the project root, so default
+        # there rather than the bootstrap launcher's folder.
+        return Path("Binaries/Win64")
 
     # -----------------------------------------------------------------------
     # Paths (concrete default — subclasses may override)
@@ -1012,6 +1056,12 @@ class UE5Game(BaseGame):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
+        _sep_deploy = load_separator_deploy_paths(profile_dir)
+        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
+        per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries)
+        per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries)
+        per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
+
         prefix_rules = self._prefix_routing_rules()
         if prefix_rules:
             _log("Routing prefix-bound files via custom rules ...")
@@ -1021,14 +1071,11 @@ class UE5Game(BaseGame):
                 mode=mode,
                 strip_prefixes=self.mod_folder_strip_prefixes,
                 per_mod_strip_prefixes=per_mod_strip,
+                per_mod_link_modes=per_mod_modes,
+                raw_mods=per_mod_raw or None,
                 log_fn=_log,
                 prefix_root=self.get_prefix_path(),
             )
-
-        _sep_deploy = load_separator_deploy_paths(profile_dir)
-        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
-        per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries)
-        per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries)
         overwrite_dir = staging.parent / "overwrite"
 
         manifest: list[str] = []

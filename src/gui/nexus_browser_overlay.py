@@ -73,12 +73,18 @@ class _FileChooserOverlay(tk.Frame):
         self._on_pick = on_pick
         self.result = None
 
+        # All raw-tk geometry below must be scale-aware — these widgets are
+        # plain tk (not CTk) so nothing multiplies by ui_scale for us.
+        min_width = scaled(self._MIN_WIDTH)
+        max_width = scaled(self._MAX_WIDTH)
+        margin = scaled(40)
+
         # Semi-transparent backdrop — absorbs clicks outside the card
         self._backdrop = tk.Frame(parent, bg="#000000")
         self._backdrop.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._backdrop.bind("<Button-1>", lambda e: self._dismiss(None))
 
-        pad = 14
+        pad = scaled(14)
 
         # Auto-size the card to fit the widest row, clamped to [_MIN_WIDTH, _MAX_WIDTH]
         # and the parent's available width.
@@ -96,16 +102,16 @@ class _FileChooserOverlay(tk.Frame):
                 if size_bytes > 0:
                     parts.append(_fmt_size(size_bytes))
                 detail = "  —  ".join(parts)
-                w = bold_font.measure(name_text) + (small_font.measure(detail) if detail else 0) + 40
+                w = bold_font.measure(name_text) + (small_font.measure(detail) if detail else 0) + scaled(40)
                 row_w = max(row_w, w)
-            content_w = max(header_w, row_w) + pad * 2 + 4
+            content_w = max(header_w, row_w) + pad * 2 + scaled(4)
             try:
-                parent_w = parent.winfo_width() or self._MAX_WIDTH
+                parent_w = parent.winfo_width() or max_width
             except Exception:
-                parent_w = self._MAX_WIDTH
-            card_w = max(self._MIN_WIDTH, min(content_w, self._MAX_WIDTH, parent_w - 40))
+                parent_w = max_width
+            card_w = max(min_width, min(content_w, max_width, parent_w - margin))
         except Exception:
-            card_w = self._MIN_WIDTH
+            card_w = min_width
 
         # Card — use grid so header/list/footer can each take their natural
         # share, with the list section the only one that's allowed to flex
@@ -135,8 +141,9 @@ class _FileChooserOverlay(tk.Frame):
 
         canvas = tk.Canvas(list_outer, bg=BORDER, bd=0, highlightthickness=0)
         canvas.grid(row=0, column=0, sticky="nsew")
-        vbar = tk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
-        vbar.grid(row=0, column=1, sticky="ns")
+        vbar = ctk.CTkScrollbar(list_outer, orientation="vertical", command=canvas.yview,
+                                width=14)
+        vbar.grid(row=0, column=1, sticky="ns", padx=(2, 0))
         canvas.configure(yscrollcommand=vbar.set)
 
         list_frame = tk.Frame(canvas, bg=BORDER)
@@ -161,14 +168,14 @@ class _FileChooserOverlay(tk.Frame):
         for idx, f in enumerate(files):
             bg = BG_ROW if idx % 2 == 0 else BG_ROW_ALT
             row = tk.Frame(list_frame, bg=bg, cursor="hand2")
-            row.pack(fill="x", ipady=6)
+            row.pack(fill="x", ipady=scaled(6))
             row_widgets.append(row)
 
             name_text = f.name or f.file_name
             tk.Label(
                 row, text=name_text,
                 font=TK_FONT_BOLD, fg=TEXT_MAIN, bg=bg, anchor="w",
-            ).pack(side="left", padx=(12, 6), pady=(4, 0), anchor="nw")
+            ).pack(side="left", padx=(scaled(12), scaled(6)), pady=(scaled(4), 0), anchor="nw")
 
             size_bytes = f.size_in_bytes or (f.size_kb * 1024 if f.size_kb else 0)
             detail_parts = []
@@ -180,7 +187,7 @@ class _FileChooserOverlay(tk.Frame):
                 tk.Label(
                     row, text="  —  ".join(detail_parts),
                     font=TK_FONT_SMALL, fg=TEXT_DIM, bg=bg, anchor="e",
-                ).pack(side="right", padx=(6, 12), pady=(4, 0))
+                ).pack(side="right", padx=(scaled(6), scaled(12)), pady=(scaled(4), 0))
 
             def _enter(e, r=row):
                 for w in (r, *r.winfo_children()):
@@ -216,20 +223,16 @@ class _FileChooserOverlay(tk.Frame):
             command=lambda: self._dismiss(None),
         ).pack(pady=(0, pad))
 
-        # Place + size the card. Compute desired height from header+rows+footer
-        # and clamp to the parent's available height so header and footer
-        # always remain visible — the list canvas absorbs the overflow.
-        ROW_H = 34
+        # Place + size the card. Fill the full available height of the parent
+        # (the modlist panel) so the card is as tall as it can be; the list
+        # canvas absorbs the extra space below the rows. Header and footer stay
+        # fixed via the grid weights, so they always remain visible.
         try:
             parent.update_idletasks()
-            parent_h = parent.winfo_height() or 600
+            parent_h = parent.winfo_height() or scaled(600)
         except Exception:
-            parent_h = 600
-        max_card_h = max(240, parent_h - 40)
-        # Estimate fixed chrome (header ~70px, footer ~60px, paddings).
-        chrome_h = 70 + 60 + pad * 2
-        desired_h = chrome_h + len(files) * ROW_H + 8
-        card_h = min(desired_h, max_card_h)
+            parent_h = scaled(600)
+        card_h = max(scaled(240), parent_h - margin)
         card.place(relx=0.5, rely=0.5, anchor="center",
                    width=card_w, height=card_h)
 
@@ -478,7 +481,7 @@ class NexusBrowserOverlay(tk.Frame):
         self.grid_columnconfigure(0, weight=1)
 
         # Toolbar
-        toolbar = tk.Frame(self, bg=BG_HEADER, height=42)
+        toolbar = tk.Frame(self, bg=BG_HEADER, height=scaled(42))
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.grid_propagate(False)
 

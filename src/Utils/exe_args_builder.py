@@ -186,6 +186,34 @@ EXE_FILTER_DEFAULTS: frozenset[str] = frozenset({
     "mwse-launcher.exe",        # Morrowind MWSE
     
     "synthesis.exe", # Only works via the wizard menu
+
+    # ReSaver (Fallout 4 / Skyrim save editor) — only ReSavor.bat should be
+    # launched.  The folder also ships an older ReSaver.bat/.exe and a raw
+    # ReSavor.exe, none of which should appear in the dropdown.
+    "resaver.bat",
+    "resaver.exe",
+    "resavor.exe",
+
+    # Bundled JRE binaries (ReSaver and other Java tools ship a private jre/) —
+    # never launched directly by the user.
+    "jabswitch.exe",
+    "java.exe",
+    "java-rmi.exe",
+    "javaw.exe",
+    "jfr.exe",
+    "jjs.exe",
+    "keytool.exe",
+    "kinit.exe",
+    "klist.exe",
+    "ktab.exe",
+    "orbd.exe",
+    "pack200.exe",
+    "policytool.exe",
+    "rmid.exe",
+    "rmiregistry.exe",
+    "servertool.exe",
+    "tnameserv.exe",
+    "unpack200.exe",
 })
 
 # ---------------------------------------------------------------------------
@@ -277,6 +305,8 @@ def _bootstrap_pgpatcher_settings(
     update: bool = False,
     output_mod: "Path | None" = None,
     pfx: "Path | None" = None,
+    mo2_instance_dir: "Path | None" = None,
+    game_type: "int | None" = None,
 ) -> None:
     """
     Write cfg/settings.json next to PGPatcher.exe.
@@ -290,6 +320,9 @@ def _bootstrap_pgpatcher_settings(
     - game_path  : game install root (Linux path)
     - staging_path : mods staging folder (Linux path)
     - output_mod : explicit output folder path; defaults to staging_path / "PGPatcher_output"
+    - mo2_instance_dir : if given, enable MO2 conflict-resolution mode
+      (modmanager.type=2) pointed at this dummy MO2 instance; if None, force
+      modmanager.type=0 (None).
     """
     if game_path is None or staging_path is None:
         log_fn("PGPatcher: game path not configured; skipping settings.json generation")
@@ -318,6 +351,20 @@ def _bootstrap_pgpatcher_settings(
     # Update the two profile-dependent paths
     settings.setdefault("params", {}).setdefault("game", {})["dir"] = _to_wine_path(game_path, pfx)
     settings["params"].setdefault("output", {})["dir"] = _to_wine_path(output_mod_dir, pfx)
+
+    # Game type (BethesdaGame::GameType: SE=0, GOG=1, VR=2, Enderal=3).  Set when
+    # known so GOG installs read the right game; left untouched otherwise.
+    if game_type is not None:
+        settings["params"]["game"]["type"] = game_type
+
+    # Mod-manager conflict-resolution mode: MO2 (2) against the dummy instance,
+    # or None (0).  type 1 would be Vortex.
+    mm = settings["params"].setdefault("modmanager", {})
+    if mo2_instance_dir is not None:
+        mm["type"] = 2
+        mm["mo2instancedir"] = _to_wine_path(mo2_instance_dir, pfx)
+    else:
+        mm["type"] = 0
 
     # Write cfg/settings.json (create cfg/ if needed)
     try:
@@ -415,6 +462,11 @@ def _bootstrap_pandora_settings(
         settings: dict = json.loads(settings_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         settings = {}
+
+    # Default to the dark theme (theme 2) on first setup; leave the user's
+    # choice alone if they've already picked one.
+    app = settings.setdefault("app", {})
+    app.setdefault("theme", 2)
 
     games = settings.setdefault("games", {})
     entry = games.setdefault(pandora_game_key, {})

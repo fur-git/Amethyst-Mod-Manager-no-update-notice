@@ -34,6 +34,7 @@ PLUGIN_INFO = {
     "game_ids":     ["Slime_Rancher"],
     "all_games":    False,
     "dialog_class": "SRMLWizard",
+    "category":     "Setup & Installers",
 }
 
 _NEXUS_URL       = "https://www.nexusmods.com/slimerancher/mods/2?tab=files&file_id=724"

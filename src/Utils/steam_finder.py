@@ -390,6 +390,24 @@ def find_prefix(steam_id: str) -> Path | None:
     return None
 
 
+def game_steam_id(game) -> str:
+    """Return the Steam App ID actually installed for *game*.
+
+    Resolves localized/alternate editions (e.g. FNV's 22490) through the game
+    handler's ``effective_steam_id()`` when available, falling back to the plain
+    ``steam_id`` attribute. Safe to call on any object.
+    """
+    if game is None:
+        return ""
+    resolver = getattr(game, "effective_steam_id", None)
+    if callable(resolver):
+        try:
+            return resolver() or ""
+        except Exception:
+            pass
+    return str(getattr(game, "steam_id", "") or "")
+
+
 def find_proton_for_game(steam_id: str) -> Path | None:
     """
     Find the Proton launcher script assigned to a Steam game.

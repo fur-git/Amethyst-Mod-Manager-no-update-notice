@@ -26,6 +26,7 @@ Game support is driven by the game handler's properties:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 import urllib.request
@@ -328,7 +329,11 @@ class SortResult:
     #   "requirements":    list[{"name","display_name","detail"}],
     #   "incompatibilities": list[{"name","display_name","detail"}],
     #   "locations":       list[{"name","url"}],
+    #   "dirty":           list[{"crc","itm","udr","nav","utility","detail"}],
+    #   "clean":           list[{"crc","itm","udr","nav","utility","detail"}],
+    #   "tags":            {"current":[...], "add":[...], "remove":[...]},
     # }
+    # dirty/clean are CRC-filtered by libloot when conditions are evaluated.
     # Populated from evaluated masterlist/userlist metadata (conditions applied).
     plugin_info: dict[str, dict] = field(default_factory=dict)
     # General (masterlist-wide) messages: list[{"type","text"}].
@@ -424,15 +429,86 @@ def _render_locations(locs) -> list[dict]:
     return out
 
 
+def _render_cleaning_data(entries, language: str = "en") -> list[dict]:
+    """Render a libloot PluginCleaningData list (dirty / clean info).
+
+    When metadata is fetched with evaluate_conditions=True, libloot already
+    filters these against the installed plugin's CRC, so every entry here
+    applies to the plugin's actual on-disk version.
+    """
+    out: list[dict] = []
+    for d in entries or []:
+        # detail is a list[MessageContent] — pick best-match language.
+        detail_text = ""
+        detail_msgs = getattr(d, "detail", None)
+        if detail_msgs:
+            try:
+                picked = loot.select_message_content(list(detail_msgs), language)
+            except Exception:
+                picked = None
+            if picked is None:
+                picked = list(detail_msgs)[0]
+            if picked is not None:
+                detail_text = getattr(picked, "text", "") or ""
+        out.append({
+            "crc": getattr(d, "crc", 0),
+            "itm": getattr(d, "itm_count", 0),
+            "udr": getattr(d, "deleted_reference_count", 0),
+            "nav": getattr(d, "deleted_navmesh_count", 0),
+            "utility": getattr(d, "cleaning_utility", "") or "",
+            "detail": detail_text,
+        })
+    return out
+
+
+def _render_bash_tags(current, suggested) -> dict:
+    """Merge a plugin's current (header) Bash Tags with masterlist suggestions.
+
+    current   — iterable of tag-name strings from plugin.bash_tags()
+    suggested — iterable of libloot Tag objects from evaluated metadata
+                (each has .name and .is_addition).
+
+    Returns {"current": [...], "add": [...], "remove": [...]} with empty lists
+    omitted by the caller. Suggested additions already present in current are
+    dropped so the UI only highlights tags the user would still need to add.
+    """
+    cur = sorted({str(t) for t in (current or []) if str(t)})
+    cur_set = {c.lower() for c in cur}
+    add: list[str] = []
+    remove: list[str] = []
+    for t in suggested or []:
+        name = getattr(t, "name", "") or ""
+        if not name:
+            continue
+        if getattr(t, "is_addition", True):
+            if name.lower() not in cur_set:
+                add.append(name)
+        else:
+            remove.append(name)
+    out: dict = {}
+    if cur:
+        out["current"] = cur
+    if add:
+        out["add"] = sorted(set(add))
+    if remove:
+        out["remove"] = sorted(set(remove))
+    return out
+
+
 def _collect_plugin_info(
     db,
     plugin_names: list[str],
+    game=None,
     language: str = "en",
 ) -> dict[str, dict]:
     """Collect evaluated masterlist/userlist metadata for each plugin.
 
     Returns a mapping of plugin name -> info dict (see SortResult.plugin_info).
     Only plugins that have at least one non-empty field are included.
+
+    When `game` is provided (the libloot Game with plugin headers loaded),
+    each plugin's current header Bash Tags are merged with the masterlist's
+    suggested add/remove tags.
     """
     out: dict[str, dict] = {}
     for name in plugin_names:
@@ -447,8 +523,25 @@ def _collect_plugin_info(
         requirements = _render_file_list(meta.requirements)
         incompatibilities = _render_file_list(meta.incompatibilities)
         locations = _render_locations(meta.locations)
+        # dirty_info / clean_info are CRC-filtered by libloot when conditions
+        # are evaluated, so they reflect the plugin's installed version.
+        dirty = _render_cleaning_data(meta.dirty_info, language)
+        clean = _render_cleaning_data(meta.clean_info, language)
 
-        if not (messages or requirements or incompatibilities or locations):
+        # Bash Tags: current (header) tags from the plugin object, merged with
+        # the masterlist's suggested additions/removals.
+        current_tags = []
+        if game is not None:
+            try:
+                pl = game.plugin(name)
+                if pl is not None:
+                    current_tags = list(pl.bash_tags())
+            except Exception:
+                current_tags = []
+        tags = _render_bash_tags(current_tags, meta.tags)
+
+        if not (messages or requirements or incompatibilities or locations
+                or dirty or clean or tags):
             continue
 
         info: dict = {}
@@ -460,6 +553,12 @@ def _collect_plugin_info(
             info["incompatibilities"] = incompatibilities
         if locations:
             info["locations"] = locations
+        if dirty:
+            info["dirty"] = dirty
+        if clean:
+            info["clean"] = clean
+        if tags:
+            info["tags"] = tags
         out[name] = info
     return out
 
@@ -486,12 +585,15 @@ def write_loot_info(
 ) -> None:
     """Persist evaluated LOOT metadata to <profile_dir>/loot.json (atomic).
 
-    Schema v2: plugin_info values are dicts {messages, dirty, requirements,
-    incompatibilities, locations}. Fields are omitted when empty.
+    Schema v3: plugin_info values are dicts {messages, requirements,
+    incompatibilities, locations, dirty, clean, tags}. Fields are omitted when
+    empty. dirty/clean are CRC-filtered PluginCleaningData lists (see
+    _render_cleaning_data); tags merges header + masterlist Bash Tags (see
+    _render_bash_tags).
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 2,
+        "version": 3,
         "generated_at": int(time.time()),
         "game_id": game_id,
         "general_messages": general_messages,
@@ -526,6 +628,53 @@ def _is_valid_plugin_file(path: Path) -> bool:
         return False
 
 
+def _scan_tree_for_plugins(
+    root: Path,
+    needed_lower: set[str],
+    plugin_exts: set[str] | None = None,
+) -> dict[str, Path]:
+    """Walk a directory tree (depth-first) looking for files whose lowercase
+    basename is in `needed_lower`.
+
+    Returns a map of lowercase basename → first matching path, stopping the walk
+    as soon as every needed name has been located. Uses os.scandir so directory
+    entries are filtered without a stat per file — the bulk of mod data (meshes,
+    textures, …) never gets stat'd, only candidate plugin files do.
+
+    When `plugin_exts` is given (e.g. {".esp", ".esm", ".esl"}), matches are
+    further restricted to those extensions; pass None to match by basename only.
+    """
+    if not needed_lower:
+        return {}
+    remaining = set(needed_lower)
+    found: dict[str, Path] = {}
+    stack: list[str] = [str(root)]
+    while stack and remaining:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                    continue
+            except OSError:
+                continue
+            name_lower = entry.name.lower()
+            if name_lower not in remaining:
+                continue
+            if plugin_exts is not None:
+                ext = name_lower.rsplit(".", 1)
+                if len(ext) != 2 or ("." + ext[1]) not in plugin_exts:
+                    continue
+            found[name_lower] = Path(entry.path)
+            remaining.discard(name_lower)
+            if not remaining:
+                break
+    return found
+
+
 def _find_plugin_paths(
     plugin_names: list[str],
     game_data_dir: Path,
@@ -557,40 +706,36 @@ def _find_plugin_paths(
                 found[name] = str(full)
                 found_basenames.add(name.lower())
 
-    # 2. For anything still missing, search staging mod folders (recursively)
+    # 2. For anything still missing, search staging mod folders (recursively).
+    #    The scan walks via os.scandir and stops as soon as every missing
+    #    plugin is located, skipping the bulk of mod data.
     if staging_root and staging_root.is_dir():
-        still_missing = [n for n in plugin_names if n not in found]
-        if still_missing:
-            missing_lower = {n.lower() for n in still_missing}
-            for mod_dir in staging_root.iterdir():
-                if not mod_dir.is_dir():
-                    continue
-                for f in mod_dir.rglob("*"):
-                    if f.is_file() and f.name.lower() in missing_lower:
-                        # Map back to the original-cased name
-                        orig = names_lower.get(f.name.lower())
-                        if (orig and orig not in found
-                                and f.name.lower() not in found_basenames
-                                and _is_valid_plugin_file(f)):
-                            found[orig] = str(f)
-                            found_basenames.add(f.name.lower())
+        missing_lower = {n.lower() for n in plugin_names if n not in found}
+        if missing_lower:
+            for name_lower, path in _scan_tree_for_plugins(
+                    staging_root, missing_lower).items():
+                orig = names_lower.get(name_lower)
+                if (orig and orig not in found
+                        and name_lower not in found_basenames
+                        and _is_valid_plugin_file(path)):
+                    found[orig] = str(path)
+                    found_basenames.add(name_lower)
 
     # 3. For anything still missing, check the overwrite folder
     #    (staging_root's sibling: Profiles/<game>/overwrite/)
     if staging_root:
         overwrite_dir = staging_root.parent / "overwrite"
         if overwrite_dir.is_dir():
-            still_missing = [n for n in plugin_names if n not in found]
-            if still_missing:
-                missing_lower = {n.lower() for n in still_missing}
-                for f in overwrite_dir.rglob("*"):
-                    if f.is_file() and f.name.lower() in missing_lower:
-                        orig = names_lower.get(f.name.lower())
-                        if (orig and orig not in found
-                                and f.name.lower() not in found_basenames
-                                and _is_valid_plugin_file(f)):
-                            found[orig] = str(f)
-                            found_basenames.add(f.name.lower())
+            missing_lower = {n.lower() for n in plugin_names if n not in found}
+            if missing_lower:
+                for name_lower, path in _scan_tree_for_plugins(
+                        overwrite_dir, missing_lower).items():
+                    orig = names_lower.get(name_lower)
+                    if (orig and orig not in found
+                            and name_lower not in found_basenames
+                            and _is_valid_plugin_file(path)):
+                        found[orig] = str(path)
+                        found_basenames.add(name_lower)
 
     found_paths = [found[n] for n in plugin_names if n in found]
     missing_names = [n for n in plugin_names if n not in found]
@@ -706,27 +851,30 @@ def sort_plugins(
     _temp_data_symlinks: list[Path] = []
 
     if staging_root and staging_root.is_dir() and effective_data_dir.is_dir():
-        names_needed = {n.lower() for n in plugin_names}
-        # Build a map of lowercase plugin name → staging file path
-        staging_plugin_map: dict[str, Path] = {}
-        for mod_dir in staging_root.iterdir():
-            if not mod_dir.is_dir():
+        # We only need to symlink plugins that aren't already present in Data/.
+        # For a deployed profile every plugin is already there, so this set is
+        # empty and we skip the (potentially huge) staging tree walk entirely.
+        needed: set[str] = set()
+        for name in plugin_names:
+            if (effective_data_dir / name).exists():
                 continue
-            for f in mod_dir.rglob("*"):
-                if (f.is_file()
-                        and f.suffix.lower() in _plugin_exts
-                        and f.name.lower() in names_needed
-                        and f.name.lower() not in staging_plugin_map):
-                    staging_plugin_map[f.name.lower()] = f
+            needed.add(name.lower())
 
-        for name_lower, src in staging_plugin_map.items():
-            dest = effective_data_dir / src.name
-            if not dest.exists() and not dest.is_symlink():
-                try:
-                    dest.symlink_to(src)
-                    _temp_data_symlinks.append(dest)
-                except OSError:
-                    pass
+        if needed:
+            # Build a map of lowercase plugin name → staging file path. Walk only
+            # for the missing plugins, scanning candidate plugin files and
+            # stopping as soon as every needed plugin is located.
+            staging_plugin_map = _scan_tree_for_plugins(
+                staging_root, needed, _plugin_exts,
+            )
+            for src in staging_plugin_map.values():
+                dest = effective_data_dir / src.name
+                if not dest.exists() and not dest.is_symlink():
+                    try:
+                        dest.symlink_to(src)
+                        _temp_data_symlinks.append(dest)
+                    except OSError:
+                        pass
 
     try:
         # Create libloot Game instance
@@ -795,17 +943,13 @@ def sort_plugins(
 
         _log(f"Sort complete. {moved} plugin(s) changed position.")
 
-        # CRC-based filtering of dirty_info was tried but required a full
-        # plugin-body load (game.load_plugins) that scales with total plugin
-        # size — unacceptably slow for real profiles. We now skip CRC matching
-        # and render every masterlist dirty entry; tooltips get noisier for
-        # plugins with many known CRCs but sort stays fast.
-
         # Collect evaluated metadata for every plugin. Conditions are evaluated
         # against the plugin headers we just loaded, so this reflects the live
-        # state of the current profile.
+        # state of the current profile. This includes dirty/clean info: libloot
+        # CRC-matches those entries during condition evaluation, so they're
+        # filtered to each plugin's installed version with no full-body load.
         try:
-            plugin_info = _collect_plugin_info(db, sortable)
+            plugin_info = _collect_plugin_info(db, sortable, game=game)
             general_msgs = _collect_general_messages(db)
             if plugin_info:
                 _log(f"Collected LOOT metadata for {len(plugin_info)} plugin(s).")
@@ -827,3 +971,93 @@ def sort_plugins(
                 _sym.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def find_overlapping_plugins(
+    target_plugin: str,
+    plugin_names: list[str],
+    game_name: str,
+    game_path: Path,
+    staging_root: Path | None = None,
+    log_fn=None,
+    game_type_attr: str = "",
+    game_data_dir: Path | None = None,
+) -> list[str]:
+    """Return plugins whose records overlap with `target_plugin`.
+
+    Unlike sort, this requires a *full* plugin load (record bodies, not just
+    headers) so libloot can compare FormIDs via Plugin.do_records_overlap.
+    That load is comparatively expensive (hundreds of ms to seconds for large
+    profiles), so callers should run this off the UI thread.
+
+    Returns the overlapping plugin names (original casing, as found on disk),
+    excluding the target itself. Raises RuntimeError if libloot is unavailable
+    or no game type is configured.
+    """
+    _log = log_fn or (lambda _: None)
+
+    if not _AVAILABLE:
+        raise RuntimeError(
+            "libloot is not available. "
+            "Rebuild it with: ./LOOT/rebuild_libloot.sh"
+        )
+    if not game_type_attr:
+        raise RuntimeError(
+            f"No LOOT game type configured for '{game_name}'. "
+            "Set loot_game_type in the game's Python handler."
+        )
+    game_type = getattr(loot.GameType, game_type_attr, None)
+    if game_type is None:
+        raise RuntimeError(
+            f"Unknown libloot GameType '{game_type_attr}' for '{game_name}'."
+        )
+
+    # Deduplicate case-insensitively and ensure the target is included.
+    seen_lower: set[str] = set()
+    deduped: list[str] = []
+    for n in plugin_names:
+        nl = n.lower()
+        if nl not in seen_lower:
+            seen_lower.add(nl)
+            deduped.append(n)
+    if target_plugin.lower() not in seen_lower:
+        deduped.append(target_plugin)
+    plugin_names = deduped
+
+    loot_data_dir = _get_data_dir()
+    effective_data_dir = game_data_dir if game_data_dir is not None else game_path / "Data"
+
+    _log("Initializing LOOT...")
+    game = loot.Game(game_type, str(game_path), str(loot_data_dir))
+
+    plugin_paths, missing = _find_plugin_paths(
+        plugin_names, effective_data_dir, staging_root,
+    )
+    if not plugin_paths:
+        return []
+
+    _log(f"Loading {len(plugin_paths)} plugins (full records)...")
+    game.load_plugins(plugin_paths)
+
+    target = game.plugin(target_plugin)
+    if target is None:
+        raise RuntimeError(
+            f"'{target_plugin}' could not be loaded (missing from disk?)."
+        )
+
+    overlapping: list[str] = []
+    target_lower = target_plugin.lower()
+    for name in plugin_names:
+        if name.lower() == target_lower:
+            continue
+        other = game.plugin(name)
+        if other is None:
+            continue
+        try:
+            if target.do_records_overlap(other):
+                overlapping.append(name)
+        except Exception:
+            continue
+
+    _log(f"Found {len(overlapping)} overlapping plugin(s).")
+    return overlapping

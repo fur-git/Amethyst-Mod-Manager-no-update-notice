@@ -77,6 +77,52 @@ def get_uncompressed_size(path: str, compressed_size: int = 0) -> int:
     return compressed_size * 15
 
 
+def _path_is_tmpfs(path: str) -> bool:
+    """Best-effort check whether *path* lives on a tmpfs (ramdisk) mount.
+
+    Used to avoid silently extracting a multi-GB archive into a small
+    tmpfs ``/tmp``, where overflowing the mount's ``size=`` cap surfaces as
+    errno EDQUOT ("Disk Quota Exceeded") rather than ENOSPC.
+    """
+    try:
+        # f_blocks * f_frsize is the *total* size of the mount.  A tmpfs is
+        # typically a small fraction of RAM; a real disk is far larger.  We
+        # don't have statfs f_type from os.statvfs, so size is our proxy.
+        st = os.statvfs(path)
+        return st.f_blocks * st.f_frsize < 8 * 1024 ** 3  # < 8 GiB ⇒ treat as ramdisk
+    except OSError:
+        return False
+
+
+def _is_disk_full_error(text: str | None) -> bool:
+    """True if *text* (tool stderr) reports an out-of-space condition.
+
+    Covers both ENOSPC ("No space left") and the tmpfs size-cap case, which
+    the kernel reports as EDQUOT — surfaced by 7z/tar as "Disk Quota Exceeded".
+    """
+    if not text:
+        return False
+    low = text.lower()
+    return any(s in low for s in (
+        "disk quota exceeded", "quota exceeded",
+        "no space left", "enospc", "edquot",
+    ))
+
+
+def _reroute_extract_dir(old_dir: str, disk_parent: "Path") -> str:
+    """Discard *old_dir* and create a fresh extraction dir under *disk_parent*.
+
+    Falls back to keeping *old_dir* if the new location can't be created.
+    """
+    try:
+        Path(disk_parent).mkdir(parents=True, exist_ok=True)
+        new_dir = tempfile.mkdtemp(prefix="modmgr_", dir=str(disk_parent))
+    except OSError:
+        return old_dir
+    shutil.rmtree(old_dir, ignore_errors=True)
+    return new_dir
+
+
 def _get_available_memory_bytes() -> int:
     """Return available system memory in bytes via /proc/meminfo."""
     try:
@@ -174,7 +220,7 @@ from gui.dialogs import (
 )
 from gui.fomod_dialog import FomodDialog
 from gui.bain_dialog import BainDialog
-from gui.mod_name_utils import _strip_title_metadata, _suggest_mod_names
+from gui.mod_name_utils import _strip_title_metadata, _suggest_mod_names, sanitize_mod_folder_name
 from Utils.fomod_parser import detect_fomod, parse_module_config, parse_mod_info
 from Utils.fomod_installer import resolve_files, check_module_dependencies
 from Utils.bain_installer import detect_bain, resolve_bain_files
@@ -953,7 +999,8 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                              clear_progress_fn=None,
                              defer_interactive_fomod: bool = False,
                              defer_interactive_bain: bool = False,
-                             suppress_notification: bool = False) -> None:
+                             suppress_notification: bool = False,
+                             skip_reload: bool = False) -> None:
     """
     Extract archive to a temp directory, detect FOMOD, run the wizard if
     present, then copy the resolved files into the game's mod staging area.
@@ -974,6 +1021,12 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
         Intended for collection installs where the author has already
         chosen the FOMOD options.
 
+    skip_reload : bool
+        When True, the per-install ``mod_panel.reload_after_install`` call is
+        suppressed.  Used by batch operations (e.g. Quick Update) that install
+        many mods back-to-back and trigger a single reload at the end instead of
+        one full reload per mod, which lags the UI on large modlists.
+
     disable_extract : bool
         When True, skip extraction entirely.  The archive file is moved as-is
         into the mod staging folder (inside a folder named after the archive
@@ -987,6 +1040,10 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
 
     suggestions = _suggest_mod_names(raw_stem)
     mod_name = preferred_name.strip() if preferred_name.strip() else (suggestions[0] if suggestions else raw_stem)
+    # Ensure the on-disk folder name is Wine/Windows-addressable: trailing dots
+    # or spaces and reserved characters make the folder invisible to Wine tools
+    # (xEdit, PGPatcher, …) and break deploy into Wine prefixes.
+    mod_name = sanitize_mod_folder_name(mod_name)
 
     # Collection installers tag SKSE-style mods (install_type="dinput") as
     # root_folder=True. Those mods are a mix of game-root files (skse_loader.exe)
@@ -1097,7 +1154,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
             _fire_on_installed(on_installed, is_fomod=False,
                                installed_mod_name=mod_name)
 
-            if mod_panel is not None:
+            if mod_panel is not None and not skip_reload:
                 mod_panel.after(0, mod_panel.reload_after_install)
             _maybe_queue_rename_after_install(
                 parent_window, mod_panel, headless=False,
@@ -1142,12 +1199,49 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
         _tmp_parent = None  # let mkdtemp use the default /tmp
     else:
         _tmp_parent = _staging.parent if _staging else None
-    try:
-        if _tmp_parent:
-            _tmp_parent.mkdir(parents=True, exist_ok=True)
-        extract_dir = tempfile.mkdtemp(prefix="modmgr_", dir=_tmp_parent or None)
-    except OSError:
+    # Resolve a concrete on-disk fallback parent (the staging filesystem) so
+    # that if the preferred location can't be created we never silently land
+    # back on the default tmpfs /tmp — overflowing that small ramdisk is what
+    # surfaces as "Disk Quota Exceeded" (EDQUOT) for large mods.
+    _disk_parent = _staging.parent if _staging else None
+    extract_dir = None
+    for _candidate in (_tmp_parent, _disk_parent, None):
+        try:
+            if _candidate is not None:
+                Path(_candidate).mkdir(parents=True, exist_ok=True)
+            extract_dir = tempfile.mkdtemp(prefix="modmgr_", dir=_candidate or None)
+        except OSError:
+            continue
+        # If we fell through to the default /tmp but it's a small ramdisk that
+        # can't hold the extraction, discard it and keep trying disk parents.
+        if (
+            _candidate is None
+            and _extract_size_estimate
+            and _path_is_tmpfs(extract_dir)
+        ):
+            try:
+                _free = os.statvfs(extract_dir)
+                if (_free.f_frsize * _free.f_bavail
+                        < _extract_size_estimate + 512 * 1024 * 1024):
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    extract_dir = None
+                    continue
+            except OSError:
+                pass
+        break
+    if extract_dir is None:
+        # Last resort — let mkdtemp pick the default location.
         extract_dir = tempfile.mkdtemp(prefix="modmgr_")
+
+    # Record where the archive is being unpacked, and how much room is there,
+    # so disk-full / "Disk Quota Exceeded" failures are diagnosable from the log.
+    try:
+        _st = os.statvfs(extract_dir)
+        _free_gb = (_st.f_frsize * _st.f_bavail) / (1024 ** 3)
+        _loc = "ramdisk" if _path_is_tmpfs(extract_dir) else "disk"
+        log_fn(f"Extracting to {extract_dir} ({_loc}, {_free_gb:.1f} GB free)")
+    except OSError:
+        log_fn(f"Extracting to {extract_dir}")
 
     try:
         if not os.path.isfile(archive_path):
@@ -1256,6 +1350,19 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     [_7z_bin, "x", archive_path, f"-o{extract_dir}", "-y", "-mmt=on"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                 )
+                # If extraction ran out of room on a small tmpfs /tmp (surfaces
+                # as "Disk Quota Exceeded" / EDQUOT or ENOSPC), re-route to the
+                # on-disk staging filesystem and retry once before giving up.
+                if (result.returncode != 0
+                        and _is_disk_full_error(result.stderr)
+                        and _staging is not None
+                        and _path_is_tmpfs(extract_dir)):
+                    log_fn("Extraction filled the temp ramdisk — retrying on disk…")
+                    extract_dir = _reroute_extract_dir(extract_dir, _staging.parent)
+                    result = subprocess.run(
+                        [_7z_bin, "x", archive_path, f"-o{extract_dir}", "-y", "-mmt=on"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                    )
                 if result.returncode == 0:
                     _7z_done = True
                     log_fn("Extracted with 7z.")
@@ -1984,7 +2091,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                 _show_mod_notification(parent_window, f"Installed bundle: {bundle_name}")
             _fire_on_installed(on_installed, is_fomod=False,
                                installed_mod_name=bundle_name)
-            if mod_panel is not None and not headless:
+            if mod_panel is not None and not headless and not skip_reload:
                 mod_panel.after(0, mod_panel.reload_after_install)
             # Bundles install one separator + N variants — renaming the
             # separator or individual variants doesn't fit the single-name
@@ -2075,7 +2182,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                 _show_mod_notification(parent_window, f"Installed {len(multi_mods)} mods")
             _fire_on_installed(on_installed, is_fomod=False,
                                installed_mod_name=(installed_names[0] if installed_names else mod_name))
-            if mod_panel is not None and not headless:
+            if mod_panel is not None and not headless and not skip_reload:
                 mod_panel.after(0, mod_panel.reload_after_install)
             return installed_names[0] if installed_names else mod_name
         else:
@@ -2459,7 +2566,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
         _fire_on_installed(on_installed, is_fomod=is_fomod_install,
                            installed_mod_name=mod_name)
 
-        if mod_panel is not None and not headless:
+        if mod_panel is not None and not headless and not skip_reload:
             mod_panel.after(0, mod_panel.reload_after_install)
 
         _maybe_queue_rename_after_install(

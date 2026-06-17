@@ -1,3 +1,23 @@
+- v1.3.10
+- Added Fallout 76 support
+- Fixed separator settings deploy method option not working
+- Added a global filter to not deploy macOS related files
+- Fix for Stardew valley AT mods where the Textures folder is in the wrong casing, causing an error in game
+- Added a guard to prevent vanilla files moving to overwrite when changing a custom games settings while deployed
+- Fixed loose CP2077 .xl files causing a deploy error 
+- Fixed a bug where custom routing rules for root deployed games could send a vanilla file to overwrite
+- Quick Update now refreshes the mod list once after all updates finish instead of after every mod install
+- The plugins panel now shows dirty plugins and bash tags when sorting with loot
+- Optimised the Loot sorting speed, Plugins should sort much faster 
+- Fixed vanilla plugins moving to overwrite when edited with xedit via symlink mode
+- The pg patcher wizard can now be launched wth the mo2 conflict resolution manager option
+- Added a wizard for ESLifier
+- Reworked the reshade wizard
+- The pandora wizard now auto applies the dark theme.
+- Renamed the ini files tab since the tab shows more than just ini files
+- Mods that contain plugins modified in xedit are now flagged
+- Fixed non nexus metadata being removed from mod names during install
+
 - v1.3.9
 - Potential fix for ssl error causing nexus login to fail
 - Tweaked Fonv and Fo3 to add bsa files to SArchiveList based on plugin load order
