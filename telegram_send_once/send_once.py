@@ -8,7 +8,6 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 
 DEFAULT_MESSAGE = "Health check failed and a bug was found and requires your attention"
 
@@ -28,11 +27,8 @@ def main() -> None:
         if len(sys.argv) > 1 and sys.argv[1].strip()
         else os.environ.get("TELEGRAM_MESSAGE", DEFAULT_MESSAGE).strip() or DEFAULT_MESSAGE
     )
-    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    text = f"{message}\n\n({when})"
-
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = json.dumps({"chat_id": user_id, "text": text}).encode("utf-8")
+    payload = json.dumps({"chat_id": user_id, "text": message}).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=payload,
