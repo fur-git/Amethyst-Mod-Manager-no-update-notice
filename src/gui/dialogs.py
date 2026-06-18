@@ -65,6 +65,8 @@ from gui.theme import (
     TONE_GREEN,
     TONE_RED,
     TONE_BLUE,
+    BG_GREEN_TEXT,
+    BG_RED_TEXT,
     TAG_BSA_ALT,
     FONT_FAMILY,
     TK_FONT_BOLD, TK_FONT_NORMAL, TK_FONT_SMALL,
@@ -4012,6 +4014,26 @@ class BundleOptionsPanel(ctk.CTkFrame):
         self._on_preview = on_preview
         self._on_preview_clear = on_preview_clear
 
+        # Per-option deployable file sets (lowercased mod-root rel paths), used to
+        # flag options that write the same file as another selected option.  Built
+        # once from the bundle library; empty when no lib_dir is available.
+        self._opt_files: dict[str, set[str]] = {}
+        if self._lib_dir is not None:
+            from Utils.re_bundle import option_deployable_rels
+            for g in self._spec.groups:
+                for o in g.options:
+                    if o.is_label:
+                        continue
+                    try:
+                        self._opt_files[o.folder] = option_deployable_rels(
+                            self._lib_dir, o.folder)
+                    except Exception:
+                        self._opt_files[o.folder] = set()
+        # folder -> {"text": str, "marker": CTkLabel} for live conflict recolour.
+        self._opt_widgets: dict[str, dict] = {}
+        # Shared tooltip for option rows whose label was elided (long names).
+        self._label_tooltip = TkTooltip(self, font=TK_FONT_NORMAL)
+
         title_bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=36)
         title_bar.pack(fill="x")
         title_bar.pack_propagate(False)
@@ -4031,7 +4053,8 @@ class BundleOptionsPanel(ctk.CTkFrame):
             text="Choose which options are active. “Select one” groups allow a "
                  "single choice; optional add-ons can be combined.\n"
                  "When optional add-ons overlap, the one lower in the list wins "
-                 "— use ▲/▼ to reorder.",
+                 "— use ▲/▼ to reorder.  Options whose files are fully replaced "
+                 "by another selection are flagged in red.",
             font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
         ).pack(anchor="w", padx=16, pady=(12, 6))
 
@@ -4067,11 +4090,32 @@ class BundleOptionsPanel(ctk.CTkFrame):
         if _first is not None:
             self._preview_option(_first.folder)
 
+    # Max option-label length before eliding.  Long bundle option names would
+    # otherwise stretch the row and push the conflict marker and ▲/▼ buttons off
+    # the right edge of the panel; the full name stays available via a tooltip.
+    _LABEL_MAX = 38
+
+    @classmethod
+    def _elide(cls, text: str) -> str:
+        """Truncate *text* with an ellipsis if longer than ``_LABEL_MAX``."""
+        if len(text) > cls._LABEL_MAX:
+            return text[: cls._LABEL_MAX - 1].rstrip() + "…"
+        return text
+
+    def _maybe_tooltip(self, widget, full_text: str) -> None:
+        """Attach a tooltip showing *full_text* when the label was elided."""
+        if len(full_text) > self._LABEL_MAX:
+            try:
+                self._label_tooltip.attach(widget, full_text)
+            except Exception:
+                pass
+
     def _build_rows(self):
         """(Re)build the option rows from the current spec.  Called on init and
         after any reorder so the displayed order matches ``group.options``."""
         for child in self._scroll.winfo_children():
             child.destroy()
+        self._opt_widgets = {}
 
         row = 0
         for gi, group in enumerate(self._spec.groups):
@@ -4090,6 +4134,7 @@ class BundleOptionsPanel(ctk.CTkFrame):
                 def _pick(g=group, v=var):
                     for i, o in enumerate(g.options):
                         o.selected = (i == v.get()) and not o.is_label
+                    self._recompute_conflicts()
                 for oi, opt in enumerate(group.options):
                     if opt.is_label:
                         ctk.CTkLabel(
@@ -4097,13 +4142,24 @@ class BundleOptionsPanel(ctk.CTkFrame):
                             text_color=TEXT_DIM, anchor="w",
                         ).grid(row=row, column=0, sticky="ew", padx=24, pady=(6, 0)); row += 1
                         continue
+                    optrow = ctk.CTkFrame(self._scroll, fg_color="transparent")
+                    optrow.grid(row=row, column=0, columnspan=2, sticky="ew",
+                                padx=24, pady=2)
                     rb = ctk.CTkRadioButton(
-                        self._scroll, text=opt.label, variable=var, value=oi,
+                        optrow, text=self._elide(opt.label), variable=var, value=oi,
                         command=_pick, font=FONT_NORMAL, text_color=TEXT_MAIN,
                         fg_color=ACCENT, hover_color=ACCENT_HOV, border_color=BORDER,
                     )
-                    rb.grid(row=row, column=0, sticky="w", padx=24, pady=2); row += 1
-                    self._bind_hover_preview(rb, opt.folder)
+                    rb.grid(row=0, column=0, sticky="w")
+                    self._maybe_tooltip(rb, opt.label)
+                    marker = ctk.CTkLabel(
+                        optrow, text="", font=FONT_SMALL, text_color=BG_RED_TEXT,
+                        anchor="w",
+                    )
+                    marker.grid(row=0, column=1, sticky="w", padx=(8, 0))
+                    self._opt_widgets[opt.folder] = {"text": opt.label, "marker": marker}
+                    self._bind_hover_preview(optrow, opt.folder)
+                    row += 1
             else:
                 n = len(group.options)
                 for oi, opt in enumerate(group.options):
@@ -4118,17 +4174,27 @@ class BundleOptionsPanel(ctk.CTkFrame):
                         continue
                     rowf = ctk.CTkFrame(self._scroll, fg_color="transparent")
                     rowf.grid(row=row, column=0, columnspan=2, sticky="ew", padx=18, pady=1)
-                    rowf.grid_columnconfigure(0, weight=1)
+                    # col 0 = checkbox, col 1 = conflict marker, col 2 = spacer
+                    # (absorbs slack so the marker hugs the label), cols 3/4 = ▲/▼.
+                    rowf.grid_columnconfigure(2, weight=1)
                     bvar = tk.BooleanVar(value=opt.selected)
                     def _toggle(o=opt, v=bvar):
                         o.selected = bool(v.get())
+                        self._recompute_conflicts()
                     cb = ctk.CTkCheckBox(
-                        rowf, text=opt.label, variable=bvar, command=_toggle,
-                        font=FONT_NORMAL, text_color=TEXT_MAIN,
+                        rowf, text=self._elide(opt.label), variable=bvar,
+                        command=_toggle, font=FONT_NORMAL, text_color=TEXT_MAIN,
                         fg_color=ACCENT, hover_color=ACCENT_HOV,
                         checkmark_color="white", border_color=BORDER,
                     )
                     cb.grid(row=0, column=0, sticky="w")
+                    self._maybe_tooltip(cb, opt.label)
+                    marker = ctk.CTkLabel(
+                        rowf, text="", font=FONT_SMALL, text_color=BG_RED_TEXT,
+                        anchor="w",
+                    )
+                    marker.grid(row=0, column=1, sticky="w", padx=(8, 0))
+                    self._opt_widgets[opt.folder] = {"text": opt.label, "marker": marker}
                     self._bind_hover_preview(cb, opt.folder)
                     self._bind_hover_preview(rowf, opt.folder)
                     ctk.CTkButton(
@@ -4136,14 +4202,57 @@ class BundleOptionsPanel(ctk.CTkFrame):
                         fg_color=BG_HEADER, hover_color=BG_HOVER, text_color=TEXT_MAIN,
                         state=("normal" if oi > 0 else "disabled"),
                         command=lambda g=group, i=oi: self._move(g, i, -1),
-                    ).grid(row=0, column=1, padx=(4, 0))
+                    ).grid(row=0, column=3, padx=(4, 0))
                     ctk.CTkButton(
                         rowf, text="▼", width=26, height=24, font=FONT_SMALL,
                         fg_color=BG_HEADER, hover_color=BG_HOVER, text_color=TEXT_MAIN,
                         state=("normal" if oi < n - 1 else "disabled"),
                         command=lambda g=group, i=oi: self._move(g, i, 1),
-                    ).grid(row=0, column=2, padx=(4, 0))
+                    ).grid(row=0, column=4, padx=(4, 0))
                     row += 1
+
+        self._recompute_conflicts()
+
+    def _recompute_conflicts(self):
+        """Flag every selected option whose files are entirely overridden by
+        another selected option, mirroring deploy order.
+
+        Apply order matches :func:`re_bundle._ordered_selected_folders`:
+        select-one groups first (in declared order), independent groups last, and
+        within a group the option order shown (lower = applied later = wins). The
+        LAST selected option to write a file wins it; an option none of whose
+        files survive is marked '(overridden)' in red.
+        """
+        if not self._opt_widgets:
+            return
+
+        ordered: list[str] = []
+        for g in self._spec.groups:
+            if not g.select_one:
+                continue
+            ordered += [o.folder for o in g.options
+                        if o.selected and not o.is_label]
+        for g in self._spec.groups:
+            if g.select_one:
+                continue
+            ordered += [o.folder for o in g.options
+                        if o.selected and not o.is_label]
+
+        # winners[rel] = folder of the LAST selected option providing that file.
+        winners: dict[str, str] = {}
+        for folder in ordered:
+            for rel in self._opt_files.get(folder, ()):
+                winners[rel] = folder
+
+        selected = set(ordered)
+        for folder, w in self._opt_widgets.items():
+            marker = w["marker"]
+            files = self._opt_files.get(folder, set())
+            if folder in selected and files and not any(
+                    winners.get(rel) == folder for rel in files):
+                marker.configure(text="(overridden)", text_color=BG_RED_TEXT)
+            else:
+                marker.configure(text="")
 
     def _move(self, group, idx: int, delta: int):
         """Swap option *idx* with its neighbour and rebuild the rows."""

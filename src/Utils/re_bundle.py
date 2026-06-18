@@ -633,6 +633,30 @@ def _is_option_metadata(rel_tail: str) -> bool:
     return rel_tail.lower().endswith(_OPTION_META_EXT)
 
 
+def option_deployable_rels(lib_dir: Path, folder: str) -> set[str]:
+    """Return the lowercased mod-root-relative paths option *folder* would
+    materialise (the option-folder prefix stripped, Fluffy bookkeeping skipped).
+
+    This mirrors :func:`materialize_selection`'s per-option file resolution so
+    callers (e.g. the Bundle Options conflict view) can tell, before any deploy,
+    which selected options write the same files.
+    """
+    opt_root = lib_dir / folder
+    if not opt_root.is_dir():
+        return set()
+    rels: set[str] = set()
+    for src in opt_root.rglob("*"):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(opt_root).as_posix()
+        if "/" not in rel and _is_option_metadata(rel):
+            continue
+        if _is_option_metadata(src.name) and src.parent == opt_root:
+            continue
+        rels.add(rel.lower())
+    return rels
+
+
 def _ordered_selected_folders(spec: BundleSpec) -> list[str]:
     """Selected option folders in apply order: select-one groups first (declared
     order), independent groups last so optional add-ons override base/group
