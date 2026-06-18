@@ -1203,13 +1203,58 @@ class CTkPopupMenu(ctk.CTkToplevel):
         # Reposition if off-screen.  Clamp to the actual screen (not the app
         # window) so context menus near the bottom/right edge flip upward or
         # leftward instead of being clipped.
+        #
+        # winfo_reqwidth/height() return *scaled* tk pixels (ui_scale applied),
+        # whereas winfo_screenwidth/height() return *physical* screen pixels.
+        # Comparing them directly mis-fires the flip on HiDPI/fractional-scale
+        # setups (e.g. Bazzite/KDE), so convert the popup size to physical px
+        # first.  See the same scale conversion in dialogs._center_dialog.
         try:
-            pw = self.winfo_reqwidth()
-            ph = self.winfo_reqheight()
+            pw = self.winfo_reqwidth() / scale
+            ph = self.winfo_reqheight() / scale
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
-            nx = x if x + pw <= sw else max(0, sw - pw)
-            ny = y if y + ph <= sh else max(0, y - ph)
+            # On Wayland the Tk app runs under XWayland, where the X root window
+            # is sized to the *whole* virtual desktop (all outputs), so
+            # winfo_screenwidth/height() are much larger than the monitor the
+            # user is actually on.  That left sh too big and the flip never
+            # triggered, so the menu ran off the bottom of the visible screen
+            # (reported on Bazzite 44 / KDE Plasma 6 / Wayland).
+            #
+            # Clamp to the app's own toplevel bounds instead — it's guaranteed
+            # to be on the active monitor — and only fall back to the screen
+            # size if the toplevel geometry isn't usable.  Same approach as the
+            # custom dropdown popup in modlist_panel._build_dropdown.
+            try:
+                app_tl = self.master_window.winfo_toplevel() if self.master_window is not None else None
+                if app_tl is not None and app_tl.winfo_width() > 1 and app_tl.winfo_height() > 1:
+                    tl_left = app_tl.winfo_rootx()
+                    tl_top = app_tl.winfo_rooty()
+                    tl_right = tl_left + app_tl.winfo_width()
+                    tl_bottom = tl_top + app_tl.winfo_height()
+                    # Use the smaller of (toplevel edge, screen edge) as the
+                    # usable boundary so we flip on the active monitor without
+                    # clipping against a stale virtual-desktop size.
+                    sw = min(sw, tl_right) if tl_right > tl_left else sw
+                    sh = min(sh, tl_bottom) if tl_bottom > tl_top else sh
+            except Exception:
+                pass
+            margin = 4
+            # Flip up when the popup would run past the bottom; if flipping up
+            # would push it past the top, clamp to the top with a small margin
+            # rather than re-clipping the bottom.
+            if y + ph + margin <= sh:
+                ny = y
+            else:
+                ny = y - ph
+                if ny < margin:
+                    ny = max(margin, sh - ph - margin)
+            nx = x if x + pw + margin <= sw else max(margin, sw - pw - margin)
+            ny = max(0, int(ny))
+            nx = max(0, int(nx))
+            if _POPUP_DEBUG:
+                print(f"[PopupMenu] flip-check x={x} y={y} pw={pw:.0f} ph={ph:.0f} "
+                      f"sw={sw} sh={sh} scale={scale} -> nx={nx} ny={ny}")
             if nx != x or ny != y:
                 self.geometry('{}x{}+{}+{}'.format(self.width, self.height, nx, ny))
                 self.x, self.y = nx, ny
