@@ -193,13 +193,21 @@ def _parse_files(files_el: ET.Element) -> list[FileInstall]:
         if tag in ("file", "folder"):
             source = child.get("source", "")
             destination = child.get("destination")
-            # Per the FOMOD spec, an absent OR empty `destination` means
-            # "install preserving the source's relative path" — MO2 treats the
-            # two identically. Defaulting empty → source keeps a
-            # <file source="meshes/x.nif" destination=""/> at meshes/x.nif
-            # instead of flattening it to the destination root.
-            if destination is None or destination == "":
+            is_folder = (tag == "folder")
+            # Empty/absent `destination` has DIFFERENT meaning per element type:
+            #   <file>   → preserve the source's relative path (so a
+            #              <file source="meshes/x.nif" destination=""/> lands at
+            #              meshes/x.nif, not flattened to the root).
+            #   <folder> → copy the folder's *contents* to the destination root,
+            #              stripping the source wrapper (so
+            #              <folder source="Base" destination=""/> puts Base/SKSE/…
+            #              at SKSE/…). This MUST stay empty so the copier's
+            #              "no dst_rel → dest_root" path does the stripping.
+            # MO2 treats absent and empty identically within each element type.
+            if not is_folder and (destination is None or destination == ""):
                 destination = source
+            elif destination is None:
+                destination = ""
             result.append(FileInstall(
                 source=source,
                 destination=destination,
