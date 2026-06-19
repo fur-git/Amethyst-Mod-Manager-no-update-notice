@@ -70,10 +70,21 @@ def bind_scrollable_wheel(scrollable) -> None:
             pass
         return "break"
 
+    # Track which widgets already carry our Button-4/5 handlers so repeated
+    # tree walks (the <Enter> rebind below) stay idempotent. Without this,
+    # every pointer-enter stacked another add="+" handler on each widget, so a
+    # notch scrolled 3 units × (times the frame had been entered) — i.e. the
+    # speed grew over the session and differed per widget depending on how many
+    # rebinds happened while it existed.
+    bound: set[str] = set()
+
     def _bind_tree(widget):
         try:
-            widget.bind("<Button-4>", _up, add="+")
-            widget.bind("<Button-5>", _down, add="+")
+            key = str(widget)
+            if key not in bound:
+                widget.bind("<Button-4>", _up, add="+")
+                widget.bind("<Button-5>", _down, add="+")
+                bound.add(key)
         except Exception:
             return
         for child in widget.winfo_children():
@@ -87,6 +98,8 @@ def bind_scrollable_wheel(scrollable) -> None:
 
     # Re-walk descendants when the pointer enters the scroller — cheap, and
     # covers rows added after the initial bind (multi-step wizard pages).
+    # Only widgets not already in ``bound`` get a handler, so this never
+    # double-binds existing rows.
     def _on_enter(_e=None):
         _bind_tree(scrollable)
         try:

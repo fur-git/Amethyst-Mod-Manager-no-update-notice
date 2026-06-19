@@ -422,9 +422,17 @@ class WizardPanel(ctk.CTkFrame):
         self._search_var.trace_add("write", lambda *_: self._render_rows(self._search_var.get()))
 
     def _bind_tree(self, widget):
-        if not LEGACY_WHEEL_REDUNDANT:
+        if LEGACY_WHEEL_REDUNDANT:
+            return
+        # Dedup so repeated walks (every search keystroke re-binds the
+        # surviving rows container) never stack add="+" handlers — that made a
+        # single notch scroll one unit per accumulated binding.
+        bound = self.__dict__.setdefault("_wheel_bound", set())
+        key = str(widget)
+        if key not in bound:
             widget.bind("<Button-4>", self._scroll_up, add="+")
             widget.bind("<Button-5>", self._scroll_down, add="+")
+            bound.add(key)
         for child in widget.winfo_children():
             self._bind_tree(child)
 
