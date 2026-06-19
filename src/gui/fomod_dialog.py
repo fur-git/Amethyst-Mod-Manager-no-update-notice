@@ -79,6 +79,7 @@ class FomodDialog(ctk.CTkFrame):
                  mod_root: str,
                  installed_files: set[str] | None = None,
                  active_files: set[str] | None = None,
+                 loose_files: set[str] | None = None,
                  saved_selections: dict[str, dict[str, list[str]]] | None = None,
                  selections_path=None,
                  on_done=None,
@@ -100,6 +101,9 @@ class FomodDialog(ctk.CTkFrame):
         self._mod_root      = mod_root
         self._installed     = installed_files or set()
         self._active        = active_files  # None means treat installed as active
+        # Deployed loose-file paths (lower-case, forward-slash) for resolving
+        # <fileDependency> nodes that reference an asset path, not a plugin.
+        self._loose         = loose_files
         self._selections_path = selections_path  # Path | None — for Reset button
         self._flag_state: dict[str, str] = {}
         # Keyed by str(config_step_index) so duplicate step names never collide.
@@ -338,7 +342,7 @@ class FomodDialog(ctk.CTkFrame):
 
     def _refresh_visible_steps(self):
         self._visible_steps = get_visible_steps(
-            self._config, self._flag_state, self._installed, self._active
+            self._config, self._flag_state, self._installed, self._active, self._loose
         )
 
     def _config_step_idx(self, step: InstallStep) -> int:
@@ -366,7 +370,7 @@ class FomodDialog(ctk.CTkFrame):
         step_key = str(self._config_step_idx(step))
         existing = self._all_selections.get(step_key)
         if existing is None:
-            defaults = get_default_selections(step, self._flag_state, self._installed, self._active)
+            defaults = get_default_selections(step, self._flag_state, self._installed, self._active, self._loose)
             # Accept both new index-keyed format and old name-keyed format for
             # saved selections (backward compatibility with on-disk JSON).
             saved = self._saved_selections.get(step_key) or self._saved_selections.get(step.name)
@@ -379,7 +383,7 @@ class FomodDialog(ctk.CTkFrame):
                     if group and saved_plugins:
                         # Drop any saved plugin whose type is NotUsable
                         plugin_type_map = {
-                            p.name: resolve_plugin_type(p, self._flag_state, self._installed, self._active)
+                            p.name: resolve_plugin_type(p, self._flag_state, self._installed, self._active, self._loose)
                             for p in group.plugins
                         }
                         filtered = [
@@ -552,7 +556,7 @@ class FomodDialog(ctk.CTkFrame):
         if gtype in ("SelectExactlyOne", "SelectAtMostOne"):
             # Radio buttons — one shared IntVar per group
             # Value -1 = nothing selected (allowed for SelectAtMostOne)
-            plugin_types = [resolve_plugin_type(p, self._flag_state, self._installed, self._active)
+            plugin_types = [resolve_plugin_type(p, self._flag_state, self._installed, self._active, self._loose)
                             for p in plugins]
 
             sel_idx = -1
@@ -624,7 +628,7 @@ class FomodDialog(ctk.CTkFrame):
             # Checkboxes — one BooleanVar per plugin
             check_vars: list[tk.BooleanVar] = []
             for plugin in plugins:
-                ptype = resolve_plugin_type(plugin, self._flag_state, self._installed, self._active)
+                ptype = resolve_plugin_type(plugin, self._flag_state, self._installed, self._active, self._loose)
                 is_required   = ptype == "Required"
                 is_not_usable = ptype == "NotUsable"
                 # Required plugins are always checked; NotUsable always unchecked
@@ -1058,7 +1062,8 @@ class FomodDialog(ctk.CTkFrame):
         step = self._visible_steps[self._current_idx]
         step_key = str(self._config_step_idx(step))
         sels = self._all_selections.get(step_key, {})
-        errors = validate_selections(step, sels)
+        errors = validate_selections(step, sels, self._flag_state,
+                                     self._installed, self._active, self._loose)
         if errors:
             self._validation_label.configure(text=errors[0])
             return
