@@ -52,7 +52,6 @@ from Utils.re_pak_patcher import (
     find_pak_files,
     hash_filepath,
     patch_pak_file,
-    remove_root_manifest,
     restore_from_root_manifest,
     restore_pak_file,
     update_root_manifest,
@@ -387,8 +386,10 @@ class ResidentEvilVillage(BaseGame):
         if restored_entries == 0:
             _log("  No PAK backups found (nothing to restore).")
 
-        # PAKs are now vanilla again — drop the game-root failsafe manifest.
-        remove_root_manifest(self._game_path)
+        # NB the game-root manifest (.mm_pak_restore.json) is intentionally
+        # kept — it is an append-only ledger of every entry the manager has
+        # ever invalidated, so the "Repair PAK files" wizard can always re-heal
+        # the PAKs even if a future deploy/restore leaves them stranded.
 
         _log("Restore: removing mod files from game root and restoring vanilla backups ...")
         restore_filemap_from_root(

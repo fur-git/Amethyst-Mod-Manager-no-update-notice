@@ -4382,15 +4382,18 @@ class BundleOptionsPanel(ctk.CTkFrame):
 
     def _promote_option(self, folder: str) -> None:
         """Make the just-checked *folder* win: turn off any other selected
-        independent option that is a full-overlap *alternative* of it — i.e. one
-        whose deployable file set is wholly contained in, or wholly contains,
-        *folder*'s (so enabling both would leave one completely shadowing the
-        other).  This is the "your click wins" rule: checking one mesh/texture
-        variant turns off the sibling variant writing the same files, regardless
-        of list order.
+        independent option that is a true *alternative* of it — i.e. one whose
+        deployable file set is **identical** to *folder*'s (so the two write
+        exactly the same files and only one can ever be visible).  This is the
+        "your click wins" rule: checking one mesh/texture variant turns off the
+        sibling variant writing the same files, regardless of list order.
 
-        Genuine partial-overlap add-ons (sharing only *some* files) are left
-        selected — both still contribute, and apply order decides the overlap."""
+        A subset/superset pair is NOT an alternative: the larger option ships
+        files the smaller one doesn't, so enabling both still lets each
+        contribute (the smaller wins the files it provides, the larger keeps its
+        extras).  Those — and genuine partial-overlap add-ons (sharing only
+        *some* files) — are left selected; apply order decides the overlap and
+        :meth:`_recompute_conflicts` marks anything fully shadowed."""
         files = self._opt_files.get(folder, set())
         if not files:
             return  # no files → nothing to win or shadow
@@ -4404,8 +4407,10 @@ class BundleOptionsPanel(ctk.CTkFrame):
             ofiles = self._opt_files.get(other, set())
             if not ofiles:
                 continue
-            # Full overlap in either direction → mutually-exclusive alternatives.
-            if ofiles <= files or files <= ofiles:
+            # Identical file sets → mutually-exclusive alternatives (e.g. two
+            # recolours of the same texture).  Subset/superset pairs are kept:
+            # the larger option still contributes the files the smaller lacks.
+            if ofiles == files:
                 o.selected = False
                 try:
                     w["var"].set(False)

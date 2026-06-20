@@ -211,9 +211,9 @@ class RePakRestoreWizard(ctk.CTkFrame):
                 restored = restore_from_root_manifest(game_root, log_fn=self._log_threadsafe)
                 if restored:
                     msg = (f"Repair complete — restored {restored} entr"
-                           f"{'y' if restored == 1 else 'ies'}. The manifest has been removed.")
+                           f"{'y' if restored == 1 else 'ies'} to vanilla.")
                 else:
-                    msg = ("Nothing to repair — the PAK entries were already vanilla "
+                    msg = ("Nothing to repair — the PAK entries are already vanilla "
                            "(or no manifest was found).")
                 self.after(0, lambda: self._finish(msg))
             except Exception as e:
@@ -227,10 +227,8 @@ class RePakRestoreWizard(ctk.CTkFrame):
     def _finish(self, msg: str):
         self._log(msg)
         self._running = False
-        # Refresh the summary so a now-empty manifest disables the button.
-        pak_count, _ = self._manifest_summary()
+        # The manifest is an append-only ledger that persists after a repair,
+        # so the button stays enabled — re-running is always a safe no-op when
+        # the PAKs are already vanilla.
         if self._repair_btn is not None:
-            if pak_count == 0:
-                self._repair_btn.configure(state="disabled")
-            else:
-                self._repair_btn.configure(state="normal")
+            self._repair_btn.configure(state="normal")

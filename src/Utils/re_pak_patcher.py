@@ -263,12 +263,23 @@ def restore_pak_file(pak_path: Path, backup_path: Path, log_fn=None) -> int:
 # Profiles/ directory is deleted while mods are still deployed.  Without it, a
 # wipe-while-deployed leaves the PAKs permanently invalidated with no way back.
 #
-# Format (mirrors the per-pak pak_patches JSON, but keyed by pak filename so a
-# single file covers every patched PAK):
-#   { "v": 1,
-#     "paks": { "<pak filename>": [ {"index": <int>, "original": "<hex>"}, ... ] } }
+# Format (mirrors the per-pak pak_patches JSON, but keyed by each pak's path
+# relative to the game root so a single file covers every patched PAK, including
+# DLC paks under dlc/):
+#   { "_comment": "<self-describing note>",
+#     "v": 1,
+#     "paks": { "<game-root-relative pak path>": [ {"index": <int>, "original": "<hex>"}, ... ] } }
 
 ROOT_MANIFEST_NAME = ".mm_pak_restore.json"
+
+# Human-readable note written as the first key of the manifest so anyone who
+# finds the file in the game folder knows what it is and how to recover from it.
+ROOT_MANIFEST_COMMENT = (
+    "Contains a record of every PAK entry Amethyst Mod Manager has edited. "
+    "In the event of corruption (e.g. the game won't load after removing mods) "
+    "this can be used with the 'Repair PAK Files' wizard tool to restore the "
+    "PAK files to vanilla. Do not delete this file while mods are deployed."
+)
 
 
 def root_manifest_path(game_root: Path) -> Path:
@@ -304,10 +315,54 @@ def update_root_manifest(game_root: Path, pak_path: Path, backup_path: Path,
         except (json.JSONDecodeError, OSError):
             pass
 
-    data["paks"][pak_path.name] = entries
+    # Append-only ledger: merge new entries into the pak's existing list by
+    # index, never dropping previously recorded ones.  The manifest thus grows
+    # into a record of *every* entry the manager has ever invalidated in this
+    # pak, so the repair wizard can always heal them all — even across mod swaps
+    # or earlier deploys whose per-profile backups are long gone.  When an index
+    # was seen before, keep the earliest-saved ``original`` (the true vanilla
+    # value); a later deploy only ever re-zeroes an already-zeroed slot, so its
+    # "original" could itself be zero.
+    # Key by the pak's path relative to the game root (POSIX-style) so DLC
+    # PAKs under dlc/ keep their subfolder — a bare filename would be looked
+    # for in the wrong place on restore.
+    try:
+        pak_key = pak_path.relative_to(game_root).as_posix()
+    except ValueError:
+        pak_key = pak_path.name
+    prior = data["paks"].get(pak_key, [])
+    merged: dict[int, str] = {}
+    for e in prior:
+        try:
+            merged[e["index"]] = e["original"]
+        except (KeyError, TypeError):
+            continue
+    for e in entries:
+        try:
+            idx, orig = e["index"], e["original"]
+        except (KeyError, TypeError):
+            continue
+        existing_orig = merged.get(idx)
+        # Don't let a later all-zero "original" clobber a real saved value.
+        if existing_orig and existing_orig.strip("0") == "":
+            merged[idx] = orig
+        elif idx not in merged:
+            merged[idx] = orig
+    data["paks"][pak_key] = [
+        {"index": idx, "original": orig} for idx, orig in sorted(merged.items())
+    ]
+
+    # Re-key in canonical order so the self-describing comment is always the
+    # first thing in the file (and refreshed for manifests written by older
+    # builds that lacked it).
+    out = {
+        "_comment": ROOT_MANIFEST_COMMENT,
+        "v": data.get("v", 1),
+        "paks": data["paks"],
+    }
     tmp = manifest.with_suffix(manifest.suffix + ".tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(out, indent=2), encoding="utf-8")
         tmp.replace(manifest)
     except OSError as exc:
         _log(f"  [WARN] Could not write root PAK manifest: {exc}")
@@ -327,7 +382,13 @@ def restore_from_root_manifest(game_root: Path, log_fn=None) -> int:
     were deployed).  Only restores entries that are still zeroed on disk, so
     re-running it is safe and so are paks that were already healed normally.
 
-    Returns the number of entries restored.  Removes the manifest on success.
+    The manifest is an append-only ledger of every entry the manager has ever
+    invalidated, so it is intentionally **not** deleted here — it stays as a
+    permanent record so the wizard can always re-heal the paks, even after a
+    later deploy/restore cycle.  Because the restore is idempotent (it only
+    rewrites slots still zeroed on disk), keeping a superset is always safe.
+
+    Returns the number of entries restored.
     """
     _log = _safe_log(log_fn)
     manifest = root_manifest_path(game_root)
@@ -343,15 +404,14 @@ def restore_from_root_manifest(game_root: Path, log_fn=None) -> int:
         return 0
 
     total = 0
-    for pak_name, entries in paks.items():
-        pak_path = game_root / pak_name
+    for pak_rel, entries in paks.items():
+        # Keys are game-root-relative POSIX paths (e.g. "dlc/re_dlc_*.pak").
+        pak_path = game_root / pak_rel
         if not pak_path.exists():
-            _log(f"  [WARN] PAK not found for manifest restore: {pak_name}")
+            _log(f"  [WARN] PAK not found for manifest restore: {pak_rel}")
             continue
         total += _restore_entries_in_pak(pak_path, entries, log_fn=_log)
 
-    if total:
-        remove_root_manifest(game_root)
     return total
 
 
