@@ -193,8 +193,21 @@ def _parse_files(files_el: ET.Element) -> list[FileInstall]:
         if tag in ("file", "folder"):
             source = child.get("source", "")
             destination = child.get("destination")
-            if destination is None:
+            is_folder = (tag == "folder")
+            # Empty/absent `destination` has DIFFERENT meaning per element type:
+            #   <file>   → preserve the source's relative path (so a
+            #              <file source="meshes/x.nif" destination=""/> lands at
+            #              meshes/x.nif, not flattened to the root).
+            #   <folder> → copy the folder's *contents* to the destination root,
+            #              stripping the source wrapper (so
+            #              <folder source="Base" destination=""/> puts Base/SKSE/…
+            #              at SKSE/…). This MUST stay empty so the copier's
+            #              "no dst_rel → dest_root" path does the stripping.
+            # MO2 treats absent and empty identically within each element type.
+            if not is_folder and (destination is None or destination == ""):
                 destination = source
+            elif destination is None:
+                destination = ""
             result.append(FileInstall(
                 source=source,
                 destination=destination,
@@ -280,9 +293,12 @@ def _apply_order(items: list, order: str, key) -> list:
     """
     Honour FOMOD's `order` attribute on installSteps/optionalFileGroups/plugins.
 
-    Values (per XSD): "Explicit" (doc order — default), "Ascending", "Descending".
-    Sorting is by the element's `name` attribute, case-insensitive to match
-    MO2/Vortex. Items without a name sort last to keep behaviour stable.
+    Values (per XSD orderEnum): "Explicit" (document order — the XSD DEFAULT
+    when the attribute is absent), "Ascending", "Descending". MO2 preserves
+    author-defined order when `order` is omitted, so we must NOT alphabetize
+    by default. Sorting (when requested) is by the element's `name` attribute,
+    case-insensitive to match MO2/Vortex. Items without a name sort last to
+    keep behaviour stable.
     """
     if order == "Ascending":
         return sorted(items, key=lambda x: (not key(x), (key(x) or "").lower()))
@@ -332,7 +348,7 @@ def _parse_group(group_el: ET.Element) -> Group:
 
     plugins_el = _find(group_el, "plugins")
     if plugins_el is not None:
-        plugin_order = plugins_el.get("order", "Ascending")  # XSD default
+        plugin_order = plugins_el.get("order", "Explicit")  # XSD default
         parsed = [_parse_plugin(pe) for pe in _findall(plugins_el, "plugin")]
         group.plugins = _apply_order(parsed, plugin_order, lambda p: p.name)
 
@@ -365,7 +381,7 @@ def _parse_install_step(step_el: ET.Element) -> InstallStep:
     # Groups
     groups_el = _find(step_el, "optionalFileGroups")
     if groups_el is not None:
-        group_order = groups_el.get("order", "Ascending")  # XSD default
+        group_order = groups_el.get("order", "Explicit")  # XSD default
         parsed = [_parse_group(ge) for ge in _findall(groups_el, "group")]
         step.groups = _apply_order(parsed, group_order, lambda g: g.name)
 
@@ -550,7 +566,7 @@ def parse_module_config(xml_path: str) -> ModuleConfig:
     # Install steps
     steps_el = _find(root, "installSteps")
     if steps_el is not None:
-        step_order = steps_el.get("order", "Ascending")  # XSD default
+        step_order = steps_el.get("order", "Explicit")  # XSD default
         parsed = [_parse_install_step(se) for se in _findall(steps_el, "installStep")]
         config.steps = _apply_order(parsed, step_order, lambda s: s.name)
 

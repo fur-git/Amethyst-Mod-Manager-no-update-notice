@@ -504,11 +504,15 @@ class BrowseModsPanel(_NexusModListPanel):
         def _worker():
             try:
                 cat_names = self._selected_cat_names or None
-                mod_infos = api.search_mods(
-                    domain, query_text,
-                    count=PAGE_SIZE, offset=page * PAGE_SIZE,
-                    category_names=cat_names,
-                )
+                if query_text.isdigit():
+                    # A bare number is treated as a direct mod-id lookup.
+                    mod_infos = api.search_mod_by_id(domain, int(query_text))
+                else:
+                    mod_infos = api.search_mods(
+                        domain, query_text,
+                        count=PAGE_SIZE, offset=page * PAGE_SIZE,
+                        category_names=cat_names,
+                    )
                 entries: list[BrowseModEntry] = []
                 for info in mod_infos:
                     get = info.get if isinstance(info, dict) else lambda k, d=None: getattr(info, k, d)

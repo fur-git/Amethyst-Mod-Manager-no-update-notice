@@ -248,6 +248,183 @@ def restore_pak_file(pak_path: Path, backup_path: Path, log_fn=None) -> int:
         _log(f"  [WARN] PAK file not found for restore: {pak_path}")
         return 0
 
+    restored = _restore_entries_in_pak(pak_path, entries, log_fn=_log)
+
+    backup_path.unlink(missing_ok=True)
+    return restored
+
+
+# ---------------------------------------------------------------------------
+# Game-root restore manifest (failsafe)
+# ---------------------------------------------------------------------------
+#
+# A second copy of the patch backups, written into the *game root* itself
+# (next to the PAKs) so the original hash bytes survive even if the manager's
+# Profiles/ directory is deleted while mods are still deployed.  Without it, a
+# wipe-while-deployed leaves the PAKs permanently invalidated with no way back.
+#
+# Format (mirrors the per-pak pak_patches JSON, but keyed by each pak's path
+# relative to the game root so a single file covers every patched PAK, including
+# DLC paks under dlc/):
+#   { "_comment": "<self-describing note>",
+#     "v": 1,
+#     "paks": { "<game-root-relative pak path>": [ {"index": <int>, "original": "<hex>"}, ... ] } }
+
+ROOT_MANIFEST_NAME = ".mm_pak_restore.json"
+
+# Human-readable note written as the first key of the manifest so anyone who
+# finds the file in the game folder knows what it is and how to recover from it.
+ROOT_MANIFEST_COMMENT = (
+    "Contains a record of every PAK entry Amethyst Mod Manager has edited. "
+    "In the event of corruption (e.g. the game won't load after removing mods) "
+    "this can be used with the 'Repair PAK Files' wizard tool to restore the "
+    "PAK files to vanilla. Do not delete this file while mods are deployed."
+)
+
+
+def root_manifest_path(game_root: Path) -> Path:
+    return game_root / ROOT_MANIFEST_NAME
+
+
+def update_root_manifest(game_root: Path, pak_path: Path, backup_path: Path,
+                         log_fn=None) -> None:
+    """Mirror a pak's pak_patches backup into the game-root manifest.
+
+    Reads the just-written *backup_path* (the authoritative per-pak JSON) and
+    merges its entries into ``<game_root>/.mm_pak_restore.json`` under the
+    pak's filename.  Existing entries for other paks are preserved.  Written
+    atomically via ``.tmp`` → rename.
+    """
+    _log = _safe_log(log_fn)
+    try:
+        saved = json.loads(backup_path.read_text(encoding="utf-8"))
+        entries = saved.get("entries", [])
+    except (json.JSONDecodeError, KeyError, OSError):
+        return
+    if not entries:
+        return
+
+    manifest = root_manifest_path(game_root)
+    data: dict = {"v": 1, "paks": {}}
+    if manifest.exists():
+        try:
+            existing = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(existing.get("paks"), dict):
+                data = existing
+                data.setdefault("v", 1)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Append-only ledger: merge new entries into the pak's existing list by
+    # index, never dropping previously recorded ones.  The manifest thus grows
+    # into a record of *every* entry the manager has ever invalidated in this
+    # pak, so the repair wizard can always heal them all — even across mod swaps
+    # or earlier deploys whose per-profile backups are long gone.  When an index
+    # was seen before, keep the earliest-saved ``original`` (the true vanilla
+    # value); a later deploy only ever re-zeroes an already-zeroed slot, so its
+    # "original" could itself be zero.
+    # Key by the pak's path relative to the game root (POSIX-style) so DLC
+    # PAKs under dlc/ keep their subfolder — a bare filename would be looked
+    # for in the wrong place on restore.
+    try:
+        pak_key = pak_path.relative_to(game_root).as_posix()
+    except ValueError:
+        pak_key = pak_path.name
+    prior = data["paks"].get(pak_key, [])
+    merged: dict[int, str] = {}
+    for e in prior:
+        try:
+            merged[e["index"]] = e["original"]
+        except (KeyError, TypeError):
+            continue
+    for e in entries:
+        try:
+            idx, orig = e["index"], e["original"]
+        except (KeyError, TypeError):
+            continue
+        existing_orig = merged.get(idx)
+        # Don't let a later all-zero "original" clobber a real saved value.
+        if existing_orig and existing_orig.strip("0") == "":
+            merged[idx] = orig
+        elif idx not in merged:
+            merged[idx] = orig
+    data["paks"][pak_key] = [
+        {"index": idx, "original": orig} for idx, orig in sorted(merged.items())
+    ]
+
+    # Re-key in canonical order so the self-describing comment is always the
+    # first thing in the file (and refreshed for manifests written by older
+    # builds that lacked it).
+    out = {
+        "_comment": ROOT_MANIFEST_COMMENT,
+        "v": data.get("v", 1),
+        "paks": data["paks"],
+    }
+    tmp = manifest.with_suffix(manifest.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(out, indent=2), encoding="utf-8")
+        tmp.replace(manifest)
+    except OSError as exc:
+        _log(f"  [WARN] Could not write root PAK manifest: {exc}")
+        tmp.unlink(missing_ok=True)
+
+
+def remove_root_manifest(game_root: Path) -> None:
+    """Delete the game-root restore manifest (after a clean full restore)."""
+    root_manifest_path(game_root).unlink(missing_ok=True)
+
+
+def restore_from_root_manifest(game_root: Path, log_fn=None) -> int:
+    """Restore every PAK listed in the game-root manifest.
+
+    Used as a failsafe / by the manual repair wizard when the manager's own
+    pak_patches/ backups are gone (e.g. the manager was reinstalled while mods
+    were deployed).  Only restores entries that are still zeroed on disk, so
+    re-running it is safe and so are paks that were already healed normally.
+
+    The manifest is an append-only ledger of every entry the manager has ever
+    invalidated, so it is intentionally **not** deleted here — it stays as a
+    permanent record so the wizard can always re-heal the paks, even after a
+    later deploy/restore cycle.  Because the restore is idempotent (it only
+    rewrites slots still zeroed on disk), keeping a superset is always safe.
+
+    Returns the number of entries restored.
+    """
+    _log = _safe_log(log_fn)
+    manifest = root_manifest_path(game_root)
+    if not manifest.exists():
+        return 0
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        paks = data.get("paks", {})
+    except (json.JSONDecodeError, OSError) as exc:
+        _log(f"  [WARN] Could not read root PAK manifest: {exc}")
+        return 0
+    if not isinstance(paks, dict):
+        return 0
+
+    total = 0
+    for pak_rel, entries in paks.items():
+        # Keys are game-root-relative POSIX paths (e.g. "dlc/re_dlc_*.pak").
+        pak_path = game_root / pak_rel
+        if not pak_path.exists():
+            _log(f"  [WARN] PAK not found for manifest restore: {pak_rel}")
+            continue
+        total += _restore_entries_in_pak(pak_path, entries, log_fn=_log)
+
+    return total
+
+
+def _restore_entries_in_pak(pak_path: Path, entries: list[dict], log_fn=None) -> int:
+    """Write the original hash bytes for *entries* back into *pak_path*.
+
+    Skips entries that are not currently zeroed (already restored / never
+    patched) so the operation is idempotent.  Shared by the per-pak restore
+    and the manifest restore.
+    """
+    _log = _safe_log(log_fn)
+    if not entries:
+        return 0
     restored = 0
     with pak_path.open("r+b") as fh:
         header_bytes = fh.read(_HEADER_SIZE)
@@ -257,19 +434,23 @@ def restore_pak_file(pak_path: Path, backup_path: Path, log_fn=None) -> int:
             _log(f"  [WARN] Could not read PAK header during restore {pak_path.name}: {exc}")
             return 0
         hash_off = _HASH_OFFSET_V2 if entry_size == _ENTRY_SIZE_V2 else _HASH_OFFSET_V4
-
         for e in entries:
-            idx = e["index"]
-            original_bytes = bytes.fromhex(e["original"])
+            try:
+                idx = e["index"]
+                original_bytes = bytes.fromhex(e["original"])
+            except (KeyError, ValueError):
+                continue
             file_off = _HEADER_SIZE + idx * entry_size + hash_off
+            fh.seek(file_off)
+            current = fh.read(8)
+            # Only restore entries we actually zeroed; leave anything else alone.
+            if current != b"\x00" * 8:
+                continue
             fh.seek(file_off)
             fh.write(original_bytes)
             restored += 1
-
     if restored:
         _log(f"  Restored {restored} entr{'y' if restored == 1 else 'ies'} in {pak_path.name}.")
-
-    backup_path.unlink(missing_ok=True)
     return restored
 
 

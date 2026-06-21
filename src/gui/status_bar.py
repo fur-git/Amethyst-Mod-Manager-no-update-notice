@@ -28,6 +28,7 @@ from Utils.ui_config import (
     load_clear_archive_after_install, save_clear_archive_after_install,
     load_keep_fomod_archives, save_keep_fomod_archives,
     load_show_summary_tooltips, save_show_summary_tooltips,
+    load_hide_bsa_conflicts, save_hide_bsa_conflicts,
     load_rename_mod_after_install, save_rename_mod_after_install,
     load_restore_on_close, save_restore_on_close,
     load_allow_prerelease, save_allow_prerelease,
@@ -569,6 +570,12 @@ class StatusBar(ctk.CTkFrame):
             self._progress_popup._update_geometry = self._reposition_popup
             self._progress_popup._configure_bid = root.bind("<Configure>", self._reposition_popup, add="+")
             self._reposition_popup()
+            # An overlay (e.g. Bundle Options) may own the bottom-right corner —
+            # keep a freshly-created popup hidden; resume_all_download_popups
+            # re-shows it when the overlay closes.
+            mp = getattr(root, "_mod_panel", None)
+            if getattr(mp, "_dl_popups_hidden", False):
+                self._progress_popup.set_force_hidden(True)
         if total > 0:
             pb = self._progress_popup.progressbar
             if pb.cget("mode") == "indeterminate":
@@ -880,6 +887,12 @@ class SettingsPanel(ctk.CTkFrame):
             text="Show the Nexus summary when hovering a mod name.",
             font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
         ).pack(anchor="w", pady=(2, 0))
+
+        self._hide_bsa_conflicts_var = tk.BooleanVar(value=load_hide_bsa_conflicts())
+        ctk.CTkCheckBox(
+            ui_sec, text="Hide BSA conflicts", variable=self._hide_bsa_conflicts_var,
+            font=FONT_NORMAL, text_color=TEXT_MAIN,
+        ).pack(anchor="w", pady=(10, 0))
 
         self._update_slider_state()
 
@@ -1605,6 +1618,7 @@ class SettingsPanel(ctk.CTkFrame):
         save_clear_archive_after_install(self._clear_archive_var.get())
         save_keep_fomod_archives(self._keep_fomod_archives_var.get())
         save_show_summary_tooltips(self._show_summary_tooltips_var.get())
+        save_hide_bsa_conflicts(self._hide_bsa_conflicts_var.get())
         save_rename_mod_after_install(self._rename_after_install_var.get())
         save_restore_on_close(self._restore_on_close_var.get())
         if hasattr(self, "_allow_prerelease_var"):
@@ -1635,6 +1649,7 @@ class SettingsPanel(ctk.CTkFrame):
         save_clear_archive_after_install(self._clear_archive_var.get())
         save_keep_fomod_archives(self._keep_fomod_archives_var.get())
         save_show_summary_tooltips(self._show_summary_tooltips_var.get())
+        save_hide_bsa_conflicts(self._hide_bsa_conflicts_var.get())
         save_rename_mod_after_install(self._rename_after_install_var.get())
         save_restore_on_close(self._restore_on_close_var.get())
         if hasattr(self, "_allow_prerelease_var"):

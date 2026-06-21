@@ -774,12 +774,26 @@ class PluginPanelModFilesMixin:
             return
         mod_name = self._mod_files_mod_name
         profile_dir = self._mod_files_profile_dir
-        excluded_keys = [
+        # The tree may only show a subset of the mod's files (search / ext /
+        # conflict filters). We can only authoritatively set exclusion state
+        # for keys that are actually present in the current tree; any saved
+        # exclusion whose file is filtered out must be preserved untouched.
+        visible_keys = {
+            key for key in (self._mf_iid_to_key.get(iid) for iid in self._mf_checked)
+            if key is not None
+        }
+        excluded_visible = {
             self._mf_iid_to_key[iid]
             for iid, checked in self._mf_checked.items()
             if not checked and self._mf_iid_to_key.get(iid) is not None
-        ]
+        }
         all_excluded = read_excluded_mod_files(profile_dir, None)
+        # Keep exclusions for files not currently shown, then merge in the
+        # state of the visible rows.
+        preserved = {
+            k for k in all_excluded.get(mod_name, set()) if k not in visible_keys
+        }
+        excluded_keys = preserved | excluded_visible
         if excluded_keys:
             all_excluded[mod_name] = sorted(excluded_keys)
         else:

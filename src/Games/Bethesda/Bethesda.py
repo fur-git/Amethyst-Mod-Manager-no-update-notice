@@ -20,6 +20,14 @@ from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
 
+# Prefix deps auto-installed on first add for the modern 64-bit Creation Engine
+# games (Skyrim SE/VR, Fallout 4/4VR, Starfield, EnderalSE): their *SE DLL
+# plugins silently fail to load without the VC++ x64 runtime, and Community
+# Shaders / ENB need the fxc2 d3dcompiler_47. Installed via the Proton-menu
+# installers, not winetricks — see base_game.auto_install_deps. The older 32-bit
+# Gamebryo titles (Oblivion/FO3/FNV/Skyrim LE) don't need these.
+_MODERN_CREATION_ENGINE_DEPS = ["vcredist", "d3dcompiler_47"]
+
 
 def _read_ini_key(ini_path: Path, section: str, key: str) -> "str | None":
     """Return the current value for [section] key, or None if not present."""
@@ -118,7 +126,15 @@ def _set_ini_key(ini_path: Path, section: str, key: str, value: "str | None") ->
     out = newline.join(lines)
     if text.endswith(newline) and not out.endswith(newline):
         out += newline
-    write_atomic_text(ini_path, out)
+    # If the INI is a symlink (profile-specific INI files routed into My Games),
+    # write *through* the link to its real target so the edit persists back to the
+    # profile's "ini files" folder and the symlink itself survives. An atomic
+    # write-temp→rename would clobber the link, turning it into a regular file.
+    if ini_path.is_symlink():
+        real = ini_path.resolve()
+        write_atomic_text(real, out)
+    else:
+        write_atomic_text(ini_path, out)
 
 
 class Fallout_3(BaseGame):
@@ -145,6 +161,7 @@ class Fallout_3(BaseGame):
         self._staging_path: Path | None = None
         self._script_extender_swap: bool = True
         self._profile_ini_files: bool = False
+        self._profile_saves: bool = False
         self.load_paths()
 
     # -----------------------------------------------------------------------
@@ -394,11 +411,13 @@ class Fallout_3(BaseGame):
     def _load_paths_extra(self, data: dict) -> None:
         self._script_extender_swap = data.get("script_extender_swap", True)
         self._profile_ini_files = data.get("profile_ini_files", False)
+        self._profile_saves = data.get("profile_saves", False)
 
     def _save_paths_extra(self) -> dict:
         return {
             "script_extender_swap": self._script_extender_swap,
             "profile_ini_files":    self._profile_ini_files,
+            "profile_saves":        self._profile_saves,
         }
 
     def set_staging_path(self, path: "Path | str | None") -> None:
@@ -430,6 +449,58 @@ class Fallout_3(BaseGame):
     def set_profile_ini_files(self, value: bool) -> None:
         self._profile_ini_files = value
         self.save_paths()
+        if value:
+            # Create the (empty) "ini files" folder in every profile so the
+            # user has an obvious place to drop their per-profile INIs.
+            self._ensure_profile_ini_dirs()
+
+    # Name of the subfolder inside each profile that holds the user's INIs.
+    _PROFILE_INI_SUBDIR = "ini files"
+
+    def _profile_ini_dir(self, profile: str) -> Path:
+        """Folder inside a profile that the user drops per-profile INIs into."""
+        return self.get_profile_root() / "profiles" / profile / self._PROFILE_INI_SUBDIR
+
+    def _ensure_profile_ini_dirs(self) -> None:
+        """Create the empty 'ini files' folder for every existing profile."""
+        profiles_root = self.get_profile_root() / "profiles"
+        if not profiles_root.is_dir():
+            return
+        for profile_dir in profiles_root.iterdir():
+            if profile_dir.is_dir():
+                (profile_dir / self._PROFILE_INI_SUBDIR).mkdir(parents=True, exist_ok=True)
+
+    @property
+    def profile_saves(self) -> bool:
+        return self._profile_saves and self.supports_profile_saves
+
+    def set_profile_saves(self, value: bool) -> None:
+        self._profile_saves = value and self.supports_profile_saves
+        self.save_paths()
+        if self._profile_saves:
+            # Create the empty Saves folder up-front so the user knows where to
+            # drop their saves, without waiting for a deploy. Seed every
+            # existing profile (and the active one) since any of them may be
+            # deployed next.
+            self._ensure_profile_saves_dirs()
+
+    def _ensure_profile_saves_dirs(self) -> None:
+        """Create an empty ``Saves`` folder in each existing profile folder."""
+        try:
+            profiles_root = self.get_profile_root() / "profiles"
+        except Exception:
+            return
+        names: set[str] = set()
+        if self._active_profile_dir is not None:
+            names.add(self._active_profile_dir.name)
+        if profiles_root.is_dir():
+            names.update(p.name for p in profiles_root.iterdir() if p.is_dir())
+        for name in names:
+            try:
+                (profiles_root / name / self._SAVES_FOLDER_NAME).mkdir(
+                    parents=True, exist_ok=True)
+            except OSError:
+                pass
 
     def set_prefix_path(self, path: Path | str | None) -> None:
         self._prefix_path = Path(path) if path else None
@@ -674,10 +745,11 @@ class Fallout_3(BaseGame):
         if not mygames_dirs:
             _log("  WARN: Prefix path not set — skipping profile INI symlinks.")
             return
-        profile_dir = self.get_profile_root() / "profiles" / profile
-        ini_files = list(profile_dir.glob("*.ini"))
+        ini_dir = self._profile_ini_dir(profile)
+        ini_dir.mkdir(parents=True, exist_ok=True)
+        ini_files = list(ini_dir.glob("*.ini"))
         if not ini_files:
-            _log("  No *.ini files found in profile folder — skipping.")
+            _log(f"  No *.ini files found in '{ini_dir.name}' folder — skipping.")
             return
         for mygames in mygames_dirs:
             mygames.mkdir(parents=True, exist_ok=True)
@@ -700,17 +772,120 @@ class Fallout_3(BaseGame):
         mygames_dirs = [p for p in self._mygames_paths() if p.is_dir()]
         if not mygames_dirs:
             return
-        profile_dir = self.get_profile_root() / "profiles" / profile
+        ini_dir = self._profile_ini_dir(profile)
+        if not ini_dir.is_dir():
+            return
+        try:
+            ini_dir_resolved = ini_dir.resolve()
+        except OSError:
+            ini_dir_resolved = ini_dir
         for mygames in mygames_dirs:
-            for src in profile_dir.glob("*.ini"):
-                target = mygames / src.name
-                if target.is_symlink() and Path(target.resolve()).parent == profile_dir:
-                    target.unlink()
-                    _log(f"  Removed profile INI symlink: {target.name}")
-                    backup = target.with_suffix(".bak")
-                    if backup.exists():
-                        backup.rename(target)
-                        _log(f"  Restored {target.name} from .bak")
+            # Scan the actual My Games folder so orphaned symlinks (whose source
+            # .ini was deleted from the profile) are still removed.
+            for target in mygames.glob("*.ini"):
+                if not target.is_symlink():
+                    continue
+                # Compare the symlink's *target* directory against our ini dir,
+                # resolving both sides so a symlinked prefix/staging path on the
+                # way to ini_dir doesn't break the match.
+                try:
+                    link_target = target.readlink()
+                    if not link_target.is_absolute():
+                        link_target = target.parent / link_target
+                    link_parent = link_target.resolve().parent
+                except OSError:
+                    continue
+                if link_parent != ini_dir_resolved:
+                    continue
+                target.unlink()
+                _log(f"  Removed profile INI symlink: {target.name}")
+                backup = target.with_suffix(".bak")
+                if backup.exists():
+                    backup.rename(target)
+                    _log(f"  Restored {target.name} from .bak")
+
+    # -----------------------------------------------------------------------
+    # Profile-specific saves
+    # -----------------------------------------------------------------------
+    #
+    # Whether this game exposes the profile-specific saves option at all. Off
+    # for games with server-side/cloud saves (e.g. Fallout 76) where there is
+    # no local Saves folder worth redirecting.
+    supports_profile_saves = True
+    # Folder name the engine reads saves from, inside each save-link target.
+    # Override on a subclass whose engine uses a different name.
+    _SAVES_FOLDER_NAME = "Saves"
+    # Suffix used to hide a pre-existing real Saves folder so the game can't
+    # see it while our profile symlink is active.
+    _SAVES_BACKUP_SUFFIX = "_backup_amm"
+
+    def _saves_link_targets(self) -> list[Path]:
+        """Return every directory that should receive a ``Saves`` symlink.
+
+        Defaults to the game's My Games folder(s). Games whose saves live
+        somewhere else can override this to point at their own location while
+        reusing the deploy/restore logic below.
+        """
+        return self._mygames_paths()
+
+    def _profile_saves_dir(self, profile: str) -> Path:
+        """Path to the profile-specific saves folder (created on demand)."""
+        return self.get_profile_root() / "profiles" / profile / self._SAVES_FOLDER_NAME
+
+    def _symlink_profile_saves(self, profile: str, log_fn) -> None:
+        """Symlink each target's ``Saves`` folder to the profile saves folder.
+
+        Creates the profile saves folder if it does not yet exist. Any real
+        (non-symlink) ``Saves`` folder already present at a target is renamed
+        to ``Saves<backup-suffix>`` so the game stops seeing it; restore puts
+        it back. Symlinks we already manage are replaced without a backup.
+        """
+        _log = log_fn
+        if not self.profile_saves:
+            return
+        targets = self._saves_link_targets()
+        if not targets:
+            _log("  WARN: No save-link target — skipping profile saves.")
+            return
+        profile_saves = self._profile_saves_dir(profile)
+        profile_saves.mkdir(parents=True, exist_ok=True)
+        for target_dir in targets:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            link = target_dir / self._SAVES_FOLDER_NAME
+            if link.is_symlink():
+                link.unlink()
+            elif link.exists():
+                backup = target_dir / (self._SAVES_FOLDER_NAME + self._SAVES_BACKUP_SUFFIX)
+                if backup.exists():
+                    _log(f"  WARN: {backup.name} already exists — leaving "
+                         f"{link.name} in place, skipping.")
+                    continue
+                link.rename(backup)
+                _log(f"  Backed up existing {link.name} → {backup.name}")
+            link.symlink_to(profile_saves)
+            _log(f"  Linked {link} → {profile_saves}")
+
+    def _remove_profile_saves_symlinks(self, profile: str, log_fn) -> None:
+        """Remove profile saves symlinks and restore any backed-up Saves folder."""
+        _log = log_fn
+        if not self.profile_saves:
+            return
+        profile_saves = self._profile_saves_dir(profile)
+        for target_dir in self._saves_link_targets():
+            if not target_dir.is_dir():
+                continue
+            link = target_dir / self._SAVES_FOLDER_NAME
+            if link.is_symlink() and Path(link.resolve()) == profile_saves.resolve():
+                link.unlink()
+                _log(f"  Removed profile saves symlink: {link}")
+            elif link.exists():
+                # Not our symlink — leave it alone and skip restoring the backup
+                # so we don't clobber whatever is there now.
+                continue
+            backup = target_dir / (self._SAVES_FOLDER_NAME + self._SAVES_BACKUP_SUFFIX)
+            if backup.exists() and not link.exists():
+                backup.rename(link)
+                _log(f"  Restored {link.name} from {backup.name}")
 
     def apply_archive_invalidation(self, log_fn) -> None:
         """Set bInvalidateOlderFiles=1 in every managed game INI so loose files win.
@@ -1215,11 +1390,14 @@ class Fallout_3(BaseGame):
         _log("Step 5: Symlinking profile INI files ...")
         self._symlink_profile_ini_files(profile, _log)
 
-        _log("Step 6: Applying archive invalidation ...")
+        _log("Step 6: Symlinking profile saves ...")
+        self._symlink_profile_saves(profile, _log)
+
+        _log("Step 7: Applying archive invalidation ...")
         self.apply_archive_invalidation(_log)
 
         if self._orders_plugins_by_mtime():
-            _log("Step 7: Setting plugin mtimes to match load order ...")
+            _log("Step 8: Setting plugin mtimes to match load order ...")
             self.stamp_plugin_load_order(profile, _log)
 
         _log(
@@ -1275,6 +1453,8 @@ class Fallout_3(BaseGame):
         if _active is not None:
             _log("Restore: removing profile INI symlinks ...")
             self._remove_profile_ini_symlinks(_active.name, _log)
+            _log("Restore: removing profile saves symlinks ...")
+            self._remove_profile_saves_symlinks(_active.name, _log)
 
         _log("Restore complete.")
 
@@ -1464,6 +1644,7 @@ class Fallout_4(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Fallout4.ccc"
     synthesis_registry_name = "Fallout4"
+    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -1475,7 +1656,23 @@ class Fallout_4(Fallout_3):
 
     @property
     def wizard_tools(self) -> list[WizardTool]:
-        return self._base_wizard_tools() + [
+        from wizards.bodyslide import find_mod_exe
+        bodyslide_tools = []
+        if find_mod_exe(self, ("BodySlide.exe", "BodySlide x64.exe")) is not None:
+            bodyslide_tools.append(WizardTool(
+                id="run_bodyslide_fo4",
+                label="Run BodySlide",
+                description="Deploy mods and run BodySlide from the Data folder.",
+                dialog_class_path="wizards.bodyslide.BodySlideWizard",
+            ))
+        if find_mod_exe(self, ("OutfitStudio.exe", "OutfitStudio x64.exe")) is not None:
+            bodyslide_tools.append(WizardTool(
+                id="run_outfitstudio_fo4",
+                label="Run Outfit Studio",
+                description="Deploy mods and run Outfit Studio from the Data folder.",
+                dialog_class_path="wizards.bodyslide.OutfitStudioWizard",
+            ))
+        return self._base_wizard_tools() + bodyslide_tools + [
             WizardTool(
                 id="install_se_fo4",
                 label="Install Script Extender (F4SE)",
@@ -1572,6 +1769,7 @@ class Fallout_4VR(Fallout_3):
     vanilla_plugins = ["Fallout4.esm", "Fallout4_VR.esm"]
     vanilla_dlc_plugins: list[str] = []
     synthesis_registry_name = "Fallout 4 VR"
+    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -1905,6 +2103,7 @@ class SkyrimVR(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Skyrim.ccc"
     synthesis_registry_name = "Skyrim VR"
+    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2023,6 +2222,7 @@ class Starfield(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Starfield.ccc"
     synthesis_registry_name = "Starfield"
+    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2316,6 +2516,7 @@ class EnderalSE(Fallout_3):
     ]
     vanilla_dlc_plugins: list[str] = []
     synthesis_registry_name = "Enderal Special Edition"
+    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def name(self) -> str:
@@ -2411,6 +2612,10 @@ class Fallout_76(Fallout_3):
     supports_esl_flag = False
     vanilla_plugins: list[str] = []
     vanilla_dlc_plugins: list[str] = []
+    # Saves are server-side (character files live on Bethesda's servers); the
+    # local My Games\Fallout 76 folder holds only config/screenshots, so there
+    # is no Saves folder to redirect.
+    supports_profile_saves = False
 
     @property
     def name(self) -> str:

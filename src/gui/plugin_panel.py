@@ -506,6 +506,15 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._log = log_fn or (lambda msg: None)
         self._get_filemap_path = get_filemap_path or (lambda: None)
 
+        # Shared mtime-keyed parse of filemap.txt. On a large profile the file
+        # is ~74k lines; several main-thread consumers (plugin sync, master
+        # checking, staged-path resolution, the Data/Ini tabs) each used to
+        # re-read+parse it per refresh. This caches the parsed
+        # list[(rel_path, mod_name)] once per filemap mtime — see
+        # _get_parsed_filemap().
+        self._filemap_parse_cache: list[tuple[str, str]] | None = None
+        self._filemap_parse_cache_sig: tuple[str, float] | None = None
+
         # Current game (set by caller when game changes)
         self._game = None
 
@@ -3137,6 +3146,43 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
                 return True
         return False
 
+    def _get_parsed_filemap(self, filemap_path: "Path | None" = None):
+        """Return a cached parse of filemap.txt as list[(rel_path, mod_name)].
+
+        Keyed on (path, mtime), so every main-thread consumer within one
+        refresh (plugin sync, master checking, staged paths, Data/Ini tabs)
+        shares a single read+parse of the ~74k-line file instead of repeating
+        it. Backslashes in rel_path are left as-is — callers normalise as
+        needed (the Data tab wants raw, master checking wants forward slashes).
+        Returns [] when the path is missing/unreadable.
+        """
+        if filemap_path is None:
+            fp_str = self._get_filemap_path()
+            filemap_path = Path(fp_str) if fp_str else None
+        if filemap_path is None:
+            return []
+        try:
+            mtime = filemap_path.stat().st_mtime
+        except OSError:
+            return []
+        sig = (str(filemap_path), mtime)
+        if self._filemap_parse_cache is not None and self._filemap_parse_cache_sig == sig:
+            return self._filemap_parse_cache
+        entries: list[tuple[str, str]] = []
+        try:
+            with filemap_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if "\t" not in line:
+                        continue
+                    rel_path, mod_name = line.split("\t", 1)
+                    entries.append((rel_path, mod_name))
+        except OSError:
+            return []
+        self._filemap_parse_cache = entries
+        self._filemap_parse_cache_sig = sig
+        return entries
+
     def _refresh_plugins_tab(self) -> None:
         """Reload plugin entries from plugins.txt and redraw."""
         try:
@@ -4016,9 +4062,20 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
     def _check_all_masters(self) -> None:
         """Build plugin_paths dict and check all plugins for missing/late masters.
 
-        Cached by (filemap_mtime, plugin_entries_tuple, data_dir). When nothing
-        material has changed between calls (e.g. toggling a mod with no plugins)
-        the cache hit short-circuits the ~450 ms filemap scan + header parses.
+        The expensive part is parsing each plugin file's header from disk
+        (check_missing/late/version masters + ESL/master flags). That only needs
+        to re-run when the *set of plugins* changes or a plugin *file* changes.
+
+        Every mod toggle rewrites filemap.txt, so keying the cache on the filemap
+        mtime (as before) meant a guaranteed miss on every toggle — re-parsing all
+        plugin headers (150–1700 ms) even when no plugin was added/removed/edited.
+
+        Now the cheap filemap scan that builds plugin_paths always runs (it must,
+        to resolve current paths), but the header-parse phase is gated on
+        (plugins_tuple, resolved-path mtimes, data_dir, staging). Toggling a
+        plugin-less mod leaves all of those identical → the header parse is
+        skipped. Adding/removing a plugin changes plugins_tuple; an xEdit save
+        changes that file's mtime → both correctly invalidate.
         """
         if not self._plugin_entries or not self._plugin_extensions:
             self._missing_masters = {}
@@ -4030,18 +4087,9 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             return
 
         filemap_path_str = self._get_filemap_path()
-        filemap_mtime = 0.0
-        if filemap_path_str:
-            try:
-                filemap_mtime = Path(filemap_path_str).stat().st_mtime
-            except OSError:
-                filemap_mtime = 0.0
         plugins_tuple = tuple((e.name, e.enabled) for e in self._plugin_entries)
         data_dir_str = str(self._data_dir) if self._data_dir else ""
         staging_str = str(self._staging_root) if self._staging_root else ""
-        cache_key = (filemap_mtime, plugins_tuple, data_dir_str, staging_str)
-        if cache_key == self._masters_cache_key:
-            return  # Nothing relevant changed — skip the expensive work.
 
         exts_lower = {ext.lower() for ext in self._plugin_extensions}
         plugin_paths: dict[str, Path] = {}
@@ -4050,34 +4098,27 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         # 1. Map plugins from filemap.txt → staging mods (and overwrite)
         overwrite_dir = self._staging_root.parent / "overwrite" if self._staging_root else None
         if filemap_path_str and self._staging_root:
-            filemap_path = Path(filemap_path_str)
-            if filemap_path.is_file():
-                with filemap_path.open(encoding="utf-8") as f:
-                    for line in f:
-                        line = line.rstrip("\n")
-                        if "\t" not in line:
-                            continue
-                        rel_path, mod_name = line.split("\t", 1)
-                        rel_path = rel_path.replace("\\", "/")
-                        if "/" in rel_path:
-                            continue
-                        if Path(rel_path).suffix.lower() in exts_lower:
-                            if mod_name == _OVERWRITE_NAME and overwrite_dir:
-                                plugin_paths[rel_path.lower()] = overwrite_dir / rel_path
-                            else:
-                                direct = self._staging_root / mod_name / rel_path
-                                if direct.is_file():
-                                    plugin_paths[rel_path.lower()] = direct
-                                else:
-                                    # File may live under a strip-prefix subfolder in staging
-                                    # (e.g. staging/mod/Data Files/plugin.esp).
-                                    # Search the mod dir for a matching filename.
-                                    found = self._find_plugin_in_mod_dir(
-                                        self._staging_root / mod_name, rel_path
-                                    )
-                                    plugin_paths[rel_path.lower()] = found or direct
-                            # Map plugin filename → mod folder name
-                            plugin_mod_map[rel_path.lower()] = mod_name
+            for rel_path, mod_name in self._get_parsed_filemap(Path(filemap_path_str)):
+                rel_path = rel_path.replace("\\", "/")
+                if "/" in rel_path:
+                    continue
+                if Path(rel_path).suffix.lower() in exts_lower:
+                    if mod_name == _OVERWRITE_NAME and overwrite_dir:
+                        plugin_paths[rel_path.lower()] = overwrite_dir / rel_path
+                    else:
+                        direct = self._staging_root / mod_name / rel_path
+                        if direct.is_file():
+                            plugin_paths[rel_path.lower()] = direct
+                        else:
+                            # File may live under a strip-prefix subfolder in staging
+                            # (e.g. staging/mod/Data Files/plugin.esp).
+                            # Search the mod dir for a matching filename.
+                            found = self._find_plugin_in_mod_dir(
+                                self._staging_root / mod_name, rel_path
+                            )
+                            plugin_paths[rel_path.lower()] = found or direct
+                    # Map plugin filename → mod folder name
+                    plugin_mod_map[rel_path.lower()] = mod_name
 
         # 2. Plugins in overwrite that may not be in filemap yet (added by sync, index stale)
         if overwrite_dir and overwrite_dir.is_dir():
@@ -4106,6 +4147,23 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
 
         self._plugin_mod_map = plugin_mod_map
         self._plugin_paths = plugin_paths
+
+        # Gate the expensive header-parse phase on the inputs that actually
+        # affect it: the enabled-plugin set/order, the resolved plugin-file
+        # paths AND their mtimes (so an xEdit save invalidates), and the dirs.
+        # The filemap mtime is deliberately NOT part of this key — it changes on
+        # every mod toggle but does not imply any plugin file changed.
+        path_fps: list[tuple[str, str, float]] = []
+        for low, p in plugin_paths.items():
+            try:
+                path_fps.append((low, str(p), p.stat().st_mtime))
+            except OSError:
+                path_fps.append((low, str(p), -1.0))
+        path_fps.sort()
+        cache_key = (plugins_tuple, tuple(path_fps), data_dir_str, staging_str)
+        if cache_key == self._masters_cache_key:
+            return  # Plugin set + files unchanged — skip the header re-parse.
+
         plugin_names = [e.name for e in self._plugin_entries if e.enabled]
         self._missing_masters = check_missing_masters(plugin_names, plugin_paths)
         self._late_masters = check_late_masters(plugin_names, plugin_paths)

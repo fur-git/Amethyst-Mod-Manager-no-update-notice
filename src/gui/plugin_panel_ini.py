@@ -688,17 +688,19 @@ class PluginPanelIniMixin:
         self._apply_ini_search_filter()
 
     def _collect_profile_ini_files(self, extensions: "frozenset[str]") -> "list[tuple[str, Path]]":
-        """Return (rel_path, full_path) for config files at the top of the active profile folder.
+        """Return (rel_path, full_path) for config files in the active profile's
+        'ini files' folder (the ones that get symlinked into My Games).
         rel_path is just the filename. Returns [] if no profile dir is known."""
         profile_dir = getattr(self._game, "_active_profile_dir", None) if self._game else None
         if not profile_dir:
             return []
-        profile_dir = Path(profile_dir)
-        if not profile_dir.is_dir():
+        subdir = getattr(self._game, "_PROFILE_INI_SUBDIR", "ini files")
+        ini_dir = Path(profile_dir) / subdir
+        if not ini_dir.is_dir():
             return []
         results: list[tuple[str, Path]] = []
         try:
-            for fpath in profile_dir.iterdir():
+            for fpath in ini_dir.iterdir():
                 if not fpath.is_file():
                     continue
                 if fpath.suffix.lower() not in extensions:

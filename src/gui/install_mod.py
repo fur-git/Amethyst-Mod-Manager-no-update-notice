@@ -123,6 +123,62 @@ def _reroute_extract_dir(old_dir: str, disk_parent: "Path") -> str:
     return new_dir
 
 
+def _debackslash_extracted_tree(extract_dir: str, log_fn=None) -> int:
+    """Repair an extraction that kept Windows backslash path separators.
+
+    Some ZIPs (commonly packed by PowerShell's ``Compress-Archive``) store
+    member names with ``\\`` separators, which violates the ZIP spec. Native
+    extractors (7z/bsdtar) and Python's ``zipfile`` then create *flat* files
+    whose names literally contain backslashes — e.g. a single file called
+    ``Data\\Interface\\foo.ttf`` — instead of a nested folder tree.
+
+    Downstream install code resolves paths with forward slashes, so those flat
+    entries are never matched (``rglob`` finds them, but ``src.is_file()`` then
+    fails against the rewritten ``Data/Interface/foo.ttf`` path) → "0 items
+    copied". This sweep relocates every backslash-named entry to its proper
+    nested location. Returns the number of entries moved.
+
+    Idempotent and cheap when no backslash names exist (the common case).
+    """
+    root = Path(extract_dir)
+    # Collect first so we don't mutate the tree mid-walk. Deepest paths first
+    # so files move before we try to clean up their (now-empty) flat parents.
+    offenders = [p for p in root.rglob("*") if "\\" in p.name]
+    if not offenders:
+        return 0
+    moved = 0
+    for entry in sorted(offenders, key=lambda p: len(str(p)), reverse=True):
+        if not entry.exists():
+            continue
+        rel = str(entry.relative_to(root)).replace("\\", "/")
+        target = root / rel
+        if target == entry:
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if entry.is_dir():
+                # A backslash-named directory: merge its contents, then drop it.
+                target.mkdir(parents=True, exist_ok=True)
+                for child in entry.iterdir():
+                    dest = target / child.name
+                    if not dest.exists():
+                        shutil.move(str(child), str(dest))
+                try:
+                    entry.rmdir()
+                except OSError:
+                    pass
+            else:
+                if target.exists():
+                    target.unlink()
+                shutil.move(str(entry), str(target))
+                moved += 1
+        except OSError:
+            continue
+    if moved and log_fn is not None:
+        log_fn(f"Normalised {moved} Windows backslash path(s) from archive.")
+    return moved
+
+
 def _get_available_memory_bytes() -> int:
     """Return available system memory in bytes via /proc/meminfo."""
     try:
@@ -218,17 +274,24 @@ from gui.dialogs import (
     _SetPrefixDialog,
     queue_rename_after_install,
 )
+import customtkinter as ctk
+from gui.theme import BG_DEEP
 from gui.fomod_dialog import FomodDialog
 from gui.bain_dialog import BainDialog
 from gui.mod_name_utils import _strip_title_metadata, _suggest_mod_names, sanitize_mod_folder_name
 from Utils.fomod_parser import detect_fomod, parse_module_config, parse_mod_info
 from Utils.fomod_installer import resolve_files, check_module_dependencies
-from Utils.bain_installer import detect_bain, resolve_bain_files
+from Utils.bain_installer import detect_bain, resolve_bain_files, bain_unwrap_single_folder
 from Utils.ui_config import load_dev_mode, load_rename_mod_after_install
 from Utils.config_paths import get_fomod_selections_path, get_bain_selections_path
 from Utils.plugins import read_plugins, append_plugin, read_loadorder, write_loadorder, PluginEntry
 from Utils.modlist import prepend_mod, ensure_mod_preserving_position, read_modlist, write_modlist, ModEntry
 from Utils.profile_state import read_separator_locks, write_separator_locks
+from Utils.re_bundle import (
+    detect_re_bundle, detect_multi_mod, BundleLayout,
+    layout_to_spec, merge_bundle_spec, read_bundle_spec, write_bundle_spec,
+    materialize_selection, BUNDLE_LIB_DIR,
+)
 from Utils.filemap import _scan_dir, update_mod_index
 from Utils.bsa_filemap import update_bsa_index
 from Nexus.nexus_meta import write_meta, read_meta, resolve_nexus_meta_for_archive
@@ -307,36 +370,139 @@ def _show_set_prefix_dialog_on_main(parent_window, required, file_list, mod_name
                         result_holder, done_event, result_attr="result")
 
 
-def _show_fomod_dialog_on_main(parent_window, config, mod_root,
-                               installed_files: set, active_files: set,
-                               saved_selections, selections_path,
-                               result_holder: list, done_event: threading.Event) -> None:
-    """Run on main thread. Creates a FomodDialog overlay on the mod-panel container."""
+def _launch_fomod_dialog(parent_window, config, mod_root,
+                         installed_files: set, active_files: set,
+                         saved_selections, selections_path, on_done,
+                         loose_files: set | None = None) -> None:
+    """Create a FomodDialog overlay on the mod-panel container, with a popout
+    toggle that re-hosts it in a separate window. Must run on the main thread.
+
+    Tk can't reparent a live widget across toplevels, so the popout/dock toggle
+    tears down the current FomodDialog and builds a fresh one in the other host,
+    carrying its in-progress state. *on_done* fires exactly once (finish/cancel),
+    regardless of how many times the user pops out and docks."""
     import traceback as _tb
     try:
         container = getattr(parent_window, '_mod_panel_container', None) or parent_window
 
-        def on_done(result):
-            result_holder[0] = result
-            done_event.set()
+        # Mutable cell holding the live popout Toplevel (None when docked).
+        popout_win: list = [None]
+        _caller_on_done = on_done
 
-        panel = FomodDialog(container, config, mod_root,
-                            installed_files=installed_files,
-                            active_files=active_files,
-                            saved_selections=saved_selections,
-                            selections_path=selections_path,
-                            on_done=on_done)
-        try:
-            if panel.winfo_exists():
-                panel.place(relx=0, rely=0, relwidth=1, relheight=1)
-                panel.lift()
-                panel.focus_set()
-        except Exception:
-            _tb.print_exc()
+        def on_done(result):
+            # Tear down a lingering popout window if the install resolved while
+            # popped out.
+            win = popout_win[0]
+            if win is not None:
+                popout_win[0] = None
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            _caller_on_done(result)
+
+        def build(state: dict | None, popped_out: bool):
+            """(Re)create the FomodDialog in the requested host."""
+            # Always start by clearing any existing popout window — when docking,
+            # the dialog inside it has already been destroyed by the toggle.
+            win = popout_win[0]
+            if win is not None:
+                popout_win[0] = None
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+            def on_rehost(new_state, going_to_popout):
+                build(new_state, going_to_popout)
+
+            common = dict(
+                installed_files=installed_files,
+                active_files=active_files,
+                loose_files=loose_files,
+                saved_selections=saved_selections,
+                selections_path=selections_path,
+                on_done=on_done,
+                on_rehost=on_rehost,
+                is_popped_out=popped_out,
+                initial_state=state,
+            )
+
+            if popped_out:
+                host = ctk.CTkToplevel(parent_window, fg_color=BG_DEEP)
+                host.title(config.name or "FOMOD Installer")
+                # Size to roughly the main window so the layout matches.
+                try:
+                    root = parent_window.winfo_toplevel()
+                    root.update_idletasks()
+                    w = max(int(root.winfo_width() * 0.85), 720)
+                    h = max(int(root.winfo_height() * 0.85), 520)
+                    x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+                    y = root.winfo_rooty() + (root.winfo_height() - h) // 2
+                    host.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+                except Exception:
+                    host.geometry("960x640")
+                host.minsize(640, 480)
+                host.grid_rowconfigure(0, weight=1)
+                host.grid_columnconfigure(0, weight=1)
+                # Closing the popout window cancels the install (mirrors the
+                # overlay's Cancel button, so the worker thread doesn't hang).
+                host.protocol("WM_DELETE_WINDOW",
+                              lambda: panel_ref[0]._on_cancel()
+                              if panel_ref[0] is not None else on_done(None))
+                popout_win[0] = host
+
+                panel = FomodDialog(host, config, mod_root, **common)
+                panel.grid(row=0, column=0, sticky="nsew")
+                panel_ref[0] = panel
+                try:
+                    # Deliberately NOT transient/topmost: a transient window
+                    # stays stacked above its parent on most Linux WMs, which
+                    # makes the manager underneath unusable. We want an ordinary
+                    # independent window the user can freely raise/lower. Just
+                    # bring it to the front once on open.
+                    host.attributes("-topmost", False)
+                    host.lift()
+                    host.focus_force()
+                    panel.focus_set()
+                except Exception:
+                    _tb.print_exc()
+            else:
+                panel = FomodDialog(container, config, mod_root, **common)
+                panel_ref[0] = panel
+                try:
+                    if panel.winfo_exists():
+                        panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+                        panel.lift()
+                        panel.focus_set()
+                except Exception:
+                    _tb.print_exc()
+
+        # Holds the currently-live FomodDialog so the popout window's close
+        # button can route through its cancel path.
+        panel_ref: list = [None]
+
+        build(None, popped_out=False)
     except Exception:
         _tb.print_exc()
-        result_holder[0] = None
+        on_done(None)
+
+
+def _show_fomod_dialog_on_main(parent_window, config, mod_root,
+                               installed_files: set, active_files: set,
+                               saved_selections, selections_path,
+                               result_holder: list, done_event: threading.Event,
+                               loose_files: set | None = None) -> None:
+    """Worker-thread entry point: marshal the FOMOD dialog onto the main thread
+    and resolve the worker's done_event when the user finishes/cancels."""
+    def _on_done(result):
+        result_holder[0] = result
         done_event.set()
+
+    _launch_fomod_dialog(parent_window, config, mod_root,
+                         installed_files, active_files,
+                         saved_selections, selections_path, _on_done,
+                         loose_files=loose_files)
 
 
 def _show_bain_dialog_on_main(parent_window, subpackages, mod_root,
@@ -633,82 +799,6 @@ def _extract_fomod_archive(fomod_path: str, dest_dir: str, log_fn) -> bool:
     except Exception as e:
         log_fn(f"zipfile failed on .fomod ({e}).")
     return False
-
-
-def detect_bundle(
-    extract_dir: str,
-) -> "tuple[str, list[tuple[str, str]]] | None":
-    """Detect a Fluffy-style bundle: a directory whose immediate subdirs each
-    contain a ``modinfo.ini`` with the same ``nameasbundle`` value.
-
-    Returns ``(bundle_name, [(variant_name, variant_path), ...])`` sorted by
-    the order subdirs appear on disk, or ``None`` if not a bundle.
-
-    A bundle requires:
-    - At least 2 immediate subdirectories.
-    - Every subdir has a ``modinfo.ini`` with a non-empty ``nameasbundle`` key.
-    - All ``nameasbundle`` values are identical.
-    """
-    import configparser
-    root = Path(extract_dir)
-    subdirs = sorted(p for p in root.iterdir() if p.is_dir())
-    if len(subdirs) < 2:
-        return None
-
-    bundle_name: str | None = None
-    variants: list[tuple[str, str]] = []
-
-    for subdir in subdirs:
-        ini_path = subdir / "modinfo.ini"
-        if not ini_path.is_file():
-            return None
-        cfg = configparser.RawConfigParser()
-        try:
-            cfg.read_string("[mod]\n" + ini_path.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            return None
-        bname = cfg.get("mod", "nameasbundle", fallback="").strip()
-        if not bname:
-            return None
-        if bundle_name is None:
-            bundle_name = bname
-        elif bname.lower() != bundle_name.lower():
-            return None  # inconsistent bundle names
-        vname = cfg.get("mod", "name", fallback=subdir.name).strip() or subdir.name
-        variants.append((vname, str(subdir)))
-
-    if bundle_name and len(variants) >= 2:
-        return bundle_name, variants
-    return None
-
-
-def detect_multi_mod(
-    extract_dir: str,
-) -> "list[tuple[str, str]] | None":
-    """Detect a multi-mod archive: immediate subdirs each have a ``modinfo.ini``
-    but without a shared ``nameasbundle`` (so not a bundle).
-
-    Returns ``[(mod_name, subdir_path), ...]`` or ``None`` if not applicable.
-    Requires at least 2 subdirs all with modinfo.ini.
-    """
-    import configparser
-    root = Path(extract_dir)
-    subdirs = sorted(p for p in root.iterdir() if p.is_dir())
-    if len(subdirs) < 2:
-        return None
-    mods: list[tuple[str, str]] = []
-    for subdir in subdirs:
-        ini_path = subdir / "modinfo.ini"
-        if not ini_path.is_file():
-            return None
-        cfg = configparser.RawConfigParser()
-        try:
-            cfg.read_string("[mod]\n" + ini_path.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            return None
-        name = cfg.get("mod", "name", fallback="").strip() or subdir.name
-        mods.append((name, str(subdir)))
-    return mods if len(mods) >= 2 else None
 
 
 def _resolve_direct_files(extract_dir: str) -> list[tuple[str, str, bool]]:
@@ -1334,6 +1424,11 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                         "deflate64) that requires the '7z' binary. Install "
                         "the 'p7zip' package or use the Flatpak build."
                     )
+            # Native extractors (7z/bsdtar) reproduce Windows backslash member
+            # names as literal flat filenames; repair them into a real tree so
+            # the rest of the install pipeline can resolve the paths.
+            if _zip_done:
+                _debackslash_extracted_tree(extract_dir, log_fn)
         elif ext.endswith(".7z"):
             import subprocess
             _7z_done = False
@@ -1683,6 +1778,24 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                 # Also add anything in loadorder.txt not already captured
                 for name in read_loadorder(loadorder_path):
                     installed_files.add(name.lower())
+            # Build the loose-file set from the current filemap (deployed mod
+            # files). FOMOD <fileDependency> nodes may reference an arbitrary
+            # asset path (e.g. "textures/foo.dds") rather than a plugin name;
+            # MO2 evaluates those against the whole virtual file tree. The
+            # filemap is "<rel_str>\t<mod_name>" per line, sitting next to
+            # plugins.txt. Keys are lower-cased, forward-slash separated.
+            loose_files: set[str] = set()
+            if _plugins_dir is not None:
+                _filemap_path = _plugins_dir / "filemap.txt"
+                try:
+                    with open(_filemap_path, "r", encoding="utf-8") as _fmf:
+                        for _line in _fmf:
+                            _rel = _line.split("\t", 1)[0].strip()
+                            if _rel:
+                                loose_files.add(_rel.replace("\\", "/").lower())
+                except OSError:
+                    pass
+
             # Add vanilla/DLC plugins. Engine loads these implicitly so they
             # never appear in plugins.txt. Use _vanilla_plugins_for_game which
             # prefers Data_Core/ (pristine backup) over Data/ (may contain
@@ -1701,7 +1814,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
             # let the install proceed (the user may be installing prerequisites
             # out of order and will resolve it by enabling/installing other mods).
             _modgate_ok, _modgate_msg = check_module_dependencies(
-                config, installed_files, active_files
+                config, installed_files, active_files, loose_files
             )
             if not _modgate_ok:
                 log_fn("WARNING: this mod's <moduleDependencies> gate is not "
@@ -1759,7 +1872,6 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                 try:
                     if threading.current_thread() is threading.main_thread():
                         import tkinter as tk
-                        container = getattr(parent_window, '_mod_panel_container', None) or parent_window
                         _done_var = tk.BooleanVar(value=False)
                         _result_holder: list = [None]
 
@@ -1767,18 +1879,12 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                             _result_holder[0] = result
                             _done_var.set(True)
 
-                        panel = FomodDialog(container, config, mod_root,
-                                            installed_files=installed_files,
-                                            active_files=active_files,
-                                            saved_selections=saved_selections,
-                                            selections_path=sel_path,
-                                            on_done=_on_done)
+                        _launch_fomod_dialog(parent_window, config, mod_root,
+                                             installed_files, active_files,
+                                             saved_selections, sel_path, _on_done,
+                                             loose_files=loose_files)
                         try:
-                            if panel.winfo_exists():
-                                panel.place(relx=0, rely=0, relwidth=1, relheight=1)
-                                panel.lift()
-                                panel.focus_set()
-                                parent_window.wait_variable(_done_var)
+                            parent_window.wait_variable(_done_var)
                         except Exception:
                             import traceback as _tb; _tb.print_exc()
                         dialog_result = _result_holder[0]
@@ -1793,6 +1899,7 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                                     installed_files, active_files,
                                     saved_selections, sel_path,
                                     result_holder, done_event,
+                                    loose_files=loose_files,
                                 ),
                             )
                             done_event.wait()
@@ -1815,7 +1922,8 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
 
                 final_selections = dialog_result
 
-            file_list = resolve_files(config, final_selections, installed_files, active_files)
+            file_list = resolve_files(config, final_selections, installed_files,
+                                      active_files, loose_files)
             is_fomod_install = True
             log_fn(f"FOMOD complete — {len(file_list)} file(s) to install.")
 
@@ -1835,10 +1943,10 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                     kind = "[dir]" if is_folder else "[file]"
                     log_fn(f"[FOMOD DEV]   {kind} {src!r} → {dst!r}")
         elif getattr(game, "supports_bain", True) and (bain_subpkgs := detect_bain(
-                _unwrap_single_folder(extract_dir),
+                bain_unwrap_single_folder(extract_dir),
                 extra_exts=getattr(game, "plugin_extensions", None))):
             # --- BAIN (Wrye Bash bundled archive) install ---
-            extract_dir = _unwrap_single_folder(extract_dir)
+            extract_dir = bain_unwrap_single_folder(extract_dir)
             mod_root = extract_dir
             log_fn(f"BAIN package detected — {len(bain_subpkgs)} sub-package(s).")
 
@@ -1975,13 +2083,21 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
             is_bain_install = True
             log_fn(f"BAIN complete — {len(selected)} sub-package(s), "
                    f"{len(file_list)} file(s) to install.")
-        elif getattr(game, "mod_supports_bundles", False) and detect_bundle(_unwrap_single_folder(extract_dir)):
-            # --- Bundle install ---
+        elif getattr(game, "mod_supports_bundles", False) and detect_re_bundle(_unwrap_single_folder(extract_dir)):
+            # --- RE / Fluffy bundle install (single mod) ---
+            # Installs as ONE normal mod: a single folder, meta.ini and modlist
+            # row.  The original option folders are tucked into a hidden
+            # <mod>/.mm_bundle/ library (invisible to the scanner); the selected
+            # options are materialised (hardlinked) onto the mod root by
+            # materialize_selection().  The bundle structure + selection live in
+            # meta.ini's [Bundle] section; the Bundle Options dialog re-materialises
+            # on change.  Downstream (scan/filemap/deploy/update) sees a normal mod.
             extract_dir = _unwrap_single_folder(extract_dir)
-            bundle_name, variants = detect_bundle(extract_dir)
-            log_fn(f"Bundle detected: '{bundle_name}' with {len(variants)} variant(s).")
+            layout: BundleLayout = detect_re_bundle(extract_dir)
+            spec = layout_to_spec(layout)
+            log_fn(f"Bundle detected: '{layout.bundle_name}' — {len(layout.groups)} group(s), "
+                   f"{layout.variant_count} option(s). Installing as one mod '{mod_name}'.")
 
-            # Resolve profile dir once
             if mod_panel is not None and mod_panel._modlist_path is not None:
                 _profile_dir = mod_panel._modlist_path.parent
             elif profile_dir is not None:
@@ -1990,113 +2106,101 @@ def install_mod_from_archive(archive_path: str, parent_window, log_fn,
                 _profile_dir = game.get_profile_root() / "profiles" / "default"
             modlist_path = _profile_dir / "modlist.txt"
 
-            strip_prefixes     = getattr(game, "mod_folder_strip_prefixes", set())
-            post_strip         = getattr(game, "mod_folder_strip_prefixes_post", set())
-            required           = getattr(game, "mod_required_top_level_folders", set())
-            auto_strip         = getattr(game, "mod_auto_strip_until_required", False)
-            install_as_is      = getattr(game, "mod_install_as_is_if_no_match", False)
-            install_prefix     = getattr(game, "mod_install_prefix", "")
-            required_lower     = {r.lower() for r in required}
-            required_file_types = getattr(game, "mod_required_file_types", set())
+            dest_root = game.get_effective_mod_staging_path() / mod_name
+            _bundle_was_existing = dest_root.exists()
+            if _bundle_was_existing:
+                # Reinstall / update: carry the user's saved option selection (and
+                # order) onto the freshly detected spec before wiping the folder.
+                # New options keep their default; removed options drop out.
+                _old_spec = read_bundle_spec(dest_root / "meta.ini")
+                if _old_spec is not None:
+                    spec = merge_bundle_spec(spec, _old_spec)
+                    log_fn("Bundle: preserved existing option selection across reinstall/update.")
+                def _frc(func, path, _exc):
+                    os.chmod(path, 0o700)
+                    func(path)
+                shutil.rmtree(dest_root, onexc=_frc)
 
-            installed_variant_names: list[str] = []
-            for v_idx, (v_name, v_path) in enumerate(variants):
-                v_mod_name = f"{bundle_name}__{v_name}"
-                v_file_list = _resolve_direct_files(v_path)
+            # Stash every extracted top-level folder under <mod>/.mm_bundle/.
+            lib_dir = dest_root / BUNDLE_LIB_DIR
+            lib_dir.mkdir(parents=True, exist_ok=True)
+            for child in Path(extract_dir).iterdir():
+                if child.is_dir():
+                    _copy_file_list(_resolve_direct_files(str(child)),
+                                    str(child), lib_dir / child.name, log_fn)
 
-                # Apply the same strip / prefix / required-folder logic as normal install
-                if strip_prefixes and not _is_root_install:
-                    v_file_list = _apply_strip_prefixes_to_file_list(v_file_list, strip_prefixes)
-                if install_prefix and not _is_root_install:
-                    _pfx = install_prefix.strip().strip("/").replace("\\", "/")
-                    _pfx_parts = _pfx.lower().split("/")
-                    new_vfl = []
-                    for s, d, f in v_file_list:
-                        d_parts = d.replace("\\", "/").split("/")
-                        d_parts_lower = [p.lower() for p in d_parts]
-                        if d_parts_lower[0] in required_lower:
-                            new_vfl.append((s, d, f))
-                            continue
-                        match_len = 0
-                        for i in range(len(_pfx_parts), 0, -1):
-                            if d_parts_lower[:i] == _pfx_parts[-i:]:
-                                match_len = i
-                                break
-                        missing = "/".join(_pfx.split("/")[:len(_pfx_parts) - match_len])
-                        new_vfl.append((s, f"{missing}/{d}" if missing else d, f))
-                    v_file_list = new_vfl
-                if required and not _check_mod_top_level(v_file_list, required):
-                    if auto_strip:
-                        v_file_list, _ = _try_auto_strip_top_level(v_file_list, required)
-                    if not v_file_list and install_as_is:
-                        v_file_list = _resolve_direct_files(v_path)
-                if post_strip and not _is_root_install:
-                    v_file_list = _apply_strip_prefixes_to_file_list(v_file_list, post_strip)
+            # Persist the spec, materialise the default selection, stamp meta.
+            meta_path = dest_root / "meta.ini"
+            write_bundle_spec(meta_path, spec)
+            materialize_selection(dest_root, spec)
+            _stamp_meta_install_date(meta_path,
+                                     installation_file=os.path.basename(archive_path))
 
-                v_dest = game.get_effective_mod_staging_path() / v_mod_name
-                if v_dest.exists():
-                    import shutil as _shutil
-                    def _frc(func, path, _exc):
-                        os.chmod(path, 0o700)
-                        func(path)
-                    _shutil.rmtree(v_dest, onexc=_frc)
-                _copy_file_list(v_file_list, v_path, v_dest, log_fn)
-                _stamp_meta_install_date(v_dest / "meta.ini",
-                                         installation_file=os.path.basename(archive_path))
-
-                # Update mod index for this variant
-                if not skip_index_update:
+            # Write Nexus metadata exactly like a normal install (preserves the
+            # [Bundle] section).  Prebuilt meta is written directly; otherwise the
+            # archive is resolved against the Nexus API in a background thread.
+            _archive = Path(archive_path)
+            _game_domain = getattr(game, "nexus_game_domain", "")
+            if prebuilt_meta is not None:
+                try:
+                    prebuilt_meta.installation_file = os.path.basename(archive_path)
+                    write_meta(meta_path, prebuilt_meta)
+                    log_fn(f"Nexus: Saved metadata for '{mod_name}' (mod {prebuilt_meta.mod_id})")
+                except OSError:
+                    pass
+            elif _game_domain and _archive.is_file():
+                def _detect_bundle_meta(_mp=meta_path, _mn=mod_name):
                     try:
-                        _strip_fs = frozenset() if _is_root_install else frozenset(s.lower() for s in (strip_prefixes or []))
-                        _exts_fs  = frozenset(e.lower() for e in (getattr(game, "install_extensions", None) or []))
-                        _root_fs  = frozenset(s.lower() for s in (getattr(game, "root_deploy_folders", None) or []))
-                        _, _nf, _rf = _scan_dir(v_mod_name, str(v_dest), _strip_fs, _exts_fs, _root_fs)
-                        _index_path = _profile_dir / "modindex.bin"
-                        _norm_case = getattr(game, "normalize_folder_case", True)
-                        update_mod_index(_index_path, v_mod_name, _nf, _rf, normalize_folder_case=_norm_case)
+                        app = None
+                        try:
+                            app = parent_window.winfo_toplevel()
+                        except Exception:
+                            pass
+                        api = getattr(app, "_nexus_api", None) if app else None
+                        meta = resolve_nexus_meta_for_archive(
+                            _archive, _game_domain, api=api,
+                            log_fn=lambda m: (app.after(0, lambda msg=m: log_fn(msg)) if app else None),
+                        )
+                        if meta:
+                            write_meta(_mp, meta)
+                            msg = f"Nexus: Saved metadata for '{_mn}' (mod {meta.mod_id})"
+                            if app:
+                                app.after(0, lambda: log_fn(msg))
                     except Exception:
                         pass
+                threading.Thread(target=_detect_bundle_meta, daemon=True).start()
 
-                log_fn(f"  Variant '{v_name}' → {v_dest}")
-                installed_variant_names.append(v_mod_name)
+            # Index the mod normally — the scanner skips .mm_bundle/, so only the
+            # materialised selection at the mod root is indexed.
+            if not skip_index_update:
+                try:
+                    _strip_fs = frozenset() if _is_root_install else frozenset(
+                        s.lower() for s in (getattr(game, "mod_folder_strip_prefixes", set()) or []))
+                    _exts_fs  = frozenset(e.lower() for e in (getattr(game, "install_extensions", None) or []))
+                    _root_fs  = frozenset(s.lower() for s in (getattr(game, "root_deploy_folders", None) or []))
+                    _, _nf, _rf, _ = _scan_dir(mod_name, str(dest_root), _strip_fs, _exts_fs, _root_fs)
+                    _index_path = _profile_dir / "modindex.bin"
+                    _norm_case = getattr(game, "normalize_folder_case", True)
+                    update_mod_index(_index_path, mod_name, _nf, _rf,
+                                     normalize_folder_case=_norm_case)
+                except Exception:
+                    pass
 
-            # Insert a locked separator + all locked variants as a block at the
-            # top of modlist.txt.  All variants are enabled by default — users
-            # can disable whichever ones they don't want.
-            sep_name = f"{bundle_name}_separator"
-            existing = read_modlist(modlist_path)
-            # Remove any pre-existing entries for this bundle's separator/variants
-            remove_names = {sep_name} | set(installed_variant_names)
-            existing = [e for e in existing if e.name not in remove_names]
-            # Build the bundle block: separator + variants (not locked — users
-            # can still toggle them; drag prevention is handled by the panel).
-            bundle_block: list[ModEntry] = [
-                ModEntry(name=sep_name, enabled=True, locked=True, is_separator=True),
-            ]
-            for vn in installed_variant_names:
-                bundle_block.append(
-                    ModEntry(name=vn, enabled=True, locked=False, is_separator=False)
-                )
-            # Prepend the bundle block at the top
-            existing = bundle_block + existing
-            write_modlist(modlist_path, existing)
+            # Single modlist row.  A reinstall/update keeps its existing load-order
+            # position (like any normal mod); a fresh install goes to the top.
+            if _bundle_was_existing:
+                ensure_mod_preserving_position(modlist_path, mod_name, enabled=True)
+            else:
+                prepend_mod(modlist_path, mod_name, enabled=True)
 
-            # Auto-lock the separator so it drags as a block
-            locks = read_separator_locks(_profile_dir)
-            locks[sep_name] = True
-            write_separator_locks(_profile_dir, locks)
-
-            log_fn(f"Installed bundle '{bundle_name}' ({len(variants)} variant(s)).")
+            log_fn(f"Installed bundle '{mod_name}' as one mod "
+                   f"({len(spec.selected_folders())} of {layout.variant_count} option(s) active).")
             if not headless:
-                _show_mod_notification(parent_window, f"Installed bundle: {bundle_name}")
-            _fire_on_installed(on_installed, is_fomod=False,
-                               installed_mod_name=bundle_name)
+                _show_mod_notification(parent_window, f"Installed bundle: {mod_name}")
+            _fire_on_installed(on_installed, is_fomod=False, installed_mod_name=mod_name)
             if mod_panel is not None and not headless and not skip_reload:
                 mod_panel.after(0, mod_panel.reload_after_install)
-            # Bundles install one separator + N variants — renaming the
-            # separator or individual variants doesn't fit the single-name
-            # prompt cleanly, so skip the post-install rename here.
-            return installed_variant_names[0] if installed_variant_names else mod_name
+            return mod_name
         elif getattr(game, "mod_supports_bundles", False) and detect_multi_mod(_unwrap_single_folder(extract_dir)):
             # --- Multi-mod archive: each subdir is a separate independent mod ---
             extract_dir = _unwrap_single_folder(extract_dir)

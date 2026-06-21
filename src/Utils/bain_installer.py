@@ -115,6 +115,27 @@ def _looks_like_subpackage(dir_path: str, data_exts: set[str]) -> bool:
     return False
 
 
+def bain_unwrap_single_folder(extract_dir: str) -> str:
+    """Peel a single wrapping top-level folder for BAIN detection, but NOT when
+    that folder is itself a recognised data dir.
+
+    Many simple (type-1) packages ship as ``<archive>/SKSE/...`` or
+    ``<archive>/Meshes/...`` with nothing else at the root. A blind single-folder
+    unwrap would descend into ``SKSE/`` and then mistake its child folders
+    (``Plugins/``, ``Scripts/`` …) for BAIN sub-packages. Refusing to peel a
+    recognised data dir keeps such packages classified as simple, matching Wrye
+    Bash (which treats a top-level data dir as package content, not a wrapper)."""
+    try:
+        entries = list(os.scandir(extract_dir))
+    except OSError:
+        return extract_dir
+    if len(entries) == 1 and entries[0].is_dir():
+        if entries[0].name.lower() in _DATA_DIRS:
+            return extract_dir
+        return entries[0].path
+    return extract_dir
+
+
 def detect_bain(extract_dir: str,
                 extra_exts: "set[str] | list[str] | None" = None
                 ) -> list[BainSubPackage] | None:

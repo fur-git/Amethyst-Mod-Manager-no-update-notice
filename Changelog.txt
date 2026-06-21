@@ -1,3 +1,19 @@
+- v1.3.11
+- Reworked RE engine bundle style mods to be detected and presented better, an interface can now be opened for these mods to change the options.
+- Fixed bugs related to reverse priority sorting
+- Sorted the right click context menu into categories
+- Added additional folder paths to the proton window and split the proton window's items into categories
+- Filtered prefix folders out when running the eslifer wizard to prevent an error in the application
+- The nexus browser can now be searched with a partial name match or by modid
+- Added a popout button to the fomod installer and nexus browser that turns it into a separate window
+- Added an option in settings to hide bsa conflicts
+- Added a use profile specfic saves option (Limited to bethesda games for now)
+- Profile specfic ini files are now taken from the ini files folder in the profile and are also symlinked so edits persist
+- Fixed RE engine pak invalidation not working correctly outside of the default profile
+- Fixed mods that install with broken backslashes in their archive
+- Fixed a bug where disabling a filtered file in the mod files tab would re enable all other files
+- Added wizard tools for configuring sse display tweaks and engine fixes config files
+
 - v1.3.10
 - Added Fallout 76 support
 - Fixed separator settings deploy method option not working

@@ -720,6 +720,7 @@ class TopBar(ctk.CTkFrame):
             self._game_var.set(result)
             _save_last_game(result)
             self._update_wizard_visibility()
+            self._check_collections_visibility()
             # Reset profile dropdown for the newly selected game BEFORE reloading
             new_profiles = _profiles_for_game(result)
             self._profile_menu.configure(values=new_profiles)
@@ -739,6 +740,7 @@ class TopBar(ctk.CTkFrame):
                     self._game_var.set(result)
                     _save_last_game(result)
                     self._update_wizard_visibility()
+                    self._check_collections_visibility()
                     # Reset profile dropdown for the newly added game BEFORE reloading
                     # so the old game's profiles are not inherited.
                     new_profiles = _profiles_for_game(result)

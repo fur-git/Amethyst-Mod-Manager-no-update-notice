@@ -184,6 +184,11 @@ def _scan_dir(
                         # filemap so they don't get deployed into the game.
                         if entry.name.startswith("prefix_"):
                             continue
+                        # RE/Fluffy bundle option library — holds the original
+                        # option folders; only the materialised selection at the
+                        # mod root is deployed (see Utils/re_bundle.py).
+                        if entry.name == ".mm_bundle":
+                            continue
                         if not _is_utf8_safe(entry.name):
                             invalid_names.append(prefix + entry.name + "/")
                             continue
@@ -396,6 +401,25 @@ def _normalize_folder_cases(
     Accepts one or more dicts (e.g. normal and root) and builds canonical
     casing from all in one pass, then rewrites each in turn.
     """
+    # All files sharing a parent directory share the exact same folder-segment
+    # chain, so the canonical-casing work is per *directory*, not per file.
+    # A large modlist has ~12x more files than unique directories, so we collect
+    # the distinct parent-dir paths first and walk segments once per directory.
+    # ``dir_str`` is the original-cased parent path (everything before the final
+    # "/"); ``""`` is used for loose top-level files (no folder to normalize).
+    unique_dirs: dict[str, None] = {}
+    for all_files in all_files_list:
+        if not all_files:
+            continue
+        for files in all_files.values():
+            for rel_str in files.values():
+                slash = rel_str.rfind("/")
+                if slash >= 0:
+                    unique_dirs[rel_str[:slash]] = None
+
+    if not unique_dirs:
+        return
+
     # Collect canonical casing per folder segment, keyed by its full ancestor
     # path so that identically-named segments at different tree locations are
     # independent.  e.g. "textures/effects" vs "interface/photomode/overlays/effects"
@@ -403,50 +427,52 @@ def _normalize_folder_cases(
     # influence Particle Patch's lowercase effects.
     # Key: (lowercase_parent_path, lowercase_segment) -> canonical segment str
     canonical: dict[tuple[str, str], str] = {}
-    for all_files in all_files_list:
-        if not all_files:
-            continue
-        for files in all_files.values():
-            for rel_str in files.values():
-                parts = rel_str.split("/")
-                if len(parts) < 2:
-                    continue
-                parent = ""
-                for seg in parts[:-1]:
-                    ctx_key = (parent, seg.lower())
-                    if ctx_key not in canonical:
-                        canonical[ctx_key] = seg
-                    else:
-                        canonical[ctx_key] = _pick_canonical_segment(canonical[ctx_key], seg, strategy)
-                    parent = parent + seg.lower() + "/"
+    for dir_str in unique_dirs:
+        parent = ""
+        for seg in dir_str.split("/"):
+            ctx_key = (parent, seg.lower())
+            cur = canonical.get(ctx_key)
+            if cur is None:
+                canonical[ctx_key] = seg
+            else:
+                canonical[ctx_key] = _pick_canonical_segment(cur, seg, strategy)
+            parent = parent + seg.lower() + "/"
 
     if not canonical:
         return
 
-    # Rewrite rel_str values so every folder segment uses the canonical casing.
+    # Resolve each unique directory path to its canonical form once, then rewrite
+    # files by simple string replacement of the parent prefix.  Directories whose
+    # casing already matches the canonical pick map to themselves (None marker)
+    # so the file loop can skip them without re-walking segments.
+    dir_rewrite: dict[str, str | None] = {}
+    for dir_str in unique_dirs:
+        parent = ""
+        new_parts: list[str] = []
+        changed = False
+        for seg in dir_str.split("/"):
+            ctx_key = (parent, seg.lower())
+            c = canonical.get(ctx_key, seg)
+            if c != seg:
+                changed = True
+            new_parts.append(c)
+            parent = parent + seg.lower() + "/"
+        dir_rewrite[dir_str] = "/".join(new_parts) if changed else None
+
+    # Rewrite rel_str values for files whose parent directory's casing changed.
     for all_files in all_files_list:
         if not all_files:
             continue
         for files in all_files.values():
             for rel_key in files:
                 rel_str = files[rel_key]
-                if "/" not in rel_str:
+                slash = rel_str.rfind("/")
+                if slash < 0:
                     continue
-                parts = rel_str.split("/")
-                changed = False
-                parent = ""
-                new_parts = []
-                for seg in parts[:-1]:
-                    ctx_key = (parent, seg.lower())
-                    c = canonical.get(ctx_key, seg)
-                    if c != seg:
-                        changed = True
-                    new_parts.append(c)
-                    parent = parent + seg.lower() + "/"
-                if not changed:
+                new_dir = dir_rewrite.get(rel_str[:slash])
+                if new_dir is None:
                     continue
-                new_parts.append(parts[-1])
-                files[rel_key] = "/".join(new_parts)
+                files[rel_key] = new_dir + rel_str[slash:]
 
 
 def _apply_force_casing(

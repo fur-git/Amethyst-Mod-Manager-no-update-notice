@@ -1876,12 +1876,20 @@ class NexusAPI:
         Pass category_names to restrict results to specific categories.
         """
         base_filter = self._build_mods_filter(game_domain, category_names)
-        # Inject the name search into the filter
+        # Inject the name search into the filter.
+        #
+        # The `nameStemmed` filter only matches whole (stemmed) words, so a
+        # trailing partial word like "disp" in "sse disp" never matches
+        # "SSE Display Tweaks". The `name` WILDCARD operator does substring
+        # matching on the raw query instead, so partial words are honoured.
+        # NB: do NOT add `*`/`%` wildcard chars around the value — the operator
+        # already matches substrings, and supplying them makes it match nothing.
+        name_cond = {"name": {"value": query_text, "op": "WILDCARD"}}
         if "filter" in base_filter:
             # nested AND structure — append name condition
-            base_filter["filter"].append({"nameStemmed": {"value": query_text}})
+            base_filter["filter"].append(name_cond)
         else:
-            base_filter["nameStemmed"] = {"value": query_text}
+            base_filter.update(name_cond)
         query = """
         query SearchMods($filter: ModsFilter, $count: Int, $offset: Int) {
             mods(
@@ -1950,6 +1958,27 @@ class NexusAPI:
             raise
         except Exception as exc:
             raise NexusAPIError(f"GraphQL search error: {exc}") from exc
+
+    def search_mod_by_id(
+        self, game_domain: str, mod_id: int
+    ) -> list[NexusModInfo]:
+        """
+        Look up a single mod by its numeric mod id for the browse search.
+
+        Returns a one-element list (to match search_mods' shape) or an empty
+        list if the mod doesn't exist / isn't visible. Network/auth errors are
+        still raised so the caller can surface them.
+        """
+        try:
+            return [self.get_mod(game_domain, mod_id)]
+        except NexusAPIError as exc:
+            # A missing or hidden mod (404) is "no results", not an error.
+            if getattr(exc, "status_code", None) == 404:
+                return []
+            raise
+        except Exception:
+            # get_mod uses self._get, which raises requests' HTTPError for 404.
+            return []
 
     # -- Tracked mods -------------------------------------------------------
 

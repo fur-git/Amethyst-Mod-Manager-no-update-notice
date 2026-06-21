@@ -65,17 +65,19 @@ from gui.theme import (
     TONE_GREEN,
     TONE_RED,
     TONE_BLUE,
+    BG_GREEN_TEXT,
+    BG_RED_TEXT,
     TAG_BSA_ALT,
     FONT_FAMILY,
     TK_FONT_BOLD, TK_FONT_NORMAL, TK_FONT_SMALL,
 )
 import gui.theme as _theme
 from gui.path_utils import _to_wine_path
-from Utils.config_paths import get_exe_args_path, get_profile_exe_args_path, get_custom_game_images_dir, get_vcredist_cache_path, get_dotnet_cache_dir, get_custom_games_dir
+from Utils.config_paths import get_exe_args_path, get_profile_exe_args_path, get_custom_game_images_dir, get_dotnet_cache_dir, get_custom_games_dir, get_config_dir
 
 from gui.ctk_components import CTkAlert, CTkLoader, ICON_PATH
 from gui.tk_tooltip import TkTooltip
-from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
+from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT, bind_scrollable_wheel
 from Utils.xdg import xdg_open, open_url
 
 
@@ -303,6 +305,7 @@ def confirm_cet_symlink(parent, game) -> bool:
 
 
 from gui.text_utils import build_tree_str as _build_tree_str
+from gui.text_utils import truncate_text as _truncate_text
 
 
 # Game picker — extracted to gui/game_picker_dialog.py
@@ -1065,26 +1068,57 @@ class ProtonToolsPanel(ctk.CTkFrame):
             command=self._on_close,
         ).pack(side="right", padx=4, pady=4)
 
-        # Body — centred vertically/horizontally
-        body = ctk.CTkFrame(self, fg_color=BG_DEEP)
+        # Body — scrollable so the categorised button list never gets clipped
+        # on short windows / high UI scales.
+        body = ctk.CTkScrollableFrame(self, fg_color=BG_DEEP, corner_radius=0)
         body.grid(row=1, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
 
         inner = ctk.CTkFrame(body, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
+        inner.pack(anchor="center", pady=(14, 14))
 
         btn_cfg = dict(width=260, height=34, font=FONT_BOLD,
                        fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT)
 
-        ctk.CTkButton(inner, text="Run winecfg",                  command=self._run_winecfg,           **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Run protontricks",              command=self._run_protontricks,     **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Run EXE in this prefix …",      command=self._run_exe,               **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Open wine registry",             command=self._run_regedit,          **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Browse prefix",                 command=self._browse_prefix,         **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Install VC++ Redistributable",  command=self._run_install_vcredist, **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Install d3dcompiler_47",         command=self._run_install_d3dcompiler_47, **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Install .NET …",                 command=self._run_install_dotnet,  **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Open game folder",               command=self._open_game_folder,    **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Wine DLL Overrides",            command=self._open_wine_dll_overrides, **btn_cfg).pack(pady=(0, 6))
+        def _category(label: str, first: bool = False) -> None:
+            ctk.CTkLabel(
+                inner, text=label.upper(), font=FONT_SMALL,
+                text_color=TEXT_MUTED, anchor="w",
+            ).pack(anchor="w", fill="x", pady=((0 if first else 14), 4))
+            ctk.CTkFrame(inner, fg_color=BORDER, height=1).pack(
+                anchor="w", fill="x", pady=(0, 8))
+
+        # --- Prefix tools ---------------------------------------------------
+        _category("Prefix Tools", first=True)
+        ctk.CTkButton(inner, text="Run winecfg",              command=self._run_winecfg,             **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Run protontricks",         command=self._run_protontricks,        **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Run EXE in this prefix …", command=self._run_exe,                 **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Open wine registry",       command=self._run_regedit,             **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Wine DLL Overrides",       command=self._open_wine_dll_overrides, **btn_cfg).pack(pady=(0, 6))
+
+        # --- Installers -----------------------------------------------------
+        _category("Installers")
+        ctk.CTkButton(inner, text="Install VC++ Redistributable", command=self._run_install_vcredist,       **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Install d3dcompiler_47",       command=self._run_install_d3dcompiler_47, **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Install .NET …",              command=self._run_install_dotnet,         **btn_cfg).pack(pady=(0, 6))
+
+        # --- Folders --------------------------------------------------------
+        _category("Open Folders")
+        for label, opener in (
+            ("Game folder",     self._open_game_folder),
+            ("Prefix folder",   self._browse_prefix),
+            ("My Games folder", self._open_mygames_folder),
+            ("AppData folder",  self._open_appdata_folder),
+            ("Staging folder",  self._open_staging_folder),
+            ("Profile folder",  self._open_profile_folder),
+            (".config folder",  self._open_config_folder),
+        ):
+            ctk.CTkButton(inner, text=label, command=opener, **btn_cfg).pack(pady=(0, 6))
+
+        # On Tk 8.6 (AppImage) X11 wheel notches arrive as Button-4/5, which the
+        # scrollable frame doesn't listen for — bind them so the wheel scrolls
+        # over the buttons too. The helper re-walks descendants on <Enter>.
+        bind_scrollable_wheel(body)
 
     def _get_proton_env(self):
         from Utils.steam_finder import (
@@ -1226,35 +1260,83 @@ class ProtonToolsPanel(ctk.CTkFrame):
                 log(f"Proton Tools error: {e}")
         self._close_and_run(_launch)
 
-    def _browse_prefix(self):
-        prefix_path = self._game.get_prefix_path()
-        if prefix_path is None or not prefix_path.is_dir():
-            self._log("Proton Tools: prefix not configured for this game.")
+    def _open_folder(self, path, descr):
+        """Close the panel and open *path* in the file manager.
+
+        ``path`` may be None / non-existent — in that case we just log why the
+        folder couldn't be opened and leave the panel as-is.
+        """
+        if path is None:
+            self._log(f"Proton Tools: {descr} is not configured for this game.")
+            return
+        path = Path(path)
+        if not path.is_dir():
+            self._log(f"Proton Tools: {descr} not found ({path}).")
             return
         log = self._log
-        path = str(prefix_path)
+        spath = str(path)
         def _launch():
-            log("Proton Tools: opening prefix folder …")
+            log(f"Proton Tools: opening {descr} …")
             try:
-                xdg_open(path)
+                xdg_open(spath)
             except Exception as e:
                 log(f"Proton Tools error: {e}")
         self._close_and_run(_launch)
 
+    def _browse_prefix(self):
+        self._open_folder(self._game.get_prefix_path(), "prefix folder")
+
     def _open_game_folder(self):
-        game_path = self._game.get_game_path()
-        if game_path is None or not game_path.is_dir():
-            self._log("Proton Tools: game folder not configured or not found.")
+        self._open_folder(self._game.get_game_path(), "game folder")
+
+    def _open_mygames_folder(self):
+        # Bethesda games expose the exact per-game My Games subpath; for other
+        # engines fall back to the generic My Games folder inside the prefix.
+        getter = getattr(self._game, "_mygames_path", None)
+        path = getter() if callable(getter) else None
+        if path is None:
+            prefix = self._game.get_prefix_path()
+            if prefix is not None:
+                path = prefix / "drive_c/users/steamuser/Documents/My Games"
+        self._open_folder(path, "My Games folder")
+
+    def _open_appdata_folder(self):
+        # The in-prefix per-game AppData/Local folder (Bethesda games expose the
+        # exact subpath; otherwise fall back to AppData/Local in the prefix).
+        prefix = self._game.get_prefix_path()
+        if prefix is None:
+            self._open_folder(None, "AppData folder")
             return
-        log = self._log
-        path = str(game_path)
-        def _launch():
-            log("Proton Tools: opening game folder …")
+        sub = getattr(self._game, "_APPDATA_SUBPATH", None)
+        if sub is not None:
+            self._open_folder(prefix / sub, "AppData folder")
+            return
+        self._open_folder(
+            prefix / "drive_c/users/steamuser/AppData/Local", "AppData folder")
+
+    def _open_staging_folder(self):
+        getter = getattr(self._game, "get_effective_mod_staging_path", None) \
+            or getattr(self._game, "get_mod_staging_path", None)
+        path = getter() if callable(getter) else None
+        self._open_folder(path, "staging folder")
+
+    def _open_profile_folder(self):
+        # Prefer the active profile directory; fall back to the profiles/ root.
+        path = getattr(self._game, "_active_profile_dir", None)
+        if path is None:
             try:
-                xdg_open(path)
-            except Exception as e:
-                log(f"Proton Tools error: {e}")
-        self._close_and_run(_launch)
+                path = self._game.get_profile_root() / "profiles"
+            except Exception:
+                path = None
+        self._open_folder(path, "profile folder")
+
+    def _open_config_folder(self):
+        # The app's top-level config dir: ~/.config/AmethystModManager/
+        try:
+            path = get_config_dir()
+        except Exception:
+            path = None
+        self._open_folder(path, ".config folder")
 
     def _run_regedit(self):
         proton_script, env = self._get_proton_env()
@@ -1360,38 +1442,11 @@ class ProtonToolsPanel(ctk.CTkFrame):
         proton_script, env = self._get_proton_env()
         if proton_script is None:
             return
-        cache_path = get_vcredist_cache_path()
         prefix_path = getattr(self._game, "_prefix_path", None)
-        vcredist_url = "https://aka.ms/vc14/vc_redist.x64.exe"
 
         def _worker(plog):
-            import urllib.request
-            from Utils.protontricks import VCREDIST_DEP_KEY, mark_dep_installed
-            try:
-                if not cache_path.is_file():
-                    plog("Downloading VC++ Redistributable …")
-                    urllib.request.urlretrieve(vcredist_url, cache_path)
-                    plog("Download complete.")
-                else:
-                    plog("Using cached VC++ Redistributable installer.")
-                plog("Installing VC++ Redistributable in game prefix (silent) — please wait …")
-                proc = subprocess.run(
-                    ["python3", str(proton_script), "run",
-                     str(cache_path), "/install", "/quiet", "/norestart"],
-                    env=env, cwd=cache_path.parent,
-                )
-                # 0 = success, 1638 = already installed, 3010 = reboot required, 1641 = reboot initiated
-                ok_codes = {0, 1638, 3010, 1641}
-                if proc.returncode in ok_codes:
-                    plog(f"VC++ Redistributable installed (exit {proc.returncode}).")
-                    if prefix_path and Path(prefix_path).is_dir():
-                        mark_dep_installed(Path(prefix_path), VCREDIST_DEP_KEY)
-                    return True
-                plog(f"Installer exited with code {proc.returncode}.")
-                return False
-            except Exception as e:
-                plog(f"Error: {e}")
-                return False
+            from Utils.protontricks import install_vcredist
+            return install_vcredist(proton_script, env, log_fn=plog, prefix_path=prefix_path)
 
         self._open_install_progress("Installing VC++ Redistributable", _worker)
 
@@ -2413,13 +2468,19 @@ class _ParallaxRRunDialog(ctk.CTkToplevel):
 _PGPATCHER_DEFAULT_PROTON = ""  # empty string = "Game default"
 
 
-def _get_tool_prefix_env(exe_path: "Path", proton_name: str) -> "tuple[Path, Path, dict] | None":
+def _get_tool_prefix_env(
+    exe_path: "Path", proton_name: str, prefix_dir: "Path | None" = None,
+) -> "tuple[Path, Path, dict] | None":
     """Resolve (proton_script, prefix_dir, env) for a tool's isolated prefix.
 
     proton_name is the display name from the dropdown (e.g. "Proton 10.0").
     Returns None if the Proton version can't be found.
     The prefix directory is created if it doesn't exist.
     Runs wineboot to initialise the prefix if it's brand new.
+
+    By default the prefix lives at ``prefix_<ProtonName>/`` next to the exe.
+    Pass *prefix_dir* to place it elsewhere (e.g. a shared prefix under the
+    app config) — the same initialisation (wineboot + ShowDotFiles) applies.
     """
     from Utils.steam_finder import find_any_installed_proton, find_steam_root_for_proton_script
     proton_script = find_any_installed_proton(proton_name)
@@ -2430,7 +2491,8 @@ def _get_tool_prefix_env(exe_path: "Path", proton_name: str) -> "tuple[Path, Pat
     if steam_root is None:
         return None
 
-    prefix_dir = exe_path.parent / f"prefix_{proton_script.parent.name}"
+    if prefix_dir is None:
+        prefix_dir = exe_path.parent / f"prefix_{proton_script.parent.name}"
     is_new = not (prefix_dir / "pfx").is_dir()
     prefix_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3987,13 +4049,473 @@ class DisablePluginsPanel(ctk.CTkFrame):
         self._on_done(self)
 
 
+class BundleOptionsPanel(ctk.CTkFrame):
+    """Inline panel to pick a RE/Fluffy bundle's active options.  Overlays
+    _plugin_panel_container.  Select-one groups render as radios; independent
+    ("Optional — any") groups as checkboxes with ▲/▼ reorder buttons.
+
+    Selection + order are written straight into a deep-copied BundleSpec as the
+    user interacts, so ``result`` is that spec on Save (None on Cancel).  Option
+    order within a group is the override order: when two selected options write
+    the same file, the one LOWER in the list wins (applied last).
+    """
+
+    def __init__(self, parent, mod_name: str, spec, on_done=None,
+                 lib_dir=None, on_preview=None, on_preview_clear=None):
+        super().__init__(parent, fg_color=BG_DEEP, corner_radius=0)
+        import copy
+        from pathlib import Path
+        self.result = None
+        self._spec = copy.deepcopy(spec)
+        self._on_done = on_done or (lambda p: None)
+        # Bundle library dir (<mod>/.mm_bundle) for resolving option screenshots,
+        # and callbacks to show/clear the preview over the modlist panel.
+        self._lib_dir = Path(lib_dir) if lib_dir else None
+        self._on_preview = on_preview
+        self._on_preview_clear = on_preview_clear
+
+        # Per-option deployable file sets (lowercased mod-root rel paths), used to
+        # flag options that write the same file as another selected option.  Built
+        # once from the bundle library; empty when no lib_dir is available.
+        self._opt_files: dict[str, set[str]] = {}
+        if self._lib_dir is not None:
+            from Utils.re_bundle import option_deployable_rels
+            for g in self._spec.groups:
+                for o in g.options:
+                    if o.is_label:
+                        continue
+                    try:
+                        self._opt_files[o.folder] = option_deployable_rels(
+                            self._lib_dir, o.folder)
+                    except Exception:
+                        self._opt_files[o.folder] = set()
+        # folder -> {"text": str, "marker": CTkLabel} for live conflict recolour.
+        self._opt_widgets: dict[str, dict] = {}
+        # Shared tooltip for option rows whose label was elided (long names).
+        self._label_tooltip = TkTooltip(
+            self, font=(_theme.FONT_FAMILY, _theme.FS10))
+
+        title_bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=36)
+        title_bar.pack(fill="x")
+        title_bar.pack_propagate(False)
+        ctk.CTkLabel(
+            title_bar, text=f"Bundle Options — {mod_name}",
+            font=FONT_BOLD, text_color=TEXT_MAIN, anchor="w",
+        ).pack(side="left", padx=12)
+        ctk.CTkButton(
+            title_bar, text="✕", width=32, height=32, font=FONT_BOLD,
+            fg_color=BG_PANEL, hover_color=BG_HOVER, text_color=TEXT_MAIN,
+            command=self._on_cancel,
+        ).pack(side="right", padx=4)
+        ctk.CTkFrame(self, fg_color=BORDER, height=1, corner_radius=0).pack(fill="x")
+
+        ctk.CTkLabel(
+            self,
+            text="Choose which options are active. “Select one” groups allow a "
+                 "single choice; optional add-ons can be combined.\n"
+                 "When optional add-ons overlap, the one lower in the list wins "
+                 "— use ▲/▼ to reorder.  Checking an add-on turns off any lower "
+                 "one it fully replaces, so your choice wins.",
+            font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
+        ).pack(anchor="w", padx=16, pady=(12, 6))
+
+        self._scroll = ctk.CTkScrollableFrame(self, fg_color=BG_PANEL, corner_radius=6)
+        self._scroll.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        self._scroll.grid_columnconfigure(0, weight=1)
+
+        bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=52)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        ctk.CTkFrame(bar, fg_color=BORDER, height=1, corner_radius=0).pack(
+            side="top", fill="x")
+        ctk.CTkButton(
+            bar, text="Cancel", width=80, height=28, font=FONT_NORMAL,
+            fg_color=BG_HEADER, hover_color=BG_HOVER, text_color=TEXT_MAIN,
+            command=self._on_cancel,
+        ).pack(side="right", padx=(4, 12), pady=12)
+        ctk.CTkButton(
+            bar, text="Save", width=80, height=28, font=FONT_BOLD,
+            fg_color=ACCENT, hover_color=ACCENT_HOV, text_color=TEXT_ON_ACCENT,
+            command=self._on_ok,
+        ).pack(side="right", padx=4, pady=12)
+
+        self._build_rows()
+        # Re-truncate option labels to the live panel width (like the modlist
+        # column does on resize) so expanding the panel reveals more of each name.
+        self._last_scroll_w = 0
+        self._scroll.bind("<Configure>", self._on_scroll_resize, add="+")
+        # Bind X11 wheel notches once; bind_scrollable_wheel re-walks descendants
+        # on <Enter>, so rows rebuilt by a reorder keep scrolling without
+        # re-binding (which would stack <Enter> handlers).
+        bind_scrollable_wheel(self._scroll)
+
+        # Show the first selected option's image as the initial preview.
+        _first = next((o for g in self._spec.groups for o in g.options
+                       if o.selected and not o.is_label), None)
+        if _first is not None:
+            self._preview_option(_first.folder)
+
+    # Fixed row chrome reserved beside an option label, in pixels.  The label
+    # column has a weighted spacer to its right, so the label only needs to clear
+    # the checkbox/radio indicator (left) plus the widgets that sit *after* it:
+    #   - checkbox/radio indicator + its text gap + the row's outer padding;
+    #   - the ▲/▼ reorder buttons (checkbox rows only);
+    #   - the '(overridden)' marker, but only on rows currently showing it (added
+    #     per-row in :meth:`_label_max_px`, since it sits right after the label).
+    _CHROME_INDICATOR_PX = 46    # checkbox/radio box + gap + row padx
+    _CHROME_BUTTONS_PX = 78      # the two ▲/▼ buttons + their pads
+    _MARKER_PX = 96              # width of the "(overridden)" marker text
+    # Floor so a very narrow panel still shows a usable stub rather than "…".
+    _LABEL_MIN_PX = 60
+
+    def _scroll_width(self) -> int:
+        """Current inner width of the option list (px)."""
+        try:
+            w = self._scroll.winfo_width()
+        except Exception:
+            w = 0
+        if w <= 1:  # not yet realised — fall back to the panel's requested width
+            try:
+                w = self.winfo_reqwidth()
+            except Exception:
+                w = 420
+        return w
+
+    def _label_max_px(self, *, has_buttons: bool = True,
+                      marker_shown: bool = False) -> int:
+        """Available pixel width for an option label at the current panel width,
+        reserving only the chrome that actually sits in this row."""
+        reserve = self._CHROME_INDICATOR_PX
+        if has_buttons:
+            reserve += self._CHROME_BUTTONS_PX
+        if marker_shown:
+            reserve += self._MARKER_PX
+        return max(self._LABEL_MIN_PX, self._scroll_width() - reserve)
+
+    def _fit_label(self, text: str, *, has_buttons: bool = True,
+                   marker_shown: bool = False) -> str:
+        """Truncate *text* to the current available label width (pixel-aware)."""
+        return _truncate_text(self._scroll, text, TK_FONT_NORMAL,
+                              self._label_max_px(has_buttons=has_buttons,
+                                                 marker_shown=marker_shown))
+
+    def _option_tooltip_text(self, full_name: str, folder: str) -> str:
+        """Tooltip body for an option row: the full name, plus the modinfo
+        ``description=`` (when present) on following lines."""
+        desc = ""
+        if self._lib_dir is not None:
+            try:
+                from Utils.re_bundle import option_description
+                desc = option_description(self._lib_dir, folder)
+            except Exception:
+                desc = ""
+        return f"{full_name}\n\n{desc}" if desc else full_name
+
+    def _maybe_tooltip(self, widget, full_text: str, folder: str = "") -> None:
+        """Attach a tooltip showing the full name (the visible label may be
+        elided) and, when *folder* resolves to a modinfo description, that text
+        below it."""
+        try:
+            self._label_tooltip.attach(
+                widget, self._option_tooltip_text(full_text, folder))
+        except Exception:
+            pass
+
+    def _on_scroll_resize(self, _event=None) -> None:
+        """Re-truncate every option label to the new panel width.  Skipped unless
+        the panel width actually changed (the scroll frame fires <Configure> for
+        height and child changes too)."""
+        width = self._scroll_width()
+        if width == getattr(self, "_last_scroll_w", 0):
+            return
+        self._last_scroll_w = width
+        for w in self._opt_widgets.values():
+            self._refit_row(w)
+
+    def _refit_row(self, w: dict) -> None:
+        """Re-truncate one row's label to the current width, reserving marker
+        space only when that row is actually showing the '(overridden)' note."""
+        lbl = w.get("label_widget")
+        if lbl is None:
+            return
+        marker = w.get("marker")
+        marker_shown = bool(marker is not None and str(marker.cget("text")))
+        max_px = self._label_max_px(
+            has_buttons=w.get("has_buttons", True), marker_shown=marker_shown)
+        try:
+            lbl.configure(text=_truncate_text(
+                self._scroll, w["text"], TK_FONT_NORMAL, max_px))
+        except Exception:
+            pass
+
+    def _build_rows(self):
+        """(Re)build the option rows from the current spec.  Called on init and
+        after any reorder so the displayed order matches ``group.options``."""
+        for child in self._scroll.winfo_children():
+            child.destroy()
+        self._opt_widgets = {}
+
+        row = 0
+        for gi, group in enumerate(self._spec.groups):
+            ctk.CTkLabel(
+                self._scroll, text=group.name, font=FONT_BOLD, text_color=TEXT_MAIN,
+                anchor="w",
+            ).grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(12, 0)); row += 1
+            ctk.CTkLabel(
+                self._scroll, text=("Select one" if group.select_one else "Optional — any"),
+                font=FONT_SMALL, text_color=TEXT_DIM, anchor="w",
+            ).grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2)); row += 1
+
+            if group.select_one:
+                var = tk.IntVar(
+                    value=next((i for i, o in enumerate(group.options) if o.selected), 0))
+                def _pick(g=group, v=var):
+                    for i, o in enumerate(g.options):
+                        o.selected = (i == v.get()) and not o.is_label
+                    self._recompute_conflicts()
+                for oi, opt in enumerate(group.options):
+                    if opt.is_label:
+                        ctk.CTkLabel(
+                            self._scroll, text=opt.label, font=FONT_SMALL,
+                            text_color=TEXT_DIM, anchor="w",
+                        ).grid(row=row, column=0, sticky="ew", padx=24, pady=(6, 0)); row += 1
+                        continue
+                    optrow = ctk.CTkFrame(self._scroll, fg_color="transparent")
+                    optrow.grid(row=row, column=0, columnspan=2, sticky="ew",
+                                padx=24, pady=2)
+                    rb = ctk.CTkRadioButton(
+                        optrow, text=self._fit_label(opt.label, has_buttons=False),
+                        variable=var, value=oi,
+                        command=_pick, font=FONT_NORMAL, text_color=TEXT_MAIN,
+                        fg_color=ACCENT, hover_color=ACCENT_HOV, border_color=BORDER,
+                    )
+                    rb.grid(row=0, column=0, sticky="w")
+                    self._maybe_tooltip(rb, opt.label, opt.folder)
+                    marker = ctk.CTkLabel(
+                        optrow, text="", font=FONT_SMALL, text_color=BG_RED_TEXT,
+                        anchor="w",
+                    )
+                    marker.grid(row=0, column=1, sticky="w", padx=(8, 0))
+                    self._opt_widgets[opt.folder] = {
+                        "text": opt.label, "marker": marker, "label_widget": rb,
+                        "has_buttons": False}
+                    self._bind_hover_preview(optrow, opt.folder)
+                    row += 1
+            else:
+                n = len(group.options)
+                for oi, opt in enumerate(group.options):
+                    if opt.is_label:
+                        # Content-less divider / info entry — non-selectable label
+                        # preserving the author's visual sectioning.
+                        ctk.CTkLabel(
+                            self._scroll, text=opt.label, font=FONT_SMALL,
+                            text_color=TEXT_DIM, anchor="w",
+                        ).grid(row=row, column=0, columnspan=2, sticky="ew",
+                               padx=24, pady=(6, 0)); row += 1
+                        continue
+                    rowf = ctk.CTkFrame(self._scroll, fg_color="transparent")
+                    rowf.grid(row=row, column=0, columnspan=2, sticky="ew", padx=18, pady=1)
+                    # col 0 = checkbox, col 1 = conflict marker, col 2 = spacer
+                    # (absorbs slack so the marker hugs the label), cols 3/4 = ▲/▼.
+                    rowf.grid_columnconfigure(2, weight=1)
+                    bvar = tk.BooleanVar(value=opt.selected)
+                    def _toggle(o=opt, v=bvar):
+                        o.selected = bool(v.get())
+                        if o.selected:
+                            # "Your click wins": if this option would be fully
+                            # overridden by lower selected options, turn those
+                            # overriders off so the one you just checked deploys.
+                            self._promote_option(o.folder)
+                        self._recompute_conflicts()
+                    cb = ctk.CTkCheckBox(
+                        rowf, text=self._fit_label(opt.label), variable=bvar,
+                        command=_toggle, font=FONT_NORMAL, text_color=TEXT_MAIN,
+                        fg_color=ACCENT, hover_color=ACCENT_HOV,
+                        checkmark_color="white", border_color=BORDER,
+                    )
+                    cb.grid(row=0, column=0, sticky="w")
+                    self._maybe_tooltip(cb, opt.label, opt.folder)
+                    marker = ctk.CTkLabel(
+                        rowf, text="", font=FONT_SMALL, text_color=BG_RED_TEXT,
+                        anchor="w",
+                    )
+                    marker.grid(row=0, column=1, sticky="w", padx=(8, 0))
+                    self._opt_widgets[opt.folder] = {
+                        "text": opt.label, "marker": marker, "label_widget": cb,
+                        "opt": opt, "var": bvar, "checkbox": cb, "has_buttons": True,
+                    }
+                    self._bind_hover_preview(cb, opt.folder)
+                    self._bind_hover_preview(rowf, opt.folder)
+                    ctk.CTkButton(
+                        rowf, text="▲", width=26, height=24, font=FONT_SMALL,
+                        fg_color=BG_HEADER, hover_color=BG_HOVER, text_color=TEXT_MAIN,
+                        state=("normal" if oi > 0 else "disabled"),
+                        command=lambda g=group, i=oi: self._move(g, i, -1),
+                    ).grid(row=0, column=3, padx=(4, 0))
+                    ctk.CTkButton(
+                        rowf, text="▼", width=26, height=24, font=FONT_SMALL,
+                        fg_color=BG_HEADER, hover_color=BG_HOVER, text_color=TEXT_MAIN,
+                        state=("normal" if oi < n - 1 else "disabled"),
+                        command=lambda g=group, i=oi: self._move(g, i, 1),
+                    ).grid(row=0, column=4, padx=(4, 0))
+                    row += 1
+
+        self._recompute_conflicts()
+
+    def _ordered_selected_folders(self) -> list[str]:
+        """Selected option folders in deploy apply order, mirroring
+        :func:`re_bundle._ordered_selected_folders`: select-one groups first (in
+        declared order), independent groups last, and within a group the shown
+        order (lower = applied later = wins)."""
+        out: list[str] = []
+        for g in self._spec.groups:
+            if not g.select_one:
+                continue
+            out += [o.folder for o in g.options
+                    if o.selected and not o.is_label]
+        for g in self._spec.groups:
+            if g.select_one:
+                continue
+            out += [o.folder for o in g.options
+                    if o.selected and not o.is_label]
+        return out
+
+    def _promote_option(self, folder: str) -> None:
+        """Make the just-checked *folder* win: turn off any other selected
+        independent option that is a true *alternative* of it — i.e. one whose
+        deployable file set is **identical** to *folder*'s (so the two write
+        exactly the same files and only one can ever be visible).  This is the
+        "your click wins" rule: checking one mesh/texture variant turns off the
+        sibling variant writing the same files, regardless of list order.
+
+        A subset/superset pair is NOT an alternative: the larger option ships
+        files the smaller one doesn't, so enabling both still lets each
+        contribute (the smaller wins the files it provides, the larger keeps its
+        extras).  Those — and genuine partial-overlap add-ons (sharing only
+        *some* files) — are left selected; apply order decides the overlap and
+        :meth:`_recompute_conflicts` marks anything fully shadowed."""
+        files = self._opt_files.get(folder, set())
+        if not files:
+            return  # no files → nothing to win or shadow
+
+        for other, w in self._opt_widgets.items():
+            if other == folder or "var" not in w:
+                continue  # self, or a radio (can't empty its group)
+            o = w["opt"]
+            if not o.selected or o.is_label:
+                continue
+            ofiles = self._opt_files.get(other, set())
+            if not ofiles:
+                continue
+            # Identical file sets → mutually-exclusive alternatives (e.g. two
+            # recolours of the same texture).  Subset/superset pairs are kept:
+            # the larger option still contributes the files the smaller lacks.
+            if ofiles == files:
+                o.selected = False
+                try:
+                    w["var"].set(False)
+                except Exception:
+                    pass
+
+    def _recompute_conflicts(self):
+        """Flag every selected option whose files are entirely overridden by
+        another selected option, mirroring deploy order (see
+        :meth:`_ordered_selected_folders`).  The LAST selected option to write a
+        file wins it; an option none of whose files survive is marked
+        '(overridden)' in red.  (Checking an option auto-promotes it past lower
+        overriders via :meth:`_promote_option`, so a freshly-checked option won't
+        be left overridden — this marks only the cases the user hasn't resolved,
+        e.g. a select-one radio shadowed by an independent add-on.)
+        """
+        if not self._opt_widgets:
+            return
+
+        ordered = self._ordered_selected_folders()
+        # winners[rel] = folder of the LAST selected option providing that file.
+        winners: dict[str, str] = {}
+        for folder in ordered:
+            for rel in self._opt_files.get(folder, ()):
+                winners[rel] = folder
+
+        selected = set(ordered)
+        for folder, w in self._opt_widgets.items():
+            marker = w["marker"]
+            files = self._opt_files.get(folder, set())
+            was_shown = bool(str(marker.cget("text")))
+            now_shown = bool(folder in selected and files and not any(
+                winners.get(rel) == folder for rel in files))
+            if now_shown:
+                marker.configure(text="(overridden)", text_color=BG_RED_TEXT)
+            else:
+                marker.configure(text="")
+            # Marker toggling changes the room left for the label, so re-fit it.
+            if now_shown != was_shown:
+                self._refit_row(w)
+
+    def _move(self, group, idx: int, delta: int):
+        """Swap option *idx* with its neighbour and rebuild the rows."""
+        j = idx + delta
+        if 0 <= j < len(group.options):
+            group.options[idx], group.options[j] = group.options[j], group.options[idx]
+            self._build_rows()
+
+    def _bind_hover_preview(self, widget, folder: str) -> None:
+        """Show the option's image while the pointer is over *widget*.  Bound on
+        the widget and its internal children so hover is reliable across the CTk
+        label/check parts.  The preview is not cleared on leave (the next hover
+        replaces it) to avoid flicker when moving between rows."""
+        if self._on_preview is None or self._lib_dir is None:
+            return
+        def _enter(_e=None, f=folder):
+            self._preview_option(f)
+        def _walk(w):
+            try:
+                w.bind("<Enter>", _enter, add="+")
+            except Exception:
+                pass
+            for child in w.winfo_children():
+                _walk(child)
+        _walk(widget)
+
+    def _preview_option(self, folder: str) -> None:
+        """Show the option's screenshot in the modlist-panel preview, or clear
+        the preview if it has no image."""
+        if self._on_preview is None or self._lib_dir is None:
+            return
+        try:
+            from Utils.re_bundle import option_image
+            img = option_image(self._lib_dir, folder)
+        except Exception:
+            img = None
+        if img is not None:
+            self._on_preview(img)
+        else:
+            self._clear_preview()
+
+    def _clear_preview(self) -> None:
+        if self._on_preview_clear is not None:
+            try:
+                self._on_preview_clear()
+            except Exception:
+                pass
+
+    def _on_ok(self):
+        # Selection + order already live in self._spec (written on each interaction).
+        self.result = self._spec
+        self._on_done(self)
+
+    def _on_cancel(self):
+        self.result = None
+        self._on_done(self)
+
+
 # ---------------------------------------------------------------------------
 # Download Custom Handler panel — overlay to download JSON handlers from GitHub
 # ---------------------------------------------------------------------------
 
 _CUSTOM_HANDLERS_SUBFOLDER_TEMPLATE = (
     "https://api.github.com/repos/ChrisDKN/Amethyst-Mod-Manager/contents/"
-    "Custom%20Handlers/{folder}?ref=main"
+    "Custom%20Handlers/{folder}?ref=Resources"
 )
 
 
@@ -5339,12 +5861,16 @@ class MissingReqsPanel(ctk.CTkFrame):
                  missing_ids: set, api,
                  install_from_browse,
                  ignored_set: set, save_ignored_fn,
-                 on_done=None):
+                 on_done=None, mods=None):
         super().__init__(parent, fg_color=BG_DEEP, corner_radius=0)
         self._mod_name = mod_name
         self._domain = domain
         self._mod_id = mod_id
         self._missing_ids = missing_ids
+        # Multi-mod mode: aggregate requirements across several mods.  Each
+        # entry is {"mod_name", "mod_id", "domain", "missing_ids"}.  When None,
+        # behave as the single-mod panel driven by the scalar fields above.
+        self._mods = list(mods) if mods else None
         self._api = api
         self._install_from_browse = install_from_browse
         self._ignored_set = ignored_set
@@ -5405,7 +5931,11 @@ class MissingReqsPanel(ctk.CTkFrame):
         footer = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0)
         footer.pack(fill="x", side="bottom")
         ctk.CTkFrame(footer, fg_color=BORDER, height=1, corner_radius=0).pack(side="top", fill="x")
-        self._ignore_var = tk.BooleanVar(value=mod_name in ignored_set)
+        if self._mods is not None:
+            ignore_init = all(m["mod_name"] in ignored_set for m in self._mods)
+        else:
+            ignore_init = mod_name in ignored_set
+        self._ignore_var = tk.BooleanVar(value=ignore_init)
         ctk.CTkCheckBox(
             footer, text="Ignore requirements",
             variable=self._ignore_var,
@@ -5425,10 +5955,29 @@ class MissingReqsPanel(ctk.CTkFrame):
         err = None
         missing_list = []
         try:
-            all_reqs = self._api.get_mod_requirements(self._domain, self._mod_id)
-            for r in all_reqs:
-                if r.mod_id in self._missing_ids:
-                    missing_list.append(r)
+            if self._mods is not None:
+                # Aggregate every mod's missing requirements, deduping by the
+                # requirement's own mod-id so a shared dependency shows once.
+                seen: set = set()
+                errors: list[str] = []
+                for m in self._mods:
+                    try:
+                        all_reqs = self._api.get_mod_requirements(
+                            m["domain"], m["mod_id"])
+                    except Exception as e:
+                        errors.append(f"{m['mod_name']}: {e}")
+                        continue
+                    for r in all_reqs:
+                        if r.mod_id in m["missing_ids"] and r.mod_id not in seen:
+                            seen.add(r.mod_id)
+                            missing_list.append(r)
+                if not missing_list and errors:
+                    err = "Could not load requirements: " + "; ".join(errors)
+            else:
+                all_reqs = self._api.get_mod_requirements(self._domain, self._mod_id)
+                for r in all_reqs:
+                    if r.mod_id in self._missing_ids:
+                        missing_list.append(r)
         except Exception as e:
             err = f"Could not load requirements: {e}"
         self.after(0, lambda: self._fetch_done(missing_list, err))
@@ -5599,10 +6148,14 @@ class MissingReqsPanel(ctk.CTkFrame):
             open_url(url)
 
     def _on_ignore_toggle(self):
+        names = ([m["mod_name"] for m in self._mods]
+                 if self._mods is not None else [self._mod_name])
         if self._ignore_var.get():
-            self._ignored_set.add(self._mod_name)
+            for n in names:
+                self._ignored_set.add(n)
         else:
-            self._ignored_set.discard(self._mod_name)
+            for n in names:
+                self._ignored_set.discard(n)
         self._save_ignored_fn()
 
     def _close(self):

@@ -10,7 +10,7 @@ Mod structure:
 import shutil
 from pathlib import Path
 
-from Games.Bethesda.Bethesda import Fallout_3
+from Games.Bethesda.Bethesda import Fallout_3, _MODERN_CREATION_ENGINE_DEPS
 from Games.base_game import WizardTool
 from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, restore_data_core, move_to_core
 from Utils.modlist import read_modlist
@@ -125,6 +125,13 @@ class SkyrimSE(Fallout_3):
             overrides[f"x3daudio1_{n}"] = "native,builtin"
         return overrides
 
+    # SKSE-plugin DLL mods need the VC++ runtime in the prefix or they fail to
+    # load silently (a common "the manager broke my DLL mods" report);
+    # d3dcompiler_47 (fxc2 build) is needed for Community Shaders / ENB. Both
+    # install silently on first add via the Proton-menu installers. Shared with
+    # the other modern Creation Engine games (FO4/4VR, SkyrimVR, Starfield, …).
+    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
+
     @property
     def frameworks(self) -> dict[str, str]:
         return {"Script Extender": "skse64_loader.exe"}
@@ -144,7 +151,7 @@ class SkyrimSE(Fallout_3):
             CustomRule(dest="", filenames=["d3dx9_42.dll"], flatten=True),
             CustomRule(dest="", filenames=["skse64_1*.dll"], flatten=True, loose_only=True),
             CustomRule(dest="", filenames=["skse64_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["d3dcompiler_47.dll"], flatten=True),
+            CustomRule(dest="", filenames=["d3dcompiler_47.dll"], flatten=True, loose_only=True),
             CustomRule(dest="Data/SKSE/Plugins/CharGen/Presets", extensions=[".jslot"], flatten=True),
             # ENB Series files → game root
             CustomRule(dest="", filenames=[
@@ -174,7 +181,27 @@ class SkyrimSE(Fallout_3):
     def wizard_tools(self) -> list[WizardTool]:
         from wizards.pandora import find_pandora_exe
         from wizards.bodyslide import find_mod_exe
+        from wizards.sse_display_tweaks import is_installed as sdt_installed
+        from wizards.engine_fixes import is_installed as ef_installed
         pandora_tools = []
+        if sdt_installed(self):
+            pandora_tools.append(WizardTool(
+                id="sse_display_tweaks_skyrimse",
+                label="SSE Display Tweaks Config",
+                description="Create or edit SSEDisplayTweaks.ini with per-setting toggles and descriptions.",
+                dialog_class_path="wizards.sse_display_tweaks.SSEDisplayTweaksWizard",
+                category="INI Tweaks",
+                extra={"_full_width_overlay": True},
+            ))
+        if ef_installed(self):
+            pandora_tools.append(WizardTool(
+                id="engine_fixes_skyrimse",
+                label="Engine Fixes Config",
+                description="Create or edit EngineFixes.toml with per-setting toggles and descriptions.",
+                dialog_class_path="wizards.engine_fixes.EngineFixesWizard",
+                category="INI Tweaks",
+                extra={"_full_width_overlay": True},
+            ))
         if find_pandora_exe(self) is not None:
             pandora_tools.append(WizardTool(
                 id="run_pandora_skyrimse",
@@ -457,7 +484,10 @@ class SkyrimSE(Fallout_3):
         _log("Step 5: Symlinking profile INI files ...")
         self._symlink_profile_ini_files(profile, _log)
 
-        _log("Step 6: Applying archive invalidation ...")
+        _log("Step 6: Symlinking profile saves ...")
+        self._symlink_profile_saves(profile, _log)
+
+        _log("Step 7: Applying archive invalidation ...")
         self.apply_archive_invalidation(_log)
 
         _log(
@@ -490,6 +520,8 @@ class SkyrimSE(Fallout_3):
         _profile_dir = self._active_profile_dir
         if _profile_dir is not None:
             self._remove_profile_ini_symlinks(_profile_dir.name, _log)
+            _log("Restore: removing profile saves symlinks ...")
+            self._remove_profile_saves_symlinks(_profile_dir.name, _log)
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []

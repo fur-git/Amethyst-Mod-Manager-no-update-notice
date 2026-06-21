@@ -1346,6 +1346,10 @@ class App(ctk.CTk):
                     data_dir=prune_data_dir,
                     disabled_plugins=disabled_map,
                     star_prefix=self._plugin_panel._plugins_star_prefix,
+                    # Reuse the panel's shared mtime-cached filemap parse so the
+                    # ~74k-line file isn't re-read here on every toggle.
+                    filemap_entries=self._plugin_panel._get_parsed_filemap(
+                        Path(filemap_path_str)),
                 )
                 if removed:
                     self._status.log(f"plugins.txt: removed {removed} plugin(s).")
@@ -2071,6 +2075,61 @@ class App(ctk.CTk):
     def hide_disable_plugins_panel(self):
         self._hide_plugin_overlay("_disable_plugins_panel")
 
+    # -- Bundle options panel (overlays plugin panel) -----------------------
+
+    def show_bundle_options_panel(self, mod_name, spec, on_done, lib_dir=None):
+        self._ensure_plugin_panel_visible()
+        # Download/deploy popups share the bottom-right corner with this panel's
+        # Save/Cancel buttons — hide them while it's open so they can't block it.
+        mp = getattr(self, "_mod_panel", None)
+        if mp is not None:
+            mp.suspend_all_download_popups()
+        from gui.dialogs import BundleOptionsPanel
+        def _factory():
+            def _done(panel):
+                self.hide_bundle_image_preview()  # close preview with the dialog
+                self._hide_plugin_overlay("_bundle_options_panel")
+                if mp is not None:
+                    mp.resume_all_download_popups()
+                on_done(panel)
+            return BundleOptionsPanel(
+                self._plugin_panel_container,
+                mod_name=mod_name, spec=spec, on_done=_done,
+                lib_dir=lib_dir,
+                on_preview=self.show_bundle_image_preview,
+                on_preview_clear=self.hide_bundle_image_preview,
+            )
+        self._show_plugin_overlay("_bundle_options_panel", _factory)
+
+    def hide_bundle_options_panel(self):
+        self._hide_plugin_overlay("_bundle_options_panel")
+        mp = getattr(self, "_mod_panel", None)
+        if mp is not None:
+            mp.resume_all_download_popups()
+
+    # -- Bundle option image preview (over the modlist panel) ----------------
+
+    def show_bundle_image_preview(self, path):
+        """Show *path* in a lightbox over the modlist panel (the selected bundle
+        option's screenshot).  Reuses the Mod Files image overlay."""
+        from gui.image_preview_overlay import ImagePreviewOverlay
+        host = self._mod_panel_container
+        overlay = getattr(self, "_bundle_image_preview", None)
+        if overlay is None or not overlay.winfo_exists():
+            overlay = ImagePreviewOverlay(host, on_close=self.hide_bundle_image_preview)
+            overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._bundle_image_preview = overlay
+        overlay.show(path)
+
+    def hide_bundle_image_preview(self):
+        overlay = getattr(self, "_bundle_image_preview", None)
+        self._bundle_image_preview = None
+        if overlay is not None:
+            try:
+                overlay.destroy()
+            except Exception:
+                pass
+
     # -- Optional mods panel (overlays plugin panel) --------------------------
 
     def show_optional_mods_panel(self, optional_mods: list, on_done, pre_skipped_fids=None):
@@ -2117,7 +2176,8 @@ class App(ctk.CTk):
 
     def show_missing_reqs_panel(self, mod_name, domain, mod_id, missing_ids,
                                 api, install_from_browse,
-                                ignored_set, save_ignored_fn, redraw_fn):
+                                ignored_set, save_ignored_fn, redraw_fn,
+                                mods=None):
         self._ensure_plugin_panel_visible()
         from gui.dialogs import MissingReqsPanel
         def _factory():
@@ -2130,7 +2190,7 @@ class App(ctk.CTk):
                 missing_ids=missing_ids, api=api,
                 install_from_browse=install_from_browse,
                 ignored_set=ignored_set, save_ignored_fn=save_ignored_fn,
-                on_done=_done,
+                on_done=_done, mods=mods,
             )
         self._show_plugin_overlay("_missing_reqs_panel", _factory)
 
@@ -2175,6 +2235,8 @@ class App(ctk.CTk):
             self._hide_plugin_overlay("_settings_panel")
             if hasattr(self._mod_panel, "refresh_show_summary_tooltips"):
                 self._mod_panel.refresh_show_summary_tooltips()
+            if hasattr(self._mod_panel, "refresh_hide_bsa_conflicts"):
+                self._mod_panel.refresh_hide_bsa_conflicts()
 
         self._show_plugin_overlay(
             "_settings_panel",
@@ -2291,10 +2353,16 @@ class App(ctk.CTk):
         import json as _json
         from Utils.config_paths import get_plugins_dir as _gpd
         from Utils.gh_cache import fetch_text as _gh_fetch_text
+        from Utils.ui_config import load_dev_mode
+
+        # In dev mode, never overwrite local plugins with the repo copy — the
+        # developer is editing them in place (mirrors _sync_custom_handlers).
+        if load_dev_mode():
+            return
 
         _PLUGINS_API_URL = (
             "https://api.github.com/repos/ChrisDKN/Amethyst-Mod-Manager/contents/"
-            "Plugins?ref=main"
+            "Plugins?ref=Resources"
         )
 
         def _do():

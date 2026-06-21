@@ -980,6 +980,37 @@ def save_show_summary_tooltips(value: bool) -> None:
         parser.write(f)
 
 
+def load_hide_bsa_conflicts() -> bool:
+    """Return the hide_bsa_conflicts setting (default False).
+
+    When True, the modlist panel hides BSA/BA2 archive conflict flags and the
+    BSA conflict parsing is skipped entirely (for better performance).
+    """
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(path)
+        return parser.getboolean(_FILEMAP_SECTION, "hide_bsa_conflicts", fallback=False)
+    except Exception:
+        return False
+
+
+def save_hide_bsa_conflicts(value: bool) -> None:
+    """Persist the hide_bsa_conflicts setting to amethyst.ini."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = configparser.ConfigParser()
+    if path.is_file():
+        parser.read(path)
+    if _FILEMAP_SECTION not in parser:
+        parser[_FILEMAP_SECTION] = {}
+    parser[_FILEMAP_SECTION]["hide_bsa_conflicts"] = "true" if value else "false"
+    with path.open("w", encoding="utf-8") as f:
+        parser.write(f)
+
+
 def load_rename_mod_after_install() -> bool:
     """Return the rename_mod_after_install setting (default False).
 

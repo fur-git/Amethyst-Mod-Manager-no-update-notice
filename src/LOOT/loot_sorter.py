@@ -628,6 +628,57 @@ def _is_valid_plugin_file(path: Path) -> bool:
         return False
 
 
+def _read_filemap_winners(
+    staging_root: Path | None,
+    needed_lower: set[str],
+) -> dict[str, Path]:
+    """Resolve plugin names to the staging file of their *winning* enabled mod.
+
+    `filemap.txt` (Profiles/<game>/filemap.txt) maps each deployed relative
+    path to the mod folder that wins the conflict — it already encodes both the
+    enabled/disabled state and mod priority. We use it to pin each plugin to the
+    copy that would actually be deployed, rather than letting an arbitrary
+    staging tree walk return a *disabled* mod's copy (e.g. a stale ESLifier
+    "cleaned" plugin left in staging after the mod is turned off).
+
+    Root-level plugins appear in filemap.txt as a bare basename key, which is
+    exactly what we match on. Returns a map of lowercase basename → resolved
+    staging path, only for names whose winning mod folder actually contains the
+    file. Names without a usable filemap entry are omitted so the caller can
+    fall back to the tree walk (covers a stale/missing filemap).
+    """
+    if not staging_root or not needed_lower:
+        return {}
+    filemap_path = staging_root.parent / "filemap.txt"
+    if not filemap_path.is_file():
+        return {}
+
+    resolved: dict[str, Path] = {}
+    try:
+        with filemap_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                tab = line.find("\t")
+                if tab < 0:
+                    continue
+                rel = line[:tab]
+                # Only root-level plugin entries (bare basename, no subfolder)
+                # correspond to a loadable plugin name.
+                if "/" in rel or "\\" in rel:
+                    continue
+                rel_lower = rel.lower()
+                if rel_lower not in needed_lower or rel_lower in resolved:
+                    continue
+                mod = line[tab + 1:].rstrip("\r\n")
+                if not mod:
+                    continue
+                candidate = staging_root / mod / rel
+                if candidate.is_file():
+                    resolved[rel_lower] = candidate
+    except OSError:
+        return resolved
+    return resolved
+
+
 def _scan_tree_for_plugins(
     root: Path,
     needed_lower: set[str],
@@ -706,12 +757,28 @@ def _find_plugin_paths(
                 found[name] = str(full)
                 found_basenames.add(name.lower())
 
-    # 2. For anything still missing, search staging mod folders (recursively).
-    #    The scan walks via os.scandir and stops as soon as every missing
-    #    plugin is located, skipping the bulk of mod data.
+    # 2. For anything still missing, search the mod staging folders.
     if staging_root and staging_root.is_dir():
         missing_lower = {n.lower() for n in plugin_names if n not in found}
         if missing_lower:
+            # 2a. Prefer the filemap winner so we read the *enabled* mod's copy
+            #     and not a disabled mod's leftover (e.g. an ESLifier "cleaned"
+            #     plugin still in staging after the mod is turned off). This
+            #     resolution drives the CRC libloot uses for dirty/clean flags.
+            for name_lower, path in _read_filemap_winners(
+                    staging_root, missing_lower).items():
+                orig = names_lower.get(name_lower)
+                if (orig and orig not in found
+                        and name_lower not in found_basenames
+                        and _is_valid_plugin_file(path)):
+                    found[orig] = str(path)
+                    found_basenames.add(name_lower)
+
+            # 2b. For anything the filemap couldn't resolve (stale/missing
+            #     filemap), fall back to a recursive scan. The scan walks via
+            #     os.scandir and stops as soon as every missing plugin is
+            #     located, skipping the bulk of mod data.
+            missing_lower = {n.lower() for n in plugin_names if n not in found}
             for name_lower, path in _scan_tree_for_plugins(
                     staging_root, missing_lower).items():
                 orig = names_lower.get(name_lower)
@@ -861,12 +928,17 @@ def sort_plugins(
             needed.add(name.lower())
 
         if needed:
-            # Build a map of lowercase plugin name → staging file path. Walk only
-            # for the missing plugins, scanning candidate plugin files and
-            # stopping as soon as every needed plugin is located.
-            staging_plugin_map = _scan_tree_for_plugins(
-                staging_root, needed, _plugin_exts,
-            )
+            # Build a map of lowercase plugin name → staging file path. Prefer
+            # the filemap winner (the enabled mod's copy) so the header — and
+            # the CRC used for dirty/clean flags — comes from the file that
+            # would actually deploy, not a disabled mod's leftover copy. Fall
+            # back to a recursive scan for anything the filemap can't resolve.
+            staging_plugin_map = _read_filemap_winners(staging_root, needed)
+            still_needed = needed - set(staging_plugin_map)
+            if still_needed:
+                staging_plugin_map.update(_scan_tree_for_plugins(
+                    staging_root, still_needed, _plugin_exts,
+                ))
             for src in staging_plugin_map.values():
                 dest = effective_data_dir / src.name
                 if not dest.exists() and not dest.is_symlink():

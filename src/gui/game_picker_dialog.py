@@ -36,7 +36,7 @@ from Utils.config_paths import get_custom_game_images_dir, get_custom_games_dir
 
 _CUSTOM_HANDLERS_API_URL = (
     "https://api.github.com/repos/ChrisDKN/Amethyst-Mod-Manager/contents/"
-    "Custom%20Handlers?ref=main"
+    "Custom%20Handlers?ref=Resources"
 )
 
 

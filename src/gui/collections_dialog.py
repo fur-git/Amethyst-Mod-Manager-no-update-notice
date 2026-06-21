@@ -912,7 +912,11 @@ class OptionalModsPanel(ctk.CTkFrame):
         scroll.pack(fill="both", expand=True, padx=12, pady=(0, 4))
         scroll.grid_columnconfigure(0, weight=1)
 
-        for mod in optional_mods:
+        sorted_mods = sorted(
+            optional_mods,
+            key=lambda m: (m.mod_name or m.file_name or "(Unknown)").casefold(),
+        )
+        for mod in sorted_mods:
             var = tk.BooleanVar(value=mod.file_id not in _pre_skipped)
             self._vars[mod.file_id] = var
             name_text = mod.mod_name or mod.file_name or "(Unknown)"
@@ -2465,6 +2469,105 @@ class CollectionDetailDialog(tk.Frame):
         except Exception as exc:
             self._log(f"Collection update: failed to write modlist.txt: {exc}")
 
+    def _append_reconcile_modlist(
+        self,
+        *,
+        modlist_path: Path,
+        install_order: "list[tuple[int, str]]",
+        pre_existing: "set[str]",
+    ) -> None:
+        """Re-apply the collection's before/after load order on an APPEND run.
+
+        Unlike the new-profile path, this preserves the existing modlist
+        verbatim — mods already present (``pre_existing``, lowercased folder
+        names) keep their exact position and enabled state. Only mods newly
+        installed by this run (those in ``install_order`` whose folder name is
+        NOT in ``pre_existing``) are inserted, positioned relative to their
+        collection-defined neighbours (the before/after rules are already
+        baked into the ``install_order`` sort keys via
+        _resolve_collection_priorities).
+
+        Insertion mirrors _reconcile_update_modlist: place each new mod just
+        before its nearest higher-priority neighbour present in the list, else
+        just after its nearest lower-priority neighbour, else at the top.
+        """
+        try:
+            existing = read_modlist(modlist_path) if modlist_path.is_file() else []
+        except Exception as exc:
+            self._log(f"Collection append: could not read modlist.txt: {exc}")
+            return
+
+        # New mods = install_order entries that were not already in the profile.
+        new_folders: list[tuple[int, str]] = [
+            (pos, folder) for pos, folder in install_order
+            if folder.lower() not in pre_existing
+        ]
+        if not new_folders:
+            self._log("Collection append: no newly-installed mods to reposition.")
+            return
+
+        # The installer (ensure_mod_preserving_position) has already appended the
+        # new mods somewhere in `existing`. Strip them out so we can re-insert at
+        # the correct collection-ordered slot without duplicating.
+        _new_lower = {folder.lower() for _, folder in new_folders}
+        result: list = [
+            e for e in existing
+            if e.is_separator or e.name.lower() not in _new_lower
+        ]
+
+        unplaced: list[str] = []
+        placeable: list[tuple[int, str]] = []
+        for pos, folder in new_folders:
+            (unplaced.append(folder) if pos < 0 else placeable.append((pos, folder)))
+        placeable.sort(key=lambda x: x[0])
+
+        sorted_io = sorted(install_order, key=lambda x: x[0])
+
+        def _find_result_index(folder_lower: str) -> int:
+            for i, e in enumerate(result):
+                if not e.is_separator and e.name.lower() == folder_lower:
+                    return i
+            return -1
+
+        for pos, folder in placeable:
+            insert_idx = None
+            # Right neighbour: nearest higher-priority (pos > this) folder present.
+            for npos, nfolder in sorted_io:
+                if npos <= pos or nfolder == folder:
+                    continue
+                idx = _find_result_index(nfolder.lower())
+                if idx >= 0:
+                    insert_idx = idx
+                    break
+            if insert_idx is None:
+                # Left neighbour: nearest lower-priority (pos < this) folder present.
+                left_candidates = [
+                    (npos, nfolder) for npos, nfolder in sorted_io
+                    if npos < pos and nfolder != folder
+                ]
+                for npos, nfolder in sorted(left_candidates, key=lambda x: -x[0]):
+                    idx = _find_result_index(nfolder.lower())
+                    if idx >= 0:
+                        insert_idx = idx + 1
+                        break
+            if insert_idx is None:
+                insert_idx = 0
+            result.insert(insert_idx, ModEntry(name=folder, enabled=True, locked=False))
+
+        # Unplaced (no schema position) go at the top.
+        for folder in reversed(unplaced):
+            result.insert(0, ModEntry(name=folder, enabled=True, locked=False))
+
+        try:
+            write_modlist(modlist_path, result)
+            self._log(
+                f"Collection append: re-applied load order "
+                f"({len(placeable)} placed, {len(unplaced)} unplaced at top; "
+                f"{len(pre_existing)} existing mods kept in place)"
+            )
+        except Exception as exc:
+            self._log(f"Collection append: failed to write modlist.txt: {exc}")
+
     def _run_install(self, mods, download_link_path, profile_dir, old_profile, downloader, app, total, overwrite_existing: "bool | None" = None, skipped_fids: "set[int] | None" = None, skipped_mods: "list | None" = None, skip_existing: bool = False):
         """Background thread: download then install each mod in collection-defined order.
 
@@ -2521,6 +2624,22 @@ class CollectionDetailDialog(tk.Frame):
         staging_path = self._game.get_effective_mod_staging_path()
         installed = 0
         skipped = 0
+
+        # When appending into an existing profile (overwrite_existing is not
+        # None), capture the modlist as it stands BEFORE any new mods are
+        # installed. Mods already present here must never be moved; only mods
+        # newly installed by this run are repositioned (see
+        # _append_reconcile_modlist).
+        _is_append_run = overwrite_existing is not None
+        _append_pre_existing: "set[str]" = set()
+        if _is_append_run and modlist_path.is_file():
+            try:
+                _append_pre_existing = {
+                    e.name.lower() for e in read_modlist(modlist_path)
+                    if not e.is_separator
+                }
+            except Exception:
+                _append_pre_existing = set()
 
         # ------------------------------------------------------------------
         # Step 1: Download and parse collection.json for authoritative order
@@ -2639,7 +2758,8 @@ class CollectionDetailDialog(tk.Frame):
         # Step 2: Install each mod, tracking the folder names in order
         # ------------------------------------------------------------------
         # Pre-scan staging dir:
-        #   already_installed_by_fid : file_id → folder name (from meta.ini fileid)
+        #   already_installed_by_ids : (mod_id, file_id) → folder (from meta.ini)
+        #   already_installed_by_fid : file_id → folder, legacy modid=0 only
         #   staging_lower_map        : lower(folder_name) → actual folder name
         # Used together to skip mods already installed in a previous (partial) run.
         #
@@ -2648,10 +2768,18 @@ class CollectionDetailDialog(tk.Frame):
         # to only the mods that are explicitly listed in *this* profile's
         # modlist.txt — otherwise mods installed for unrelated profiles will
         # produce false-positive "already installed" matches and be silently
-        # skipped.  The file_id exact-match (already_installed_by_fid) is safe
-        # to populate from all folders, because a file_id collision across
-        # different mod pages is essentially impossible.
-        already_installed_by_fid: dict[int, str] = {}  # file_id → staging folder name
+        # skipped.  The (mod_id, file_id) exact-match is safe to populate from
+        # all folders, because that pair is globally unique (only a byte-identical
+        # file shares both ids) — file_id alone is not, so it is only trusted for
+        # legacy installs that lack a mod_id.
+        # (mod_id, file_id) → folder is the authoritative match: a mod is only
+        # "already installed" when BOTH ids match (same mod page AND same file).
+        # file_id alone is not globally unique — two different mod pages can
+        # share a file_id — so matching on file_id alone risks a false positive.
+        already_installed_by_ids: dict[tuple[int, int], str] = {}  # (mod_id, file_id) → folder
+        # Legacy fallback: installs whose meta.ini predates mod_id capture have
+        # modid=0; for those we still match on file_id alone (see _match_existing).
+        already_installed_by_fid: dict[int, str] = {}  # file_id → folder (modid=0 only)
         staging_lower_map: dict[str, str] = {}          # lower(name) → actual name
 
         # Build the set of mod folder names that are actually in this profile.
@@ -2679,15 +2807,30 @@ class CollectionDetailDialog(tk.Frame):
                     _parser = _cp.ConfigParser()
                     _parser.read(str(meta_ini), encoding="utf-8")
                     fid_str = _parser.get("General", "fileid", fallback="").strip()
+                    mid_str = _parser.get("General", "modid", fallback="").strip()
                     if fid_str and fid_str != "0":
                         # When skip_existing is set, only record mods that are
                         # actually in this profile's modlist (avoids cross-profile
                         # false positives).
                         if skip_existing and mod_dir.name.lower() not in _profile_mod_names:
                             continue
-                        already_installed_by_fid[int(fid_str)] = mod_dir.name
+                        _fid = int(fid_str)
+                        _mid = int(mid_str) if mid_str.isdigit() else 0
+                        if _mid > 0:
+                            already_installed_by_ids[(_mid, _fid)] = mod_dir.name
+                        else:
+                            already_installed_by_fid[_fid] = mod_dir.name
                 except Exception:
                     pass
+
+        def _match_existing(mod) -> str:
+            """Return the staging folder of an already-installed copy of *mod*,
+            matching on (mod_id, file_id) first and falling back to file_id alone
+            only for legacy installs that lack a mod_id. Returns "" if none."""
+            _mid = schema_file_id_to_mod_id.get(mod.file_id, 0) or getattr(mod, "mod_id", 0) or 0
+            if _mid > 0 and (_mid, mod.file_id) in already_installed_by_ids:
+                return already_installed_by_ids[(_mid, mod.file_id)]
+            return already_installed_by_fid.get(mod.file_id, "")
 
         # ------------------------------------------------------------------
         # Remove staging folders for unticked optional mods
@@ -2699,8 +2842,8 @@ class CollectionDetailDialog(tk.Frame):
                 if not mod.file_id or mod.file_id not in skipped_fids:
                     continue
 
-                # Match by file_id first (same as classify step)
-                folder_name = already_installed_by_fid.get(mod.file_id, "")
+                # Match by (mod_id, file_id) first (same as classify step)
+                folder_name = _match_existing(mod)
 
                 # Fallback: match by predicted folder name (same logic as classify)
                 if not folder_name:
@@ -2754,11 +2897,11 @@ class CollectionDetailDialog(tk.Frame):
                 skipped += 1
                 continue
 
-            # Check 1: fileid in meta.ini matches exactly
-            existing_folder: str = ""
-            if mod.file_id in already_installed_by_fid:
-                existing_folder = already_installed_by_fid[mod.file_id]
-            else:
+            # Check 1: (mod_id, file_id) in meta.ini matches exactly. Both ids
+            # must match — file_id alone isn't globally unique. Legacy installs
+            # with modid=0 fall back to file_id-only inside _match_existing.
+            existing_folder: str = _match_existing(mod)
+            if not existing_folder:
                 # Check 2: predicted folder name (logicalFilename / schema name / mod_name)
                 logical = schema_file_id_to_logical.get(mod.file_id, "") or ""
                 schema_name = schema_pos_to_name.get(schema_file_id_to_pos.get(mod.file_id, -1), "") or ""
@@ -2865,6 +3008,7 @@ class CollectionDetailDialog(tk.Frame):
         # downstream consumer needs this map to find every collection mod —
         # not just the freshly-installed ones.
         _install_results: dict[int, str] = dict(already_installed_by_fid)
+        _install_results.update({fid: folder for (_mid, fid), folder in already_installed_by_ids.items()})
         _fomod_deferred: list = []  # (mod, result, effective_domain) tuples deferred for post-install
         _bain_deferred: list = []   # BAIN mods deferred — processed before FOMODs
 
@@ -3801,6 +3945,16 @@ class CollectionDetailDialog(tk.Frame):
                     self._log(f"Collection install: wrote modlist.txt with {len(final_entries)} entries")
                 except Exception as exc:
                     self._log(f"Collection install: failed to write modlist.txt: {exc}")
+        elif _is_append_run and not _col_pause.is_set():
+            # Append run: re-apply the collection's before/after load order, but
+            # only reposition mods newly installed by this run — every mod that
+            # was already in the profile keeps its position and enabled state.
+            install_order.sort(key=lambda x: x[0])
+            self._append_reconcile_modlist(
+                modlist_path=modlist_path,
+                install_order=install_order,
+                pre_existing=_append_pre_existing,
+            )
 
         # ------------------------------------------------------------------
         # Step 3b: Install bundled folders + apply binary patches from the
@@ -3849,7 +4003,9 @@ class CollectionDetailDialog(tk.Frame):
 
         # ------------------------------------------------------------------
         # Step 4: Write plugins.txt / loadorder.txt from collection.json.
-        # Also skipped when appending — existing plugin order is preserved.
+        # The full plugins.txt rewrite + LOOT resort is skipped when appending
+        # (existing plugin order is preserved); the append branch below still
+        # writes the collection's group/plugin rules to userlist.yaml.
         #
         # Strategy:
         #   1. Write all plugin rules (after/before/group) and group definitions
@@ -3948,6 +4104,15 @@ class CollectionDetailDialog(tk.Frame):
                 )
             except Exception as exc:
                 self._log(f"Collection install: failed to write plugins.txt: {exc}")
+        elif schema_plugins and _is_append_run and not _col_pause.is_set():
+            # Append run: write the collection's group/plugin (before/after)
+            # rules to userlist.yaml so the author's intent is recorded, but do
+            # NOT re-run LOOT or rewrite plugins.txt — that would reorder the
+            # user's existing plugins.
+            try:
+                _apply_collection_groups(profile_dir, collection_schema, self._log)
+            except Exception as exc:
+                self._log(f"Collection append: failed to write userlist.yaml rules: {exc}")
 
         # ------------------------------------------------------------------
         # Final reconciliation: ensure every mod in modlist.txt is enabled
@@ -3956,9 +4121,11 @@ class CollectionDetailDialog(tk.Frame):
         # Skipped on pause — reconciliation will run on Resume once all
         # mods are actually installed. Also skipped on update runs — the
         # update reconcile above already placed new mods correctly without
-        # disturbing existing mod order or separators.
+        # disturbing existing mod order or separators. Skipped on append runs —
+        # _append_reconcile_modlist already placed the new mods without moving
+        # the user's existing mods (this reconcile would shove them around).
         # ------------------------------------------------------------------
-        if install_order and modlist_path.is_file() and not _col_pause.is_set() and not _is_update_run:
+        if install_order and modlist_path.is_file() and not _col_pause.is_set() and not _is_update_run and not _is_append_run:
             try:
                 _folder_to_key: dict[str, int] = {
                     folder: key for key, folder in install_order
@@ -5016,6 +5183,19 @@ class CollectionDetailDialog(tk.Frame):
         installed = 0
         skipped = 0
 
+        # Append run: snapshot the modlist before any new mods land so we only
+        # reposition newly-installed mods (see _append_reconcile_modlist).
+        _is_append_run = overwrite_existing is not None
+        _append_pre_existing: "set[str]" = set()
+        if _is_append_run and modlist_path.is_file():
+            try:
+                _append_pre_existing = {
+                    e.name.lower() for e in read_modlist(modlist_path)
+                    if not e.is_separator
+                }
+            except Exception:
+                _append_pre_existing = set()
+
         # ------------------------------------------------------------------
         # Step 1: Parse collection.json (same as _run_install)
         # ------------------------------------------------------------------
@@ -5138,6 +5318,9 @@ class CollectionDetailDialog(tk.Frame):
         # ------------------------------------------------------------------
         # Step 2: Classify already-installed mods (same as _run_install)
         # ------------------------------------------------------------------
+        # (mod_id, file_id) → folder is authoritative; file_id-only map is the
+        # legacy fallback for installs whose meta.ini predates mod_id capture.
+        already_installed_by_ids: dict[tuple[int, int], str] = {}
         already_installed_by_fid: dict[int, str] = {}
         staging_lower_map: dict[str, str] = {}
         _profile_mod_names: set[str] = set()
@@ -5162,12 +5345,26 @@ class CollectionDetailDialog(tk.Frame):
                     _parser = _cp.ConfigParser()
                     _parser.read(str(meta_ini), encoding="utf-8")
                     fid_str = _parser.get("General", "fileid", fallback="").strip()
+                    mid_str = _parser.get("General", "modid", fallback="").strip()
                     if fid_str and fid_str != "0":
                         if skip_existing and mod_dir.name.lower() not in _profile_mod_names:
                             continue
-                        already_installed_by_fid[int(fid_str)] = mod_dir.name
+                        _fid = int(fid_str)
+                        _mid = int(mid_str) if mid_str.isdigit() else 0
+                        if _mid > 0:
+                            already_installed_by_ids[(_mid, _fid)] = mod_dir.name
+                        else:
+                            already_installed_by_fid[_fid] = mod_dir.name
                 except Exception:
                     pass
+
+        def _match_existing(mod) -> str:
+            """(mod_id, file_id) match first; file_id-only fallback for legacy
+            installs lacking a mod_id. Returns "" if no copy is installed."""
+            _mid = schema_file_id_to_mod_id.get(mod.file_id, 0) or getattr(mod, "mod_id", 0) or 0
+            if _mid > 0 and (_mid, mod.file_id) in already_installed_by_ids:
+                return already_installed_by_ids[(_mid, mod.file_id)]
+            return already_installed_by_fid.get(mod.file_id, "")
 
         # Remove staging folders for unticked optional mods
         if skipped_fids and skipped_mods:
@@ -5176,7 +5373,7 @@ class CollectionDetailDialog(tk.Frame):
             for mod in skipped_mods:
                 if not mod.file_id or mod.file_id not in skipped_fids:
                     continue
-                folder_name = already_installed_by_fid.get(mod.file_id, "")
+                folder_name = _match_existing(mod)
                 if not folder_name:
                     logical = schema_file_id_to_logical.get(mod.file_id, "") or ""
                     schema_name = schema_pos_to_name.get(
@@ -5216,10 +5413,8 @@ class CollectionDetailDialog(tk.Frame):
             if not mod.file_id:
                 skipped += 1
                 continue
-            existing_folder = ""
-            if mod.file_id in already_installed_by_fid:
-                existing_folder = already_installed_by_fid[mod.file_id]
-            else:
+            existing_folder = _match_existing(mod)
+            if not existing_folder:
                 logical = schema_file_id_to_logical.get(mod.file_id, "") or ""
                 schema_name = schema_pos_to_name.get(schema_file_id_to_pos.get(mod.file_id, -1), "") or ""
                 candidates = []
@@ -5315,7 +5510,7 @@ class CollectionDetailDialog(tk.Frame):
                 _phase_staging = self._game.get_effective_mod_staging_path()
                 _known_folders: list[str] = []
                 _seen_folders: set[str] = set()
-                for _fname in already_installed_by_fid.values():
+                for _fname in (*already_installed_by_ids.values(), *already_installed_by_fid.values()):
                     if _fname and _fname not in _seen_folders:
                         _seen_folders.add(_fname)
                         _known_folders.append(_fname)
@@ -5671,11 +5866,22 @@ class CollectionDetailDialog(tk.Frame):
                         write_separator_locks(profile_dir, _locks)
                 except Exception as exc:
                     self._log(f"Manual install: failed to write modlist.txt: {exc}")
+        elif _is_append_run:
+            # Append: reposition only newly-installed mods per the collection's
+            # before/after order; existing mods keep their position.
+            install_order.sort(key=lambda x: x[0])
+            self._append_reconcile_modlist(
+                modlist_path=modlist_path,
+                install_order=install_order,
+                pre_existing=_append_pre_existing,
+            )
 
         # ------------------------------------------------------------------
         # Step 7: Write plugins.txt / loadorder.txt from collection.json.
         # Same strategy as _run_install step 4: write userlist rules first,
         # then run LOOT so it applies them, fall back to flat list if needed.
+        # The full rewrite is skipped on append; the append branch below still
+        # writes the collection's group/plugin rules to userlist.yaml.
         # ------------------------------------------------------------------
         schema_plugins: list[dict] = collection_schema.get("plugins", [])
         if schema_plugins and overwrite_existing is None:
@@ -5760,13 +5966,22 @@ class CollectionDetailDialog(tk.Frame):
                 )
             except Exception as exc:
                 self._log(f"Manual install: failed to write plugins.txt: {exc}")
+        elif schema_plugins and _is_append_run:
+            # Append: write the collection's group/plugin rules to userlist.yaml
+            # without re-running LOOT or rewriting plugins.txt.
+            try:
+                _apply_collection_groups(profile_dir, collection_schema, self._log)
+            except Exception as exc:
+                self._log(f"Manual install (append): failed to write userlist.yaml rules: {exc}")
 
         # ------------------------------------------------------------------
         # Step 8: Final reconciliation (skipped on update runs — the update
         # reconcile already placed new mods correctly without disturbing
-        # existing mod order or separators).
+        # existing mod order or separators; skipped on append runs —
+        # _append_reconcile_modlist already handled placement without moving
+        # existing mods).
         # ------------------------------------------------------------------
-        if install_order and modlist_path.is_file() and not _is_update_run:
+        if install_order and modlist_path.is_file() and not _is_update_run and not _is_append_run:
             try:
                 _folder_to_key = {folder: key for key, folder in install_order}
                 _existing = read_modlist(modlist_path)
@@ -6547,6 +6762,11 @@ class CollectionDetailDialog(tk.Frame):
                     final_loadorder = vanilla_prefix + loadorder_lines
                     loadorder_path.write_text("\n".join(final_loadorder) + "\n", encoding="utf-8")
                     self._log(f"Reset load order: wrote loadorder.txt with {len(final_loadorder)} plugins ({len(vanilla_prefix)} vanilla)")
+                    # Direct writes bypass write_plugins/write_loadorder — drop
+                    # the read cache so the next read re-parses (Utils/plugins).
+                    from Utils.plugins import invalidate_plugins_cache
+                    invalidate_plugins_cache(plugins_path)
+                    invalidate_plugins_cache(loadorder_path)
                 except Exception as exc:
                     self._log(f"Reset load order: failed to write plugins.txt: {exc}")
 
@@ -6759,7 +6979,7 @@ class CollectionsDialog(tk.Frame):
         self._workshop_btn.pack(side="left", padx=4, pady=2)
 
         self._import_manifest_btn = ctk.CTkButton(
-            toolbar, text="Import Manifest", width=115, height=26,
+            toolbar, text="Import", width=90, height=26,
             fg_color=BTN_SUCCESS_DEEP, hover_color=BTN_SUCCESS_DEEP_HOV, text_color=TEXT_WHITE,
             font=FONT_HEADER, command=self._import_manifest,
         )

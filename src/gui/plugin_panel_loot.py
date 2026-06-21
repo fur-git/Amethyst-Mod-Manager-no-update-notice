@@ -294,7 +294,23 @@ class PluginPanelLOOTMixin:
                 if i >= len(_before) or _before[i] != n
             )
 
+            # Whether the *full* order (vanilla included) changed. LOOT pins
+            # vanilla masters to canonical positions, so a re-sort can leave
+            # every mod in place (visible_moved == 0) while still repositioning
+            # vanilla plugins. We still want to commit that so the panel shows
+            # the canonical vanilla order rather than a stale interleaving.
+            _full_changed = [e.name for e in self._plugin_entries] != [
+                e.name for e in new_entries
+            ]
+
             if visible_moved == 0 and not locked_indices:
+                # No mod the user manages moved — report "already sorted", but
+                # still persist if only vanilla plugins shifted (cosmetic).
+                if _full_changed:
+                    self._plugin_entries = new_entries
+                    write_loadorder(
+                        self._plugins_path.parent / "loadorder.txt", new_entries,
+                    )
                 self._log("Load order is already sorted.")
                 self._refresh_plugins_tab()
                 _done_notif = CTkNotification(
@@ -558,17 +574,30 @@ class PluginPanelLOOTMixin:
     def _get_enabled_nexus_mod_ids(self) -> set[int]:
         """Return the set of Nexus mod_ids for mods enabled in the current profile.
 
-        Cached on self; invalidated via _invalidate_enabled_mod_ids() whenever
-        the modlist, profile, or staging root changes.
+        Result is cached against modlist.txt's mtime; the underlying per-mod
+        ``mod_name → mod_id`` map is cached per meta.ini mtime so a plain mod
+        toggle (which rewrites modlist.txt but touches no meta.ini) re-derives
+        the id set from the cached map without re-parsing any meta.ini file.
         """
+        modlist_path = (
+            self._plugins_path.parent / "modlist.txt"
+            if self._plugins_path is not None else None
+        )
+        try:
+            ml_mtime = modlist_path.stat().st_mtime if modlist_path else 0.0
+        except OSError:
+            ml_mtime = 0.0
         cached = getattr(self, "_enabled_mod_ids_cache", None)
-        if cached is not None:
+        if cached is not None and getattr(self, "_enabled_mod_ids_cache_mtime", None) == ml_mtime:
             return cached
+
+        # Persistent per-mod id map: mod_name → (meta_mtime, mod_id|None).
+        # Survives across refreshes; only re-reads a meta.ini whose mtime moved.
+        id_map: dict[str, tuple[float, int | None]] = getattr(self, "_mod_id_map", None) or {}
         ids: set[int] = set()
         if self._plugins_path is not None:
             staging_root = self._staging_root
-            modlist_path = self._plugins_path.parent / "modlist.txt"
-            if staging_root and staging_root.is_dir() and modlist_path.is_file():
+            if staging_root and staging_root.is_dir() and modlist_path and modlist_path.is_file():
                 try:
                     from Utils.modlist import read_modlist
                     entries = read_modlist(modlist_path)
@@ -576,23 +605,38 @@ class PluginPanelLOOTMixin:
                         if not e.enabled:
                             continue
                         meta_path = staging_root / e.name / "meta.ini"
-                        if not meta_path.is_file():
-                            continue
                         try:
-                            meta = read_meta(meta_path)
-                        except Exception:
+                            m_mtime = meta_path.stat().st_mtime
+                        except OSError:
+                            id_map.pop(e.name, None)
                             continue
-                        if meta.mod_id:
-                            ids.add(int(meta.mod_id))
+                        cached_entry = id_map.get(e.name)
+                        if cached_entry is None or cached_entry[0] != m_mtime:
+                            mod_id_val: int | None = None
+                            try:
+                                meta = read_meta(meta_path)
+                                if meta.mod_id:
+                                    mod_id_val = int(meta.mod_id)
+                            except Exception:
+                                mod_id_val = None
+                            id_map[e.name] = (m_mtime, mod_id_val)
+                            cached_entry = id_map[e.name]
+                        if cached_entry[1]:
+                            ids.add(cached_entry[1])
                 except Exception:
                     pass
+        self._mod_id_map = id_map
         self._enabled_mod_ids_cache = ids
+        self._enabled_mod_ids_cache_mtime = ml_mtime
         return ids
 
     def _invalidate_enabled_mod_ids(self) -> None:
-        self._enabled_mod_ids_cache = None
-        self._staged_paths_cache = None
-        self._game_root_files_cache = None
+        # mtime-validated caches self-heal, so a plain plugin-tab refresh no
+        # longer needs to clear them (that forced a full modlist + 300×meta.ini
+        # re-parse and a 74k-line filemap re-parse on every mod toggle). Kept as
+        # a no-op so any external caller is harmless; the getters re-derive
+        # against modlist/filemap mtimes.
+        return
 
     def _get_staged_paths(self) -> set[str]:
         """Return the lowercase set of relative paths currently staged.
@@ -601,23 +645,32 @@ class PluginPanelLOOTMixin:
         (e.g. 'SKSE/Plugins/PapyrusUtil.dll') rather than a plugin or a
         Nexus link. Paths are normalised to forward slashes and lowercased.
         """
+        # Validate the cache against the filemap's mtime rather than clearing it
+        # on every plugin-tab refresh. The staged-path set only changes when
+        # filemap.txt changes, so re-parsing its 74k lines on every mod toggle
+        # (when the relevant content is identical) is wasted work.
+        filemap_path = (
+            self._staging_root.parent / "filemap.txt"
+            if self._staging_root is not None else None
+        )
+        try:
+            fm_mtime = filemap_path.stat().st_mtime if filemap_path else 0.0
+        except OSError:
+            fm_mtime = 0.0
         cached = getattr(self, "_staged_paths_cache", None)
-        if cached is not None:
+        if cached is not None and getattr(self, "_staged_paths_cache_mtime", None) == fm_mtime:
             return cached
         paths: set[str] = set()
-        if self._staging_root is not None and self._staging_root.is_dir():
-            filemap_path = self._staging_root.parent / "filemap.txt"
-            if filemap_path.is_file():
-                try:
-                    for line in filemap_path.read_text(encoding="utf-8").splitlines():
-                        if not line.strip():
-                            continue
-                        rel = line.split("\t", 1)[0].strip()
-                        if rel:
-                            paths.add(rel.replace("\\", "/").lower())
-                except OSError:
-                    pass
+        if (self._staging_root is not None and self._staging_root.is_dir()
+                and filemap_path and filemap_path.is_file()):
+            # Reuse the panel's shared mtime-keyed parse instead of re-reading
+            # the (large) filemap directly — see PluginPanel._get_parsed_filemap.
+            for rel, _mod in self._get_parsed_filemap(filemap_path):
+                rel = rel.strip()
+                if rel:
+                    paths.add(rel.replace("\\", "/").lower())
         self._staged_paths_cache = paths
+        self._staged_paths_cache_mtime = fm_mtime
         return paths
 
     def _get_game_root_files(self) -> set[str]:
@@ -628,26 +681,34 @@ class PluginPanelLOOTMixin:
         "Skyrim Script Extender" should be treated as satisfied if that file is
         present. Top-level only — we don't recurse into subfolders.
         """
-        cached = getattr(self, "_game_root_files_cache", None)
-        if cached is not None:
-            return cached
-        names: set[str] = set()
         game = getattr(self, "_game", None)
+        game_path = None
         if game is not None and hasattr(game, "get_game_path"):
             try:
                 game_path = game.get_game_path()
             except Exception:
                 game_path = None
-            if game_path is not None:
-                root = Path(game_path)
-                if root.is_dir():
-                    try:
-                        for entry in root.iterdir():
-                            if entry.is_file():
-                                names.add(entry.name.lower())
-                    except OSError:
-                        pass
+        # Self-validate against the game root's dir mtime so a loader dropped in
+        # mid-session is still picked up, without re-listing the dir every refresh.
+        try:
+            root_mtime = Path(game_path).stat().st_mtime if game_path else 0.0
+        except OSError:
+            root_mtime = 0.0
+        cached = getattr(self, "_game_root_files_cache", None)
+        if cached is not None and getattr(self, "_game_root_files_cache_mtime", None) == root_mtime:
+            return cached
+        names: set[str] = set()
+        if game_path is not None:
+            root = Path(game_path)
+            if root.is_dir():
+                try:
+                    for entry in root.iterdir():
+                        if entry.is_file():
+                            names.add(entry.name.lower())
+                except OSError:
+                    pass
         self._game_root_files_cache = names
+        self._game_root_files_cache_mtime = root_mtime
         return names
 
     @staticmethod

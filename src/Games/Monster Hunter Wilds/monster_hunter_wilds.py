@@ -48,7 +48,7 @@ class MonsterHunterWilds(ResidentEvilRequiem):
     
     @property
     def collections_disabled(self) -> bool:
-        return True
+        return False
     
 class MonsterHunterRise(ResidentEvilRequiem):
 
@@ -74,4 +74,36 @@ class MonsterHunterRise(ResidentEvilRequiem):
     
     @property
     def collections_disabled(self) -> bool:
-        return True
+        return False
+    
+    @property
+    def custom_routing_rules(self) -> list:
+        from Utils.deploy import CustomRule
+        return [
+            CustomRule(
+                dest="pak_mods",
+                extensions=[".pak"],
+                flatten=True,
+            ),
+            CustomRule(
+                dest="pak_mods",
+                extensions=[".patch_metadata.json"],
+                flatten=True,
+            ),
+            CustomRule(
+                dest="reframework/autorun",
+                extensions=[".lua"],
+                flatten=True,
+            ),
+            CustomRule(
+                dest="reframework/quests",
+                extensions=[".json"],
+                flatten=True,
+                loose_only=True,
+            ),
+            CustomRule(
+                dest="reframework",
+                folders=["quests"],
+                flatten=True,
+            ),
+        ]
