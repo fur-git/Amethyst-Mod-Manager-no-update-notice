@@ -2658,9 +2658,35 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     # Hide other mod-only items on separators
                     c.itemconfigure(self._pool_category_text[s], state="hidden")
                     c.itemconfigure(self._pool_install_text[s], state="hidden")
-                    c.itemconfigure(self._pool_priority_text[s], state="hidden")
                     c.itemconfigure(self._pool_version_text[s], state="hidden")
                     c.itemconfigure(self._pool_size_text[s], state="hidden")
+
+                    # Priority column — for a collapsed separator, show the
+                    # priority range of the mods hidden inside its block
+                    # (e.g. "0 - 20"). Expanded separators show nothing.
+                    _prio_range_text = ""
+                    if _sep_is_collapsed:
+                        _blk_prios = [
+                            priorities[_bi]
+                            for _bi in self._sep_block_range(i)
+                            if _bi != i
+                            and not self._entries[_bi].is_separator
+                            and _bi in priorities
+                        ]
+                        if _blk_prios:
+                            _lo, _hi = min(_blk_prios), max(_blk_prios)
+                            _prio_range_text = (
+                                str(_lo) if _lo == _hi else f"{_lo} - {_hi}"
+                            )
+                    if _prio_range_text:
+                        prio_cx = _PRIO_X + _PRIO_W // 2
+                        c.coords(self._pool_priority_text[s], prio_cx, y_mid)
+                        c.itemconfigure(self._pool_priority_text[s],
+                                        text=_prio_range_text, anchor="center",
+                                        fill=TEXT_DIM, font=_FONT_SMALL,
+                                        state="normal")
+                    else:
+                        c.itemconfigure(self._pool_priority_text[s], state="hidden")
 
                     # Pool check widget — hidden for separators
                     c.itemconfigure(self._pool_cb_rect[s], state="hidden")
