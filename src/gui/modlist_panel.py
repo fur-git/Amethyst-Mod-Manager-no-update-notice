@@ -7819,15 +7819,49 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._redraw()
         self._update_info()
 
+    @staticmethod
+    def _toposort_categories(cats, edges: dict[str, set[str]]) -> list[str]:
+        """Order categories so that for every edge a→b in `edges`, a precedes b.
+
+        `edges[b]` is the set of categories that must come before b. Independent
+        categories (and ties) are ordered alphabetically (case-insensitive).
+        Any cycle (shouldn't happen for a valid load order) is broken by the
+        same alphabetical fallback so the result is always a full ordering.
+        """
+        cats = list(cats)
+        remaining = set(cats)
+        # indeg[c] = number of not-yet-emitted prerequisites of c
+        prereqs = {c: set(edges.get(c, set())) & remaining for c in cats}
+        result: list[str] = []
+        while remaining:
+            ready = sorted(
+                (c for c in remaining if not (prereqs[c] & remaining)),
+                key=str.casefold,
+            )
+            if not ready:
+                # Cycle: emit the alphabetically-first remaining category to break it.
+                ready = [sorted(remaining, key=str.casefold)[0]]
+            for c in ready:
+                result.append(c)
+                remaining.discard(c)
+        return result
+
     def _generate_separators(self) -> None:
         """Create a separator for each category and move loose mods (not already inside a separator) into it.
 
         Rules:
         - Mods already inside a separator block are untouched.
-        - Loose mods with conflicts stay at the bottom in their original relative order.
-        - Loose mods without conflicts are grouped by category, each group placed under
-          a new (or existing) separator named after the category.
-        - Mods with no category get a separator named "Uncategorized".
+        - Loose mods are grouped by category under a new (or existing) separator
+          named after the category. Mods with no category go to "Uncategorized".
+        - Conflicting mods are handled by connected component of the conflict
+          graph (loose↔loose override edges, loose + BSA):
+            * A component confined to one category is moved into that category's
+              separator intact, in original relative order, so its winners are
+              preserved.
+            * A component spanning multiple categories cannot be split safely and
+              stays in the "Conflicts" separator (original order).
+        - Category separators are ordered conflict-aware (a category whose mods
+          must load earlier comes first), alphabetical as the tiebreaker.
         - New separators are inserted just above the conflict/bottom section.
         """
         OVERWRITE = OVERWRITE_NAME  # synthetic first entry
@@ -7859,33 +7893,113 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         if not loose:
             return  # nothing to do
 
-        # --- Step 3: Split loose mods into conflict vs non-conflict groups ---
-        conflict_mods: list[ModEntry] = []
-        no_conflict_mods: list[ModEntry] = []
-        for entry in loose:
-            c = self._conflict_map.get(entry.name, CONFLICT_NONE)
-            if c != CONFLICT_NONE:
-                conflict_mods.append(entry)
-            else:
-                no_conflict_mods.append(entry)
+        # --- Step 3: Build the conflict graph among loose mods only ---
+        # Edges come from loose-asset overrides AND BSA overrides. We only care
+        # about loose↔loose edges here: a conflict with a mod that's already
+        # locked inside a separator can't be reordered by us anyway.
+        loose_names = {e.name for e in loose}
+        cat_of = lambda n: (self._category_names.get(n, "") or "Uncategorized")
 
-        # --- Step 4: Group non-conflict mods by category (sorted alphabetically within group) ---
+        adj: dict[str, set[str]] = {n: set() for n in loose_names}
+        for src in (self._overrides, self._overridden_by,
+                    self._bsa_overrides, self._bsa_overridden_by):
+            for name, others in src.items():
+                if name not in loose_names:
+                    continue
+                for other in others:
+                    if other in loose_names and other != name:
+                        adj[name].add(other)
+                        adj[other].add(name)
+
+        # --- Step 3b: Connected components of the conflict graph ---
+        # Each component is a set of loose mods transitively linked by conflicts;
+        # their relative order must be preserved to keep the same winners.
+        loose_order = {e.name: i for i, e in enumerate(loose)}
+        seen: set[str] = set()
+        components: list[list[str]] = []  # each: member names in original list order
+        for entry in loose:
+            start = entry.name
+            if start in seen or not adj[start]:
+                continue  # no-conflict mods handled separately
+            stack = [start]
+            seen.add(start)
+            comp: list[str] = []
+            while stack:
+                cur = stack.pop()
+                comp.append(cur)
+                for nb in adj[cur]:
+                    if nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+            comp.sort(key=lambda n: loose_order[n])
+            components.append(comp)
+
+        # --- Step 3c: Classify components ---
+        # A component confined to a single category can be moved (intact, in
+        # original order) into that category's separator without flipping any
+        # winner. A component spanning multiple categories cannot be split
+        # safely, so it stays in the Conflicts separator.
+        entry_by_name = {e.name: e for e in loose}
+        placeable_components: dict[str, list[list[str]]] = {}  # category → list of comps
+        unresolved_names: list[str] = []  # → Conflicts separator, original order
+        for comp in components:
+            cats = {cat_of(n) for n in comp}
+            if len(cats) == 1:
+                cat = next(iter(cats))
+                placeable_components.setdefault(cat, []).append(comp)
+            else:
+                unresolved_names.extend(comp)
+        unresolved_names.sort(key=lambda n: loose_order[n])
+
+        # --- Step 4: Group the truly-conflict-free loose mods by category ---
+        no_conflict_mods = [e for e in loose if not adj[e.name]]
         cat_groups: dict[str, list[ModEntry]] = {}
         for entry in no_conflict_mods:
-            cat = self._category_names.get(entry.name, "") or "Uncategorized"
-            if cat not in cat_groups:
-                cat_groups[cat] = []
-            cat_groups[cat].append(entry)
+            cat_groups.setdefault(cat_of(entry.name), []).append(entry)
         for mods in cat_groups.values():
             mods.sort(key=lambda e: e.name.casefold())
 
-        # --- Step 5: Build the new entries list ---
-        # Keep: synthetic Overwrite + all existing separator blocks (untouched)
-        # Then append: new category separators + their mods
-        # Then append: "Conflicts" separator + conflict mods at bottom
+        # Merge placeable conflict components into their category groups. The
+        # no-conflict mods stay alpha-sorted at the top of the group; the
+        # conflict components follow in original relative order so winners are
+        # preserved.
+        for cat, comps in placeable_components.items():
+            comps.sort(key=lambda c: loose_order[c[0]])
+            tail: list[ModEntry] = []
+            for comp in comps:
+                tail.extend(entry_by_name[n] for n in comp)
+            cat_groups.setdefault(cat, []).extend(tail)
 
+        conflict_mods = [entry_by_name[n] for n in unresolved_names]
+
+        # --- Step 4b: Decide the order of the category separators -------------
+        # Conflict-aware: if a mod in category A must load before a mod in
+        # category B (an override edge A→B between placed mods), separator A
+        # should appear before B. We topologically sort categories by these
+        # cross-category edges, breaking ties (and ordering independent
+        # categories) alphabetically.
+        placed_cat_of = {
+            n: cat for cat, comps in placeable_components.items()
+            for comp in comps for n in comp
+        }
+        # cat_edges[c] = categories that must appear BEFORE c.
+        cat_edges: dict[str, set[str]] = {c: set() for c in cat_groups}
+        # _overrides[a] = mods a beats (a wins). In _entries, index 0 is the
+        # HIGHEST priority, so the winner `a` sits earlier (lower index) than
+        # the loser `b`. Thus a's category must come before b's category.
+        for src in (self._overrides, self._bsa_overrides):
+            for a, beaten in src.items():
+                ca = placed_cat_of.get(a)
+                if ca is None:
+                    continue
+                for b in beaten:
+                    cb = placed_cat_of.get(b)
+                    if cb is not None and cb != ca:
+                        cat_edges[cb].add(ca)  # ca before cb
+        ordered_cats = self._toposort_categories(cat_groups.keys(), cat_edges)
+
+        # --- Step 5: Build the new entries list ---
         # Remove all loose mods from _entries (they will be re-inserted).
-        loose_names = {e.name for e in loose}
         new_entries: list[ModEntry] = [e for e in self._entries if e.name not in loose_names]
 
         # Find insertion point: just before ROOT_FOLDER (if present), otherwise end.
@@ -7898,7 +8012,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # Build the block to insert: category separators + mods, then conflict mods.
         to_insert: list[ModEntry] = []
         existing_sep_names = {e.name for e in new_entries if e.is_separator}
-        for cat, mods in sorted(cat_groups.items()):
+        for cat in ordered_cats:
+            mods = cat_groups[cat]
             sep_name = cat + "_separator"
             if sep_name not in existing_sep_names:
                 sep_entry = ModEntry(name=sep_name, enabled=True, locked=True, is_separator=True)
