@@ -118,6 +118,7 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         self._archive_invalidation_var = tk.BooleanVar(value=True)
         self._profile_ini_files_var = tk.BooleanVar(value=False)
         self._profile_saves_var = tk.BooleanVar(value=False)
+        self._prefix_numbering_var = tk.BooleanVar(value=True)
         self._patch_version_var = tk.StringVar(value="8")
         self._flatpak_symlink_warned = False
 
@@ -156,6 +157,8 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                 self._profile_ini_files_var.set(game.profile_ini_files)
             if hasattr(game, "profile_saves"):
                 self._profile_saves_var.set(game.profile_saves)
+            if hasattr(game, "prefix_numbering"):
+                self._prefix_numbering_var.set(game.prefix_numbering)
             if hasattr(game, "get_patch_version"):
                 self._patch_version_var.set(str(game.get_patch_version()))
         else:
@@ -430,6 +433,14 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                 font=FONT_NORMAL, text_color=TEXT_MAIN,
                 fg_color=ACCENT, hover_color=ACCENT_HOV,
             ).grid(row=21, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        if hasattr(self._game, "prefix_numbering"):
+            ctk.CTkCheckBox(
+                body, text="Prepend load-order numbers to mod folders",
+                variable=self._prefix_numbering_var,
+                font=FONT_NORMAL, text_color=TEXT_MAIN,
+                fg_color=ACCENT, hover_color=ACCENT_HOV,
+            ).grid(row=25, column=0, sticky="w", padx=16, pady=(0, 8))
 
         if hasattr(self._game, "get_patch_version"):
             ctk.CTkLabel(
@@ -1390,6 +1401,8 @@ class ReconfigureGamePanel(ctk.CTkFrame):
             self._game.set_profile_ini_files(self._profile_ini_files_var.get())
         if hasattr(self._game, "set_profile_saves"):
             self._game.set_profile_saves(self._profile_saves_var.get())
+        if hasattr(self._game, "prefix_numbering"):
+            self._game.prefix_numbering = self._prefix_numbering_var.get()
         if hasattr(self._game, "set_patch_version"):
             try:
                 self._game.set_patch_version(int(self._patch_version_var.get()))

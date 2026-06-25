@@ -242,6 +242,25 @@ class SevenDaysToDie(BaseGame):
         self._deploy_mode = mode
         self.save_paths()
 
+    @property
+    def prefix_numbering(self) -> bool:
+        """If True (default), deployed Mods/ folders are prefixed with a
+        zero-padded ``NNNN_`` index derived from the modlist position so the
+        game's strict-alphabetical load order matches the manager's priority.
+
+        When False, mods are linked under their bare folder name (with any
+        author-supplied numeric prefix preserved) and load order falls back to
+        plain alphabetical order — useful for users who manage 7D2D ordering
+        themselves or whose mods rely on their original folder names.
+        """
+        return self._load_settings().get("prefix_numbering", True)
+
+    @prefix_numbering.setter
+    def prefix_numbering(self, value: bool) -> None:
+        data = self._load_settings()
+        data["prefix_numbering"] = bool(value)
+        self._save_settings(data)
+
     # -----------------------------------------------------------------------
     # Deployment
     # -----------------------------------------------------------------------
@@ -318,17 +337,28 @@ class SevenDaysToDie(BaseGame):
 
         done = 0
         total_steps = total_mods + total_data
+        use_prefix = self.prefix_numbering
+        if not use_prefix:
+            _log("  (Folder numbering disabled — linking mods under their "
+                 "original folder names; load order is plain alphabetical.)")
         for n, (_idx, staged_name, inner) in enumerate(mods_folders):
-            # mods_folders is in modlist order (idx 0 = highest priority), so
-            # n=0 needs the LARGEST NNNN to sort last alphabetically and win.
-            priority = total_mods - n
-            prefix = str(priority).zfill(_PRIORITY_WIDTH)
-            bare_name = _strip_existing_prefix(inner.name)
-            dst_name = f"{prefix}_{_safe_folder_name(bare_name)}"
+            if use_prefix:
+                # mods_folders is in modlist order (idx 0 = highest priority),
+                # so n=0 needs the LARGEST NNNN to sort last alphabetically and
+                # win on any conflicting XPath patch.
+                priority = total_mods - n
+                prefix = str(priority).zfill(_PRIORITY_WIDTH)
+                bare_name = _strip_existing_prefix(inner.name)
+                dst_name = f"{prefix}_{_safe_folder_name(bare_name)}"
+            else:
+                # Numbering off: preserve the mod's own folder name (including
+                # any author-supplied numeric prefix) so its intended ordering
+                # survives untouched.
+                dst_name = _safe_folder_name(inner.name)
             dst = mods_dir / dst_name
             try:
                 _deploy_mod_folder(inner, dst, mode)
-                _log(f"  [{priority:>4}] {staged_name} / {inner.name} → {dst_name}")
+                _log(f"  {staged_name} / {inner.name} → {dst_name}")
             except OSError as err:
                 _log(f"  ERROR: failed to deploy {staged_name}/{inner.name}: {err}")
             done += 1
