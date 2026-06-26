@@ -34,6 +34,7 @@ import fnmatch
 import os
 import re
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path
@@ -43,6 +44,7 @@ import msgpack
 
 from Utils.atomic_write import atomic_writer
 from Utils.modlist import read_modlist
+from Utils import perftrace
 
 # Conflict status constants (returned per-mod in build_filemap result)
 CONFLICT_NONE    = 0   # no conflicts at all
@@ -1047,6 +1049,14 @@ def build_filemap(
     # scan of filemap_winner per conflicting file in UE5 builds.
     conflict_staged: dict[str, str] = {}
 
+    # Hoist feature-flags out of the per-file hot loop. When a feature is
+    # unused (the common case) we skip its function call entirely on each of
+    # the ~100k+ files rather than calling a helper that immediately returns.
+    _has_excluded_loose = _loose_excl_re is not None
+    _has_unknown_top    = _allowed_top is not None
+    _has_ignore         = _ignore_re is not None
+
+    _merge_t0 = time.perf_counter()
     for name in priority_order:
         entry = index.get(name)
         if not entry:
@@ -1054,14 +1064,16 @@ def build_filemap(
         normal, _ = entry
         if not normal:
             continue
-        # Guard against surrogate-encoded filenames left in an old modindex.bin.
-        # (Old scans ran before the _scan_dir surrogate-skip fix.)  Skip the
-        # entire mod and log it so the user knows to Refresh / reinstall it.
-        bad_names = [rs for rs in normal.values() if not _is_utf8_safe(rs)]
-        if bad_names:
+        # Guard against surrogate-encoded filenames left in an old modindex.bin
+        # (pre surrogate-skip-fix). v4 indexes are written after that fix, so
+        # this is a legacy-only condition. Use a cheap any()-with-early-exit so
+        # the common all-UTF-8 mod stops at the first name; only build the full
+        # bad-name list (for the log) on the rare mod that actually trips it.
+        if any(not _is_utf8_safe(rs) for rs in normal.values()):
+            bad_names = [rs for rs in normal.values() if not _is_utf8_safe(rs)]
             if log_fn is not None:
                 log_fn(
-                    f"WARN: Mod \"{name}\" skipped \u2014 contains file(s) with "
+                    f"WARN: Mod \"{name}\" skipped — contains file(s) with "
                     f"non-UTF-8 name(s): {', '.join(bad_names[:5])}"
                 )
             continue
@@ -1074,11 +1086,11 @@ def build_filemap(
         for rel_key, rel_str in normal.items():
             if exc and rel_key in exc:
                 continue
-            if _is_excluded_loose(rel_key):
+            if _has_excluded_loose and _is_excluded_loose(rel_key):
                 continue
-            if _is_unknown_top_level(rel_key):
+            if _has_unknown_top and _is_unknown_top_level(rel_key):
                 continue
-            if _is_ignored(rel_key):
+            if _has_ignore and _is_ignored(rel_key):
                 continue
             had_file = True
             prev = _winner_ns.get(rel_key)
@@ -1108,10 +1120,12 @@ def build_filemap(
                 conflict_staged[ck] = rel_key
         if had_file:
             mods_with_files.add(name)
+    perftrace.mark("filemap: priority merge loop", time.perf_counter() - _merge_t0)
 
-    conflict_map = _compute_conflict_status(
-        priority_order, overrides, overridden_by, win_count, mods_with_files,
-    )
+    with perftrace.span("filemap: _compute_conflict_status"):
+        conflict_map = _compute_conflict_status(
+            priority_order, overrides, overridden_by, win_count, mods_with_files,
+        )
 
     # Normalize folder casing across the merged filemap so that two mods which
     # ship the same logical path with different casings (e.g. "archive/pc/Mod"
@@ -1124,6 +1138,7 @@ def build_filemap(
     #   "lower"        — pick variant with more lowercase letters
     #   "force_lower"  — every folder/filename forced lowercase
     #   "force_upper"  — every folder/filename-stem forced uppercase (extension stays lower)
+    _norm_t0 = time.perf_counter()
     if normalize_folder_case and (filemap or filemap_root):
         _strategy = filemap_casing if filemap_casing in _VALID_FILEMAP_CASINGS else FILEMAP_CASING_UPPER
         _norm_normal: dict[str, dict[str, str]] = {}
@@ -1142,6 +1157,7 @@ def build_filemap(
         for _mn, _files in _norm_root.items():
             for _rk, _rs in _files.items():
                 filemap_root[_rk] = (_rs, _mn)
+    perftrace.mark("filemap: normalize folder casing", time.perf_counter() - _norm_t0)
 
     # Build per-mod disabled-plugin sets for fast lookup (lowercase filenames, root-level only).
     # Cached by (id, fingerprint) to avoid rebuilding the lowercase sets on every
@@ -1165,7 +1181,8 @@ def build_filemap(
         count = sum(1 for _ in filemap_winner)  # approx — disabled_plugins may trim a few
         return count, conflict_map, overrides, overridden_by
 
-    count = _write_filemap(output_path, filemap, _disabled_lower)
+    with perftrace.span("filemap: _write_filemap (sort+disk)"):
+        count = _write_filemap(output_path, filemap, _disabled_lower)
 
     # Write filemap_root.txt for root-flagged mods.
     _root_filemap_path = output_path.parent / "filemap_root.txt"

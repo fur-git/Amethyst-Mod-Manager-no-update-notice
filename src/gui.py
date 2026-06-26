@@ -363,6 +363,14 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+        # Timing diagnostic (env-gated; auto-on from source). Press F11 to dump
+        # a summary of where UI time is spent, Shift+F11 to reset the counters.
+        try:
+            from Utils import perftrace
+            perftrace.install(self)
+        except Exception:
+            pass
+
     # -- Focus management ---------------------------------------------------
     _TEXT_INPUT_CLASSES = (
         "Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox",

@@ -42,6 +42,7 @@ from gui.theme import (
     scaled,
 )
 from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
+from Utils import perftrace
 
 
 class PluginPanelArchiveMixin:
@@ -371,6 +372,7 @@ class PluginPanelArchiveMixin:
         self._bsa_conflict_cache = (sig, bsa_winner, loose_winner, contested)
         return bsa_winner, loose_winner, contested
 
+    @perftrace.timed("archive.show_mod_archives (click)")
     def show_mod_archives(self, mod_name: str | None):
         """Populate the Archive tab for the given mod name (lazy: only renders
         when the Archive tab is visible; otherwise flags dirty)."""

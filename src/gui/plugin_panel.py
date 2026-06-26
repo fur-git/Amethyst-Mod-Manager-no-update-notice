@@ -91,6 +91,7 @@ from Utils.profile_state import (
 )
 from Utils.filemap import OVERWRITE_NAME as _OVERWRITE_NAME, build_filemap
 from Utils.xdg import xdg_open, open_url
+from Utils import perftrace
 from Utils.plugins import (
     PluginEntry,
     read_plugins,
@@ -2714,6 +2715,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
     # Public entry point
     # ------------------------------------------------------------------
 
+    @perftrace.timed("plugin.load_plugins")
     def load_plugins(self, plugins_path: Path, plugin_extensions: list[str]) -> None:
         """Load plugins.txt for the given path and extension list."""
         self._plugins_path = plugins_path
@@ -3182,6 +3184,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._filemap_parse_cache_sig = sig
         return entries
 
+    @perftrace.timed("plugin._refresh_plugins_tab")
     def _refresh_plugins_tab(self) -> None:
         """Reload plugin entries from plugins.txt and redraw."""
         try:
@@ -3570,6 +3573,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._plugin_esl_counter_label.configure(text=texts[1])
         self._plugin_non_esl_counter_label.configure(text=texts[2])
 
+    @perftrace.timed("plugin._predraw")
     def _predraw(self, update_counters: bool = True):
         """Redraw by reconfiguring the pre-allocated pool of canvas items."""
         self._predraw_after_id = None
@@ -3863,6 +3867,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             self.after_cancel(self._marker_strip_after_id)
         self._marker_strip_after_id = self.after(250, self._draw_marker_strip)
 
+    @perftrace.timed("plugin._draw_marker_strip")
     def _draw_marker_strip(self):
         """Paint the combined scrollbar + marker strip.
 

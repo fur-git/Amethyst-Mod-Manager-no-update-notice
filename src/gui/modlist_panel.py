@@ -154,6 +154,7 @@ from gui.changelog_overlay import ChangelogOverlay
 from Nexus.nexus_meta import ensure_installed_stamp, read_meta, write_meta
 from Utils.config_paths import get_download_cache_dir, list_all_cache_dirs
 from Utils.ui_config import load_column_widths, load_column_order, load_normalize_folder_case, load_sort_state, save_sort_state, load_column_hidden, load_show_summary_tooltips, load_hide_bsa_conflicts
+from Utils import perftrace
 
 
 from gui.text_utils import truncate_text as _truncate_text_for_width, clear_truncate_cache as _clear_truncate_cache
@@ -564,6 +565,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # routing rule with dest="" (i.e. files that deploy to the game root).
         # Auto-detected from the mod index + game's custom_routing_rules.
         self._root_rule_mods: set[str] = set()
+        # (index_mtime, result_set) cache for _compute_root_rule_mods — the
+        # match scan is ~1.45s and the result only changes when modindex.bin
+        # changes (install/remove/refresh), not on a mod toggle.
+        self._root_rule_cache: tuple[float, set[str]] | None = None
         # Sets of mod names tagged by collection install — populated from
         # meta.ini's fromCollectionBundled / fromCollectionPatched flags.
         self._collection_bundled_mods: set[str] = set()
@@ -1685,8 +1690,13 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._redraw()
         self._update_info()
 
-    def _compute_root_rule_mods(self) -> set[str]:
-        """Mods owning files matched by a custom routing rule with dest=""."""
+    def _compute_root_rule_mods(self, index=None) -> set[str]:
+        """Mods owning files matched by a custom routing rule with dest="".
+
+        *index* — optional pre-loaded modindex.bin dict.  The filemap worker
+        already reads the index for build_filemap; passing it here avoids a
+        second ~1s disk read + msgpack decode of the same file on every rebuild.
+        """
         game = self._game
         if game is None:
             return set()
@@ -1702,14 +1712,35 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         except Exception:
             return set()
         index_path = self._staging_root.parent / "modindex.bin"
-        index = read_mod_index(index_path)
+        if index is None:
+            index = read_mod_index(index_path)
         if not index:
             return set()
-        mod_files = {
-            name: list(normal.values()) + list(root.values())
-            for name, (normal, root) in index.items()
-        }
-        return mods_matching_root_rules(mod_files, rules)
+        # The root-rule mod set is a pure function of (index contents, rules).
+        # The index is only rewritten on install/remove/refresh — NOT on a mod
+        # toggle (that only edits modlist.txt) — so its mtime is a sound cache
+        # key. Matching scans every file in every mod (~1.45s on a 124k-file
+        # Skyrim list), and that ran on EVERY filemap rebuild (every toggle).
+        # Cache on the index mtime so toggles are free; recompute only when the
+        # index actually changes.
+        try:
+            _idx_mtime = index_path.stat().st_mtime
+        except OSError:
+            _idx_mtime = None
+        if (_idx_mtime is not None
+                and self._root_rule_cache is not None
+                and self._root_rule_cache[0] == _idx_mtime):
+            return self._root_rule_cache[1]
+        with perftrace.span("root_rule: build mod_files dict"):
+            mod_files = {
+                name: list(normal.values()) + list(root.values())
+                for name, (normal, root) in index.items()
+            }
+        with perftrace.span("root_rule: mods_matching_root_rules"):
+            result = mods_matching_root_rules(mod_files, rules)
+        if _idx_mtime is not None:
+            self._root_rule_cache = (_idx_mtime, result)
+        return result
 
     def _scan_update_flags(self):
         """Scan meta.ini for update flags. Uses async to avoid blocking UI."""
@@ -1920,6 +1951,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
     # Drawing
     # ------------------------------------------------------------------
 
+    @perftrace.timed("modlist._compute_conflict_highlights")
     def _compute_conflict_highlights(
         self, sel_entry,
     ) -> tuple[set[int], set[int], set[str], set[str], set[str], set[str]]:
@@ -2335,6 +2367,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         if not star_placed:
             c.itemconfigure(star_slot, state="hidden")
 
+    @perftrace.timed("modlist._redraw")
     def _redraw(self):
         """Pool-based redraw: reconfigure pre-allocated canvas items for the visible viewport.
 
@@ -3183,6 +3216,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     self._priorities[idx] = p
                     p -= 1
 
+    @perftrace.timed("modlist._compute_visible_indices")
     def _compute_visible_indices(self) -> list[int]:
         """Return entry indices that match the current filter, collapsed state, and column sort."""
         self._ensure_priorities()
@@ -3822,6 +3856,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._canvas.after_cancel(self._drag_scroll_after)
             self._drag_scroll_after = None
 
+    @perftrace.timed("modlist._on_mouse_press (click)")
     def _on_mouse_press(self, event):
         try:
             self.winfo_toplevel()._last_list_panel = "mod"
@@ -8324,6 +8359,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
     # Toggle
     # ------------------------------------------------------------------
 
+    @perftrace.timed("modlist._on_toggle")
     def _on_toggle(self, idx: int):
         if not self._check_vars or not self._entries:
             return
@@ -8883,19 +8919,21 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             + ", ".join(names)
                         ))
                 if rescan_index:
-                    rebuild_mod_index(
-                        output.parent / "modindex.bin",
-                        staging,
-                        strip_prefixes=strip_prefixes,
-                        per_mod_strip_prefixes=per_mod_strip,
-                        allowed_extensions=install_extensions or None,
-                        root_deploy_folders=root_deploy_folders or None,
-                        normalize_folder_case=normalize_folder_case,
-                        exclude_dirs=exclude_dirs,
-                        log_fn=_log_thread_safe,
-                        root_folder_mods=root_folder_mods_snap,
-                    )
-                count, conflict_map, overrides, overridden_by = build_filemap(
+                    with perftrace.span("filemap.rebuild_mod_index (worker)"):
+                        rebuild_mod_index(
+                            output.parent / "modindex.bin",
+                            staging,
+                            strip_prefixes=strip_prefixes,
+                            per_mod_strip_prefixes=per_mod_strip,
+                            allowed_extensions=install_extensions or None,
+                            root_deploy_folders=root_deploy_folders or None,
+                            normalize_folder_case=normalize_folder_case,
+                            exclude_dirs=exclude_dirs,
+                            log_fn=_log_thread_safe,
+                            root_folder_mods=root_folder_mods_snap,
+                        )
+                with perftrace.span("filemap.build_filemap (worker)"):
+                  count, conflict_map, overrides, overridden_by = build_filemap(
                     modlist_path, staging, output,
                     strip_prefixes=strip_prefixes,
                     per_mod_strip_prefixes=per_mod_strip,
@@ -8916,17 +8954,20 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 _game = getattr(self, "_game", None)
                 if _game is not None:
                     _game.post_build_filemap(output, staging)
+                # Read the index ONCE here and reuse it for pre-RTX detection and
+                # root-rule mod computation below. Previously each of those re-read
+                # modindex.bin from disk (~1s msgpack decode each) on every rebuild.
+                with perftrace.span("filemap.read_mod_index (worker, shared)"):
+                    _worker_index = read_mod_index(output.parent / "modindex.bin")
                 # Detect pre-RTX mods: any mod with at least one file under a
                 # remapped source prefix (e.g. natives/x64/).
                 prertx_mods: set[str] = set()
-                if _prertx_prefixes:
-                    _index = read_mod_index(output.parent / "modindex.bin")
-                    if _index:
-                        for mod_name, (normal, _) in _index.items():
-                            for rel_key in normal:
-                                if any(rel_key.startswith(p) for p in _prertx_prefixes):
-                                    prertx_mods.add(mod_name)
-                                    break
+                if _prertx_prefixes and _worker_index:
+                    for mod_name, (normal, _) in _worker_index.items():
+                        for rel_key in normal:
+                            if any(rel_key.startswith(p) for p in _prertx_prefixes):
+                                prertx_mods.add(mod_name)
+                                break
                 # BSA/BA2 archive conflict detection (Bethesda games only).
                 bsa_conflict_map: dict[str, int] = {}
                 bsa_overrides: dict[str, set[str]] = {}
@@ -8942,14 +8983,15 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             bsa_index_path, staging, _archive_exts,
                             log_fn=_log_thread_safe,
                         )
-                    (bsa_conflict_map, bsa_overrides, bsa_overridden_by,
-                     loose_over_bsa, bsa_over_loose) = build_bsa_conflicts(
+                    with perftrace.span("filemap.build_bsa_conflicts (worker)"):
+                      (bsa_conflict_map, bsa_overrides, bsa_overridden_by,
+                       loose_over_bsa, bsa_over_loose) = build_bsa_conflicts(
                         modlist_path, bsa_index_path, _archive_exts,
                         loose_index_path=output.parent / "modindex.bin",
                         plugin_order=_plugin_order_snap or None,
                         plugin_extensions=_plugin_exts_snap or None,
                         log_fn=_log_thread_safe,
-                    )
+                      )
                 # Preserve the untransformed loose dicts; _done will fold
                 # loose↔BSA relationships (idempotently) on top of them.
                 base_conflict_map  = dict(conflict_map)
@@ -8958,12 +9000,14 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 # Compute root-rule mods here (off main thread) — was ~930 ms
                 # of main-thread time on large modlists (read_mod_index + scan).
                 try:
-                    worker_root_rule_mods = self._compute_root_rule_mods()
+                    with perftrace.span("filemap._compute_root_rule_mods (worker)"):
+                        worker_root_rule_mods = self._compute_root_rule_mods(_worker_index)
                 except Exception:
                     worker_root_rule_mods = set()
                 def _done_wrapped():
                     self._root_rule_mods = worker_root_rule_mods
-                    _done(count,
+                    with perftrace.span("modlist._done (main thread)"):
+                      _done(count,
                           base_conflict_map, base_overrides, base_overridden_by,
                           bsa_conflict_map, bsa_overrides, bsa_overridden_by,
                           loose_over_bsa, bsa_over_loose,
@@ -9177,6 +9221,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self.after_cancel(self._marker_strip_after_id)
         self._marker_strip_after_id = self.after(250, self._draw_marker_strip)
 
+    @perftrace.timed("modlist._draw_marker_strip")
     def _draw_marker_strip(self):
         """Paint the combined scrollbar + marker strip.
 
