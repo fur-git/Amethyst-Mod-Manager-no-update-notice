@@ -59,6 +59,7 @@ from gui.theme import (
 import gui.theme as _theme
 from gui.theme import scaled
 from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
+from gui.mod_card import destroy_widget_tree
 from gui.ctk_components import CTkAlert, CTkNotification, CTkPopupMenu, CTkProgressPopup
 from gui.game_helpers import (
     _GAMES,
@@ -2657,9 +2658,35 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     # Hide other mod-only items on separators
                     c.itemconfigure(self._pool_category_text[s], state="hidden")
                     c.itemconfigure(self._pool_install_text[s], state="hidden")
-                    c.itemconfigure(self._pool_priority_text[s], state="hidden")
                     c.itemconfigure(self._pool_version_text[s], state="hidden")
                     c.itemconfigure(self._pool_size_text[s], state="hidden")
+
+                    # Priority column — for a collapsed separator, show the
+                    # priority range of the mods hidden inside its block
+                    # (e.g. "0 - 20"). Expanded separators show nothing.
+                    _prio_range_text = ""
+                    if _sep_is_collapsed:
+                        _blk_prios = [
+                            priorities[_bi]
+                            for _bi in self._sep_block_range(i)
+                            if _bi != i
+                            and not self._entries[_bi].is_separator
+                            and _bi in priorities
+                        ]
+                        if _blk_prios:
+                            _lo, _hi = min(_blk_prios), max(_blk_prios)
+                            _prio_range_text = (
+                                str(_lo) if _lo == _hi else f"{_lo} - {_hi}"
+                            )
+                    if _prio_range_text:
+                        prio_cx = _PRIO_X + _PRIO_W // 2
+                        c.coords(self._pool_priority_text[s], prio_cx, y_mid)
+                        c.itemconfigure(self._pool_priority_text[s],
+                                        text=_prio_range_text, anchor="center",
+                                        fill=TEXT_DIM, font=_FONT_SMALL,
+                                        state="normal")
+                    else:
+                        c.itemconfigure(self._pool_priority_text[s], state="hidden")
 
                     # Pool check widget — hidden for separators
                     c.itemconfigure(self._pool_cb_rect[s], state="hidden")
@@ -8079,15 +8106,32 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         panel.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._collections_panel = panel
 
+    def _release_memory_soon(self) -> None:
+        """Schedule a gc + malloc_trim after a heavy panel teardown settles."""
+        try:
+            self.after(50, self._do_release_memory)
+        except Exception:
+            pass
+
+    def _do_release_memory(self) -> None:
+        try:
+            from Utils.mem_release import release_memory
+            release_memory()
+        except Exception:
+            pass
+
     def _close_collections(self):
         """Destroy the inline collections panel and restore the modlist."""
         panel = getattr(self, "_collections_panel", None)
         if panel is not None:
             try:
-                panel.destroy()
+                # CTk-safe recursive teardown — a bare destroy() strands the
+                # panel's CTk children in CTk's global trackers (memory leak).
+                destroy_widget_tree(panel)
             except Exception:
                 pass
             self._collections_panel = None
+            self._release_memory_soon()
 
     def _on_workshop(self, entries: list):
         """Open the Workshop overlay over the modlist panel."""
@@ -8110,7 +8154,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         panel = getattr(self, "_workshop_panel", None)
         if panel is not None:
             try:
-                panel.destroy()
+                destroy_widget_tree(panel)
             except Exception:
                 pass
             self._workshop_panel = None
@@ -8195,17 +8239,21 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         panel = getattr(self, "_nexus_browser_panel", None)
         if panel is not None:
             try:
-                panel.destroy()
+                destroy_widget_tree(panel)
             except Exception:
                 pass
             self._nexus_browser_panel = None
         win = getattr(self, "_nexus_browser_window", None)
         if win is not None:
             try:
-                win.destroy()
+                destroy_widget_tree(win)
             except Exception:
                 pass
             self._nexus_browser_window = None
+        # The browser builds 4 heavy panels; once destroyed, hand the freed
+        # heap pages back to the OS (glibc otherwise keeps RSS pinned). Deferred
+        # so the destroy fully settles first.
+        self._release_memory_soon()
 
     def show_profile_settings(self, game_name: str, current_profile: str,
                                on_profile_renamed=None, on_profile_removed=None,
@@ -8231,7 +8279,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         panel = getattr(self, "_profile_settings_panel", None)
         if panel is not None:
             try:
-                panel.destroy()
+                destroy_widget_tree(panel)
             except Exception:
                 pass
             self._profile_settings_panel = None
@@ -8248,7 +8296,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         panel = getattr(self, "_changelog_panel", None)
         if panel is not None:
             try:
-                panel.destroy()
+                destroy_widget_tree(panel)
             except Exception:
                 pass
             self._changelog_panel = None

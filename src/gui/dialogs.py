@@ -15,7 +15,6 @@ import threading
 import tkinter as tk
 import tkinter.messagebox
 import tkinter.ttk as ttk
-import webbrowser
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1499,7 +1498,8 @@ class ProtonToolsPanel(ctk.CTkFrame):
                 try:
                     if not cache_path.is_file():
                         plog(f"Downloading .NET {version} runtime …")
-                        urllib.request.urlretrieve(dl_url, cache_path)
+                        from Utils.ca_bundle import download_file
+                        download_file(dl_url, cache_path)
                         plog("Download complete.")
                     else:
                         plog(f"Using cached .NET {version} installer.")
@@ -4740,7 +4740,8 @@ class DownloadCustomHandlerPanel(ctk.CTkFrame):
             import urllib.request as _urllib
             try:
                 req = _urllib.Request(download_url, headers={"User-Agent": "Amethyst-Mod-Manager"})
-                with _urllib.urlopen(req, timeout=15) as resp:
+                from Utils.ca_bundle import get_ssl_context
+                with _urllib.urlopen(req, timeout=15, context=get_ssl_context()) as resp:
                     data = resp.read().decode("utf-8", errors="replace")
                 # Validate JSON
                 _json.loads(data)
