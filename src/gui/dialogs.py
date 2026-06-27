@@ -1091,7 +1091,7 @@ class ProtonToolsPanel(ctk.CTkFrame):
         # --- Prefix tools ---------------------------------------------------
         _category("Prefix Tools", first=True)
         ctk.CTkButton(inner, text="Run winecfg",              command=self._run_winecfg,             **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Run protontricks",         command=self._run_protontricks,        **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Run winetricks",           command=self._run_protontricks,        **btn_cfg).pack(pady=(0, 6))
         ctk.CTkButton(inner, text="Run EXE in this prefix …", command=self._run_exe,                 **btn_cfg).pack(pady=(0, 6))
         ctk.CTkButton(inner, text="Open wine registry",       command=self._run_regedit,             **btn_cfg).pack(pady=(0, 6))
         ctk.CTkButton(inner, text="Wine DLL Overrides",       command=self._open_wine_dll_overrides, **btn_cfg).pack(pady=(0, 6))
@@ -1362,55 +1362,38 @@ class ProtonToolsPanel(ctk.CTkFrame):
             install_winetricks,
             winetricks_installed,
         )
-        from Utils.steam_finder import game_steam_id
-        steam_id = game_steam_id(self._game)
-        prefix_path = getattr(self._game, "_prefix_path", None)
         log = self._log
 
-        if shutil.which("protontricks") is not None and steam_id:
-            cmd = ["protontricks", steam_id, "--gui"]
-        elif shutil.which("flatpak") is not None and steam_id and subprocess.run(
-            ["flatpak", "info", "com.github.Matoking.protontricks"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0:
-            cmd = ["flatpak", "run", "com.github.Matoking.protontricks", steam_id, "--gui"]
-        elif prefix_path and prefix_path.is_dir():
-            def _launch_winetricks():
-                if not winetricks_installed():
-                    log("Proton Tools: winetricks not found — downloading …")
-                    if not install_winetricks(log_fn=lambda m: log(f"Proton Tools: {m}")):
-                        return
-                if not cabextract_installed():
-                    log("Proton Tools: cabextract not found — downloading a portable copy …")
-                    if not install_cabextract(log_fn=lambda m: log(f"Proton Tools: {m}")):
-                        return
-                wt = _bundled_winetricks()
-                env = os.environ.copy()
-                env["WINEPREFIX"] = str(prefix_path)
-                path_prefix = str(wt.parent)
-                proton_bin = _get_proton_bin()
-                if proton_bin:
-                    path_prefix = proton_bin + os.pathsep + path_prefix
-                env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
-                log("Proton Tools: launching winetricks GUI …")
-                try:
-                    subprocess.Popen([str(wt), "--gui"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-                except Exception as e:
-                    log(f"Proton Tools error: {e}")
-            self._close_and_run(_launch_winetricks)
-            return
-        else:
-            self._log("Proton Tools: protontricks is not installed and no prefix path is available.")
+        prefix_path = self._game.get_prefix_path()
+        if prefix_path is None or not prefix_path.is_dir():
+            log("Proton Tools: prefix not configured for this game — cannot launch winetricks.")
             return
 
-        def _launch():
-            log(f"Proton Tools: launching protontricks for app {steam_id}: It may take a while to open")
+        def _launch_winetricks():
+            if not winetricks_installed():
+                log("Proton Tools: winetricks not found — downloading …")
+                if not install_winetricks(log_fn=lambda m: log(f"Proton Tools: {m}")):
+                    return
+            if not cabextract_installed():
+                log("Proton Tools: cabextract not found — downloading a portable copy …")
+                if not install_cabextract(log_fn=lambda m: log(f"Proton Tools: {m}")):
+                    return
+            wt = _bundled_winetricks()
+            env = os.environ.copy()
+            env["WINEPREFIX"] = str(prefix_path)
+            path_prefix = str(wt.parent)
+            proton_bin = _get_proton_bin()
+            if proton_bin:
+                path_prefix = proton_bin + os.pathsep + path_prefix
+            env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
+            log(f"Proton Tools: launching winetricks GUI against {prefix_path} …")
             try:
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen([str(wt), "--gui"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
             except Exception as e:
                 log(f"Proton Tools error: {e}")
-        self._close_and_run(_launch)
+
+        self._close_and_run(_launch_winetricks)
 
     def _run_exe(self):
         proton_script, env = self._get_proton_env()
@@ -2920,7 +2903,7 @@ class ExeConfigPanel(ctk.CTkFrame):
                 command=self._run_exe_in_prefix, **small_btn,
             ).pack(side="left", padx=(0, 6))
             ctk.CTkButton(
-                btn_row, text="Run protontricks", width=140,
+                btn_row, text="Run winetricks", width=140,
                 command=self._run_protontricks_in_prefix, **small_btn,
             ).pack(side="left", padx=(0, 6))
             ctk.CTkButton(
@@ -3239,40 +3222,8 @@ class ExeConfigPanel(ctk.CTkFrame):
         result = self._get_selected_tool_env()
         if result is None:
             return
-        proton_script, prefix_dir, env = result
-
-        from Utils.steam_finder import game_steam_id
-        steam_id = game_steam_id(self._game)
-
-        if shutil.which("protontricks") is not None:
-            cmd = ["protontricks"]
-            if steam_id:
-                cmd += [steam_id, "--gui"]
-            else:
-                cmd += ["--gui"]
-        elif shutil.which("flatpak") is not None and subprocess.run(
-            ["flatpak", "info", "com.github.Matoking.protontricks"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0:
-            cmd = ["flatpak", "run", "com.github.Matoking.protontricks"]
-            if steam_id:
-                cmd += [steam_id, "--gui"]
-            else:
-                cmd += ["--gui"]
-        else:
-            self._launch_winetricks_gui_in_prefix(prefix_dir / "pfx")
-            return
-
-        env["STEAM_COMPAT_DATA_PATH"] = str(prefix_dir)
-        env["PROTON_VERSION"] = proton_script.parent.name
-        self._log(f"Prefix tools: launching protontricks for prefix {prefix_dir.name} …")
-        try:
-            subprocess.Popen(
-                cmd, env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            self._log(f"Prefix tools error: {e}")
+        _proton_script, prefix_dir, _env = result
+        self._launch_winetricks_gui_in_prefix(prefix_dir / "pfx")
 
     def _launch_winetricks_gui_in_prefix(self, wineprefix: Path):
         from Utils.protontricks import (
@@ -3286,8 +3237,8 @@ class ExeConfigPanel(ctk.CTkFrame):
 
         if not wineprefix.is_dir():
             self._log(
-                "Prefix tools: protontricks not found and no Wine prefix is "
-                "available — cannot launch winetricks."
+                "Prefix tools: no Wine prefix is available — cannot launch "
+                "winetricks."
             )
             return
         if not winetricks_installed():
@@ -6000,6 +5951,35 @@ class MissingReqsPanel(ctk.CTkFrame):
 
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def _resolve_ids_directly(self, domain, ids, seen):
+        """Resolve requirement *ids* by fetching each mod's own Nexus page.
+
+        Used when the parent mod has no Nexus mod_id of its own (mod_id == 0),
+        e.g. the locally-built Tale of Two Wastelands mod whose requirements
+        were seeded straight into meta.ini. Returns a list of
+        ``NexusModRequirement`` (built from each mod's get_mod details), skipping
+        ids already in *seen*. Individual fetch failures fall back to a minimal
+        requirement entry so the mod is still listed and installable by id.
+        """
+        from Nexus.nexus_api import NexusModRequirement
+        out = []
+        for rid in sorted(ids):
+            if rid in seen:
+                continue
+            seen.add(rid)
+            try:
+                info = self._api.get_mod(domain, rid)
+                name = getattr(info, "name", "") or f"Mod {rid}"
+                summary = getattr(info, "summary", "") or ""
+            except Exception:
+                name, summary = f"Mod {rid}", ""
+            out.append(NexusModRequirement(
+                mod_id=rid, mod_name=name, game_domain=domain,
+                url=f"https://www.nexusmods.com/{domain}/mods/{rid}",
+                notes=summary,
+            ))
+        return out
+
     def _worker(self):
         err = None
         missing_list = []
@@ -6010,6 +5990,13 @@ class MissingReqsPanel(ctk.CTkFrame):
                 seen: set = set()
                 errors: list[str] = []
                 for m in self._mods:
+                    # Locally-built mods (mod_id 0) have no parent requirements
+                    # list — resolve each seeded id on its own page instead.
+                    if not m.get("mod_id"):
+                        missing_list.extend(
+                            self._resolve_ids_directly(
+                                m["domain"], m["missing_ids"], seen))
+                        continue
                     try:
                         all_reqs = self._api.get_mod_requirements(
                             m["domain"], m["mod_id"])
@@ -6022,6 +6009,11 @@ class MissingReqsPanel(ctk.CTkFrame):
                             missing_list.append(r)
                 if not missing_list and errors:
                     err = "Could not load requirements: " + "; ".join(errors)
+            elif not self._mod_id:
+                # Single mod with no Nexus mod_id of its own — resolve each
+                # seeded requirement id directly.
+                missing_list = self._resolve_ids_directly(
+                    self._domain, self._missing_ids, set())
             else:
                 all_reqs = self._api.get_mod_requirements(self._domain, self._mod_id)
                 for r in all_reqs:
