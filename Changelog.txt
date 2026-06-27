@@ -1,20 +1,35 @@
 - v1.3.12
-- Fixed memory leak issues related to the nexus browser and collection windows
-- Priority numbers are now shown in collapsed separators
-- Potential fix for users who get ssl cert errors when using proton tools
-- Running an application via the Run exe button will now open the applications wizard tool if it has one
+## Additions
 - Added a wizard for Creation kit
-- Tweaked mod installer to work with nexus's new mod filename format
-- Fixed a bcj2 error in some wizard tools in the flatpak version
-- Added option to disable load order prepending to 7DTD mod folders
-- Fixed scaling issue in the collection browser
-- Added update checking for bg3 mods installed via mod.io (Api key is set in the wizard menu for bg3)
-- Double clicking a mod will now open it on disk
-- Added a search bar to the add game menu
-- Clicking a conflict flag now opens the "Show conflicts" window
-- Profiles can now use their own game install path and prefix path as well as config options
-- Moved the fonts folder to ./local/share instead of being created in the home folder
 - Added a Tales of Two Wastelands installer and setup wizard
+- Added update checking for bg3 mods installed via mod.io (Api key is set in the wizard menu for bg3)
+- Added option to disable load order prepending to 7DTD mod folders
+- Added a search bar to the add game menu
+- Added a popout button to the show conflicts and change version windows
+- Profiles can now use their own game install path and prefix path as well as config options
+- Double clicking a mod will now open it on disk
+- Priority numbers are now shown in collapsed separators
+- Clicking a conflict flag now opens the "Show conflicts" window
+- Added a warning if a .fomod file contains a C# script that we can't run
+- Added a select/deselect all option to the downloads panel as well as being able to shift+click mods in the panel
+- Added some missing required top level folders for Morrowind
+## Bug Fixes
+- Fixed memory leak issues related to the Nexus browser and collection windows
+- Potential fix for users who get ssl cert errors when using proton tools
+- Fixed an issue where root folder routing would take 1-2 seconds to calculate, Causing ui slowdowns with large modlists (It's now instant)
+- Fixed a bcj2 error in some wizard tools in the flatpak version
+- Fixed scaling issue in the collection browser
+- Fixed some buttons not opening the correct browser
+- Fixed generate separators not working correctly on xfs filesystems
+- Fixed non loose lua files being routed incorrectly for Re engine games
+- Fixed not being able to move mods to the last position in a separator with reverse priority sorting
+- Removed the automated dtkit patch on deploy/restore from Darktide
+## Changes
+- Tweaked mod installer to work with Nexus's new mod filename format
+- Running an application via the Run exe button will now open the applications wizard tool if it has one
+- Moved the fonts folder to ./local/share instead of being created in the home folder
+- The workshop now includes disabled mods, Ini files and save files on export
+- Removed protontricks option in the proton window in favour of winetricks
 
 - v1.3.11
 - Reworked RE engine bundle style mods to be detected and presented better, an interface can now be opened for these mods to change the options.
