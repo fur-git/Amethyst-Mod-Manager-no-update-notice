@@ -12,21 +12,13 @@ import re
 import shutil
 from pathlib import Path
 
-from Games.base_game import BaseGame, WizardTool
+from Games.base_game import BaseGame, WizardTool, MODERN_DIRECTX_DEPS
 from Utils.atomic_write import write_atomic_text
 from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, move_to_core, restore_data_core
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
-
-# Prefix deps auto-installed on first add for the modern 64-bit Creation Engine
-# games (Skyrim SE/VR, Fallout 4/4VR, Starfield, EnderalSE): their *SE DLL
-# plugins silently fail to load without the VC++ x64 runtime, and Community
-# Shaders / ENB need the fxc2 d3dcompiler_47. Installed via the Proton-menu
-# installers, not winetricks — see base_game.auto_install_deps. The older 32-bit
-# Gamebryo titles (Oblivion/FO3/FNV/Skyrim LE) don't need these.
-_MODERN_CREATION_ENGINE_DEPS = ["vcredist", "d3dcompiler_47"]
 
 
 def _read_ini_key(ini_path: Path, section: str, key: str) -> "str | None":
@@ -147,6 +139,12 @@ class Fallout_3(BaseGame):
         "PointLookout.esm", "Zeta.esm",
     ]
     synthesis_registry_name = "Fallout3"
+
+    # Auto-install the VC++ x64 runtime + fxc2 d3dcompiler_47 on add/save for
+    # every Bethesda title (inherited by all subclasses below). The modern
+    # Creation Engine games genuinely need them; the older Gamebryo titles
+    # don't, but installing is harmless.
+    auto_install_deps = MODERN_DIRECTX_DEPS
 
     # paths.json extras that a non-default profile may override (per-profile).
     # heroic_app_name etc. are deliberately excluded so they stay global.
@@ -1739,7 +1737,6 @@ class Fallout_4(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Fallout4.ccc"
     synthesis_registry_name = "Fallout4"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -1864,7 +1861,6 @@ class Fallout_4VR(Fallout_3):
     vanilla_plugins = ["Fallout4.esm", "Fallout4_VR.esm"]
     vanilla_dlc_plugins: list[str] = []
     synthesis_registry_name = "Fallout 4 VR"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2198,7 +2194,6 @@ class SkyrimVR(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Skyrim.ccc"
     synthesis_registry_name = "Skyrim VR"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2317,7 +2312,6 @@ class Starfield(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Starfield.ccc"
     synthesis_registry_name = "Starfield"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2611,7 +2605,6 @@ class EnderalSE(Fallout_3):
     ]
     vanilla_dlc_plugins: list[str] = []
     synthesis_registry_name = "Enderal Special Edition"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def name(self) -> str:

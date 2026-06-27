@@ -10,7 +10,7 @@ Mod structure:
 import json
 from pathlib import Path
 
-from Games.base_game import BaseGame
+from Games.base_game import BaseGame, MODERN_DIRECTX_DEPS
 from Utils.deploy import (
     CustomRule,
     LinkMode,
@@ -30,6 +30,11 @@ _PROFILES_DIR = get_profiles_dir()
 
 
 class Cyberpunk2077(BaseGame):
+
+    # Many script/ENB-style Cyberpunk mods need the VC++ x64 runtime + fxc2
+    # d3dcompiler_47; auto-install them on add/save like the modern Bethesda
+    # titles. Installed via the Proton-menu installers, not winetricks.
+    auto_install_deps = MODERN_DIRECTX_DEPS
 
     def __init__(self):
         self._game_path: Path | None = None

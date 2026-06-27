@@ -25,6 +25,13 @@ if TYPE_CHECKING:
     from typing import Any
 
 
+# Shared auto_install_deps preset for modern DirectX/x64-runtime games (modern
+# Bethesda Creation Engine titles, Cyberpunk 2077, etc.): their script/SE/ENB
+# DLL plugins need the VC++ x64 runtime and Community Shaders / ENB need the
+# fxc2 d3dcompiler_47. Installed via the Proton-menu installers, not winetricks.
+MODERN_DIRECTX_DEPS = ["vcredist", "d3dcompiler_47"]
+
+
 # Shared serialisation tables for load_paths/save_paths. Note that we map both
 # "symlink" and "copy" → SYMLINK on read — historically the user-facing "copy"
 # option was renamed to symlink years ago and the saved string can be either.
