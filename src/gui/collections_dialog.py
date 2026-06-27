@@ -4553,9 +4553,32 @@ class CollectionDetailDialog(tk.Frame):
         game_name = getattr(self._game, "name", "") or ""
         allowed_targets = GAME_INI_TARGETS.get(game_name)
 
+        # Profile-specific INIs now live in the profile's "ini files" subdir,
+        # which is what _symlink_profile_ini_files links into My Games at deploy.
+        # Writing tweaks to the profile root no longer works, so route them into
+        # that subdir and make sure the feature is enabled so the symlink runs.
+        ini_target_dir = profile_dir
+        profile_name = profile_dir.name
+        get_ini_dir = getattr(self._game, "_profile_ini_dir", None)
+        if callable(get_ini_dir):
+            try:
+                ini_target_dir = get_ini_dir(profile_name)
+                ini_target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self._log(f"Collection INI tweaks: could not resolve profile "
+                          f"'ini files' folder ({exc}) — using profile root")
+                ini_target_dir = profile_dir
+        if not getattr(self._game, "profile_ini_files", False):
+            try:
+                self._game.set_profile_ini_files(True)
+                self._log("Collection INI tweaks: enabled profile-specific INI files")
+            except Exception as exc:
+                self._log(f"Collection INI tweaks: could not enable profile INI "
+                          f"files ({exc})")
+
         result = apply_collection_ini_tweaks(
             archive_root=archive_root,
-            profile_dir=profile_dir,
+            profile_dir=ini_target_dir,
             prefix_ini_dir=prefix_ini_dir,
             set_ini_key=_set_ini_key,
             read_ini_key=_read_ini_key,
