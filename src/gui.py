@@ -78,6 +78,45 @@ _UI_SCALE = load_ui_scale()
 # scaling` to the design baseline, and CustomTkinter renders all fonts as
 # negative-pixel sizes which ignore Xft.dpi entirely.
 
+# CustomTkinter's FontManager copies its bundled fonts into ~/.fonts (a legacy,
+# non-XDG location) and mkdir's that dir at import time. To keep the home folder
+# clean we redirect it to the XDG user font dir (~/.local/share/fonts).
+#
+# The mkdir + font copies run unconditionally inside font/__init__.py the first
+# time customtkinter is imported, so simply setting the attribute afterwards is
+# too late — ~/.fonts is already created. Instead we load font_manager.py as its
+# fully-qualified module and seed it into sys.modules *before* importing ctk;
+# CTk's `from .font_manager import FontManager` then picks up our patched class,
+# so the import-time mkdir/copy target the XDG dir and ~/.fonts is never made.
+try:
+    import os as _os
+    import importlib.util as _ilu
+    import sys as _sys
+
+    _xdg_fonts = _os.path.join(
+        _os.environ.get("XDG_DATA_HOME", _os.path.expanduser("~/.local/share")),
+        "fonts",
+    )
+    _os.makedirs(_xdg_fonts, exist_ok=True)
+
+    # find_spec on the top package returns its location WITHOUT executing the
+    # package __init__ (which is what triggers the font init we're racing).
+    _ctk_spec = _ilu.find_spec("customtkinter")
+    if _ctk_spec and _ctk_spec.submodule_search_locations:
+        _fm_name = "customtkinter.windows.widgets.font.font_manager"
+        _fm_path = _os.path.join(
+            _ctk_spec.submodule_search_locations[0],
+            "windows", "widgets", "font", "font_manager.py",
+        )
+        if _fm_name not in _sys.modules and _os.path.isfile(_fm_path):
+            _fm_spec = _ilu.spec_from_file_location(_fm_name, _fm_path)
+            _fm_mod = _ilu.module_from_spec(_fm_spec)
+            _fm_spec.loader.exec_module(_fm_mod)
+            _fm_mod.FontManager.linux_font_path = _xdg_fonts + _os.sep
+            _sys.modules[_fm_name] = _fm_mod
+except Exception:
+    pass
+
 import customtkinter as ctk
 
 ctk.set_widget_scaling(_UI_SCALE)
