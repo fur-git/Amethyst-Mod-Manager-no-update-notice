@@ -241,45 +241,52 @@ def _optimise_one_texture(args: tuple) -> str:
     if not dds_path.is_file():
         return f"SKIP (missing): {dds_path.name}"
 
-    try:
-        from PIL import Image
+    cli_dir = comp_cli.parent
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
+        str(cli_dir),
+        str(cli_dir / "pkglibs"),
+        str(cli_dir / "qt"),
+        env.get("LD_LIBRARY_PATH", ""),
+    ]))
 
+    def _run_compress(src: Path, out_file: Path, resize: bool) -> subprocess.CompletedProcess:
+        # Compressonator reads BC-compressed DDS natively, so let it do the
+        # resize too (-width/-height) — this avoids handing an already-BC7
+        # DDS to Pillow, which can't decode it ("Unimplemented DXGI format 72").
+        cmd = [str(comp_cli), "-fd", target_fmt, "-miplevels", "1"]
+        if resize:
+            cmd += ["-width", str(target_w), "-height", str(target_h)]
+        cmd += [str(src), str(out_file)]
+        return subprocess.run(
+            cmd, env=env,
+            capture_output=True, text=True, errors="replace",
+            # BC7 encoding of large textures on Deck-class CPUs (with several
+            # parallel workers) can legitimately exceed 5 min, so allow more.
+            timeout=900,
+        )
+
+    try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-
-            # Resize with Pillow if needed
-            if needs_resize:
-                img = Image.open(dds_path)
-                resized = img.resize((target_w, target_h), Image.LANCZOS)
-                src_for_compress = tmp_path / "resized.tga"
-                resized.save(src_for_compress)
-            else:
-                src_for_compress = dds_path
-
-            # Compress with Compressonator
             out_file = tmp_path / "output.dds"
-            cmd = [
-                str(comp_cli),
-                "-fd", target_fmt,
-                "-miplevels", "1",
-                str(src_for_compress),
-                str(out_file),
-            ]
 
-            cli_dir = comp_cli.parent
-            env = os.environ.copy()
-            env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-                str(cli_dir),
-                str(cli_dir / "pkglibs"),
-                str(cli_dir / "qt"),
-                env.get("LD_LIBRARY_PATH", ""),
-            ]))
+            # Primary path: Compressonator handles decode + resize + encode.
+            result = _run_compress(dds_path, out_file, needs_resize)
 
-            result = subprocess.run(
-                cmd, env=env,
-                capture_output=True, text=True, errors="replace",
-                timeout=300,
-            )
+            # Fallback: if Compressonator couldn't read/resize the source, try a
+            # Pillow pre-resize to TGA (works for formats Pillow can decode).
+            if (result.returncode != 0 or not out_file.is_file()) and needs_resize:
+                try:
+                    from PIL import Image
+
+                    img = Image.open(dds_path)
+                    resized = img.resize((target_w, target_h), Image.LANCZOS)
+                    tga_src = tmp_path / "resized.tga"
+                    resized.save(tga_src)
+                    result = _run_compress(tga_src, out_file, resize=False)
+                except Exception:
+                    pass  # keep the original Compressonator failure below
 
             if result.returncode != 0 or not out_file.is_file():
                 stderr_snippet = (result.stderr or result.stdout or "")[:200]
@@ -291,6 +298,8 @@ def _optimise_one_texture(args: tuple) -> str:
         action = f"resized to {target_w}x{target_h} and " if needs_resize else ""
         return f"OK: {dds_path.name} — {action}converted to {target_fmt}"
 
+    except subprocess.TimeoutExpired:
+        return f"ERROR: {dds_path.name} — compression timed out (900s)"
     except Exception as exc:
         return f"ERROR: {dds_path.name} — {exc}"
 

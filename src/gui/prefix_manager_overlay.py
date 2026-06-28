@@ -224,6 +224,26 @@ def _enumerate_prefixes() -> list[PrefixEntry]:
                 proton=d.name[len("shared_"):],
             ))
 
+        # Isolated wizard prefixes relocated into wine_prefixes/ because their
+        # exe lives somewhere a prefix shouldn't go (e.g. CreationKit.exe in the
+        # game root → creationkit_<Proton>/).
+        try:
+            isolated_dirs = [
+                d for d in wine_root.iterdir()
+                if d.is_dir() and d.name.startswith("creationkit_")
+            ]
+        except OSError:
+            isolated_dirs = []
+        for d in isolated_dirs:
+            _add(PrefixEntry(
+                key=str(d),
+                path=d,
+                tool="Creation Kit",
+                game="Skyrim Special Edition",
+                location="wine_prefixes",
+                proton=d.name[len("creationkit_"):],
+            ))
+
     out.sort(key=lambda e: (e.game.lower(), e.tool.lower(), e.proton.lower()))
     return out
 
@@ -344,26 +364,30 @@ class PrefixManagerOverlay(ctk.CTkFrame):
 
         btn_row = tk.Frame(action, bg=BG_DEEP)
         btn_row.grid(row=1, column=0, sticky="ew")
-        for col in range(4):
-            btn_row.grid_columnconfigure(col, weight=1, uniform="prefix_btns")
+        # All / None are short; the Delete buttons carry longer bold labels and
+        # need more room, so weight their columns higher (no uniform sizing).
+        btn_row.grid_columnconfigure(0, weight=2)
+        btn_row.grid_columnconfigure(1, weight=2)
+        btn_row.grid_columnconfigure(2, weight=3)
+        btn_row.grid_columnconfigure(3, weight=3)
 
         ctk.CTkButton(
             btn_row, text="All",
-            height=30,
+            height=30, width=60,
             fg_color="#3a4a5a", hover_color="#4a6a7a", text_color="white",
             font=FONT_NORMAL, command=self._select_all,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         ctk.CTkButton(
             btn_row, text="None",
-            height=30,
+            height=30, width=60,
             fg_color="#3a4a5a", hover_color="#4a6a7a", text_color="white",
             font=FONT_NORMAL, command=self._select_none,
         ).grid(row=0, column=1, sticky="ew", padx=(0, 4))
 
         self._del_sel_btn = ctk.CTkButton(
             btn_row, text="Delete Selected",
-            height=30,
+            height=30, width=130,
             fg_color="#5a3a00", hover_color="#7a5200", text_color="white",
             font=FONT_BOLD, command=self._on_delete_selected,
         )
@@ -371,7 +395,7 @@ class PrefixManagerOverlay(ctk.CTkFrame):
 
         self._del_all_btn = ctk.CTkButton(
             btn_row, text="Delete All",
-            height=30,
+            height=30, width=110,
             fg_color="#a83232", hover_color="#c43c3c", text_color="white",
             font=FONT_BOLD, command=self._on_delete_all,
         )
@@ -624,14 +648,18 @@ class PrefixManagerOverlay(ctk.CTkFrame):
 
 
 def _is_deletable_prefix(path: Path) -> bool:
-    """True for prefix_* dirs, the shared_<Proton> wizard prefixes, or a known
-    shared wine_prefixes/<tool> dir."""
+    """True for prefix_* dirs, the shared_<Proton> / creationkit_<Proton> wizard
+    prefixes, or a known shared wine_prefixes/<tool> dir."""
     if path.name.startswith("prefix_"):
         return True
     try:
         return (
             path.parent == get_wine_prefixes_dir()
-            and (path.name in _WINE_PREFIX_TOOLS or path.name.startswith("shared_"))
+            and (
+                path.name in _WINE_PREFIX_TOOLS
+                or path.name.startswith("shared_")
+                or path.name.startswith("creationkit_")
+            )
         )
     except Exception:
         return False

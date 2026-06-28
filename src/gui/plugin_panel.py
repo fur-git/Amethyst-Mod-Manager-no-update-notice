@@ -91,6 +91,7 @@ from Utils.profile_state import (
 )
 from Utils.filemap import OVERWRITE_NAME as _OVERWRITE_NAME, build_filemap
 from Utils.xdg import xdg_open, open_url
+from Utils import perftrace
 from Utils.plugins import (
     PluginEntry,
     read_plugins,
@@ -667,6 +668,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._loot_info: dict[str, dict] = {}
         self._esl_flagged_plugins: set[str] = set()  # lowercase plugin names with ESL flag set
         self._master_flag_plugins: set[str] = set()  # lowercase .esp names with the master header bit
+        self._master_flags_resolved: bool = True      # False until header flags are known (filemap built)
         self._esl_safe_plugins: set[str] = set()    # lowercase plugin names eligible for ESL flag
         self._esl_unsafe_plugins: set[str] = set()  # lowercase plugin names ineligible for ESL flag
         # Cache for ESL eligibility results.
@@ -2714,6 +2716,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
     # Public entry point
     # ------------------------------------------------------------------
 
+    @perftrace.timed("plugin.load_plugins")
     def load_plugins(self, plugins_path: Path, plugin_extensions: list[str]) -> None:
         """Load plugins.txt for the given path and extension list."""
         self._plugins_path = plugins_path
@@ -3182,6 +3185,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._filemap_parse_cache_sig = sig
         return entries
 
+    @perftrace.timed("plugin._refresh_plugins_tab")
     def _refresh_plugins_tab(self) -> None:
         """Reload plugin entries from plugins.txt and redraw."""
         try:
@@ -3425,6 +3429,13 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         """
         if not self._master_block_enabled() or not self._plugin_entries:
             return False
+        # Don't reorder while master header flags are unknown (filemap not built
+        # yet — e.g. a freshly-imported profile). With flags unresolved, every
+        # master-flagged .esp looks like a normal plugin and would be wrongly
+        # demoted below the master block, corrupting loadorder.txt on save. Leave
+        # the order untouched until a refresh has read the real flags.
+        if not getattr(self, "_master_flags_resolved", True):
+            return False
         masters: list[PluginEntry] = []
         others: list[PluginEntry] = []
         for e in self._plugin_entries:
@@ -3570,6 +3581,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
         self._plugin_esl_counter_label.configure(text=texts[1])
         self._plugin_non_esl_counter_label.configure(text=texts[2])
 
+    @perftrace.timed("plugin._predraw")
     def _predraw(self, update_counters: bool = True):
         """Redraw by reconfiguring the pre-allocated pool of canvas items."""
         self._predraw_after_id = None
@@ -3863,6 +3875,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             self.after_cancel(self._marker_strip_after_id)
         self._marker_strip_after_id = self.after(250, self._draw_marker_strip)
 
+    @perftrace.timed("plugin._draw_marker_strip")
     def _draw_marker_strip(self):
         """Paint the combined scrollbar + marker strip.
 
@@ -4082,6 +4095,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             self._version_mismatch_masters = {}
             self._plugin_mod_map = {}
             self._master_flag_plugins = set()
+            self._master_flags_resolved = True
             self._masters_cache_key = None
             return
 
@@ -4304,23 +4318,36 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
     # ------------------------------------------------------------------
 
     def _load_master_flags(self, plugin_paths: "dict[str, Path]") -> None:
-        """Populate _master_flag_plugins (master header bit on non-.esm/.esl files)."""
+        """Populate _master_flag_plugins (master header bit on non-.esm/.esl files).
+
+        Also records ``_master_flags_resolved``: whether every non-.esm/.esl
+        plugin could be resolved to a file on disk so its header flag is known.
+        When the filemap hasn't been built yet (e.g. a freshly-imported profile)
+        ``plugin_paths`` is empty and the flags are unknown — the master-block
+        enforcement must NOT run in that state, or master-flagged .esp plugins
+        would be wrongly demoted and the load order corrupted on save.
+        """
         if not self._master_block_enabled():
             self._master_flag_plugins = set()
+            self._master_flags_resolved = True
             return
         flagged: set[str] = set()
         cache: dict = getattr(self, "_master_flag_cache", {})
         self._master_flag_cache = cache
+        resolved = True
         for entry in self._plugin_entries:
             name_lower = entry.name.lower()
             if name_lower.endswith((".esm", ".esl")):
                 continue  # master by extension — no header read needed
             path = plugin_paths.get(name_lower)
-            if path is None:
+            if path is None or not Path(path).is_file():
+                # Header flag unknown for this plugin (filemap not built yet).
+                resolved = False
                 continue
             try:
                 st = os.stat(str(path))
             except OSError:
+                resolved = False
                 continue
             stat_key = (str(path), st.st_mtime_ns, st.st_size)
             flag_val = cache.get(stat_key)
@@ -4333,6 +4360,7 @@ class PluginPanel(PluginPanelExeLauncherMixin, PluginPanelLOOTMixin,
             if flag_val:
                 flagged.add(name_lower)
         self._master_flag_plugins = flagged
+        self._master_flags_resolved = resolved
 
     def _load_esl_flags(self, plugin_paths: "dict[str, Path]") -> None:
         """Populate _esl_flagged_plugins / _esl_safe_plugins / _esl_unsafe_plugins

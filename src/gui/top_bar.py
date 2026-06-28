@@ -478,6 +478,10 @@ class TopBar(ctk.CTkFrame):
                 / "profiles" / self._profile_var.get()
             )
             game.set_active_profile_dir(profile_dir)
+            # Re-resolve paths for the newly active profile so any per-profile
+            # game/prefix/deploy-mode overrides take effect (or fall back to the
+            # default profile's paths when this profile has none).
+            game.load_paths()
             # Update plugin panel paths BEFORE load_game, because load_game
             # triggers _rebuild_filemap → _on_filemap_rebuilt which reads
             # _plugins_path. If we update after, the old game's path is used.
@@ -632,6 +636,9 @@ class TopBar(ctk.CTkFrame):
                 self._log(f"Profile removal blocked: {_mount_err}")
                 return
             game.set_active_profile_dir(profile_dir)
+            # Resolve this profile's own paths before restoring so files are
+            # repatriated to the right game folder when it overrides them.
+            game.load_paths()
             try:
                 if hasattr(game, "restore"):
                     game.restore()
@@ -1067,6 +1074,10 @@ class TopBar(ctk.CTkFrame):
                     game.set_active_profile_dir(
                         game.get_profile_root() / "profiles" / last_deployed
                     )
+                    # Re-resolve paths for the last-deployed profile in case it
+                    # overrides game_path/prefix (per-profile paths).
+                    game.load_paths()
+                game_root = game.get_game_path()
                 if hasattr(game, "restore"):
                     game.restore(log_fn=_tlog, progress_fn=_progress)
                 else:
@@ -1083,6 +1094,7 @@ class TopBar(ctk.CTkFrame):
                 game.set_active_profile_dir(
                     game.get_profile_root() / "profiles" / current_profile
                 )
+                game.load_paths()
                 self.after(0, lambda: self._set_deploy_buttons_enabled(True))
                 self.after(0, self._reload_mod_panel)
                 self.after(1500, status_bar.clear_progress)

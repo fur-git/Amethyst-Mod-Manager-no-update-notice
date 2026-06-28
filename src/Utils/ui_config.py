@@ -226,13 +226,55 @@ def _run_capture(argv: list[str], timeout: int = 3) -> str:
     return ""
 
 
-def get_monitor_rects() -> list[tuple[int, int, int, int]]:
-    """Return list of (x, y, w, h) for every connected monitor, in xrandr/wlr-randr order.
+def _gdk_monitor_rects() -> list[tuple[int, int, int, int]]:
+    """Return per-monitor (x, y, w, h) via Gdk — no external binary needed.
 
-    Returns [] if no display query tool succeeds. Inside Flatpak the sandbox
-    has no xrandr binary, so falls through to ``flatpak-spawn --host`` with
-    ``--directory=/`` (the sandbox cwd /app/... doesn't exist on the host).
+    PyGObject/Gdk is a hard dependency (the GTK splash and file portal use it),
+    so this works even on bare WMs (DWM, i3) that ship no xrandr/wlr-randr.
+    Gdk reports each monitor's *logical* geometry (the mode actually in use),
+    which is exactly what we want for window placement. Tries GTK4's
+    Display.get_monitors() first, then GTK3's get_n_monitors()/get_monitor().
     """
+    try:
+        import gi
+        try:
+            gi.require_version("Gdk", "4.0")
+        except Exception:
+            gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk
+        display = Gdk.Display.get_default()
+        if display is None:
+            return []
+        rects: list[tuple[int, int, int, int]] = []
+        # GTK4: get_monitors() -> Gio.ListModel of Gdk.Monitor
+        if hasattr(display, "get_monitors"):
+            monitors = display.get_monitors()
+            n = monitors.get_n_items()
+            for i in range(n):
+                g = monitors.get_item(i).get_geometry()
+                rects.append((g.x, g.y, g.width, g.height))
+        # GTK3: get_n_monitors()/get_monitor(i)
+        elif hasattr(display, "get_n_monitors"):
+            for i in range(display.get_n_monitors()):
+                g = display.get_monitor(i).get_geometry()
+                rects.append((g.x, g.y, g.width, g.height))
+        return rects
+    except Exception:
+        return []
+
+
+def get_monitor_rects() -> list[tuple[int, int, int, int]]:
+    """Return list of (x, y, w, h) for every connected monitor.
+
+    Source order: Gdk (no binary needed, works on bare WMs and reports the
+    in-use mode) → xrandr (X11) → wlr-randr (wlroots Wayland). Returns [] if
+    all fail. Inside Flatpak the sandbox has no xrandr binary, so the CLI paths
+    fall through to ``flatpak-spawn --host`` with ``--directory=/`` (the
+    sandbox cwd /app/... doesn't exist on the host).
+    """
+    rects = _gdk_monitor_rects()
+    if rects:
+        return rects
     out = _run_capture(["xrandr", "--current"])
     if not out:
         out = _run_capture(["flatpak-spawn", "--host", "--directory=/", "xrandr", "--current"])

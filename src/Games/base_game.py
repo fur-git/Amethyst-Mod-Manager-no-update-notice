@@ -25,18 +25,36 @@ if TYPE_CHECKING:
     from typing import Any
 
 
+# Shared auto_install_deps preset for modern DirectX/x64-runtime games (modern
+# Bethesda Creation Engine titles, Cyberpunk 2077, etc.): their script/SE/ENB
+# DLL plugins need the VC++ x64 runtime and Community Shaders / ENB need the
+# fxc2 d3dcompiler_47. Installed via the Proton-menu installers, not winetricks.
+MODERN_DIRECTX_DEPS = ["vcredist", "d3dcompiler_47"]
+
+
 # Shared serialisation tables for load_paths/save_paths. Note that we map both
 # "symlink" and "copy" → SYMLINK on read — historically the user-facing "copy"
 # option was renamed to symlink years ago and the saved string can be either.
+# Games that genuinely deploy by copying (7DTD, Morrowind, OpenMW) set
+# deploy_mode_supports_copy = True to use _DEPLOY_MODE_FROM_STR_COPY instead.
 _DEPLOY_MODE_FROM_STR: dict[str, LinkMode] = {
     "symlink": LinkMode.SYMLINK,
     "copy":    LinkMode.SYMLINK,
+}
+_DEPLOY_MODE_FROM_STR_COPY: dict[str, LinkMode] = {
+    "symlink": LinkMode.SYMLINK,
+    "copy":    LinkMode.COPY,
 }
 _DEPLOY_MODE_TO_STR: dict[LinkMode, str] = {
     LinkMode.SYMLINK: "symlink",
     LinkMode.COPY:    "copy",
 }
 _DEFAULT_DEPLOY_MODE = LinkMode.HARDLINK
+
+# Sentinel for "key absent" / "no change" when diffing a profile's settings or
+# paths against their effective value (so a real value of None/False/"" is never
+# confused with unset, and "no override to write" is distinct from a real value).
+_UNSET = object()
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +86,32 @@ class WizardTool:
 
 
 class BaseGame(ABC):
+
+    # -----------------------------------------------------------------------
+    # Per-profile setting overrides
+    # -----------------------------------------------------------------------
+    # Keys a non-default profile may override (default keeps the global value):
+    #   profile_overridable_settings       → game_settings.json keys (via
+    #                                         _load_settings/_save_settings)
+    #   profile_overridable_paths_extras   → paths.json extras (via
+    #                                         _load_paths_extra/_save_paths_extra)
+    # Subclasses extend these; unlisted keys stay global for all profiles
+    # (e.g. heroic_app_name, a game-detection detail).
+    #
+    # True for games that deploy by copying files (so the saved "copy" deploy
+    # mode is preserved instead of collapsing to symlink).
+    deploy_mode_supports_copy: bool = False
+
+    # LinkMode used when a saved deploy_mode string is unknown/"hardlink".
+    # Override (e.g. to LinkMode.COPY) for games that never hardlink.
+    deploy_mode_fallback: LinkMode = _DEFAULT_DEPLOY_MODE
+
+    profile_overridable_settings: tuple[str, ...] = (
+        "auto_deploy",
+        "archive_invalidation",
+        "prefix_numbering",
+    )
+    profile_overridable_paths_extras: tuple[str, ...] = ()
 
     # -----------------------------------------------------------------------
     # Identity
@@ -1085,11 +1129,64 @@ class BaseGame(ABC):
     def set_active_profile_dir(self, profile_dir: "Path | None") -> None:
         """Record which profile folder is currently active.
 
-        Call this whenever the user selects a profile so that
-        :meth:`get_effective_mod_staging_path` can decide whether to route
-        mods into the profile-specific folder or the shared folder.
+        Call on every profile switch (so get_effective_mod_staging_path can route
+        mods correctly), then re-run :meth:`load_paths` to apply that profile's
+        path overrides.
         """
         self._active_profile_dir = profile_dir
+
+    def _is_default_profile(self) -> bool:
+        """True when the active profile is the default one (or none is set).
+
+        The default keeps its settings global; only non-default profiles override.
+        """
+        return self._active_profile_dir is None or self._active_profile_dir.name == "default"
+
+    def _deploy_mode_from_str(self, raw: str) -> LinkMode:
+        """Parse a saved deploy-mode string, honouring deploy_mode_supports_copy.
+
+        Unknown values (including "hardlink") fall back to deploy_mode_fallback.
+        """
+        table = (
+            _DEPLOY_MODE_FROM_STR_COPY
+            if self.deploy_mode_supports_copy
+            else _DEPLOY_MODE_FROM_STR
+        )
+        return table.get(raw, self.deploy_mode_fallback)
+
+    def _apply_profile_path_overrides(self, paths_data: dict | None = None) -> None:
+        """Overlay the active non-default profile's overrides on the loaded paths.
+
+        No-op for the default profile. Overridden game_path/prefix_path/
+        deploy_mode replace the instance vars; absent keys keep the default's
+        value. staging_path stays global. Overridable subclass extras are applied
+        by re-running _load_paths_extra() with profile values overlaid on
+        *paths_data*.
+        """
+        if self._is_default_profile():
+            return
+        try:
+            from Utils.profile_state import read_profile_settings
+            pset = read_profile_settings(self._active_profile_dir)
+        except Exception:
+            return
+        if isinstance(pset.get("game_path"), str) and pset["game_path"]:
+            self._game_path = Path(pset["game_path"])
+        if isinstance(pset.get("prefix_path"), str) and pset["prefix_path"]:
+            self._prefix_path = Path(pset["prefix_path"])
+        if isinstance(pset.get("deploy_mode"), str) and pset["deploy_mode"]:
+            # Parse via the helper (not the already-loaded value), or a "hardlink"
+            # override would silently revert to the default profile's mode.
+            self._deploy_mode = self._deploy_mode_from_str(pset["deploy_mode"])
+        if self.profile_overridable_paths_extras:
+            overlay = dict(paths_data or {})
+            applied = False
+            for key in self.profile_overridable_paths_extras:
+                if key in pset:
+                    overlay[key] = pset[key]
+                    applied = True
+            if applied:
+                self._load_paths_extra(overlay)
 
     def get_effective_mod_staging_path(self) -> Path:
         """Return the mods staging path that should be used for the active profile.
@@ -1264,17 +1361,65 @@ class BaseGame(ABC):
         """
         return get_game_config_dir(self.name) / "game_settings.json"
 
-    def _load_settings(self) -> dict:
+    def _read_global_settings(self) -> dict:
+        """Read game_settings.json verbatim, without any per-profile overlay."""
         try:
             if self._settings_file.exists():
-                return json.loads(self._settings_file.read_text(encoding="utf-8"))
+                data = json.loads(self._settings_file.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError):
             pass
         return {}
 
+    def _load_settings(self) -> dict:
+        # Every option property reads through here, so overlaying the active
+        # non-default profile's overrides makes them transparently per-profile.
+        data = self._read_global_settings()
+        if not self._is_default_profile() and self.profile_overridable_settings:
+            try:
+                from Utils.profile_state import read_profile_settings
+                pset = read_profile_settings(self._active_profile_dir)
+            except Exception:
+                pset = {}
+            for key in self.profile_overridable_settings:
+                if key in pset:
+                    data[key] = pset[key]
+        return data
+
     def _save_settings(self, data: dict) -> None:
+        # Default profile writes straight to game_settings.json.
+        if self._is_default_profile() or not self.profile_overridable_settings:
+            self._settings_file.parent.mkdir(parents=True, exist_ok=True)
+            self._settings_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return
+
+        # Non-default profile: persist an overridable key as a sticky per-profile
+        # override only when the incoming value differs from the profile's current
+        # effective value (global overlaid with any existing override). A key the
+        # user actually changed differs and gets pinned — and stays pinned even if
+        # it equals the default, surviving later changes to the default. A key
+        # left untouched matches its effective value and is not written, so it
+        # keeps following the default.
+        effective = self._load_settings()
+        override_updates: dict = {}
+        for key in self.profile_overridable_settings:
+            if key in data and data[key] != effective.get(key, _UNSET):
+                override_updates[key] = data[key]
+        if override_updates:
+            try:
+                from Utils.profile_state import merge_profile_settings
+                merge_profile_settings(self._active_profile_dir, override_updates)
+            except Exception:
+                pass
+
+        # Non-overridable keys are global: update them in game_settings.json
+        # without disturbing the default's overridable values stored there.
+        on_disk = self._read_global_settings()
+        for k, v in data.items():
+            if k not in self.profile_overridable_settings:
+                on_disk[k] = v
         self._settings_file.parent.mkdir(parents=True, exist_ok=True)
-        self._settings_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._settings_file.write_text(json.dumps(on_disk, indent=2), encoding="utf-8")
 
     @property
     def auto_deploy(self) -> bool:
@@ -1351,7 +1496,10 @@ class BaseGame(ABC):
             self._game_path = None
             self._prefix_path = None
             self._staging_path = None
-            return False
+            # A non-default profile may still carry overrides even with no global
+            # paths.json yet, so apply them before giving up.
+            self._apply_profile_path_overrides()
+            return bool(self._game_path)
         try:
             data = json.loads(self._paths_file.read_text(encoding="utf-8"))
             raw = data.get("game_path", "")
@@ -1361,17 +1509,24 @@ class BaseGame(ABC):
             if raw_pfx:
                 self._prefix_path = Path(raw_pfx)
             raw_mode = data.get("deploy_mode", "hardlink")
-            self._deploy_mode = _DEPLOY_MODE_FROM_STR.get(raw_mode, _DEFAULT_DEPLOY_MODE)
+            self._deploy_mode = self._deploy_mode_from_str(raw_mode)
             raw_staging = data.get("staging_path", "")
             if raw_staging:
                 self._staging_path = Path(raw_staging)
             self._load_paths_extra(data)
             self._validate_staging()
+            # Overlay any per-profile overrides on top of the default's values
+            # before the prefix-autolocate check, so a profile-specific prefix is
+            # respected and never overwritten by the default's auto-detection.
+            self._apply_profile_path_overrides(data)
             if not self._prefix_path or not self._prefix_path.is_dir():
                 found = self._find_prefix_for_load()
                 if found:
                     self._prefix_path = found
-                    self.save_paths()
+                    # The auto-located prefix is a fallback for the default, not a
+                    # deliberate per-profile choice, so persist it globally rather
+                    # than as a spurious override on a non-default profile.
+                    self._save_global_prefix(found)
             return bool(self._game_path)
         except (json.JSONDecodeError, OSError):
             pass
@@ -1379,17 +1534,88 @@ class BaseGame(ABC):
         self._prefix_path = None
         return False
 
+    def _save_global_prefix(self, prefix: Path) -> None:
+        """Write an auto-located prefix into the global paths.json.
+
+        Used during load_paths() so an auto-detected prefix never becomes a
+        per-profile override (it is a fallback shared by all profiles).
+        """
+        self._paths_file.parent.mkdir(parents=True, exist_ok=True)
+        data = self._read_global_paths()
+        data["prefix_path"] = str(prefix)
+        self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def _read_global_paths(self) -> dict:
+        """Read paths.json verbatim, without any per-profile overlay."""
+        try:
+            if self._paths_file.exists():
+                data = json.loads(self._paths_file.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            pass
+        return {}
+
     def save_paths(self) -> None:
-        """Write current path configuration to the user config directory."""
+        """Write path configuration to the user config directory.
+
+        Default profile: everything goes to paths.json. Non-default profile:
+        game_path/prefix_path/deploy_mode and overridable extras are stored as
+        sticky per-profile overrides, but only for fields whose new value differs
+        from the profile's current effective value (global overlaid with any
+        existing override). A field the user actually changed gets pinned and
+        survives later default changes; an unchanged field is not written and
+        keeps following the default. staging_path and non-overridable extras stay
+        global.
+        """
         self._paths_file.parent.mkdir(parents=True, exist_ok=True)
         mode_str = _DEPLOY_MODE_TO_STR.get(self._deploy_mode, "hardlink")
-        data = {
-            "game_path":    str(self._game_path)    if self._game_path    else "",
-            "prefix_path":  str(self._prefix_path)  if self._prefix_path  else "",
-            "deploy_mode":  mode_str,
-            "staging_path": str(self._staging_path) if self._staging_path else "",
+
+        if self._is_default_profile():
+            data = {
+                "game_path":    str(self._game_path)    if self._game_path    else "",
+                "prefix_path":  str(self._prefix_path)  if self._prefix_path  else "",
+                "deploy_mode":  mode_str,
+                "staging_path": str(self._staging_path) if self._staging_path else "",
+            }
+            data.update(self._save_paths_extra())
+            self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return
+
+        # Non-default profile. Build the current effective value for each field
+        # (global overlaid with the existing override) and pin only the fields
+        # that the incoming value actually changes.
+        from Utils.profile_state import merge_profile_settings, read_profile_settings
+        glb = self._read_global_paths()
+        existing = read_profile_settings(self._active_profile_dir)
+        extras = self._save_paths_extra()
+
+        def _pin(key: str, value, missing_default):
+            effective = existing.get(key, glb.get(key, missing_default))
+            # Only write when the value changed; never None (clear) so a
+            # deliberate value equal to the default still stays pinned.
+            return value if value != effective else _UNSET
+
+        candidates = {
+            "game_path":   _pin("game_path",   str(self._game_path) if self._game_path else "", ""),
+            "prefix_path": _pin("prefix_path", str(self._prefix_path) if self._prefix_path else "", ""),
+            "deploy_mode": _pin("deploy_mode", mode_str, ""),
         }
-        data.update(self._save_paths_extra())
+        for key, value in extras.items():
+            if key in self.profile_overridable_paths_extras:
+                candidates[key] = _pin(key, value, None)
+        override_updates = {k: v for k, v in candidates.items() if v is not _UNSET}
+        if override_updates:
+            merge_profile_settings(self._active_profile_dir, override_updates)
+
+        # Write only the still-global fields to paths.json, preserving the
+        # default's overridable values already stored there.
+        global_extras = {
+            k: v for k, v in extras.items()
+            if k not in self.profile_overridable_paths_extras
+        }
+        data = self._read_global_paths()
+        data["staging_path"] = str(self._staging_path) if self._staging_path else ""
+        data.update(global_extras)
         self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def set_game_path(self, path: Path | str | None) -> None:

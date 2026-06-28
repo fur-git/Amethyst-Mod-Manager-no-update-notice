@@ -398,9 +398,98 @@ def _toggle_selected(app):
     panel._update_info()
 
 
+def _install_entry_class_bindings(app) -> None:
+    """Normalise text-input behaviour across every Entry/Text widget.
+
+    Tkinter's defaults for the ``Entry`` / ``Text`` widget classes are
+    inconsistent (and, on X11, differ from what users expect):
+
+    * ``Ctrl+A`` defaults to "move cursor to line start" (Emacs binding),
+      not "select all". Only a handful of our entries bound it locally, so
+      most input boxes had no working select-all.
+    * On X11 the default ``<<Paste>>`` binding inserts at the cursor
+      *without* deleting the current selection, so pasting over highlighted
+      text appended instead of replacing.
+
+    Binding these on the widget *class* (rather than per-widget) means every
+    Entry/Text in the app — including ones in dialogs and wizards created
+    later — gets the same behaviour for free. ``CTkEntry`` wraps a ``tk.Entry``
+    (class ``Entry``) and ``CTkTextbox`` wraps a ``tk.Text`` (class ``Text``),
+    so both are covered.
+    """
+
+    def _select_all_entry(event):
+        w = event.widget
+        try:
+            w.select_range(0, "end")
+            w.icursor("end")
+        except Exception:
+            pass
+        return "break"
+
+    def _select_all_text(event):
+        w = event.widget
+        try:
+            w.tag_add("sel", "1.0", "end-1c")
+            w.mark_set("insert", "1.0")
+            w.see("insert")
+        except Exception:
+            pass
+        return "break"
+
+    def _paste_replace_entry(event):
+        w = event.widget
+        try:
+            text = w.clipboard_get()
+        except Exception:
+            return "break"
+        try:
+            if w.selection_present():
+                w.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        try:
+            w.insert("insert", text)
+            w.see("insert")
+        except Exception:
+            pass
+        return "break"
+
+    def _paste_replace_text(event):
+        w = event.widget
+        try:
+            text = w.clipboard_get()
+        except Exception:
+            return "break"
+        try:
+            if w.tag_ranges("sel"):
+                w.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        try:
+            w.insert("insert", text)
+            w.see("insert")
+        except Exception:
+            pass
+        return "break"
+
+    # Apply to both the themed (ttk -> "TEntry") and classic ("Entry")
+    # variants so raw tk.Entry, ttk.Entry and CTkEntry inner widgets all match.
+    for cls in ("Entry", "TEntry"):
+        app.bind_class(cls, "<Control-a>", _select_all_entry)
+        app.bind_class(cls, "<Control-A>", _select_all_entry)
+        app.bind_class(cls, "<<Paste>>", _paste_replace_entry)
+    for cls in ("Text",):
+        app.bind_class(cls, "<Control-a>", _select_all_text)
+        app.bind_class(cls, "<Control-A>", _select_all_text)
+        app.bind_class(cls, "<<Paste>>", _paste_replace_text)
+
+
 def register_shortcuts(app) -> None:
     """Install the global keyboard shortcuts on the main App window."""
     app._last_list_panel = "mod"
+
+    _install_entry_class_bindings(app)
 
     def _guard(fn):
         def _handler(event=None):

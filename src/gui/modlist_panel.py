@@ -3,6 +3,7 @@ Mod list panel: canvas-based virtual list, toolbar, filters, Nexus update/endors
 Used by App. Imports theme, game_helpers, dialogs, install_mod.
 """
 
+import configparser
 import json
 import os
 import shutil
@@ -75,7 +76,7 @@ from gui.dialogs import (
     _RenameDialog,
     _SeparatorNameDialog,
     _ModNameDialog,
-    _OverwritesDialog,
+    OverwritesPanel,
     _PriorityDialog,
     _DisablePluginsDialog,
     _ReplaceModDialog,
@@ -153,6 +154,7 @@ from gui.changelog_overlay import ChangelogOverlay
 from Nexus.nexus_meta import ensure_installed_stamp, read_meta, write_meta
 from Utils.config_paths import get_download_cache_dir, list_all_cache_dirs
 from Utils.ui_config import load_column_widths, load_column_order, load_normalize_folder_case, load_sort_state, save_sort_state, load_column_hidden, load_show_summary_tooltips, load_hide_bsa_conflicts
+from Utils import perftrace
 
 
 from gui.text_utils import truncate_text as _truncate_text_for_width, clear_truncate_cache as _clear_truncate_cache
@@ -216,12 +218,14 @@ def _format_size(num_bytes: int) -> str:
     return f"{mb / 1024:.2f} GB"
 
 
-def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = False) -> dict:
+def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = False,
+                          is_bg3: bool = False) -> dict:
     """Pure scan over meta.ini; returns dict of results. Safe to run in thread.
 
     Folder sizes are only walked when compute_sizes is set (Size column visible),
     since walking every mod tree is expensive and fires on many GUI events."""
     update_mods: set[str] = set()
+    update_modio_mods: set[str] = set()
     missing_reqs: set[str] = set()
     missing_reqs_detail: dict[str, list[str]] = {}
     endorsed_mods: set[str] = set()
@@ -240,6 +244,10 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = F
     bundle_mods: set[str] = set()  # RE/Fluffy single-mod bundles (have a [Bundle] spec)
     from Utils.re_bundle import read_bundle_spec as _read_bundle_spec
     today = datetime.now().date()
+    # Collected during the loop so a second pass can hide seeded requirements
+    # that are actually installed (and re-show them if the mod is later removed).
+    _installed_ids: set[int] = set()
+    _raw_missing_pairs: dict[str, list[tuple[int, str]]] = {}
     for entry in entries:
         if entry.is_separator:
             continue
@@ -258,16 +266,38 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = F
                 meta = read_meta(meta_path)
             if meta.has_update and not meta.ignore_update:
                 update_mods.add(entry.name)
+            # mod.io (BG3 only): update flag when the installed file id differs
+            # from the latest one; also capture the mod.io version so it can
+            # stand in for a missing Nexus version below.
+            _modio_version = ""
+            if is_bg3:
+                try:
+                    _cp = configparser.ConfigParser(interpolation=None)
+                    _cp.read(str(meta_path), encoding="utf-8")
+                    _fid = int(_cp.get("General", "modioFileId", fallback="0") or "0")
+                    _lfid = int(_cp.get("General", "modioLatestFileId", fallback="0") or "0")
+                    if _fid > 0 and _lfid > 0 and _fid != _lfid:
+                        update_modio_mods.add(entry.name)
+                    _modio_version = _cp.get("General", "modioVersion", fallback="")
+                except Exception:
+                    pass
+            if meta.mod_id > 0:
+                _installed_ids.add(meta.mod_id)
             if meta.missing_requirements:
-                missing_reqs.add(entry.name)
-                names = []
+                pairs: list[tuple[int, str]] = []
                 for pair in meta.missing_requirements.split(";"):
-                    parts = pair.split(":", 1)
-                    if len(parts) == 2:
-                        names.append(parts[1])
-                    elif parts[0]:
-                        names.append(parts[0])
-                missing_reqs_detail[entry.name] = names
+                    raw_id, _, name = pair.partition(":")
+                    raw_id = raw_id.strip()
+                    if not raw_id:
+                        continue
+                    try:
+                        pairs.append((int(raw_id), name.strip()))
+                    except ValueError:
+                        pass
+                if pairs:
+                    # Finalized in a post-loop pass once every installed mod_id
+                    # is known, so satisfied requirements are filtered out.
+                    _raw_missing_pairs[entry.name] = pairs
             if meta.endorsed:
                 endorsed_mods.add(entry.name)
             if meta.installed:
@@ -281,6 +311,8 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = F
                 category_names[entry.name] = meta.category_name
             if meta.version:
                 mod_versions[entry.name] = meta.version
+            elif _modio_version:
+                mod_versions[entry.name] = _modio_version
             if meta.is_fomod:
                 fomod_mods.add(entry.name)
             if meta.is_bain:
@@ -300,8 +332,22 @@ def _scan_meta_flags_impl(entries: list, mods_dir: Path, compute_sizes: bool = F
                 bundle_mods.add(entry.name)
         except Exception:
             pass
+
+    # Second pass: now that every installed mod_id is known, hide requirements
+    # that are actually present. The full seeded list stays in meta.ini, so a
+    # requirement reappears here automatically if its mod is later removed.
+    for name, pairs in _raw_missing_pairs.items():
+        unmet = [(mid, nm) for (mid, nm) in pairs if mid not in _installed_ids]
+        if not unmet:
+            continue
+        missing_reqs.add(name)
+        # Prefer the stored name; fall back to the id when blank (locally-seeded
+        # requirements store "modId:" with no name).
+        missing_reqs_detail[name] = [nm or str(mid) for mid, nm in unmet]
+
     return {
         "update_mods": update_mods,
+        "update_modio_mods": update_modio_mods,
         "missing_reqs": missing_reqs,
         "missing_reqs_detail": missing_reqs_detail,
         "endorsed_mods": endorsed_mods,
@@ -413,6 +459,13 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._icon_update = ImageTk.PhotoImage(
                 PilImage.open(_update_path).convert("RGBA").resize((_icon_sz, _icon_sz), PilImage.LANCZOS))
 
+        # mod.io update-available icon (BG3 mods identified via PublishHandle)
+        self._icon_update_modio: ImageTk.PhotoImage | None = None
+        _update_modio_path = _ICONS_DIR / "update_modio.png"
+        if _update_modio_path.is_file():
+            self._icon_update_modio = ImageTk.PhotoImage(
+                PilImage.open(_update_modio_path).convert("RGBA").resize((_icon_sz, _icon_sz), PilImage.LANCZOS))
+
         # Missing-requirements warning icon
         self._icon_warning: ImageTk.PhotoImage | None = None
         _warning_path = _ICONS_DIR / "warning.png"
@@ -491,6 +544,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         # Set of mod names that have a Nexus update available
         self._update_mods: set[str] = set()
+        self._update_modio_mods: set[str] = set()
 
         # Lazy cache of mod_name → description (Nexus summary), loaded from meta.ini
         # on first hover. Cleared whenever update info is recomputed (since the
@@ -535,6 +589,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # routing rule with dest="" (i.e. files that deploy to the game root).
         # Auto-detected from the mod index + game's custom_routing_rules.
         self._root_rule_mods: set[str] = set()
+        # (index_mtime, result_set) cache for _compute_root_rule_mods — the
+        # match scan is ~1.45s and the result only changes when modindex.bin
+        # changes (install/remove/refresh), not on a mod toggle.
+        self._root_rule_cache: tuple[float, set[str]] | None = None
         # Sets of mod names tagged by collection install — populated from
         # meta.ini's fromCollectionBundled / fromCollectionPatched flags.
         self._collection_bundled_mods: set[str] = set()
@@ -567,6 +625,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._filemap_pending: bool = False   # True while a background rebuild is running
         self._filemap_dirty:   bool = False   # True if another rebuild was requested while one was running
         self._filemap_after_id: str | None = None  # after() handle for debounce timer
+        # True if the user clicked "Generate Separators" while conflict data was
+        # still being (re)built; the generation runs once the rebuild lands.
+        self._pending_generate_separators: bool = False
         self._filemap_rescan_index: bool = False  # True if next rebuild should regenerate modindex.bin first
         self._redraw_after_id: str | None = None  # after_idle handle for scroll-debounce
         self._canvas_resize_after_id: str | None = None  # after() handle for resize-debounce
@@ -959,6 +1020,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._canvas.bind("<Control-ButtonPress-1>", self._on_mouse_press)
         self._canvas.bind("<B1-Motion>",             self._on_mouse_drag)
         self._canvas.bind("<ButtonRelease-1>",       self._on_mouse_release)
+        self._canvas.bind("<Double-Button-1>",       self._on_double_click)
         self._canvas.bind("<ButtonRelease-3>", self._on_right_click)
         self._canvas.bind("<ButtonRelease-2>", self._on_middle_click)
         self._canvas.bind("<Motion>",         self._on_mouse_motion)
@@ -1573,7 +1635,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
     def _scan_meta_flags(self):
         """Single pass over meta.ini: update, missing_reqs, endorsed, install_dates (sync)."""
         results = _scan_meta_flags_impl(self._entries, self._staging_root,
-                                        compute_sizes=8 not in self._col_hidden)
+                                        compute_sizes=8 not in self._col_hidden,
+                                        is_bg3=self._is_bg3())
         self._apply_meta_results(results)
 
     def _scan_meta_flags_async(self):
@@ -1585,6 +1648,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         """
         if self._modlist_path is None or not self._staging_root.is_dir():
             self._update_mods.clear()
+            self._update_modio_mods.clear()
             self._missing_reqs.clear()
             self._missing_reqs_detail.clear()
             self._endorsed_mods.clear()
@@ -1608,9 +1672,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         modlist_path = self._modlist_path
         call_threadsafe = self._call_threadsafe
         compute_sizes = 8 not in self._col_hidden
+        is_bg3 = self._is_bg3()
 
         def _worker():
-            results = _scan_meta_flags_impl(entries, mods_dir, compute_sizes)
+            results = _scan_meta_flags_impl(entries, mods_dir, compute_sizes, is_bg3)
             results["_modlist_path"] = modlist_path
             call_threadsafe(lambda: self._apply_meta_results(results))
 
@@ -1623,6 +1688,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         if "_modlist_path" in results and results["_modlist_path"] != self._modlist_path:
             return  # Stale: user switched game before scan finished
         self._update_mods = results["update_mods"]
+        self._update_modio_mods = results.get("update_modio_mods", set())
         self._description_cache.clear()
         self._missing_reqs = results["missing_reqs"]
         self._missing_reqs_detail = results["missing_reqs_detail"]
@@ -1648,8 +1714,13 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._redraw()
         self._update_info()
 
-    def _compute_root_rule_mods(self) -> set[str]:
-        """Mods owning files matched by a custom routing rule with dest=""."""
+    def _compute_root_rule_mods(self, index=None) -> set[str]:
+        """Mods owning files matched by a custom routing rule with dest="".
+
+        *index* — optional pre-loaded modindex.bin dict.  The filemap worker
+        already reads the index for build_filemap; passing it here avoids a
+        second ~1s disk read + msgpack decode of the same file on every rebuild.
+        """
         game = self._game
         if game is None:
             return set()
@@ -1665,14 +1736,35 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         except Exception:
             return set()
         index_path = self._staging_root.parent / "modindex.bin"
-        index = read_mod_index(index_path)
+        if index is None:
+            index = read_mod_index(index_path)
         if not index:
             return set()
-        mod_files = {
-            name: list(normal.values()) + list(root.values())
-            for name, (normal, root) in index.items()
-        }
-        return mods_matching_root_rules(mod_files, rules)
+        # The root-rule mod set is a pure function of (index contents, rules).
+        # The index is only rewritten on install/remove/refresh — NOT on a mod
+        # toggle (that only edits modlist.txt) — so its mtime is a sound cache
+        # key. Matching scans every file in every mod (~1.45s on a 124k-file
+        # Skyrim list), and that ran on EVERY filemap rebuild (every toggle).
+        # Cache on the index mtime so toggles are free; recompute only when the
+        # index actually changes.
+        try:
+            _idx_mtime = index_path.stat().st_mtime
+        except OSError:
+            _idx_mtime = None
+        if (_idx_mtime is not None
+                and self._root_rule_cache is not None
+                and self._root_rule_cache[0] == _idx_mtime):
+            return self._root_rule_cache[1]
+        with perftrace.span("root_rule: build mod_files dict"):
+            mod_files = {
+                name: list(normal.values()) + list(root.values())
+                for name, (normal, root) in index.items()
+            }
+        with perftrace.span("root_rule: mods_matching_root_rules"):
+            result = mods_matching_root_rules(mod_files, rules)
+        if _idx_mtime is not None:
+            self._root_rule_cache = (_idx_mtime, result)
+        return result
 
     def _scan_update_flags(self):
         """Scan meta.ini for update flags. Uses async to avoid blocking UI."""
@@ -1883,6 +1975,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
     # Drawing
     # ------------------------------------------------------------------
 
+    @perftrace.timed("modlist._compute_conflict_highlights")
     def _compute_conflict_highlights(
         self, sel_entry,
     ) -> tuple[set[int], set[int], set[str], set[str], set[str], set[str]]:
@@ -2298,6 +2391,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         if not star_placed:
             c.itemconfigure(star_slot, state="hidden")
 
+    @perftrace.timed("modlist._redraw")
     def _redraw(self):
         """Pool-based redraw: reconfigure pre-allocated canvas items for the visible viewport.
 
@@ -2605,6 +2699,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             if _be.name in self._update_mods and self._icon_update and "update" not in _seen_flag:
                                 _agg_flags.append(("img", self._icon_update))
                                 _seen_flag.add("update")
+                            if (_be.name in self._update_modio_mods and self._icon_update_modio
+                                    and "update_modio" not in _seen_flag):
+                                _agg_flags.append(("img", self._icon_update_modio))
+                                _seen_flag.add("update_modio")
                             if _be.name in self._endorsed_mods and self._icon_endorsed and "endorsed" not in _seen_flag:
                                 _agg_flags.append(("img", self._icon_endorsed))
                                 _seen_flag.add("endorsed")
@@ -2811,6 +2909,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                         _flags.append(("star",))
                     if entry.name in self._update_mods and self._icon_update:
                         _flags.append(("img", self._icon_update))
+                    if entry.name in self._update_modio_mods and self._icon_update_modio:
+                        _flags.append(("img", self._icon_update_modio))
                     if entry.name in self._endorsed_mods and self._icon_endorsed:
                         _flags.append(("img", self._icon_endorsed))
                     if entry.name in self._prertx_mods and self._icon_info:
@@ -3140,6 +3240,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     self._priorities[idx] = p
                     p -= 1
 
+    @perftrace.timed("modlist._compute_visible_indices")
     def _compute_visible_indices(self) -> list[int]:
         """Return entry indices that match the current filter, collapsed state, and column sort."""
         self._ensure_priorities()
@@ -3342,7 +3443,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
          lambda s, _ms: (lambda e: s._mod_is_modified_in_mf(e.name)),
          lambda s, _ms: s._sep_block_has_disabled_files),
         ("_filter_has_updates", None,
-         lambda s, _ms: (lambda e: e.name in s._update_mods),
+         lambda s, _ms: (lambda e: e.name in s._update_mods
+                         or e.name in s._update_modio_mods),
          lambda s, _ms: s._sep_block_has_updates),
         ("_filter_fomod_only", None,
          lambda s, _ms: (lambda e: e.name in s._fomod_mods),
@@ -3598,7 +3700,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 has_warning  = (name in self._missing_reqs
                                and name not in self._ignored_missing_reqs)
                 is_locked    = self._entries[i].locked
-                has_update   = name in self._update_mods
+                has_update   = (name in self._update_mods
+                                or name in self._update_modio_mods)
                 has_root     = (name in self._root_folder_mods
                                 or name in self._root_rule_mods)
                 has_disabled = self._mod_is_modified_in_mf(name)
@@ -3777,6 +3880,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._canvas.after_cancel(self._drag_scroll_after)
             self._drag_scroll_after = None
 
+    @perftrace.timed("modlist._on_mouse_press (click)")
     def _on_mouse_press(self, event):
         try:
             self.winfo_toplevel()._last_list_panel = "mod"
@@ -3848,6 +3952,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     _items.append("star")
                 if entry.name in self._update_mods:
                     _items.append("update")
+                if entry.name in self._update_modio_mods:
+                    _items.append("update_modio")
                 if entry.name in self._endorsed_mods:
                     _items.append("endorsed")
                 if entry.name in self._prertx_mods:
@@ -3882,7 +3988,37 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             elif _kind == "update":
                                 self._update_nexus_mod(entry.name)
                                 return
+                            elif _kind == "update_modio":
+                                self._open_modio_mod_page(entry.name)
+                                return
                             break
+
+            # Conflicts icon hit-test: clicking a conflict flag icon opens the
+            # Show Conflicts dialog. Only fire when the click lands on an actual
+            # icon, not anywhere in the column (geometry mirrors
+            # _render_conflict_cell).
+            conf_slot = self._col_pos.get(4, 4)
+            _CONF_X = self._COL_X[conf_slot]
+            _CONF_W = self._COL_W[conf_slot]
+            if _CONF_X <= event.x < _CONF_X + _CONF_W and not entry.locked:
+                loose = self._conflict_map.get(entry.name, CONFLICT_NONE)
+                bsa   = self._bsa_conflict_map.get(entry.name, CONFLICT_NONE)
+                has_loose = loose != CONFLICT_NONE
+                has_bsa   = bsa != CONFLICT_NONE
+                if has_loose or has_bsa:
+                    cx_center = _CONF_X + _CONF_W // 2
+                    icon_half = scaled(12)
+                    if has_loose and has_bsa:
+                        gap = scaled(6)
+                        loose_cx = cx_center - gap - icon_half
+                        bsa_cx   = cx_center + gap + icon_half
+                    else:
+                        loose_cx = bsa_cx = cx_center
+                    on_loose = has_loose and abs(event.x - loose_cx) <= icon_half
+                    on_bsa   = has_bsa   and abs(event.x - bsa_cx)   <= icon_half
+                    if on_loose or on_bsa:
+                        self._show_overwrites_dialog(entry.name)
+                        return
 
         if self._entries[idx].is_separator:
             if self._entries[idx].name in (OVERWRITE_NAME, ROOT_FOLDER_NAME):
@@ -4400,7 +4536,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
     def _sep_block_has_updates(self, sep_idx: int) -> bool:
         return self._sep_block_has_any(
-            sep_idx, lambda e: e.name in self._update_mods,
+            sep_idx, lambda e: (e.name in self._update_mods
+                                or e.name in self._update_modio_mods),
         )
 
     def _sep_block_has_fomod(self, sep_idx: int) -> bool:
@@ -4645,6 +4782,12 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # first group in reverse mode).
         _is_full_sep_block = self._drag_is_block and not self._drag_sel_indices
 
+        _rf_idx = next((i for i, e in enumerate(self._entries)
+                        if e.is_separator and e.name == ROOT_FOLDER_NAME), None)
+        _first_user_sep = (_rf_idx + 1 if (_rf_idx is not None
+                           and _rf_idx + 1 < len(self._entries)
+                           and self._entries[_rf_idx + 1].is_separator) else None)
+
         if slot == 0 and len(vis_without_drag) > 0:
             _pre_removal_insert = vis_without_drag[0]
         elif slot >= len(vis_without_drag):
@@ -4664,10 +4807,16 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                     # this slot stays reachable.  (Dropping below the divider is
                     # the next slot down, handled by below_ei == first float mod.)
                     _pre_removal_insert = below_ei
-                elif _inverted_physical and not _is_full_sep_block:
-                    # Join the group this separator heads (insert after it).
-                    # Only for lone-mod / multi-select drags — a full separator
-                    # block stays above the separator (see _is_full_sep_block).
+                elif (_inverted_physical and not _is_full_sep_block
+                      and below_ei == _first_user_sep):
+                    # Dropping just above the FIRST user separator would land in
+                    # the Root-adjacent gap (uninverts to highest priority / the
+                    # #165 jump-to-0).  Fall through into that separator's group
+                    # instead (insert after it).  For every other separator,
+                    # "just above" legitimately means the bottom of the group
+                    # that ends there — handled by the else (insert before it).
+                    # A full separator block stays above the separator regardless
+                    # (see _is_full_sep_block).
                     _pre_removal_insert = below_ei + 1
                 else:
                     _pre_removal_insert = below_ei
@@ -4687,13 +4836,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # uninverts to the very top / highest priority).  A full separator block
         # is exempt: dropping it above the first user separator legitimately makes
         # it the lowest-priority group, not a stray priority-0 mod.
-        if _inverted_physical and not _is_full_sep_block:
-            _rf_idx = next((i for i, e in enumerate(self._entries)
-                            if e.is_separator and e.name == ROOT_FOLDER_NAME), None)
-            if _rf_idx is not None and _rf_idx + 1 < len(self._entries) \
-                    and self._entries[_rf_idx + 1].is_separator:
-                # A user separator immediately follows Root — floor is just after it.
-                _pre_removal_insert = max(_pre_removal_insert, _rf_idx + 2)
+        if _inverted_physical and not _is_full_sep_block and _first_user_sep is not None:
+            # A user separator immediately follows Root — floor is just after it.
+            _pre_removal_insert = max(_pre_removal_insert, _first_user_sep + 1)
 
         # Confine drags inside a locked separator's block (Alt bypasses).
         # Re-check Alt each tick so the user can press/release Alt mid-drag.
@@ -4959,6 +5104,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             _items.append("star")
         if entry.name in self._update_mods:
             _items.append("update")
+        if entry.name in self._update_modio_mods:
+            _items.append("update_modio")
         if entry.name in self._endorsed_mods:
             _items.append("endorsed")
         if entry.name in self._prertx_mods:
@@ -4995,6 +5142,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                            if missing else "Missing requirements")
                 elif _kind == "update":
                     tip = "Update available on Nexus Mods"
+                elif _kind == "update_modio":
+                    tip = "Update available on mod.io"
                 elif _kind == "endorsed":
                     tip = "Endorsed"
                 elif _kind == "prertx":
@@ -5144,6 +5293,52 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._hover_idx = -1
             self._repaint_hover_rows(old_hover)
 
+    def _resolve_entry_folder(self, idx: int) -> Path | None:
+        """Resolve the on-disk folder for the entry at *idx*.
+
+        Handles regular mods (staging/<name>) plus the synthetic Overwrite and
+        Root_Folder separators.  Returns None when no folder applies (real
+        separators) or the modlist is not loaded.
+        """
+        if self._modlist_path is None or not (0 <= idx < len(self._entries)):
+            return None
+        entry = self._entries[idx]
+        staging_root = self._staging_root
+        if not entry.is_separator:
+            return staging_root / entry.name
+        if entry.name == OVERWRITE_NAME:
+            return staging_root.parent / "overwrite"
+        if entry.name == ROOT_FOLDER_NAME:
+            return (
+                self._game.get_effective_root_folder_path()
+                if self._game is not None
+                else staging_root.parent / "Root_Folder"
+            )
+        return None
+
+    def _on_double_click(self, event):
+        """Double-click a row to open its folder in the file manager.
+
+        Covers regular mods and the synthetic Overwrite / Root_Folder
+        separators; real user separators have no folder and are ignored.
+        """
+        if not self._entries:
+            return
+        cy = self._event_canvas_y(event)
+        idx = self._canvas_y_to_index(cy)
+        if not (0 <= idx < len(self._entries)):
+            return
+        if self._entries[idx].name == BOUNDARY_NAME:
+            return
+        # Ignore double-clicks that land in the checkbox column — those are
+        # enable/disable toggles (the second press would have flipped state
+        # back), not a request to open the folder.
+        if event.x <= self._COL_X[1] - 4:
+            return
+        folder = self._resolve_entry_folder(idx)
+        if folder is not None:
+            self._open_folder(folder)
+
     def _on_right_click(self, event):
         if not self._entries:
             return
@@ -5160,13 +5355,12 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         # Find .ini files in this mod's staging folder (only for non-separators)
         ini_files: list[Path] = []
-        mod_folder: Path | None = None
+        mod_folder: Path | None = self._resolve_entry_folder(idx)
         plugin_files: list[str] = []
         if self._modlist_path is not None:
             staging_root = self._staging_root
             if not is_sep:
                 mod_dir = staging_root / entry.name
-                mod_folder = mod_dir
                 if mod_dir.is_dir():
                     ini_files = [p for p in sorted(mod_dir.rglob("*.ini"))
                                  if p.name.lower() != "meta.ini"]
@@ -5183,14 +5377,6 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             except PermissionError:
                                 pass
                         plugin_files.sort()
-            elif entry.name == OVERWRITE_NAME:
-                mod_folder = staging_root.parent / "overwrite"
-            elif entry.name == ROOT_FOLDER_NAME:
-                mod_folder = (
-                    self._game.get_effective_root_folder_path()
-                    if self._game is not None
-                    else staging_root.parent / "Root_Folder"
-                )
 
         self._show_context_menu(event.x_root, event.y_root, idx, is_sep, ini_files,
                                 mod_folder=mod_folder, plugin_files=plugin_files)
@@ -5403,6 +5589,37 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             is_premium=is_premium, quick_update_names=quick_update_names,
         )
 
+    def _is_bg3(self) -> bool:
+        """True if the current game is Baldur's Gate 3 (mod.io features only)."""
+        return getattr(self._game, "game_id", "") == "baldurs_gate_3"
+
+    def _modio_mod_id(self, mod_name: str) -> int:
+        """Return the stored mod.io mod id for *mod_name* (0 if none/non-BG3)."""
+        if not self._is_bg3():
+            return 0
+        meta_path = self._staging_root / mod_name / "meta.ini"
+        if not meta_path.is_file():
+            return 0
+        try:
+            cp = configparser.ConfigParser(interpolation=None)
+            cp.read(str(meta_path), encoding="utf-8")
+            return int(cp.get("General", "modioModId", fallback="0") or "0")
+        except Exception:
+            return 0
+
+    def _is_modio_trackable(self, mod_name: str) -> bool:
+        """True if *mod_name* can be mod.io update-checked: a stored mod.io id,
+        or a .pak the checker can resolve from on demand (BG3 only)."""
+        if not self._is_bg3():
+            return False
+        if self._modio_mod_id(mod_name) > 0:
+            return True
+        folder = self._staging_root / mod_name
+        try:
+            return folder.is_dir() and any(folder.rglob("*.pak"))
+        except OSError:
+            return False
+
     def _resolve_nexus_domain(self, meta) -> str:
         """Best-effort game-domain resolution: meta.game_domain, then the
         domain segment of nexus_page_url, then the configured game default."""
@@ -5536,17 +5753,20 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             menu.add_command("Change Version",
                 lambda mn=mod_name: self._update_nexus_mod(mn))
 
-        # Check Updates (single)
+        # Check Updates (single) — Nexus mod, or a mod.io-trackable BG3 mod.
         if (c.is_real_mod and not c.is_multi
-                and ctx_meta is not None and ctx_meta.mod_id > 0):
+                and ((ctx_meta is not None and ctx_meta.mod_id > 0)
+                     or self._is_modio_trackable(mod_name))):
             menu.add_command("Check Updates",
                 lambda mn=mod_name: self._on_check_updates_for_mods([mn]))
 
         # Check Updates (multi)
-        if c.is_multi and c.nexus_urls:
+        if c.is_multi:
             check_names = [self._entries[i].name for i in c.toggleable]
-            menu.add_command(f"Check Updates ({len(check_names)})",
-                lambda mns=check_names: self._on_check_updates_for_mods(mns))
+            # Show when any selected mod is Nexus- or mod.io-trackable.
+            if c.nexus_urls or any(self._is_modio_trackable(n) for n in check_names):
+                menu.add_command(f"Check Updates ({len(check_names)})",
+                    lambda mns=check_names: self._on_check_updates_for_mods(mns))
 
         # Endorse Mod (single)
         if (c.is_real_mod and not c.is_multi
@@ -5572,7 +5792,12 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             menu.add_command(f"Missing Requirements ({len(names)})",
                 lambda mns=names: self._show_missing_reqs_multi(mns))
 
-        # Open on Nexus (single)
+        # Open on mod.io / Nexus (single) — a mod can be on both sites, so
+        # show whichever entries apply (mod.io listed first).
+        if (c.is_real_mod and not c.is_multi
+                and self._modio_mod_id(mod_name) > 0):
+            menu.add_command("Open on mod.io",
+                lambda mn=mod_name: self._open_modio_mod_page(mn))
         if (c.is_real_mod and not c.is_multi and ctx_meta is not None and c.nexus_url):
             menu.add_command("Open on Nexus",
                 lambda u=c.nexus_url: self._open_nexus_page(u))
@@ -6412,7 +6637,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         # 2. Transient in-memory flags (no disk representation of their own;
         # rebuilt on reload, so just migrate the current snapshot).
-        for s in (self._update_mods, self._missing_reqs, self._ignored_missing_reqs,
+        for s in (self._update_mods, self._update_modio_mods,
+                  self._missing_reqs, self._ignored_missing_reqs,
                   self._endorsed_mods, self._prertx_mods, self._fomod_mods,
                   self._bain_mods,
                   self._collection_bundled_mods, self._collection_patched_mods):
@@ -7241,13 +7467,20 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._log(f"Could not open folder: {e}")
 
     def _on_middle_click(self, event) -> None:
-        """Middle-click: open the hovered mod's Nexus page in the browser."""
+        """Middle-click: open the hovered mod's page in the browser.
+
+        mod.io takes precedence when the mod carries mod.io metadata (BG3 mods
+        installed from mod.io); otherwise the Nexus page is opened."""
         if not self._entries or self._modlist_path is None:
             return
         cy = self._event_canvas_y(event)
         idx = self._canvas_y_to_index(cy)
         entry = self._entries[idx]
         if entry.is_separator:
+            return
+        # mod.io mods first (replaces the Nexus open, mirroring the right-click).
+        if self._modio_mod_id(entry.name) > 0:
+            self._open_modio_mod_page(entry.name)
             return
         staging_root = self._staging_root
         meta_path = staging_root / entry.name / "meta.ini"
@@ -7376,11 +7609,32 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._log(f"Removed note from {removed} mod(s).")
         self._redraw()
 
-    def _build_missing_req_spec(self, mod_name: str, default_domain: str):
+    def _scan_installed_mod_ids(self) -> set[int]:
+        """Return the set of Nexus mod ids currently installed in staging
+        (read from every mod's meta.ini)."""
+        installed: set[int] = set()
+        try:
+            for sub in self._staging_root.iterdir():
+                mp = sub / "meta.ini"
+                if not mp.is_file():
+                    continue
+                try:
+                    m = read_meta(mp)
+                    if m.mod_id > 0:
+                        installed.add(m.mod_id)
+                except Exception:
+                    pass
+        except OSError:
+            pass
+        return installed
+
+    def _build_missing_req_spec(self, mod_name: str, default_domain: str,
+                                installed_ids: "set[int] | None" = None):
         """Resolve (mod_id, domain, missing_ids) for one mod, or None on failure.
 
-        Logs the reason and returns None when the mod has no usable meta.ini /
-        Nexus mod-id / game domain.
+        Filters the seeded requirements against what's installed (non-destructive
+        — meta.ini keeps the full list, so a requirement reappears if its mod is
+        removed). Pass *installed_ids* to skip a per-call staging rescan.
         """
         meta_path = self._staging_root / mod_name / "meta.ini"
         if not meta_path.is_file():
@@ -7391,9 +7645,6 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         except Exception:
             self._log(f"{mod_name}: Could not read meta.ini.")
             return None
-        if meta.mod_id <= 0:
-            self._log(f"{mod_name}: No Nexus mod ID.")
-            return None
         domain = default_domain
         if not domain and "/mods/" in meta.nexus_page_url:
             domain = meta.nexus_page_url.split("/mods/")[0].rsplit("/", 1)[-1]
@@ -7401,16 +7652,23 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self._log(f"{mod_name}: Could not determine game domain.")
             return None
 
-        missing_ids: set[int] = set()
+        seeded_ids: set[int] = set()
         for pair in (meta.missing_requirements or "").split(";"):
             part = pair.split(":", 1)[0].strip()
             if part:
                 try:
-                    missing_ids.add(int(part))
+                    seeded_ids.add(int(part))
                 except ValueError:
                     pass
+
+        if installed_ids is None:
+            installed_ids = self._scan_installed_mod_ids()
+
+        missing_ids = {mid for mid in seeded_ids if mid not in installed_ids}
+        # mod_id 0 (locally-built mods like TTW) is allowed: the panel resolves
+        # each requirement id on its own page (MissingRequirementsDialog._worker).
         return SimpleNamespace(
-            mod_name=mod_name, mod_id=meta.mod_id,
+            mod_name=mod_name, mod_id=max(meta.mod_id, 0),
             domain=domain, missing_ids=missing_ids,
         )
 
@@ -7441,6 +7699,12 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         spec = self._build_missing_req_spec(mod_name, domain)
         if spec is None:
+            return
+        if not spec.missing_ids:
+            # The re-check found every requirement is now installed — nothing to
+            # show. Refresh so the (now-cleared) marker disappears.
+            self._log(f"{mod_name}: all requirements are installed.")
+            self._redraw()
             return
 
         if hasattr(app, "show_missing_reqs_panel"):
@@ -7474,9 +7738,10 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         game = _GAMES.get(topbar._game_var.get()) if topbar else None
         domain = (game.nexus_game_domain if game and game.is_configured() else "") or ""
 
+        installed_ids = self._scan_installed_mod_ids()
         specs = []
         for mn in mod_names:
-            spec = self._build_missing_req_spec(mn, domain)
+            spec = self._build_missing_req_spec(mn, domain, installed_ids=installed_ids)
             if spec is not None and spec.missing_ids:
                 specs.append(spec)
         if not specs:
@@ -7758,17 +8023,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
             # Dispatch results back to the main thread
             def _show():
-                app = self.winfo_toplevel()
-                show_fn = getattr(app, "show_conflicts_panel", None)
-                if show_fn:
-                    show_fn(mod_name, files_i_win_final, files_i_lose, files_no_conflict)
-                else:
-                    _OverwritesDialog(
-                        app,
-                        mod_name=mod_name,
-                        files_win=files_i_win_final,
-                        files_lose=files_i_lose,
-                    )
+                self._open_overwrites_panel(
+                    mod_name, files_i_win_final, files_i_lose, files_no_conflict)
 
             if call_threadsafe:
                 call_threadsafe(_show)
@@ -7776,6 +8032,89 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 self.after(0, _show)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _open_overwrites_panel(self, mod_name, files_win, files_lose,
+                               files_no_conflict):
+        """Show the conflict-detail overlay over the modlist panel.
+
+        A popout toggle re-hosts the panel in a separate window. Tk can't
+        reparent a live widget across toplevels, so the toggle tears down the
+        current panel and builds a fresh one in the other host, carrying the
+        already-computed conflict data."""
+        app = self.winfo_toplevel()
+        self._close_overwrites_panel()
+
+        def _build(popped_out: bool):
+            self._close_overwrites_panel()
+
+            def _on_rehost(going_to_popout):
+                _build(going_to_popout)
+
+            common = dict(
+                mod_name=mod_name,
+                files_win=files_win,
+                files_lose=files_lose,
+                files_no_conflict=files_no_conflict,
+                on_done=lambda p: self._close_overwrites_panel(),
+                on_rehost=_on_rehost,
+                is_popped_out=popped_out,
+            )
+
+            if popped_out:
+                host = ctk.CTkToplevel(app, fg_color=BG_DEEP)
+                host.title(f"Conflicts: {mod_name}")
+                try:
+                    root = app.winfo_toplevel()
+                    root.update_idletasks()
+                    w = max(int(root.winfo_width() * 0.85), 860)
+                    h = max(int(root.winfo_height() * 0.85), 580)
+                    x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+                    y = root.winfo_rooty() + (root.winfo_height() - h) // 2
+                    host.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+                except Exception:
+                    host.geometry("900x620")
+                host.minsize(600, 380)
+                host.grid_rowconfigure(0, weight=1)
+                host.grid_columnconfigure(0, weight=1)
+                host.protocol("WM_DELETE_WINDOW", self._close_overwrites_panel)
+                self._overwrites_window = host
+
+                panel = OverwritesPanel(host, **common)
+                panel.grid(row=0, column=0, sticky="nsew")
+                self._overwrites_panel = panel
+                try:
+                    host.attributes("-topmost", False)
+                    host.lift()
+                    host.focus_force()
+                except Exception:
+                    pass
+            else:
+                panel = OverwritesPanel(self, **common)
+                panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+                panel.lift()
+                self._overwrites_panel = panel
+
+        _build(popped_out=False)
+
+    def _close_overwrites_panel(self):
+        panel = getattr(self, "_overwrites_panel", None)
+        if panel is not None:
+            self._overwrites_panel = None
+            try:
+                panel.place_forget()
+            except Exception:
+                pass
+            try:
+                panel.destroy()
+            except Exception:
+                pass
+        win = getattr(self, "_overwrites_window", None)
+        if win is not None:
+            self._overwrites_window = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
     def _add_separator(self, ref_idx: int, above: bool):
         """Prompt for a separator name and insert it above or below ref_idx."""
@@ -7820,15 +8159,70 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         self._update_info()
 
     def _generate_separators(self) -> None:
+        """Button handler: ensure conflict data is fresh, then generate separators.
+
+        The partition into category separators vs. the "Conflicts" separator is
+        driven entirely by the conflict maps (``_overrides`` / ``_bsa_overrides``
+        / ``_conflict_map``). Those are populated by a *background* filemap
+        rebuild, so if we read them while a rebuild is pending — or before the
+        first one finishes — they can be empty and every conflicting mod gets
+        mis-sorted into a category group, flipping winners and breaking the load
+        order. This is reliably hit on slow filesystems (e.g. XFS) where the
+        scan takes long enough that the user clicks before it lands.
+
+        So: if a rebuild is in flight or queued, defer the actual generation
+        until the rebuild completes (see ``_done`` in ``_rebuild_filemap_now``).
+        Otherwise run immediately against the already-fresh data.
+        """
+        if self._modlist_path is None:
+            self._log("GenSep: button pressed but no modlist loaded — ignoring.")
+            return
+        self._log(
+            "GenSep: button pressed. "
+            f"filemap_pending={self._filemap_pending} "
+            f"filemap_dirty={self._filemap_dirty} "
+            f"debounce_armed={self._filemap_after_id is not None} "
+            f"conflict_map={len(self._conflict_map)} entr(ies) "
+            f"bsa_conflict_map={len(self._bsa_conflict_map)} "
+            f"overrides={len(self._overrides)} "
+            f"bsa_overrides={len(self._bsa_overrides)}"
+        )
+        # A rebuild is running, or one is debounced/queued — wait for fresh
+        # conflict data rather than acting on a stale/empty map.
+        if (self._filemap_pending
+                or self._filemap_dirty
+                or self._filemap_after_id is not None):
+            self._log("GenSep: conflict data not settled — deferring until rebuild completes.")
+            self._pending_generate_separators = True
+            # Make sure a rebuild actually lands (if only a debounce timer is
+            # armed, _rebuild_filemap coalesces into the in-flight/queued run).
+            self._rebuild_filemap()
+            return
+        self._generate_separators_now()
+
+    def _generate_separators_now(self) -> None:
         """Create a separator for each category and move loose mods (not already inside a separator) into it.
+
+        Assumes conflict data is fresh — call via ``_generate_separators``.
 
         Rules:
         - Mods already inside a separator block are untouched.
-        - Loose mods with conflicts stay at the bottom in their original relative order.
-        - Loose mods without conflicts are grouped by category, each group placed under
-          a new (or existing) separator named after the category.
-        - Mods with no category get a separator named "Uncategorized".
+        - A loose mod with ANY conflict (loose-asset OR BSA) goes to a single
+          "Conflicts" separator at the bottom, in its original relative order.
+          This is the only safe move: a conflicting mod's winners depend on its
+          position relative to the mods it overrides / is overridden by, so we
+          must not reorder it among them. Keeping all conflicting mods together
+          at the bottom in original order preserves every winner.
+        - Loose mods with NO conflict don't override anyone, so they can be
+          grouped by category (alphabetical within the group) without changing
+          any asset winner. Mods with no category go to "Uncategorized".
         - New separators are inserted just above the conflict/bottom section.
+
+        NOTE: this intentionally does NOT scatter conflicting mods into their
+        category separators (the connected-component approach reordered mods
+        relative to non-conflicting ones and could flip winners via
+        relationships not captured in the loose↔loose conflict graph — e.g.
+        root-flagged, BSA-vs-loose, or UE5 effective-path conflicts).
         """
         OVERWRITE = OVERWRITE_NAME  # synthetic first entry
         ROOT = ROOT_FOLDER_NAME     # synthetic last entry
@@ -7856,36 +8250,60 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             and e.enabled
         ]
 
+        self._log(
+            f"GenSep: {len(self._entries)} total entr(ies), "
+            f"{len(in_separator)} already inside a separator, "
+            f"{len(loose)} loose mod(s) to place."
+        )
         if not loose:
+            self._log("GenSep: no loose mods to place — nothing to do.")
             return  # nothing to do
 
-        # --- Step 3: Split loose mods into conflict vs non-conflict groups ---
+        loose_names = {e.name for e in loose}
+        cat_of = lambda n: (self._category_names.get(n, "") or "Uncategorized")
+
+        # --- Step 3: Split loose mods into conflict vs. no-conflict ---
+        # A mod "has a conflict" if it wins, loses, or both, on EITHER a loose
+        # asset or a BSA — i.e. anything the Conflicts column would flag. Such a
+        # mod's winners depend on where it sits relative to the mods it fights
+        # with, so it must keep its original position; we collect all of them,
+        # in original relative order, into the bottom "Conflicts" separator.
+        # No-conflict mods override nobody, so grouping/sorting them is safe.
         conflict_mods: list[ModEntry] = []
         no_conflict_mods: list[ModEntry] = []
         for entry in loose:
-            c = self._conflict_map.get(entry.name, CONFLICT_NONE)
-            if c != CONFLICT_NONE:
-                conflict_mods.append(entry)
-            else:
-                no_conflict_mods.append(entry)
+            loose_status = self._conflict_map.get(entry.name, CONFLICT_NONE)
+            bsa_status = self._bsa_conflict_map.get(entry.name, CONFLICT_NONE)
+            has_conflict = (loose_status != CONFLICT_NONE or bsa_status != CONFLICT_NONE)
+            (conflict_mods if has_conflict else no_conflict_mods).append(entry)
+            # Per-mod detail so we can see exactly why a mod was/wasn't treated
+            # as conflicting (the crux of the "no Conflicts separator" report).
+            self._log(
+                f"GenSep:   loose='{entry.name}' cat='{cat_of(entry.name)}' "
+                f"loose_conflict={loose_status} bsa_conflict={bsa_status} "
+                f"-> {'CONFLICT' if has_conflict else 'no-conflict'}"
+            )
+        self._log(
+            f"GenSep: split -> {len(conflict_mods)} conflicting, "
+            f"{len(no_conflict_mods)} no-conflict."
+        )
 
-        # --- Step 4: Group non-conflict mods by category (sorted alphabetically within group) ---
+        # --- Step 4: Group the no-conflict mods by category (alpha within group) ---
         cat_groups: dict[str, list[ModEntry]] = {}
         for entry in no_conflict_mods:
-            cat = self._category_names.get(entry.name, "") or "Uncategorized"
-            if cat not in cat_groups:
-                cat_groups[cat] = []
-            cat_groups[cat].append(entry)
+            cat_groups.setdefault(cat_of(entry.name), []).append(entry)
         for mods in cat_groups.values():
             mods.sort(key=lambda e: e.name.casefold())
 
-        # --- Step 5: Build the new entries list ---
-        # Keep: synthetic Overwrite + all existing separator blocks (untouched)
-        # Then append: new category separators + their mods
-        # Then append: "Conflicts" separator + conflict mods at bottom
+        # Category separators are emitted alphabetically.
+        ordered_cats = sorted(cat_groups.keys(), key=str.casefold)
+        self._log(
+            "GenSep: category groups -> "
+            + (", ".join(f"{c}({len(cat_groups[c])})" for c in ordered_cats) or "(none)")
+        )
 
+        # --- Step 5: Build the new entries list ---
         # Remove all loose mods from _entries (they will be re-inserted).
-        loose_names = {e.name for e in loose}
         new_entries: list[ModEntry] = [e for e in self._entries if e.name not in loose_names]
 
         # Find insertion point: just before ROOT_FOLDER (if present), otherwise end.
@@ -7898,7 +8316,8 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
         # Build the block to insert: category separators + mods, then conflict mods.
         to_insert: list[ModEntry] = []
         existing_sep_names = {e.name for e in new_entries if e.is_separator}
-        for cat, mods in sorted(cat_groups.items()):
+        for cat in ordered_cats:
+            mods = cat_groups[cat]
             sep_name = cat + "_separator"
             if sep_name not in existing_sep_names:
                 sep_entry = ModEntry(name=sep_name, enabled=True, locked=True, is_separator=True)
@@ -7919,9 +8338,18 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
 
         if conflict_mods:
             conflicts_sep_name = "Conflicts_separator"
-            if conflicts_sep_name not in existing_sep_names:
+            already_existed = conflicts_sep_name in existing_sep_names
+            if not already_existed:
                 to_insert.append(ModEntry(name=conflicts_sep_name, enabled=True, locked=True, is_separator=True))
             to_insert.extend(conflict_mods)
+            self._log(
+                f"GenSep: Conflicts separator "
+                f"{'reused (already present)' if already_existed else 'CREATED'} "
+                f"with {len(conflict_mods)} mod(s): "
+                + ", ".join(e.name for e in conflict_mods)
+            )
+        else:
+            self._log("GenSep: no conflicting mods — NO Conflicts separator created.")
 
         # Insert the block at the correct position.
         for offset, entry in enumerate(to_insert):
@@ -8002,6 +8430,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
     # Toggle
     # ------------------------------------------------------------------
 
+    @perftrace.timed("modlist._on_toggle")
     def _on_toggle(self, idx: int):
         if not self._check_vars or not self._entries:
             return
@@ -8561,19 +8990,21 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             + ", ".join(names)
                         ))
                 if rescan_index:
-                    rebuild_mod_index(
-                        output.parent / "modindex.bin",
-                        staging,
-                        strip_prefixes=strip_prefixes,
-                        per_mod_strip_prefixes=per_mod_strip,
-                        allowed_extensions=install_extensions or None,
-                        root_deploy_folders=root_deploy_folders or None,
-                        normalize_folder_case=normalize_folder_case,
-                        exclude_dirs=exclude_dirs,
-                        log_fn=_log_thread_safe,
-                        root_folder_mods=root_folder_mods_snap,
-                    )
-                count, conflict_map, overrides, overridden_by = build_filemap(
+                    with perftrace.span("filemap.rebuild_mod_index (worker)"):
+                        rebuild_mod_index(
+                            output.parent / "modindex.bin",
+                            staging,
+                            strip_prefixes=strip_prefixes,
+                            per_mod_strip_prefixes=per_mod_strip,
+                            allowed_extensions=install_extensions or None,
+                            root_deploy_folders=root_deploy_folders or None,
+                            normalize_folder_case=normalize_folder_case,
+                            exclude_dirs=exclude_dirs,
+                            log_fn=_log_thread_safe,
+                            root_folder_mods=root_folder_mods_snap,
+                        )
+                with perftrace.span("filemap.build_filemap (worker)"):
+                  count, conflict_map, overrides, overridden_by = build_filemap(
                     modlist_path, staging, output,
                     strip_prefixes=strip_prefixes,
                     per_mod_strip_prefixes=per_mod_strip,
@@ -8594,17 +9025,20 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 _game = getattr(self, "_game", None)
                 if _game is not None:
                     _game.post_build_filemap(output, staging)
+                # Read the index ONCE here and reuse it for pre-RTX detection and
+                # root-rule mod computation below. Previously each of those re-read
+                # modindex.bin from disk (~1s msgpack decode each) on every rebuild.
+                with perftrace.span("filemap.read_mod_index (worker, shared)"):
+                    _worker_index = read_mod_index(output.parent / "modindex.bin")
                 # Detect pre-RTX mods: any mod with at least one file under a
                 # remapped source prefix (e.g. natives/x64/).
                 prertx_mods: set[str] = set()
-                if _prertx_prefixes:
-                    _index = read_mod_index(output.parent / "modindex.bin")
-                    if _index:
-                        for mod_name, (normal, _) in _index.items():
-                            for rel_key in normal:
-                                if any(rel_key.startswith(p) for p in _prertx_prefixes):
-                                    prertx_mods.add(mod_name)
-                                    break
+                if _prertx_prefixes and _worker_index:
+                    for mod_name, (normal, _) in _worker_index.items():
+                        for rel_key in normal:
+                            if any(rel_key.startswith(p) for p in _prertx_prefixes):
+                                prertx_mods.add(mod_name)
+                                break
                 # BSA/BA2 archive conflict detection (Bethesda games only).
                 bsa_conflict_map: dict[str, int] = {}
                 bsa_overrides: dict[str, set[str]] = {}
@@ -8620,14 +9054,15 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                             bsa_index_path, staging, _archive_exts,
                             log_fn=_log_thread_safe,
                         )
-                    (bsa_conflict_map, bsa_overrides, bsa_overridden_by,
-                     loose_over_bsa, bsa_over_loose) = build_bsa_conflicts(
+                    with perftrace.span("filemap.build_bsa_conflicts (worker)"):
+                      (bsa_conflict_map, bsa_overrides, bsa_overridden_by,
+                       loose_over_bsa, bsa_over_loose) = build_bsa_conflicts(
                         modlist_path, bsa_index_path, _archive_exts,
                         loose_index_path=output.parent / "modindex.bin",
                         plugin_order=_plugin_order_snap or None,
                         plugin_extensions=_plugin_exts_snap or None,
                         log_fn=_log_thread_safe,
-                    )
+                      )
                 # Preserve the untransformed loose dicts; _done will fold
                 # loose↔BSA relationships (idempotently) on top of them.
                 base_conflict_map  = dict(conflict_map)
@@ -8636,12 +9071,14 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 # Compute root-rule mods here (off main thread) — was ~930 ms
                 # of main-thread time on large modlists (read_mod_index + scan).
                 try:
-                    worker_root_rule_mods = self._compute_root_rule_mods()
+                    with perftrace.span("filemap._compute_root_rule_mods (worker)"):
+                        worker_root_rule_mods = self._compute_root_rule_mods(_worker_index)
                 except Exception:
                     worker_root_rule_mods = set()
                 def _done_wrapped():
                     self._root_rule_mods = worker_root_rule_mods
-                    _done(count,
+                    with perftrace.span("modlist._done (main thread)"):
+                      _done(count,
                           base_conflict_map, base_overrides, base_overridden_by,
                           bsa_conflict_map, bsa_overrides, bsa_overridden_by,
                           loose_over_bsa, bsa_over_loose,
@@ -8666,6 +9103,9 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
                 self._bsa_conflict_map = {}
                 self._bsa_overrides = {}
                 self._bsa_overridden_by = {}
+                # Conflict data is invalid — drop any deferred generation rather
+                # than firing it later against unrelated fresh data.
+                self._pending_generate_separators = False
                 self._log(f"Filemap error: {exc}")
             else:
                 self._conflict_map_base  = base_conflict_map
@@ -8693,6 +9133,18 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             # If something changed while we were running, rebuild again.
             if self._filemap_dirty:
                 self._rebuild_filemap()
+            # A "Generate Separators" click that arrived mid-rebuild was deferred
+            # so it could act on fresh conflict data. Run it now that the maps
+            # are settled — but only on success (on error they were wiped) and
+            # only if no further rebuild is queued (otherwise wait for that one).
+            elif exc is None and self._pending_generate_separators:
+                self._pending_generate_separators = False
+                self._log(
+                    "GenSep: rebuild finished — running deferred generation. "
+                    f"conflict_map={len(self._conflict_map)} "
+                    f"bsa_conflict_map={len(self._bsa_conflict_map)}"
+                )
+                self._generate_separators_now()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -8840,6 +9292,7 @@ class ModListPanel(ModListFilterPanelMixin, ModListDownloadBarMixin,
             self.after_cancel(self._marker_strip_after_id)
         self._marker_strip_after_id = self.after(250, self._draw_marker_strip)
 
+    @perftrace.timed("modlist._draw_marker_strip")
     def _draw_marker_strip(self):
         """Paint the combined scrollbar + marker strip.
 

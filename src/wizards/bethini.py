@@ -8,14 +8,16 @@ Workflow
 --------
 1. Prompt the user to download BethINI Pie from Nexus Mods (manual download only).
 2. Auto-detect and extract the archive to Profiles/<game>/Applications/BethINI Pie/.
-3. Run BethINI Pie.exe via Proton.
+3. Pick the Proton version / prefix placement (same step every other wizard
+   uses, via ProtonPrefixStepMixin).
+4. Run BethINI Pie.exe via Proton.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
+from Utils.steam_finder import proton_run_command
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +35,9 @@ from gui.theme import (
     TEXT_ON_ACCENT,
     TEXT_DIM, TEXT_MAIN,
     FONT_NORMAL, FONT_BOLD,
+)
+from wizards._proton_prefix import (
+    ProtonPrefixStepMixin, shutdown_prefix_wineserver, PREFIX_MODE_GAME,
 )
 
 _NEXUS_URL = "https://www.nexusmods.com/site/mods/631?tab=files"
@@ -78,8 +83,20 @@ def _flatten_subdirs(dest: Path, exe_name: str) -> None:
             break
 
 
-class BethINIWizard(ctk.CTkFrame):
+class BethINIWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
     """Step-by-step wizard to set up and run BethINI Pie."""
+
+    _tool_exe_name      = _EXE_NAME
+    _tool_display_name  = "BethINI Pie"
+    _proton_step_title  = "Step 4: Choose Proton Version"
+    _proton_deps_note   = "Each version gets its own prefix."
+    _exe_missing_text   = (
+        f"{_EXE_NAME!r} was not found.\n\n"
+        "Reopen this wizard and install BethINI Pie first."
+    )
+
+    def _proton_next_step(self):
+        self._show_step_run()
 
     def __init__(
         self,
@@ -95,6 +112,8 @@ class BethINIWizard(ctk.CTkFrame):
         self._game        = game
         self._log         = log_fn or (lambda msg: None)
         self._archive_path: Path | None = None
+        self._exe         = _bethini_exe_path(game)
+        self._proton_name = ""
 
         title_bar = ctk.CTkFrame(self, fg_color=BG_HEADER, corner_radius=0, height=40)
         title_bar.pack(fill="x")
@@ -133,45 +152,6 @@ class BethINIWizard(ctk.CTkFrame):
                 pass
         self.after(0, _apply)
 
-    def _get_proton_env(self):
-        from Utils.steam_finder import (
-            find_any_installed_proton,
-            find_proton_for_game,
-            game_steam_id,
-            find_steam_root_for_proton_script,
-        )
-
-        prefix_path = self._game.get_prefix_path()
-        if prefix_path is None or not prefix_path.is_dir():
-            return None, None, None
-
-        steam_id    = game_steam_id(self._game)
-        from gui.plugin_panel import _resolve_compat_data, _read_prefix_runner
-        compat_data = _resolve_compat_data(prefix_path)
-        proton_script = find_proton_for_game(steam_id) if steam_id else None
-
-        if proton_script is None:
-            preferred_runner = _read_prefix_runner(compat_data)
-            proton_script = find_any_installed_proton(preferred_runner)
-            if proton_script is None:
-                return None, None, prefix_path
-
-        steam_root = find_steam_root_for_proton_script(proton_script)
-        if steam_root is None:
-            return None, None, prefix_path
-
-        env = os.environ.copy()
-        env["STEAM_COMPAT_DATA_PATH"]           = str(compat_data)
-        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
-        game_path = self._game.get_game_path()
-        if game_path:
-            env["STEAM_COMPAT_INSTALL_PATH"] = str(game_path)
-        if steam_id:
-            env.setdefault("SteamAppId",  steam_id)
-            env.setdefault("SteamGameId", steam_id)
-
-        return proton_script, env, prefix_path
-
     def _on_done(self):
         try:
             topbar = self.winfo_toplevel()._topbar
@@ -190,7 +170,7 @@ class BethINIWizard(ctk.CTkFrame):
 
     def _show_step_download(self):
         if _bethini_exe_path(self._game) is not None:
-            self._show_step_run()
+            self._show_step_proton()
             return
 
         self._clear_body()
@@ -333,22 +313,23 @@ class BethINIWizard(ctk.CTkFrame):
                     f"Check that the archive contains {_EXE_NAME!r}."
                 )
 
+            self._exe = _bethini_exe_path(self._game)
             self._set_label("_extract_status", f"Extracted {file_count} file(s).", color="#6bc76b")
-            self.after(0, self._show_step_run)
+            self.after(0, self._show_step_proton)
 
         except Exception as exc:
             self._set_label("_extract_status", f"Error: {exc}", color="#e06c6c")
             self._log(f"BethINI Wizard: extract error: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 4 — Run BethINI Pie
+    # Step 5 — Run BethINI Pie
     # ------------------------------------------------------------------
 
     def _show_step_run(self):
         self._clear_body()
 
         ctk.CTkLabel(
-            self._body, text="Step 4: Run BethINI Pie",
+            self._body, text="Step 5: Run BethINI Pie",
             font=FONT_BOLD, text_color=TEXT_MAIN,
         ).pack(pady=(0, 12))
 
@@ -387,19 +368,39 @@ class BethINIWizard(ctk.CTkFrame):
         threading.Thread(target=lambda: self._do_run(exe), daemon=True).start()
 
     def _do_run(self, exe: Path):
-        proton_script, env, _prefix = self._get_proton_env()
+        self._set_label("_run_status", "Preparing BethINI Pie's Wine prefix…")
+        proton_script, env, compat_data = self._get_tool_env()
         if proton_script is None:
             self._set_label(
                 "_run_status",
-                "Could not find Proton — check that the prefix is configured.",
+                f"Could not find Proton '{self._proton_name}' — "
+                "check that it is installed in Steam.",
                 color="#e06c6c",
             )
             return
 
+        # On an isolated/shared prefix, seed the Bethesda registry key and link
+        # the game's My Games folder so BethINI can locate the game and edit the
+        # same INIs the game uses. (No-op when running in the game's own prefix.)
+        if self._prefix_mode != PREFIX_MODE_GAME:
+            try:
+                from Utils.bethesda_registry import maybe_register_for_game
+                maybe_register_for_game(
+                    prefix_dir=compat_data,
+                    proton_script=Path(proton_script),
+                    env=env,
+                    game=self._game,
+                    log_fn=self._log,
+                )
+            except Exception as exc:
+                self._log(f"BethINI Wizard: registry write skipped: {exc}")
+            self._link_mygames(compat_data / "pfx")
+            self._link_plugins_txt(compat_data / "pfx")
+
         self._log(f"BethINI Wizard: launching {exe} via Proton")
         try:
             proc = subprocess.Popen(
-                ["python3", str(proton_script), "run", str(exe)],
+                proton_run_command(proton_script, "run", str(exe)),
                 env=env,
                 cwd=str(exe.parent),
                 stdout=subprocess.DEVNULL,
@@ -412,6 +413,10 @@ class BethINIWizard(ctk.CTkFrame):
             )
             self.after(0, lambda: self._done_btn.configure(state="normal"))
             proc.wait()
+            shutdown_prefix_wineserver(
+                proton_script, compat_data,
+                log_fn=lambda m: self._log(f"BethINI Wizard: {m}"),
+            )
             self._log("BethINI Wizard: BethINI Pie closed.")
             self._set_label("_run_status", "BethINI Pie finished.", color="#6bc76b")
             self.after(0, self._on_done)

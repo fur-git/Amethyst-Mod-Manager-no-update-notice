@@ -298,6 +298,18 @@ class ProtonPrefixStepMixin:
     def _refresh_topbar_deploy_state(self):
         refresh_topbar_deploy_state(self)
 
+    def _isolated_prefix_dir(self, proton_name: str) -> "Path | None":
+        """Location of the isolated (non-shared) tool prefix for *proton_name*.
+
+        Defaults to ``prefix_<proton_name>/`` next to the tool exe. Hosts whose
+        exe sits somewhere a prefix shouldn't go (e.g. the game root) override
+        this to relocate it. Used by both ``_get_tool_env`` (creation) and
+        ``_selected_prefix_dir`` (the Delete Prefix button) so they always agree.
+        """
+        if self._exe is None:
+            return None
+        return self._exe.parent / f"prefix_{proton_name}"
+
     def _get_tool_env(self):
         """Resolve (proton_script, env, compat_data) for the tool's own prefix.
 
@@ -316,6 +328,7 @@ class ProtonPrefixStepMixin:
             return self._get_game_prefix_env()
 
         from gui.dialogs import _get_tool_prefix_env
+        from Utils.steam_finder import game_steam_id
         name = self._proton_name or load_saved_proton(self._game, self._tool_exe_name)
         target = None
         if mode == PREFIX_MODE_SHARED:
@@ -324,7 +337,14 @@ class ProtonPrefixStepMixin:
             if proton_script is None:
                 return None, None, None
             target = shared_prefix_dir(proton_script.parent.name)
-        result = _get_tool_prefix_env(self._exe, name, prefix_dir=target)
+        else:
+            # Isolated mode: default is prefix_<name>/ next to the exe, but a host
+            # may relocate it (e.g. when the exe lives in the game root and a
+            # prefix there would pollute the game install).
+            target = self._isolated_prefix_dir(name)
+        result = _get_tool_prefix_env(
+            self._exe, name, prefix_dir=target, steam_id=game_steam_id(self._game),
+        )
         if result is None:
             return None, None, None
         proton_script, compat_data, env = result
@@ -368,6 +388,9 @@ class ProtonPrefixStepMixin:
         env = os.environ.copy()
         env["STEAM_COMPAT_DATA_PATH"] = str(compat_data)
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
+        if steam_id:
+            env.setdefault("SteamAppId", str(steam_id))
+            env.setdefault("SteamGameId", str(steam_id))
         extra = parse_env_overrides(load_tool_launch_env(self._exe))
         if extra:
             env.update(extra)
@@ -655,7 +678,7 @@ class ProtonPrefixStepMixin:
             return None
         if self._shared_var.get():
             return shared_prefix_dir(name)
-        return self._exe.parent / f"prefix_{name}"
+        return self._isolated_prefix_dir(name)
 
     def _update_prefix_delete_state(self):
         self._confirm_delete = False
@@ -695,7 +718,13 @@ class ProtonPrefixStepMixin:
     def _do_delete_prefix(self, d: Path):
         import shutil
         try:
-            if not (d.name.startswith("prefix_") or d.name.startswith("shared_")):
+            # Safety: only delete recognised tool-prefix dirs. "prefix_" (isolated,
+            # next to the exe), "shared_" (shared config prefix), and host-relocated
+            # isolated prefixes that still carry a "_<Proton>" suffix (e.g.
+            # CreationKit's "creationkit_<Proton>" in the config wine_prefixes dir).
+            if not (d.name.startswith("prefix_")
+                    or d.name.startswith("shared_")
+                    or d.name.startswith("creationkit_")):
                 raise RuntimeError(f"refusing to delete non-prefix dir: {d}")
             shutil.rmtree(d)
             self._log(f"{self._tool_display_name} Wizard: deleted prefix {d}")

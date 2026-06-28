@@ -320,7 +320,8 @@ class CTkNotification(ctk.CTkToplevel):
 
     _active: "list[CTkNotification]" = []
 
-    def __init__(self, master, state: str = "info", message: str = "message", side: str = "right_bottom"):
+    def __init__(self, master, state: str = "info", message: str = "message", side: str = "right_bottom",
+                 show_progress: bool = False):
         from gui.theme import BG_PANEL
         super().__init__(master, fg_color=BG_PANEL)
         self.withdraw()
@@ -333,6 +334,7 @@ class CTkNotification(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
         CTkNotification._active.append(self)
 
+        self._state = state
         if state not in ICON_PATH or ICON_PATH[state] is None:
             self.icon = ctk.CTkImage(Image.open(ICON_PATH["info"]), Image.open(ICON_PATH["info"]), (24, 24))
         else:
@@ -349,6 +351,17 @@ class CTkNotification(ctk.CTkToplevel):
         self.close_btn = ctk.CTkButton(self, text="", image=self.close_icon, width=20, height=20, hover=False,
                                       fg_color="transparent", command=self.close_notification)
         self.close_btn.grid(row=0, column=1, sticky="ne", padx=10, pady=10)
+
+        # Optional progress bar (used for pooled batch operations). When
+        # enabled the toast grows to accommodate a determinate bar under the
+        # message.
+        self.progress_bar = None
+        if show_progress:
+            self.progress_bar = ctk.CTkProgressBar(self, height=8)
+            self.progress_bar.set(0)
+            self.progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew",
+                                   padx=15, pady=(0, 12))
+            self.geometry(f"{self.width}x96")
 
         self._configure_bid = master.bind("<Configure>", self._update_geometry, add="+")
         self._focus_out_bid = master.bind("<FocusOut>", self._on_focus_out, add="+")
@@ -387,8 +400,37 @@ class CTkNotification(ctk.CTkToplevel):
     def _get_nh(self):
         nh = self.winfo_height()
         if nh <= 1:
-            nh = int(80 * self._get_window_scaling())
+            base = 96 if self.progress_bar is not None else 80
+            nh = int(base * self._get_window_scaling())
         return nh
+
+    def update_message(self, message: str, state: str | None = None) -> None:
+        """Update the toast text in place (and optionally swap its icon).
+
+        Used to keep a single pooled notification reflecting the latest
+        status of a batch operation instead of spawning one toast per item.
+        """
+        if not self.winfo_exists():
+            return
+        try:
+            self.message_label.configure(text=f"  {message}")
+            if state is not None and state != self._state:
+                self._state = state
+                if state in ICON_PATH and ICON_PATH[state] is not None:
+                    self.icon = ctk.CTkImage(Image.open(ICON_PATH[state]),
+                                             Image.open(ICON_PATH[state]), (24, 24))
+                    self.message_label.configure(image=self.icon)
+        except Exception:
+            pass
+
+    def set_progress(self, fraction: float) -> None:
+        """Set the determinate progress bar (0.0–1.0). No-op without a bar."""
+        if self.progress_bar is None or not self.winfo_exists():
+            return
+        try:
+            self.progress_bar.set(max(0.0, min(1.0, fraction)))
+        except Exception:
+            pass
 
     def _update_geometry(self, event=None):
         # NB: do NOT call update_idletasks() here. This runs from the master's

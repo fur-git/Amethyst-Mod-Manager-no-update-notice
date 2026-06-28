@@ -12,21 +12,13 @@ import re
 import shutil
 from pathlib import Path
 
-from Games.base_game import BaseGame, WizardTool
+from Games.base_game import BaseGame, WizardTool, MODERN_DIRECTX_DEPS
 from Utils.atomic_write import write_atomic_text
 from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, move_to_core, restore_data_core
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
-
-# Prefix deps auto-installed on first add for the modern 64-bit Creation Engine
-# games (Skyrim SE/VR, Fallout 4/4VR, Starfield, EnderalSE): their *SE DLL
-# plugins silently fail to load without the VC++ x64 runtime, and Community
-# Shaders / ENB need the fxc2 d3dcompiler_47. Installed via the Proton-menu
-# installers, not winetricks — see base_game.auto_install_deps. The older 32-bit
-# Gamebryo titles (Oblivion/FO3/FNV/Skyrim LE) don't need these.
-_MODERN_CREATION_ENGINE_DEPS = ["vcredist", "d3dcompiler_47"]
 
 
 def _read_ini_key(ini_path: Path, section: str, key: str) -> "str | None":
@@ -147,6 +139,20 @@ class Fallout_3(BaseGame):
         "PointLookout.esm", "Zeta.esm",
     ]
     synthesis_registry_name = "Fallout3"
+
+    # Auto-install the VC++ x64 runtime + fxc2 d3dcompiler_47 on add/save for
+    # every Bethesda title (inherited by all subclasses below). The modern
+    # Creation Engine games genuinely need them; the older Gamebryo titles
+    # don't, but installing is harmless.
+    auto_install_deps = MODERN_DIRECTX_DEPS
+
+    # paths.json extras that a non-default profile may override (per-profile).
+    # heroic_app_name etc. are deliberately excluded so they stay global.
+    profile_overridable_paths_extras = (
+        "script_extender_swap",
+        "profile_ini_files",
+        "profile_saves",
+    )
 
     # BAIN packages are authored for Bethesda games, so re-enable the
     # sub-package picker that BaseGame disables by default.
@@ -1549,6 +1555,13 @@ class Fallout_NV(Fallout_3):
                 dialog_class_path="wizards.fnv_4gb_patch.Fnv4GbPatchWizard",
             ),
             WizardTool(
+                id="install_ttw",
+                label="Install Tale of Two Wastelands",
+                description="Run the native Linux TTW installer (merges Fallout 3 + New Vegas) and add the result as a mod. Requires Fallout 3 installed and a TTW .mpi package from mod.pub.",
+                dialog_class_path="wizards.ttw.TTWInstallerWizard",
+                category="Setup & Installers",
+            ),
+            WizardTool(
                 id="run_bethini_fonv",
                 label="Run BethINI Pie",
                 description="Install BethINI Pie and configure Fallout New Vegas INI settings.",
@@ -1628,6 +1641,86 @@ class Fallout_NV(Fallout_3):
     def _script_extender_exe(self) -> str:
         return "nvse_loader.exe"
 
+    # FalloutCustom.ini key/value set the TTW NVSE plugin expects (section, key,
+    # value). Applied via _set_ini_key so existing keys are updated and missing
+    # ones appended, leaving any other user keys untouched. Comments are omitted.
+    _TTW_CUSTOM_INI_VALUES: list[tuple[str, str, str]] = [
+        ("Audio", "bMultiThreadAudio", "1"),
+        ("Audio", "bUseAudioDebugInformation", "0"),
+        ("Audio", "iAudioCacheSize", "16384"),
+        ("Audio", "iMaxSizeForCachedSound", "2048"),
+        ("BackgroundLoad", "bSelectivePurgeUnusedOnFastTravel", "1"),
+        ("BackgroundLoad", "bBackgroundLoadLipFiles", "1"),
+        ("Controls", "fForegroundMouseAccelBase", "0"),
+        ("Controls", "fForegroundMouseAccelTop", "0"),
+        ("Controls", "fForegroundMouseBase", "0"),
+        ("Controls", "fForegroundMouseMult", "0"),
+        ("Display", "bFull Screen", "1"),
+        ("Display", "iPresentInterval", "1"),
+        ("Display", "iTexMipMapSkip", "0"),
+        ("Display", "bDrawShadows", "0"),
+        ("Display", "iActorShadowCountInt", "0"),
+        ("Display", "iActorShadowCountExt", "0"),
+        ("Display", "fDefaultWorldFOV", "75.0000"),
+        ("Display", "fDefault1stPersonFOV", "55.0000"),
+        ("Display", "fPipboy1stPersonFOV", "47.0"),
+        ("General", "bPreemptivelyUnloadCells", "1"),
+        ("General", "iNumHWThreads", "3"),
+        ("General", "SCharGenQuest", "001FFFF8"),
+        ("General", "SIntroMovie", ""),
+        ("Grass", "fGrassStartFadeDistance", "11200"),
+        ("Grass", "b30GrassVS", "1"),
+        ("Water", "bForceHighDetailReflections", "0"),
+        ("BlurShaderHDR", "bDoHighDynamicRange", "1"),
+        ("BlurShader", "bUseBlurShader", "0"),
+        ("PipBoy", "fLightEffectFadeDuration", "400"),
+    ]
+
+    _TTW_CUSTOM_INI_FILENAME = "FalloutCustom.ini"
+    # INIs migrated from the prefix into the profile's "ini files" folder.
+    _TTW_MIGRATE_INI_NAMES = ("Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini")
+
+    def setup_ttw_custom_ini(self, profile: str, log_fn=None) -> None:
+        """Set up per-profile INIs for TTW: enable profile-specific INIs, migrate
+        the prefix INIs into the profile's 'ini files' folder (without
+        overwriting), and write the TTW FalloutCustom.ini values. Idempotent.
+        Caller must set the active-profile context to *profile* first."""
+        import shutil
+
+        _log = log_fn or (lambda _m: None)
+
+        # 1. Enable profile-specific INIs for this profile.
+        if not self._profile_ini_files:
+            self.set_profile_ini_files(True)
+            _log(f"  Enabled profile-specific INI files for '{profile}'.")
+
+        ini_dir = self._profile_ini_dir(profile)
+        ini_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Migrate INIs from the prefix → profile, without overwriting.
+        for mygames in self._mygames_paths():
+            for name in self._TTW_MIGRATE_INI_NAMES:
+                src = mygames / name
+                dst = ini_dir / name
+                # Resolve through any symlink: a managed symlink already points
+                # back into a profile, so there's nothing to migrate.
+                if not src.exists() or src.is_symlink():
+                    continue
+                if dst.exists():
+                    _log(f"  Kept existing '{name}' in profile (not overwritten).")
+                    continue
+                try:
+                    shutil.copy2(src, dst)
+                    _log(f"  Migrated '{name}' from prefix → profile 'ini files'.")
+                except OSError as exc:
+                    _log(f"  WARN: could not migrate '{name}': {exc}")
+
+        # 3. Create / update FalloutCustom.ini with the TTW values.
+        custom_ini = ini_dir / self._TTW_CUSTOM_INI_FILENAME
+        for section, key, value in self._TTW_CUSTOM_INI_VALUES:
+            _set_ini_key(custom_ini, section, key, value)
+        _log(f"  Wrote TTW values to '{custom_ini.name}'.")
+
 
 class Fallout_4(Fallout_3):
 
@@ -1644,7 +1737,6 @@ class Fallout_4(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Fallout4.ccc"
     synthesis_registry_name = "Fallout4"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -1769,7 +1861,6 @@ class Fallout_4VR(Fallout_3):
     vanilla_plugins = ["Fallout4.esm", "Fallout4_VR.esm"]
     vanilla_dlc_plugins: list[str] = []
     synthesis_registry_name = "Fallout 4 VR"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2103,7 +2194,6 @@ class SkyrimVR(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Skyrim.ccc"
     synthesis_registry_name = "Skyrim VR"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2222,7 +2312,6 @@ class Starfield(Fallout_3):
     vanilla_dlc_plugins: list[str] = []
     vanilla_ccc_filename = "Starfield.ccc"
     synthesis_registry_name = "Starfield"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def reshade_dll(self) -> str:
@@ -2516,7 +2605,6 @@ class EnderalSE(Fallout_3):
     ]
     vanilla_dlc_plugins: list[str] = []
     synthesis_registry_name = "Enderal Special Edition"
-    auto_install_deps = _MODERN_CREATION_ENGINE_DEPS
 
     @property
     def name(self) -> str:

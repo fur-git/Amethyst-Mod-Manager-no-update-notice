@@ -16,7 +16,6 @@ Key differences from the vanilla Morrowind handler:
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
@@ -56,6 +55,12 @@ def _detect_openmw_cfg() -> Path | None:
 
 class OpenMW(BaseGame):
 
+    # OpenMW can deploy by copying, so the saved "copy" mode must be honoured.
+    deploy_mode_supports_copy = True
+    # The openmw.cfg path is a configured path, so make it per-profile like the
+    # game/prefix paths (stored as a paths.json extra).
+    profile_overridable_paths_extras = ("openmw_cfg_path",)
+
     vanilla_plugins = ["Morrowind.esm", "Tribunal.esm", "Bloodmoon.esm"]
 
     @property
@@ -64,6 +69,7 @@ class OpenMW(BaseGame):
 
     def __init__(self):
         self._game_path: Path | None = None
+        self._prefix_path: Path | None = None
         self._openmw_cfg_path: Path | None = None  # None → auto-detect
         self._deploy_mode: LinkMode = LinkMode.HARDLINK
         self._staging_path: Path | None = None
@@ -228,54 +234,20 @@ class OpenMW(BaseGame):
     # Configuration persistence
     # -----------------------------------------------------------------------
 
-    def load_paths(self) -> bool:
-        self._migrate_old_config()
-        if not self._paths_file.exists():
-            self._game_path = None
-            self._openmw_cfg_path = None
-            self._staging_path = None
-            return False
-        try:
-            data = json.loads(self._paths_file.read_text(encoding="utf-8"))
-            raw = data.get("game_path", "")
-            if raw:
-                self._game_path = Path(raw)
-            raw_cfg = data.get("openmw_cfg_path", "")
-            if raw_cfg:
-                self._openmw_cfg_path = Path(raw_cfg)
-            raw_mode = data.get("deploy_mode", "hardlink")
-            self._deploy_mode = {
-                "symlink": LinkMode.SYMLINK,
-                "copy":    LinkMode.COPY,
-            }.get(raw_mode, LinkMode.HARDLINK)
-            raw_staging = data.get("staging_path", "")
-            if raw_staging:
-                self._staging_path = Path(raw_staging)
-            self._validate_staging()
-            return bool(self._game_path)
-        except (json.JSONDecodeError, OSError):
-            pass
-        self._game_path = None
-        self._openmw_cfg_path = None
-        return False
+    # OpenMW is a native Linux binary — never look up a Proton prefix.
+    def _find_prefix_for_load(self) -> "Path | None":
+        return None
 
-    def save_paths(self) -> None:
-        self._paths_file.parent.mkdir(parents=True, exist_ok=True)
-        mode_str = {
-            LinkMode.SYMLINK: "symlink",
-            LinkMode.COPY:    "copy",
-        }.get(self._deploy_mode, "hardlink")
-        data = {
-            "game_path":       str(self._game_path)       if self._game_path       else "",
+    # load_paths / save_paths are inherited from BaseGame (profile-aware);
+    # openmw_cfg_path is persisted via the _load/_save_paths_extra hooks below.
+    def _load_paths_extra(self, data: dict) -> None:
+        raw_cfg = data.get("openmw_cfg_path", "")
+        self._openmw_cfg_path = Path(raw_cfg) if raw_cfg else None
+
+    def _save_paths_extra(self) -> dict:
+        return {
             "openmw_cfg_path": str(self._openmw_cfg_path) if self._openmw_cfg_path else "",
-            "deploy_mode":     mode_str,
-            "staging_path":    str(self._staging_path)    if self._staging_path    else "",
         }
-        self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-    def set_game_path(self, path: "Path | str | None") -> None:
-        self._game_path = Path(path) if path else None
-        self.save_paths()
 
     def set_staging_path(self, path: "Path | str | None") -> None:
         self._staging_path = Path(path) if path else None

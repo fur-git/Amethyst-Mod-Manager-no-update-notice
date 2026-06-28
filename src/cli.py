@@ -154,6 +154,9 @@ def cmd_restore(games: dict, key: str):
     last_deployed = game.get_last_deployed_profile()
     if last_deployed:
         game.set_active_profile_dir(profile_root / "profiles" / last_deployed)
+        # Reload so the last-deployed profile's path overrides drive the restore.
+        game.load_paths()
+        game_root = game.get_game_path()
 
     if hasattr(game, "restore"):
         game.restore(log_fn=_log)

@@ -404,6 +404,8 @@ class ProfileSettingsOverlay(tk.Frame):
         )
         if is_deployed:
             game.set_active_profile_dir(profile_dir)
+            # Reload so the restore targets this profile's own game folder.
+            game.load_paths()
             try:
                 if hasattr(game, "restore"):
                     game.restore()
@@ -418,6 +420,7 @@ class ProfileSettingsOverlay(tk.Frame):
             except Exception:
                 pass
             game.set_active_profile_dir(None)
+            game.load_paths()
 
         if profile_dir.is_dir():
             from gui.game_helpers import profile_uses_specific_mods

@@ -3,10 +3,14 @@ bendr.py
 Linux wrapper for BENDr — runs the Windows BENDr normal-map pipeline on Linux
 via Wine/Proton.
 
-All steps (BSA extract, loose copy, exclusions, filter, parallax prep,
-alpha handling, BENDing, BC7, output QC) run through the original BENDr
-.exe tools under Wine. Paths and work directory are provided by the mod
-manager; no registry or PowerShell dialogs.
+All steps (BSA extract, loose copy, exclusions, filter, BENDing +
+texconv/BC7 compression) run through the original BENDr .exe tools under
+Wine. Paths and work directory are provided by the mod manager; no
+registry or PowerShell dialogs.
+
+Targets BENDr v3.0331+ (March 2026), whose simplified workflow folds the
+old PrepParallax / AlphaNormalSQL / separate BC7 steps into BENDr.exe
+itself (BENDr.exe takes a --tool texconv.exe argument and compresses).
 
 Public entry point:  run_bendr(...)
 """
@@ -27,7 +31,6 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\[[?][0-9;]*[A-Za-z]|\x1b[A-Za
 
 from Utils.config_paths import get_wine_prefixes_dir
 from Utils.steam_finder import find_wine
-from wrappers.vramr import _ensure_compressonator, _optimise_one_texture
 
 
 # ── Wine helpers ───────────────────────────────────────────────────────────
@@ -176,53 +179,6 @@ def _ensure_utf8_prefix(wine: str, prefix: str) -> None:
     reg_file.write_text(content)
 
 
-def _run_native_bc7(
-    output_dir: Path,
-    comp_cli: Path,
-    log_fn: Callable[[str], None],
-    progress_fn: Callable[[int], None],
-    progress_start: int = 82,
-    progress_end: int = 95,
-) -> None:
-    """Native replacement for BC7.exe — compresses all DDS files to BC7.
-
-    BENDr's BC7.exe just recompresses every DDS in the output directory to
-    BC7 format.  No resizing is needed; PrepParallax already handled that.
-    """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    dds_files = list(output_dir.rglob("*.dds"))
-    total = len(dds_files)
-    if total == 0:
-        log_fn("  No DDS files to compress.")
-        return
-
-    log_fn(f"  Compressing {total} DDS files to BC7 (native)...")
-
-    tasks = [
-        (str(f), 0, 0, "BC7", str(comp_cli), False)
-        for f in dds_files
-    ]
-
-    cpu_count = os.cpu_count() or 4
-    workers = min(max(1, cpu_count // 2), total)
-    done = 0
-    errors = 0
-
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_optimise_one_texture, task): task for task in tasks}
-        for future in as_completed(futures):
-            done += 1
-            result_msg = future.result()
-            if result_msg.startswith("FAIL") or result_msg.startswith("ERROR"):
-                errors += 1
-            log_fn(f"  [{done}/{total}] {result_msg}")
-            pct = progress_start + int((progress_end - progress_start) * done / total)
-            progress_fn(pct)
-
-    log_fn(f"  BC7 compression complete: {done - errors}/{total} succeeded, {errors} failed.")
-
-
 def _timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -275,7 +231,6 @@ def run_bendr(
     Path(prefix).mkdir(parents=True, exist_ok=True)
     _log(f"  Wine: {wine}")
     _ensure_utf8_prefix(wine, prefix)
-    comp_cli = _ensure_compressonator(_log)
     _progress(5)
 
     # Prepare output directory
@@ -305,6 +260,11 @@ def run_bendr(
     w_output    = _linux_to_wine(work_output)
     w_logfiles  = _linux_to_wine(work_logfiles)
     w_exclusions = _linux_to_wine(tools_dir / "Exclusions.mod")
+    w_texconv    = _linux_to_wine(tools_dir / "texconv.exe")
+
+    # BENDr v3.0331+ simplified workflow (see BENDr.bat). PrepParallax,
+    # AlphaNormalSQL and the separate BC7 pass are gone — BENDr.exe now bends
+    # the normals and compresses via the supplied --tool texconv.exe.
 
     # ── Step 1: BSA extraction (normals + parallax only)
     _file_log("Extracting BSA Archives...")
@@ -313,8 +273,8 @@ def run_bendr(
         "--dest", w_output,
         "--logfile", w_logfiles,
         "--filter", "*_n.dds", "*_p.dds",
-    ], log_fn=_log, label="Step 1/8: BSA Extraction")
-    _progress(20)
+    ], log_fn=_log, label="Step 1/5: BSA Extraction")
+    _progress(25)
 
     # ── Step 2: Loose file copy (normals + parallax only)
     _file_log("Copying Loose Normal/Parallax Textures...")
@@ -323,8 +283,8 @@ def run_bendr(
         "--dest", w_output + "\\textures",
         "--logfile", w_logfiles,
         "--filter", "*_n.dds", "*_p.dds",
-    ], log_fn=_log, label="Step 2/8: Loose File Copy")
-    _progress(30)
+    ], log_fn=_log, label="Step 2/5: Loose File Copy")
+    _progress(38)
 
     # ── Step 3: Exclusions
     _file_log("Processing Exclusions...")
@@ -332,64 +292,24 @@ def run_bendr(
         "--Exclude", w_exclusions,
         "--Dest", w_output,
         "--Logfile", w_logfiles,
-    ], log_fn=_log, label="Step 3/8: Applying Exclusions")
-    _progress(38)
+    ], log_fn=_log, label="Step 3/5: Applying Exclusions")
+    _progress(45)
 
     # ── Step 4: Filter pairs (keeps only matched normal+parallax pairs)
     _file_log("Filtering Pairs...")
     _wine_run(wine, prefix, _tool("BENDrFilter.exe"), [
         "--source", w_output,
         "--logfiles", w_logfiles,
-    ], log_fn=_log, label="Step 4/8: Filtering Pairs")
-    _progress(45)
+    ], log_fn=_log, label="Step 4/5: Filtering Pairs")
+    _progress(55)
 
-    # ── Step 5: Prepare parallax height maps (downscale to 1024)
-    _file_log("Preparing Parallax Height Maps...")
-    _wine_run(wine, prefix, _tool("PrepParallax.exe"), [
-        "--downscale", "1024",
-        "--source", w_output,
-        "--logfiles", w_logfiles,
-    ], log_fn=_log, label="Step 5/8: Prep Parallax")
-    _progress(54)
-
-    # ── Step 6a: Build alpha-normal SQL database (remove alpha channel)
-    _file_log("Building Normal Map Alpha DB...")
-    _wine_run(wine, prefix, _tool("AlphaNormalSQL.exe"), [
-        "--remove",
-        "--downscale", "1024",
-        "--source", w_output,
-        "--logfile", w_logfiles,
-    ], log_fn=_log, label="Step 6/8: Alpha Normal SQL (remove)")
-    _progress(62)
-
-    # ── Step 7: BENDr — bend the normal maps
+    # ── Step 5: BENDr — bend the normal maps and compress via texconv
     _file_log("BENDing Normal Maps...")
     _wine_run(wine, prefix, _tool("BENDr.exe"), [
         "--source", w_output,
         "--logfile", w_logfiles,
-    ], log_fn=_log, label="Step 7/8: BENDr")
-    _progress(75)
-
-    # ── Step 6b: Restore alpha transparency
-    _file_log("Recovering Alpha Transparency...")
-    _wine_run(wine, prefix, _tool("AlphaNormalSQL.exe"), [
-        "--restore",
-        "--source", w_output,
-        "--logfile", w_logfiles,
-    ], log_fn=_log, label="Step 7b/8: Alpha Normal SQL (restore)")
-    _progress(82)
-
-    # ── Step 8: BC7 compression (native — Pillow + CompressonatorCLI)
-    _file_log("Finalising DDS Library (BC7, native)...")
-    _log("── Step 8/8: BC7 Compression (native) ──")
-    _run_native_bc7(
-        output_dir=work_output,
-        comp_cli=comp_cli,
-        log_fn=_log,
-        progress_fn=_progress,
-        progress_start=82,
-        progress_end=95,
-    )
+        "--tool", w_texconv,
+    ], log_fn=_log, label="Step 5/5: BENDr (BEND + BC7)")
     _progress(95)
 
     # ── Tidy up

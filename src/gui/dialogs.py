@@ -78,6 +78,7 @@ from gui.ctk_components import CTkAlert, CTkLoader, ICON_PATH
 from gui.tk_tooltip import TkTooltip
 from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT, bind_scrollable_wheel
 from Utils.xdg import xdg_open, open_url
+from Utils.steam_finder import proton_run_command
 
 
 def _resolve_exe_args_file(game) -> "Path":
@@ -1090,7 +1091,7 @@ class ProtonToolsPanel(ctk.CTkFrame):
         # --- Prefix tools ---------------------------------------------------
         _category("Prefix Tools", first=True)
         ctk.CTkButton(inner, text="Run winecfg",              command=self._run_winecfg,             **btn_cfg).pack(pady=(0, 6))
-        ctk.CTkButton(inner, text="Run protontricks",         command=self._run_protontricks,        **btn_cfg).pack(pady=(0, 6))
+        ctk.CTkButton(inner, text="Run winetricks",           command=self._run_protontricks,        **btn_cfg).pack(pady=(0, 6))
         ctk.CTkButton(inner, text="Run EXE in this prefix …", command=self._run_exe,                 **btn_cfg).pack(pady=(0, 6))
         ctk.CTkButton(inner, text="Open wine registry",       command=self._run_regedit,             **btn_cfg).pack(pady=(0, 6))
         ctk.CTkButton(inner, text="Wine DLL Overrides",       command=self._open_wine_dll_overrides, **btn_cfg).pack(pady=(0, 6))
@@ -1231,7 +1232,7 @@ class ProtonToolsPanel(ctk.CTkFrame):
                 f"(checked: {', '.join(checked)}); falling back to "
                 "'proton run', which boots the steam.exe shim and may crash "
                 "with an lsteamclient assertion if Steam is unavailable.")
-            return ["python3", str(proton_script), "run", tool]
+            return proton_run_command(proton_script, "run", tool)
         log(f"Proton Tools: using bundled wine binary {wine_bin}")
         prefix_path = self._game.get_prefix_path()
         if prefix_path is not None:
@@ -1361,55 +1362,38 @@ class ProtonToolsPanel(ctk.CTkFrame):
             install_winetricks,
             winetricks_installed,
         )
-        from Utils.steam_finder import game_steam_id
-        steam_id = game_steam_id(self._game)
-        prefix_path = getattr(self._game, "_prefix_path", None)
         log = self._log
 
-        if shutil.which("protontricks") is not None and steam_id:
-            cmd = ["protontricks", steam_id, "--gui"]
-        elif shutil.which("flatpak") is not None and steam_id and subprocess.run(
-            ["flatpak", "info", "com.github.Matoking.protontricks"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0:
-            cmd = ["flatpak", "run", "com.github.Matoking.protontricks", steam_id, "--gui"]
-        elif prefix_path and prefix_path.is_dir():
-            def _launch_winetricks():
-                if not winetricks_installed():
-                    log("Proton Tools: winetricks not found — downloading …")
-                    if not install_winetricks(log_fn=lambda m: log(f"Proton Tools: {m}")):
-                        return
-                if not cabextract_installed():
-                    log("Proton Tools: cabextract not found — downloading a portable copy …")
-                    if not install_cabextract(log_fn=lambda m: log(f"Proton Tools: {m}")):
-                        return
-                wt = _bundled_winetricks()
-                env = os.environ.copy()
-                env["WINEPREFIX"] = str(prefix_path)
-                path_prefix = str(wt.parent)
-                proton_bin = _get_proton_bin()
-                if proton_bin:
-                    path_prefix = proton_bin + os.pathsep + path_prefix
-                env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
-                log("Proton Tools: launching winetricks GUI …")
-                try:
-                    subprocess.Popen([str(wt), "--gui"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-                except Exception as e:
-                    log(f"Proton Tools error: {e}")
-            self._close_and_run(_launch_winetricks)
-            return
-        else:
-            self._log("Proton Tools: protontricks is not installed and no prefix path is available.")
+        prefix_path = self._game.get_prefix_path()
+        if prefix_path is None or not prefix_path.is_dir():
+            log("Proton Tools: prefix not configured for this game — cannot launch winetricks.")
             return
 
-        def _launch():
-            log(f"Proton Tools: launching protontricks for app {steam_id}: It may take a while to open")
+        def _launch_winetricks():
+            if not winetricks_installed():
+                log("Proton Tools: winetricks not found — downloading …")
+                if not install_winetricks(log_fn=lambda m: log(f"Proton Tools: {m}")):
+                    return
+            if not cabextract_installed():
+                log("Proton Tools: cabextract not found — downloading a portable copy …")
+                if not install_cabextract(log_fn=lambda m: log(f"Proton Tools: {m}")):
+                    return
+            wt = _bundled_winetricks()
+            env = os.environ.copy()
+            env["WINEPREFIX"] = str(prefix_path)
+            path_prefix = str(wt.parent)
+            proton_bin = _get_proton_bin()
+            if proton_bin:
+                path_prefix = proton_bin + os.pathsep + path_prefix
+            env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
+            log(f"Proton Tools: launching winetricks GUI against {prefix_path} …")
             try:
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen([str(wt), "--gui"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
             except Exception as e:
                 log(f"Proton Tools error: {e}")
-        self._close_and_run(_launch)
+
+        self._close_and_run(_launch_winetricks)
 
     def _run_exe(self):
         proton_script, env = self._get_proton_env()
@@ -1425,7 +1409,7 @@ class ProtonToolsPanel(ctk.CTkFrame):
                 return
             log(f"Proton Tools: launching {exe_path.name} via {proton_script.parent.name} …")
             try:
-                subprocess.Popen(["python3", str(proton_script), "run", str(exe_path)],
+                subprocess.Popen(proton_run_command(proton_script, "run", str(exe_path)),
                                  env=env, cwd=exe_path.parent,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as e:
@@ -1505,8 +1489,8 @@ class ProtonToolsPanel(ctk.CTkFrame):
                         plog(f"Using cached .NET {version} installer.")
                     plog(f"Installing .NET {version} in game prefix (silent) — may take a few minutes …")
                     proc = subprocess.run(
-                        ["python3", str(proton_script), "run",
-                         str(cache_path), "/quiet", "/norestart"],
+                        proton_run_command(proton_script, "run",
+                         str(cache_path), "/quiet", "/norestart"),
                         env=env, cwd=cache_path.parent,
                     )
                     # 0 = success, 102 = already installed/no-op, 1638 = newer present, 3010 = reboot required
@@ -1946,9 +1930,18 @@ class OverwritesPanel(ctk.CTkFrame):
                  files_win: list[tuple[str, str]],
                  files_lose: list[tuple[str, str]],
                  files_no_conflict: list[str] | None = None,
-                 on_done=None):
+                 on_done=None,
+                 on_rehost=None,
+                 is_popped_out: bool = False):
         super().__init__(parent, fg_color=BG_DEEP, corner_radius=0)
         self._on_done = on_done or (lambda p: None)
+        # Called when the popout/dock toggle is clicked. The launcher rebuilds
+        # the panel in the other host (Tk can't reparent across toplevels), so
+        # we ship the conflict data back. Signature: on_rehost(going_to_popout).
+        self._on_rehost = on_rehost
+        self._is_popped_out = is_popped_out
+        # Stashed so the launcher can rebuild us in the other host.
+        self._rehost_data = (mod_name, files_win, files_lose, files_no_conflict)
         files_no_conflict = files_no_conflict or []
 
         # Title bar
@@ -1964,6 +1957,24 @@ class OverwritesPanel(ctk.CTkFrame):
             fg_color=BG_PANEL, hover_color=BG_HOVER, text_color=TEXT_MAIN,
             command=self._on_close,
         ).pack(side="right", padx=4)
+        # Popout / dock toggle. Hidden when no re-host handler is wired up.
+        if self._on_rehost is not None:
+            popout_btn = ctk.CTkButton(
+                title_bar, text=("\u2921" if self._is_popped_out else "\u2922"),
+                width=32, height=32, font=FONT_BOLD,
+                fg_color=BG_PANEL, hover_color=BG_HOVER, text_color=TEXT_MAIN,
+                command=self._on_popout_toggle,
+            )
+            popout_btn.pack(side="right", padx=(4, 0))
+            try:
+                from gui.ctk_tooltip import CTkToolTip
+                CTkToolTip(
+                    popout_btn,
+                    message="Dock back to main window" if self._is_popped_out
+                    else "Open in a separate window",
+                )
+            except Exception:
+                pass
         ctk.CTkFrame(self, fg_color=BORDER, height=1, corner_radius=0).pack(fill="x")
 
         # Body — left column has win+lose stacked, right column has no-conflicts
@@ -2144,6 +2155,16 @@ class OverwritesPanel(ctk.CTkFrame):
 
     def _on_close(self):
         self._on_done(self)
+
+    def _on_popout_toggle(self):
+        """Hand off to the launcher, which rebuilds this panel in the other host
+        (docked overlay vs. separate window). Tk can't reparent a live widget
+        across toplevels, so we ship our conflict data and let the launcher
+        construct a fresh OverwritesPanel in the new host."""
+        if self._on_rehost is None:
+            return
+        going_to_popout = not self._is_popped_out
+        self._on_rehost(going_to_popout)
 
 
 # VRAMr preset panel — overlay on plugin panel
@@ -2470,6 +2491,7 @@ _PGPATCHER_DEFAULT_PROTON = ""  # empty string = "Game default"
 
 def _get_tool_prefix_env(
     exe_path: "Path", proton_name: str, prefix_dir: "Path | None" = None,
+    steam_id: "str | None" = None,
 ) -> "tuple[Path, Path, dict] | None":
     """Resolve (proton_script, prefix_dir, env) for a tool's isolated prefix.
 
@@ -2499,12 +2521,18 @@ def _get_tool_prefix_env(
     env = os.environ.copy()
     env["STEAM_COMPAT_DATA_PATH"] = str(prefix_dir)
     env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
+    # lsteamclient's steamclient_main.c asserts (Expression: "!status") when it
+    # tries to attach to the Steam client with no app context. Tools running in
+    # their own isolated prefix have no AppId from Steam, so set one explicitly.
+    if steam_id:
+        env.setdefault("SteamAppId", steam_id)
+        env.setdefault("SteamGameId", steam_id)
 
     if is_new:
         # Initialise the prefix synchronously before returning
         try:
             subprocess.run(
-                ["python3", str(proton_script), "run", "wineboot", "--init"],
+                proton_run_command(proton_script, "run", "wineboot", "--init"),
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -2517,9 +2545,9 @@ def _get_tool_prefix_env(
         # checkbox: HKCU\Software\Wine\ShowDotFiles = "Y".
         try:
             subprocess.run(
-                ["python3", str(proton_script), "run", "reg", "add",
+                proton_run_command(proton_script, "run", "reg", "add",
                  r"HKCU\Software\Wine", "/v", "ShowDotFiles",
-                 "/t", "REG_SZ", "/d", "Y", "/f"],
+                 "/t", "REG_SZ", "/d", "Y", "/f"),
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -2875,7 +2903,7 @@ class ExeConfigPanel(ctk.CTkFrame):
                 command=self._run_exe_in_prefix, **small_btn,
             ).pack(side="left", padx=(0, 6))
             ctk.CTkButton(
-                btn_row, text="Run protontricks", width=140,
+                btn_row, text="Run winetricks", width=140,
                 command=self._run_protontricks_in_prefix, **small_btn,
             ).pack(side="left", padx=(0, 6))
             ctk.CTkButton(
@@ -3125,7 +3153,10 @@ class ExeConfigPanel(ctk.CTkFrame):
         if selected == "Game default":
             self._log("Prefix tools: select a specific Proton version first.")
             return None
-        result = _get_tool_prefix_env(self._exe_path, selected)
+        from Utils.steam_finder import game_steam_id
+        result = _get_tool_prefix_env(
+            self._exe_path, selected, steam_id=game_steam_id(self._game),
+        )
         if result is None:
             self._log(f"Prefix tools: could not find Proton '{selected}'.")
             return None
@@ -3177,7 +3208,7 @@ class ExeConfigPanel(ctk.CTkFrame):
             self._log(f"Prefix tools: launching {exe.name} …")
             try:
                 subprocess.Popen(
-                    ["python3", str(proton_script), "run", str(exe)],
+                    proton_run_command(proton_script, "run", str(exe)),
                     env=env, cwd=exe.parent,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
@@ -3191,40 +3222,8 @@ class ExeConfigPanel(ctk.CTkFrame):
         result = self._get_selected_tool_env()
         if result is None:
             return
-        proton_script, prefix_dir, env = result
-
-        from Utils.steam_finder import game_steam_id
-        steam_id = game_steam_id(self._game)
-
-        if shutil.which("protontricks") is not None:
-            cmd = ["protontricks"]
-            if steam_id:
-                cmd += [steam_id, "--gui"]
-            else:
-                cmd += ["--gui"]
-        elif shutil.which("flatpak") is not None and subprocess.run(
-            ["flatpak", "info", "com.github.Matoking.protontricks"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0:
-            cmd = ["flatpak", "run", "com.github.Matoking.protontricks"]
-            if steam_id:
-                cmd += [steam_id, "--gui"]
-            else:
-                cmd += ["--gui"]
-        else:
-            self._launch_winetricks_gui_in_prefix(prefix_dir / "pfx")
-            return
-
-        env["STEAM_COMPAT_DATA_PATH"] = str(prefix_dir)
-        env["PROTON_VERSION"] = proton_script.parent.name
-        self._log(f"Prefix tools: launching protontricks for prefix {prefix_dir.name} …")
-        try:
-            subprocess.Popen(
-                cmd, env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            self._log(f"Prefix tools error: {e}")
+        _proton_script, prefix_dir, _env = result
+        self._launch_winetricks_gui_in_prefix(prefix_dir / "pfx")
 
     def _launch_winetricks_gui_in_prefix(self, wineprefix: Path):
         from Utils.protontricks import (
@@ -3238,8 +3237,8 @@ class ExeConfigPanel(ctk.CTkFrame):
 
         if not wineprefix.is_dir():
             self._log(
-                "Prefix tools: protontricks not found and no Wine prefix is "
-                "available — cannot launch winetricks."
+                "Prefix tools: no Wine prefix is available — cannot launch "
+                "winetricks."
             )
             return
         if not winetricks_installed():
@@ -5952,6 +5951,29 @@ class MissingReqsPanel(ctk.CTkFrame):
 
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def _resolve_ids_directly(self, domain, ids, seen):
+        """Resolve requirement *ids* by fetching each mod's own Nexus page — used
+        when the parent has no mod_id (e.g. the locally-built TTW mod). Skips ids
+        in *seen*; falls back to a minimal entry if a fetch fails."""
+        from Nexus.nexus_api import NexusModRequirement
+        out = []
+        for rid in sorted(ids):
+            if rid in seen:
+                continue
+            seen.add(rid)
+            try:
+                info = self._api.get_mod(domain, rid)
+                name = getattr(info, "name", "") or f"Mod {rid}"
+                summary = getattr(info, "summary", "") or ""
+            except Exception:
+                name, summary = f"Mod {rid}", ""
+            out.append(NexusModRequirement(
+                mod_id=rid, mod_name=name, game_domain=domain,
+                url=f"https://www.nexusmods.com/{domain}/mods/{rid}",
+                notes=summary,
+            ))
+        return out
+
     def _worker(self):
         err = None
         missing_list = []
@@ -5962,6 +5984,13 @@ class MissingReqsPanel(ctk.CTkFrame):
                 seen: set = set()
                 errors: list[str] = []
                 for m in self._mods:
+                    # Locally-built mods (mod_id 0) have no parent requirements
+                    # list — resolve each seeded id on its own page instead.
+                    if not m.get("mod_id"):
+                        missing_list.extend(
+                            self._resolve_ids_directly(
+                                m["domain"], m["missing_ids"], seen))
+                        continue
                     try:
                         all_reqs = self._api.get_mod_requirements(
                             m["domain"], m["mod_id"])
@@ -5974,6 +6003,11 @@ class MissingReqsPanel(ctk.CTkFrame):
                             missing_list.append(r)
                 if not missing_list and errors:
                     err = "Could not load requirements: " + "; ".join(errors)
+            elif not self._mod_id:
+                # Single mod with no Nexus mod_id of its own — resolve each
+                # seeded requirement id directly.
+                missing_list = self._resolve_ids_directly(
+                    self._domain, self._missing_ids, set())
             else:
                 all_reqs = self._api.get_mod_requirements(self._domain, self._mod_id)
                 for r in all_reqs:

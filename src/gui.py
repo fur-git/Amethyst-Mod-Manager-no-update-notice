@@ -78,6 +78,45 @@ _UI_SCALE = load_ui_scale()
 # scaling` to the design baseline, and CustomTkinter renders all fonts as
 # negative-pixel sizes which ignore Xft.dpi entirely.
 
+# CustomTkinter's FontManager copies its bundled fonts into ~/.fonts (a legacy,
+# non-XDG location) and mkdir's that dir at import time. To keep the home folder
+# clean we redirect it to the XDG user font dir (~/.local/share/fonts).
+#
+# The mkdir + font copies run unconditionally inside font/__init__.py the first
+# time customtkinter is imported, so simply setting the attribute afterwards is
+# too late — ~/.fonts is already created. Instead we load font_manager.py as its
+# fully-qualified module and seed it into sys.modules *before* importing ctk;
+# CTk's `from .font_manager import FontManager` then picks up our patched class,
+# so the import-time mkdir/copy target the XDG dir and ~/.fonts is never made.
+try:
+    import os as _os
+    import importlib.util as _ilu
+    import sys as _sys
+
+    _xdg_fonts = _os.path.join(
+        _os.environ.get("XDG_DATA_HOME", _os.path.expanduser("~/.local/share")),
+        "fonts",
+    )
+    _os.makedirs(_xdg_fonts, exist_ok=True)
+
+    # find_spec on the top package returns its location WITHOUT executing the
+    # package __init__ (which is what triggers the font init we're racing).
+    _ctk_spec = _ilu.find_spec("customtkinter")
+    if _ctk_spec and _ctk_spec.submodule_search_locations:
+        _fm_name = "customtkinter.windows.widgets.font.font_manager"
+        _fm_path = _os.path.join(
+            _ctk_spec.submodule_search_locations[0],
+            "windows", "widgets", "font", "font_manager.py",
+        )
+        if _fm_name not in _sys.modules and _os.path.isfile(_fm_path):
+            _fm_spec = _ilu.spec_from_file_location(_fm_name, _fm_path)
+            _fm_mod = _ilu.module_from_spec(_fm_spec)
+            _fm_spec.loader.exec_module(_fm_mod)
+            _fm_mod.FontManager.linux_font_path = _xdg_fonts + _os.sep
+            _sys.modules[_fm_name] = _fm_mod
+except Exception:
+    pass
+
 import customtkinter as ctk
 
 ctk.set_widget_scaling(_UI_SCALE)
@@ -268,6 +307,36 @@ class App(ctk.CTk):
         # everything here is in DESIGN units; screen caps are converted from
         # physical pixels by dividing by the UI scale.
         _s = get_ui_scale()
+        # Size against the ACTUAL monitor the window opens on, NOT
+        # winfo_screenwidth/height — on a multi-monitor desktop those return
+        # the combined virtual-desktop size (e.g. 3600x3625 for stacked
+        # displays), so caps computed from them never engage and the window is
+        # sized/placed for a space far larger than the real monitor. We reuse
+        # the per-monitor rects already used for splash placement; fall back to
+        # a single sane monitor size (NOT the virtual desktop) when the query
+        # fails (bare WMs without xrandr, etc.).
+        def _current_monitor_size() -> tuple[int, int]:
+            try:
+                from Utils.ui_config import get_monitor_rects
+                rects = get_monitor_rects()
+                if rects:
+                    _px = self.winfo_pointerx()
+                    _py = self.winfo_pointery()
+                    for _mx, _my, _mw, _mh in rects:
+                        if _mx <= _px < _mx + _mw and _my <= _py < _my + _mh:
+                            return _mw, _mh
+                    # Pointer not over any reported monitor — use the smallest,
+                    # so caps stay conservative and the window always fits.
+                    return min(rects, key=lambda r: r[2] * r[3])[2:]
+            except Exception:
+                pass
+            # No per-monitor data available — fall back to the original
+            # behaviour (full reported screen). This is the combined virtual
+            # desktop on multi-monitor, but with no rect data we can't do
+            # better, and it's strictly no worse than before this change.
+            return self.winfo_screenwidth(), self.winfo_screenheight()
+
+        _mon_w, _mon_h = _current_monitor_size()
         # Restore saved window size/position, or use default
         saved_geom = load_window_geometry()
         if saved_geom:
@@ -277,8 +346,8 @@ class App(ctk.CTk):
                 import re
                 m = re.match(r"(\d+)x(\d+)", saved_geom)
                 if m:
-                    sw = self.winfo_screenwidth() / _s
-                    sh = self.winfo_screenheight() / _s
+                    sw = _mon_w / _s
+                    sh = _mon_h / _s
                     w, h = int(m.group(1)), int(m.group(2))
                     if w <= sw and h <= sh:
                         self.geometry(saved_geom)
@@ -291,9 +360,9 @@ class App(ctk.CTk):
         else:
             self.geometry("1280x720")
         # Keep the window from shrinking below the toolbar, but cap the
-        # minimum to the screen so it always fits on smaller/HiDPI monitors.
-        _min_w = min(1280, int((self.winfo_screenwidth() - 50) / _s))
-        _min_h = min(720, int((self.winfo_screenheight() - 100) / _s))
+        # minimum to the monitor so it always fits on smaller monitors.
+        _min_w = min(1280, int((_mon_w - 50) / _s))
+        _min_h = min(720, int((_mon_h - 100) / _s))
         self.minsize(_min_w, _min_h)
         self.bind("<Configure>", self._on_window_configure)
         self._geom_save_id: str | None = None
@@ -360,6 +429,14 @@ class App(ctk.CTk):
         try:
             from Utils import memtrace
             memtrace.install(self)
+        except Exception:
+            pass
+
+        # Timing diagnostic (env-gated; auto-on from source). Press F11 to dump
+        # a summary of where UI time is spent, Shift+F11 to reset the counters.
+        try:
+            from Utils import perftrace
+            perftrace.install(self)
         except Exception:
             pass
 
@@ -1519,6 +1596,8 @@ class App(ctk.CTk):
                 initial_game.set_active_profile_dir(
                     initial_game.get_profile_root() / "profiles" / profile
                 )
+                # Reload so the startup profile's per-profile path overrides apply.
+                initial_game.load_paths()
                 self._plugin_panel._plugins_path = plugins_path
                 self._plugin_panel._plugin_extensions = initial_game.plugin_extensions
                 self._plugin_panel._vanilla_plugins = _vanilla_plugins_for_game(initial_game)
@@ -2416,10 +2495,16 @@ class App(ctk.CTk):
         threading.Thread(target=_do, daemon=True).start()
 
     def _startup_log(self):
-        from Utils.ui_config import get_ui_scale, get_screen_info
+        from Utils.ui_config import get_ui_scale, get_screen_info, get_monitor_rects
         w, h, detected = get_screen_info()
+        # w x h is the combined virtual desktop on multi-monitor setups; also
+        # log each real monitor so a "window sized for the wrong screen" bug
+        # (custom mode / second display) is visible in the diagnostic.
+        rects = get_monitor_rects()
+        mons = ", ".join(f"{r[2]}x{r[3]}+{r[0]}+{r[1]}" for r in rects) or "unknown"
         self._status.log(
-            f"Display: {w}x{h}, HiDPI detected={detected}, scale={get_ui_scale()}"
+            f"Display: virtual {w}x{h}, monitors=[{mons}], "
+            f"HiDPI detected={detected}, scale={get_ui_scale()}"
         )
         configured = sum(1 for g in _GAMES.values() if g.is_configured())
         total = len(_GAMES)
@@ -2477,6 +2562,10 @@ if __name__ == "__main__":
                     game.set_active_profile_dir(
                         game.get_profile_root() / "profiles" / last_deployed
                     )
+                    # Reload so the last-deployed profile's path overrides drive
+                    # the restore (it may target a different game folder).
+                    game.load_paths()
+                    game_root = game.get_game_path()
                 try:
                     if hasattr(game, "restore"):
                         game.restore(log_fn=log_fn)
@@ -2487,6 +2576,7 @@ if __name__ == "__main__":
                 finally:
                     if original_profile_dir is not None:
                         game.set_active_profile_dir(original_profile_dir)
+                        game.load_paths()
             except Exception as e:
                 log_fn(f"Restore-on-close error for {game.name}: {e}")
 
