@@ -9,6 +9,7 @@ on:
 # Scheduled workflows only run on the repo default branch (main).
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   sync:
