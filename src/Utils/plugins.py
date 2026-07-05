@@ -33,6 +33,34 @@ class PluginEntry:
     enabled: bool
 
 
+# Per-path mtime-keyed cache of the *parsed* plugins.txt / loadorder.txt content.
+# A single plugin-tab refresh reads plugins.txt 2-3× (the two sync passes plus
+# _refresh_plugins_tab) for a ~1300-line file; on a toggle that writes nothing,
+# all three hit this cache. We store immutable tuples and rebuild fresh
+# PluginEntry objects per call so callers can freely mutate the returned list
+# without corrupting the cache. A write to either file bumps its mtime, so the
+# next read re-parses automatically (no explicit invalidation needed).
+_plugins_parse_cache: dict[tuple[str, bool], tuple[float, tuple[tuple[str, bool], ...]]] = {}
+_loadorder_parse_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+
+
+def invalidate_plugins_cache(path: "Path | None" = None) -> None:
+    """Drop cached read_plugins/read_loadorder data for *path* (or all).
+
+    Call this after writing plugins.txt by any path other than write_plugins()
+    (e.g. a direct path.write_text in a wizard or collection installer) so the
+    next read re-parses even on a filesystem with coarse mtime resolution.
+    """
+    if path is None:
+        _plugins_parse_cache.clear()
+        _loadorder_parse_cache.clear()
+        return
+    ps = str(path)
+    _plugins_parse_cache.pop((ps, True), None)
+    _plugins_parse_cache.pop((ps, False), None)
+    _loadorder_parse_cache.pop(ps, None)
+
+
 def _normalise_ext(name: str) -> str:
     """Return name with its file extension lowercased (e.g. Mod.ESP → Mod.esp)."""
     dot = name.rfind(".")
@@ -53,22 +81,33 @@ def read_plugins(path: Path, star_prefix: bool = True) -> list[PluginEntry]:
       in the file — callers that need the full plugin set (to recover
       disabled state) should cross-reference loadorder.txt.
     """
-    entries: list[PluginEntry] = []
     if not path.is_file():
-        return entries
+        return []
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    cache_key = (str(path), star_prefix)
+    if mtime is not None:
+        cached = _plugins_parse_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime:
+            # Rebuild fresh objects so callers can mutate the list safely.
+            return [PluginEntry(name=n, enabled=en) for n, en in cached[1]]
+    parsed: list[tuple[str, bool]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if star_prefix:
             if line.startswith("*"):
-                name = line[1:]
-                entries.append(PluginEntry(name=_normalise_ext(name), enabled=True))
+                parsed.append((_normalise_ext(line[1:]), True))
             else:
-                entries.append(PluginEntry(name=_normalise_ext(line), enabled=False))
+                parsed.append((_normalise_ext(line), False))
         else:
-            entries.append(PluginEntry(name=_normalise_ext(line), enabled=True))
-    return entries
+            parsed.append((_normalise_ext(line), True))
+    if mtime is not None:
+        _plugins_parse_cache[cache_key] = (mtime, tuple(parsed))
+    return [PluginEntry(name=n, enabled=en) for n, en in parsed]
 
 
 def write_plugins(path: Path, entries: list[PluginEntry], star_prefix: bool = True) -> None:
@@ -92,6 +131,23 @@ def write_plugins(path: Path, entries: list[PluginEntry], star_prefix: bool = Tr
         "\n".join(lines) + ("\n" if lines else ""),
         encoding="utf-8",
     )
+    # Refresh the parse cache from what we just wrote so a same-mtime-resolution
+    # write (e.g. exFAT's coarse timestamps) can't serve stale data on the next
+    # read. We cache under both star_prefix variants of the parsed content.
+    try:
+        mtime = path.stat().st_mtime
+        star_parsed = tuple(
+            (_normalise_ext(e.name), e.enabled) for e in entries
+        )
+        _plugins_parse_cache[(str(path), True)] = (mtime, star_parsed)
+        # Legacy (no-star) reads return only enabled plugins, all enabled.
+        legacy_parsed = tuple(
+            (_normalise_ext(e.name), True) for e in entries if e.enabled
+        )
+        _plugins_parse_cache[(str(path), False)] = (mtime, legacy_parsed)
+    except OSError:
+        _plugins_parse_cache.pop((str(path), True), None)
+        _plugins_parse_cache.pop((str(path), False), None)
 
 
 def read_loadorder(path: Path) -> list[str]:
@@ -102,12 +158,22 @@ def read_loadorder(path: Path) -> list[str]:
     """
     if not path.is_file():
         return []
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    if mtime is not None:
+        cached = _loadorder_parse_cache.get(str(path))
+        if cached is not None and cached[0] == mtime:
+            return list(cached[1])  # fresh list; names are immutable str
     names: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             names.append(line)
-    return names
+    if mtime is not None:
+        _loadorder_parse_cache[str(path)] = (mtime, tuple(names))
+    return list(names)
 
 
 def write_loadorder(path: Path, entries: list[PluginEntry]) -> None:
@@ -118,6 +184,11 @@ def write_loadorder(path: Path, entries: list[PluginEntry]) -> None:
         "\n".join(lines) + ("\n" if lines else ""),
         encoding="utf-8",
     )
+    # Keep the read cache coherent even under coarse (exFAT) mtime resolution.
+    try:
+        _loadorder_parse_cache[str(path)] = (path.stat().st_mtime, tuple(lines))
+    except OSError:
+        _loadorder_parse_cache.pop(str(path), None)
 
 
 def append_plugin(path: Path, plugin_name: str, enabled: bool = True,
@@ -360,6 +431,7 @@ def sync_plugins_from_filemap_combined(
     data_dir: Path | None = None,
     disabled_plugins: dict[str, list[str]] | None = None,
     star_prefix: bool = True,
+    filemap_entries: "list[tuple[str, str]] | None" = None,
 ) -> tuple[int, int]:
     """Single-pass replacement for prune_plugins_from_filemap() followed by
     sync_plugins_from_filemap() + disabled-plugin pruning.
@@ -368,6 +440,10 @@ def sync_plugins_from_filemap_combined(
     and each read plugins.txt, costing ~450 ms combined. This variant reads
     filemap.txt once, reads plugins.txt once, computes the new plugin list,
     and writes plugins.txt at most once.
+
+    filemap_entries — optional pre-parsed list[(rel_path, mod_name)] (e.g. from
+    PluginPanel._get_parsed_filemap). When supplied, the ~74k-line file is not
+    re-read here; the caller's shared mtime-cached parse is reused instead.
 
     Returns (removed_count, added_count).
     """
@@ -379,26 +455,33 @@ def sync_plugins_from_filemap_combined(
     # --- 1. Collect root-level plugins present in the filemap, keyed by lower name.
     filemap_names: dict[str, str] = {}   # lower -> original-case filename
     filemap_mod_for: dict[str, str] = {} # lower -> owning mod name
-    if filemap_path.is_file():
+
+    def _consume(rel_path: str, mod_name: str) -> None:
+        rel_path = rel_path.replace("\\", "/")
+        if "/" in rel_path:
+            return
+        # Cheap suffix test — avoid Path() allocation per line.
+        dot = rel_path.rfind(".")
+        if dot < 0:
+            return
+        if rel_path[dot:].lower() not in exts_lower:
+            return
+        low = rel_path.lower()
+        if low not in filemap_names:
+            filemap_names[low] = rel_path
+            filemap_mod_for[low] = mod_name
+
+    if filemap_entries is not None:
+        for rel_path, mod_name in filemap_entries:
+            _consume(rel_path, mod_name)
+    elif filemap_path.is_file():
         with filemap_path.open(encoding="utf-8") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if "\t" not in line:
                     continue
                 rel_path, mod_name = line.split("\t", 1)
-                rel_path = rel_path.replace("\\", "/")
-                if "/" in rel_path:
-                    continue
-                # Cheap suffix test — avoid Path() allocation per line.
-                dot = rel_path.rfind(".")
-                if dot < 0:
-                    continue
-                if rel_path[dot:].lower() not in exts_lower:
-                    continue
-                low = rel_path.lower()
-                if low not in filemap_names:
-                    filemap_names[low] = rel_path
-                    filemap_mod_for[low] = mod_name
+                _consume(rel_path, mod_name)
 
     # --- 2. Vanilla plugins in the game's Data dir are always kept.
     in_data_dir: set[str] = set()

@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageTk
 from gui.theme import (
     font_sized_px, scaled, FONT_FAMILY,
     BG_PANEL, BG_DEEP, CTK_TEXT, CTK_FOOTER_FG, CTK_FOOTER_HOV, CTK_SEP, CTK_SEP_ALT,
-    CTK_BTN_HOVER, SCROLL_BG, SCROLL_TROUGH, SCROLL_ACTIVE, LINK_BLUE,
+    CTK_BTN_HOVER, SCROLL_BG, SCROLL_TROUGH, SCROLL_ACTIVE, LINK_BLUE, TEXT_MUTED,
 )
 
 try:
@@ -320,7 +320,8 @@ class CTkNotification(ctk.CTkToplevel):
 
     _active: "list[CTkNotification]" = []
 
-    def __init__(self, master, state: str = "info", message: str = "message", side: str = "right_bottom"):
+    def __init__(self, master, state: str = "info", message: str = "message", side: str = "right_bottom",
+                 show_progress: bool = False):
         from gui.theme import BG_PANEL
         super().__init__(master, fg_color=BG_PANEL)
         self.withdraw()
@@ -333,6 +334,7 @@ class CTkNotification(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
         CTkNotification._active.append(self)
 
+        self._state = state
         if state not in ICON_PATH or ICON_PATH[state] is None:
             self.icon = ctk.CTkImage(Image.open(ICON_PATH["info"]), Image.open(ICON_PATH["info"]), (24, 24))
         else:
@@ -349,6 +351,17 @@ class CTkNotification(ctk.CTkToplevel):
         self.close_btn = ctk.CTkButton(self, text="", image=self.close_icon, width=20, height=20, hover=False,
                                       fg_color="transparent", command=self.close_notification)
         self.close_btn.grid(row=0, column=1, sticky="ne", padx=10, pady=10)
+
+        # Optional progress bar (used for pooled batch operations). When
+        # enabled the toast grows to accommodate a determinate bar under the
+        # message.
+        self.progress_bar = None
+        if show_progress:
+            self.progress_bar = ctk.CTkProgressBar(self, height=8)
+            self.progress_bar.set(0)
+            self.progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew",
+                                   padx=15, pady=(0, 12))
+            self.geometry(f"{self.width}x96")
 
         self._configure_bid = master.bind("<Configure>", self._update_geometry, add="+")
         self._focus_out_bid = master.bind("<FocusOut>", self._on_focus_out, add="+")
@@ -387,8 +400,37 @@ class CTkNotification(ctk.CTkToplevel):
     def _get_nh(self):
         nh = self.winfo_height()
         if nh <= 1:
-            nh = int(80 * self._get_window_scaling())
+            base = 96 if self.progress_bar is not None else 80
+            nh = int(base * self._get_window_scaling())
         return nh
+
+    def update_message(self, message: str, state: str | None = None) -> None:
+        """Update the toast text in place (and optionally swap its icon).
+
+        Used to keep a single pooled notification reflecting the latest
+        status of a batch operation instead of spawning one toast per item.
+        """
+        if not self.winfo_exists():
+            return
+        try:
+            self.message_label.configure(text=f"  {message}")
+            if state is not None and state != self._state:
+                self._state = state
+                if state in ICON_PATH and ICON_PATH[state] is not None:
+                    self.icon = ctk.CTkImage(Image.open(ICON_PATH[state]),
+                                             Image.open(ICON_PATH[state]), (24, 24))
+                    self.message_label.configure(image=self.icon)
+        except Exception:
+            pass
+
+    def set_progress(self, fraction: float) -> None:
+        """Set the determinate progress bar (0.0–1.0). No-op without a bar."""
+        if self.progress_bar is None or not self.winfo_exists():
+            return
+        try:
+            self.progress_bar.set(max(0.0, min(1.0, fraction)))
+        except Exception:
+            pass
 
     def _update_geometry(self, event=None):
         # NB: do NOT call update_idletasks() here. This runs from the master's
@@ -837,8 +879,12 @@ class CTkPopupMenu(ctk.CTkToplevel):
 
         self.withdraw()
 
-    def add_command(self, label: str, command=None, font=None):
-        """Add a menu item. command is called when the menu is dismissed."""
+    def add_command(self, label: str, command=None, font=None, accelerator=None):
+        """Add a menu item. command is called when the menu is dismissed.
+
+        accelerator: optional shortcut hint (e.g. "Del", "F2") shown dimmed and
+        right-aligned over the item.
+        """
         btn_kwargs = dict(
             fg_color="transparent", hover=True,
             text_color=ctk.ThemeManager.theme["CTkLabel"]["text_color"],
@@ -850,6 +896,20 @@ class CTkPopupMenu(ctk.CTkToplevel):
             btn_kwargs["font"] = font
         btn = ctk.CTkButton(self.frame, text=label, anchor="w", **btn_kwargs)
         btn.grid(row=self._item_row, column=0, sticky="ew", padx=6, pady=1)
+        if accelerator:
+            accel = ctk.CTkLabel(
+                self.frame, text=accelerator, anchor="e",
+                text_color=TEXT_MUTED, fg_color="transparent",
+            )
+            # Overlay in the same cell, floated to the right edge. Clicking the
+            # hint invokes the underlying button; hovering it drives the button's
+            # hover colour manually (the label sits on top of the right strip of
+            # the button, so the button's own <Enter>/<Leave> can't fire there).
+            accel.grid(row=self._item_row, column=0, sticky="e", padx=14, pady=1)
+            hover_color = ctk.ThemeManager.theme["CTkButton"]["hover_color"]
+            accel.bind("<Button-1>", lambda e: self._on_item_click(command))
+            accel.bind("<Enter>", lambda e, b=btn: b.configure(fg_color=hover_color))
+            accel.bind("<Leave>", lambda e, b=btn: b.configure(fg_color="transparent"))
         self._item_row += 1
         self._content_height += _MENU_ITEM_H + 2
         self._has_items = True
@@ -1203,13 +1263,58 @@ class CTkPopupMenu(ctk.CTkToplevel):
         # Reposition if off-screen.  Clamp to the actual screen (not the app
         # window) so context menus near the bottom/right edge flip upward or
         # leftward instead of being clipped.
+        #
+        # winfo_reqwidth/height() return *scaled* tk pixels (ui_scale applied),
+        # whereas winfo_screenwidth/height() return *physical* screen pixels.
+        # Comparing them directly mis-fires the flip on HiDPI/fractional-scale
+        # setups (e.g. Bazzite/KDE), so convert the popup size to physical px
+        # first.  See the same scale conversion in dialogs._center_dialog.
         try:
-            pw = self.winfo_reqwidth()
-            ph = self.winfo_reqheight()
+            pw = self.winfo_reqwidth() / scale
+            ph = self.winfo_reqheight() / scale
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
-            nx = x if x + pw <= sw else max(0, sw - pw)
-            ny = y if y + ph <= sh else max(0, y - ph)
+            # On Wayland the Tk app runs under XWayland, where the X root window
+            # is sized to the *whole* virtual desktop (all outputs), so
+            # winfo_screenwidth/height() are much larger than the monitor the
+            # user is actually on.  That left sh too big and the flip never
+            # triggered, so the menu ran off the bottom of the visible screen
+            # (reported on Bazzite 44 / KDE Plasma 6 / Wayland).
+            #
+            # Clamp to the app's own toplevel bounds instead — it's guaranteed
+            # to be on the active monitor — and only fall back to the screen
+            # size if the toplevel geometry isn't usable.  Same approach as the
+            # custom dropdown popup in modlist_panel._build_dropdown.
+            try:
+                app_tl = self.master_window.winfo_toplevel() if self.master_window is not None else None
+                if app_tl is not None and app_tl.winfo_width() > 1 and app_tl.winfo_height() > 1:
+                    tl_left = app_tl.winfo_rootx()
+                    tl_top = app_tl.winfo_rooty()
+                    tl_right = tl_left + app_tl.winfo_width()
+                    tl_bottom = tl_top + app_tl.winfo_height()
+                    # Use the smaller of (toplevel edge, screen edge) as the
+                    # usable boundary so we flip on the active monitor without
+                    # clipping against a stale virtual-desktop size.
+                    sw = min(sw, tl_right) if tl_right > tl_left else sw
+                    sh = min(sh, tl_bottom) if tl_bottom > tl_top else sh
+            except Exception:
+                pass
+            margin = 4
+            # Flip up when the popup would run past the bottom; if flipping up
+            # would push it past the top, clamp to the top with a small margin
+            # rather than re-clipping the bottom.
+            if y + ph + margin <= sh:
+                ny = y
+            else:
+                ny = y - ph
+                if ny < margin:
+                    ny = max(margin, sh - ph - margin)
+            nx = x if x + pw + margin <= sw else max(margin, sw - pw - margin)
+            ny = max(0, int(ny))
+            nx = max(0, int(nx))
+            if _POPUP_DEBUG:
+                print(f"[PopupMenu] flip-check x={x} y={y} pw={pw:.0f} ph={ph:.0f} "
+                      f"sw={sw} sh={sh} scale={scale} -> nx={nx} ny={ny}")
             if nx != x or ny != y:
                 self.geometry('{}x{}+{}+{}'.format(self.width, self.height, nx, ny))
                 self.x, self.y = nx, ny
@@ -1300,6 +1405,10 @@ class CTkProgressPopup(ctk.CTkToplevel):
         self.withdraw()
         self._update_geometry()
         self._was_shown = False  # tracks last known shown state
+        # When True, the visibility poll never deiconifies this popup — used to
+        # keep it hidden behind an overlay that owns its screen corner.  Survives
+        # focus changes, unlike a bare withdraw() (which the poll would undo).
+        self._force_hidden = False
         # Poll the root window state every 200 ms to show/hide the popup.
         # Event bindings (<FocusOut>, <Map>/<Unmap>) are unreliable with
         # overrideredirect windows on Linux — polling is simple and robust.
@@ -1323,7 +1432,7 @@ class CTkProgressPopup(ctk.CTkToplevel):
         """Periodically sync popup visibility with the root window's active state."""
         if not self.winfo_exists():
             return
-        should_show = self._root_is_active()
+        should_show = self._root_is_active() and not self._force_hidden
         if should_show and not self._was_shown:
             self._update_geometry()
             self.deiconify()
@@ -1360,6 +1469,22 @@ class CTkProgressPopup(ctk.CTkToplevel):
     def update_position(self, event=None):
         self._update_geometry()
         self.update_idletasks()
+
+    def set_force_hidden(self, hidden: bool) -> None:
+        """Keep this popup hidden (True) regardless of focus, or release it
+        (False).  The visibility poll re-shows a released popup on its next tick
+        if the app is active."""
+        self._force_hidden = bool(hidden)
+        try:
+            if hidden:
+                self.withdraw()
+                self._was_shown = False
+            elif self._root_is_active():
+                self._update_geometry()
+                self.deiconify()
+                self._was_shown = True
+        except Exception:
+            pass
 
     def update_progress(self, progress):
         if self.cancelled:

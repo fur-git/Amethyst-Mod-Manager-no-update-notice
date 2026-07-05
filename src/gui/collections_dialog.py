@@ -16,7 +16,6 @@ import threading
 import tkinter as tk
 import tkinter.messagebox
 import tkinter.ttk as ttk
-import webbrowser
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -49,7 +48,7 @@ from Utils.profile_state import (
     write_collection_install_paused,
 )
 from gui.install_mod import install_mod_from_archive, FOMOD_DEFERRED, BAIN_DEFERRED, ExtractionMemoryBudget, get_uncompressed_size
-from gui.mod_card import CARD_PAD, make_placeholder_image
+from gui.mod_card import CARD_PAD, make_placeholder_image, LRUImageCache, destroy_widget_tree
 from gui.tk_tooltip import TkTooltip
 from gui.wheel_compat import LEGACY_WHEEL_REDUNDANT
 from Utils.ui_config import get_ui_scale
@@ -71,8 +70,13 @@ from LOOT.loot_sorter import sort_plugins as _loot_sort, is_available as _loot_a
 # Collections-specific card dimensions (5-column grid)
 _COLL_COLS  = 5
 _COLL_W     = 220  # 200 was too narrow at 1.25x–1.5x scale; extra width avoids clipping
-_COLL_IMG_W = 210
-_COLL_IMG_H = 240
+# Image width must leave room for the card's border (1px/side) plus the image
+# pad (_IMG_PAD/side) at EVERY scale, otherwise the image overflows the card
+# horizontally — and the overflow grows with ui_scale. Keep a generous design
+# margin: _COLL_W - _COLL_IMG_W = 20 > 2*(border+pad) = 2*(1+5) = 12.
+_COLL_IMG_W = 200
+_COLL_IMG_H = 228  # keep the original ~0.875 tile aspect ratio (200/228 ≈ 210/240)
+_IMG_PAD    = 5    # per-side padding around the tile image (design px)
 import gui.theme as _theme
 from gui.theme import (
     BG_DEEP,
@@ -700,26 +704,60 @@ class CollectionCard:
         self._coll_w = scaled(_COLL_W)
         self._coll_img_w = scaled(_COLL_IMG_W)
         self._coll_img_h = scaled(_COLL_IMG_H)
-        # Text area: name + stats + author only (summary moved to hover tooltip).
-        s = get_ui_scale()
-        text_h = max(60, int(110 * s))
-        # Include image pady so card height matches actual layout (image + pady + btn + text)
-        _img_pady = scaled(6) + scaled(3)
-        _btn_row_h = scaled(60)  # taller at high scale so View button is fully visible
-        self._coll_h = self._coll_img_h + _img_pady + _btn_row_h + text_h
 
-        # Outer card frame — fixed size, content clips if too long.
-        self.card = tk.Frame(
+        # Outer card frame.
+        #
+        # CTkFrame RE-APPLIES widget scaling to its width/height args, so they
+        # must be UNSCALED design values. The historic bug here was passing
+        # width=scaled(_COLL_W) (and height=scaled(...)), which CTk then scaled
+        # *again* — the frame grew by ui_scale² while the image grew by only
+        # ui_scale, leaving the image small with wide side margins and a big gap
+        # above the View button at every scale > 1x. Pass design px instead.
+        #
+        # MUST be a CTkFrame (not plain tk.Frame): the card holds CTk children
+        # (CTkLabel/CTkButton/CTkImage). When a plain tk.Frame parent is
+        # destroyed, Tk tears down the subtree at the Tcl level but the nested
+        # CTk widgets' Python destroy() never runs, so they stay registered in
+        # CTk's global Scaling/AppearanceMode trackers forever — a hard memory
+        # leak (every paged/searched collection card stranded its images). A
+        # CTkFrame parent cascades destroy() to its CTk descendants.
+        self.card = ctk.CTkFrame(
             parent,
-            width=self._coll_w, height=self._coll_h,
-            bg=BG_PANEL,
-            highlightbackground=BORDER,
-            highlightthickness=1,
+            width=_COLL_W,
+            fg_color=BG_PANEL,
+            border_color=BORDER,
+            border_width=1,
+            corner_radius=0,
         )
-        self.card.pack_propagate(False)
-        self.card.grid_propagate(False)
-
         self._build(on_view)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """Pin the card to its natural content height so there is never a dead
+        gap above the View button, at any ui_scale.
+
+        Strategy: keep grid propagation ON (so the frame's requested height is
+        the true stacked height of its rows), then freeze that exact height and
+        switch propagation OFF so the width stays pinned and the grid cell is
+        stable.
+        """
+        card = self.card
+        try:
+            card.update_idletasks()
+            req_h = card.winfo_reqheight()  # natural content height (real px)
+            # CTkFrame.configure(height=) re-applies widget scaling, so pass a
+            # design value (divide the measured real px back out). Width stays at
+            # the design _COLL_W the frame was created with.
+            scale = max(0.0001, get_ui_scale())
+            card.configure(width=_COLL_W, height=max(1, round(req_h / scale)))
+            card.grid_propagate(False)
+            card.pack_propagate(False)
+        except Exception:
+            # Fallback: a fixed propagation-off frame at the configured width.
+            try:
+                card.grid_propagate(False)
+            except Exception:
+                pass
 
     def _build(self, on_view: Callable):
         col = self._collection
@@ -729,69 +767,71 @@ class CollectionCard:
         placeholder = make_placeholder_image(_COLL_IMG_W, _COLL_IMG_H)
         ph_ctk = ctk.CTkImage(light_image=placeholder, dark_image=placeholder,
                                size=(_COLL_IMG_W, _COLL_IMG_H))
-        self._img_label = ctk.CTkLabel(
-            self.card, image=ph_ctk, text="",
-            width=_COLL_IMG_W, height=_COLL_IMG_H,
-        )
+        # No explicit width/height: let the label size to the (CTk-scaled) image,
+        # exactly like mod_card.ModCard. Passing width/height makes the label
+        # frame scale by widget-scaling while the image scales independently,
+        # leaving the image smaller than its slot at high ui_scale.
+        self._img_label = ctk.CTkLabel(self.card, image=ph_ctk, text="")
 
-        _btn_row_h = scaled(60)
-        text_h = self._coll_h - self._coll_img_h - scaled(6) - scaled(3) - _btn_row_h
-        text_frame = tk.Frame(self.card, bg=BG_PANEL, height=text_h)
-        text_frame.pack_propagate(False)
-
-        btn_frame = tk.Frame(self.card, bg=BG_PANEL, height=_btn_row_h)
-        btn_frame.pack_propagate(False)
-        # CTk scales widget width/height via set_widget_scaling(); use unscaled design
-        # values so CTk scales once to fit the card (avoid double-scaling overflow)
-        _btn_w = _COLL_W - 20
-        _btn_h = 28
-        ctk.CTkButton(
-            btn_frame, text="View",
-            width=_btn_w, height=_btn_h,
-            fg_color=ACCENT, hover_color=ACCENT_HOV,
-            text_color=TEXT_WHITE, font=FONT_SMALL,
-            command=on_view,
-        ).place(relx=0.5, rely=0.5, anchor="center")
-
-        # Use grid: row0=image (fixed), row2=btn (fixed), row1=text (flexible remainder).
-        # No minsize on row1 — it gets whatever is left so btn row never overflows the card.
-        self.card.grid_rowconfigure(0, minsize=self._coll_img_h + scaled(6) + scaled(3), weight=0)
-        self.card.grid_rowconfigure(1, weight=1)
-        self.card.grid_rowconfigure(2, minsize=_btn_row_h, weight=0)
-        pad = scaled(5)
-        self._img_label.grid(row=0, column=0, padx=pad, pady=(scaled(6), scaled(3)), sticky="n")
-        text_frame.grid(row=1, column=0, sticky="nsew")
-        btn_frame.grid(row=2, column=0, sticky="ew")
+        # Fixed-structure rows so every card has identical height and aligns in
+        # the grid (name is always 2 lines, author row always present):
+        #   row0  image
+        #   row1  name   (2 lines reserved)
+        #   row2  stats
+        #   row3  author (always rendered, empty if missing)
+        #   row4  View button
+        # _fit_height() then pins the measured height (same for every card).
         self.card.grid_columnconfigure(0, weight=1)
+        pad = scaled(_IMG_PAD)
+        self._img_label.grid(row=0, column=0, padx=pad, pady=(scaled(6), scaled(3)), sticky="ew")
 
         # Use tk.Label (not CTkLabel) so wraplength is in pixels with no CTk scaling
         _wrap = self._coll_w - scaled(16)
-        # Name
+        # Name — ALWAYS reserve 2 text lines (height=2) so 1-line and 2-line
+        # titles occupy identical vertical space and every card's stats/author/
+        # button rows line up across the grid (mirrors mod_card.ModCard).
         name_text = col.name or f"Collection {col.id}"
         tk.Label(
-            text_frame, text=name_text,
+            self.card, text=name_text,
             bg=BG_PANEL, fg=TEXT_MAIN,
             font=TK_FONT_BOLD,
-            wraplength=_wrap, justify="left", anchor="w",
-        ).pack(padx=scaled(8), fill="x")
+            wraplength=_wrap, justify="left", anchor="nw",
+            height=2,
+        ).grid(row=1, column=0, padx=scaled(8), pady=(0, scaled(1)), sticky="ew")
 
         # Stats: downloads, endorsements, mod count
         stats = f"↓{col.total_downloads:,}  {col.mod_count} mods"
         tk.Label(
-            text_frame, text=stats,
+            self.card, text=stats,
             bg=BG_PANEL, fg=TEXT_DIM,
             font=TK_FONT_SMALL,
             anchor="w", wraplength=_wrap,
-        ).pack(padx=scaled(8), fill="x")
+        ).grid(row=2, column=0, padx=scaled(8), sticky="ew")
 
-        # Author
-        if col.user_name:
-            tk.Label(
-                text_frame, text=f"by {col.user_name}",
-                bg=BG_PANEL, fg=TEXT_DIM,
-                font=TK_FONT_SMALL,
-                anchor="w", wraplength=_wrap,
-            ).pack(padx=scaled(8), fill="x")
+        # Author — always render the row (empty if missing) so cards with and
+        # without an author have identical height and stay aligned in the grid.
+        tk.Label(
+            self.card, text=(f"by {col.user_name}" if col.user_name else ""),
+            bg=BG_PANEL, fg=TEXT_DIM,
+            font=TK_FONT_SMALL,
+            anchor="w", wraplength=_wrap,
+        ).grid(row=3, column=0, padx=scaled(8), sticky="ew")
+
+        # CTkFrame (not tk.Frame): holds a CTkButton — see the card-frame note
+        # above. A plain-tk parent would strand the button in CTk's trackers.
+        btn_frame = ctk.CTkFrame(self.card, fg_color="transparent", corner_radius=0)
+        btn_frame.grid(row=4, column=0, padx=scaled(10), pady=(scaled(6), scaled(10)),
+                       sticky="ew")
+        btn_frame.grid_columnconfigure(0, weight=1)
+        # CTk scales widget width/height via set_widget_scaling(); use unscaled
+        # design height so CTk scales once (avoid double-scaling overflow).
+        ctk.CTkButton(
+            btn_frame, text="View",
+            height=30,
+            fg_color=ACCENT, hover_color=ACCENT_HOV,
+            text_color=TEXT_WHITE, font=FONT_SMALL,
+            command=on_view,
+        ).grid(row=0, column=0, sticky="ew")
 
         # Summary shown as a hover tooltip on the card instead of inline text.
         summary = (col.summary or "").strip()
@@ -817,9 +857,12 @@ class CollectionCard:
                 from io import BytesIO
                 raw = Image.open(BytesIO(r.content)).convert("RGBA")
                 # Scale to cover the slot (zoom), then center-crop.
-                # Use unscaled design dims — CTk applies set_widget_scaling internally.
+                # PIL works in real pixels, so crop at the SCALED slot size for a
+                # sharp tile at high ui_scale (matches mod_card.py). CTkImage then
+                # gets the UNSCALED design size — CTk multiplies it by widget
+                # scaling itself, so the bitmap and displayed size line up.
                 src_w, src_h = raw.size
-                iw, ih = _COLL_IMG_W, _COLL_IMG_H
+                iw, ih = scaled(_COLL_IMG_W), scaled(_COLL_IMG_H)
                 scale = max(iw / src_w, ih / src_h)
                 new_w = int(src_w * scale)
                 new_h = int(src_h * scale)
@@ -828,7 +871,7 @@ class CollectionCard:
                 y_off = (new_h - ih) // 2
                 bg = raw.crop((x_off, y_off, x_off + iw, y_off + ih))
                 photo = ctk.CTkImage(light_image=bg, dark_image=bg,
-                                     size=(iw, ih))
+                                     size=(_COLL_IMG_W, _COLL_IMG_H))
                 cache[url] = photo
 
                 def _done():
@@ -912,7 +955,11 @@ class OptionalModsPanel(ctk.CTkFrame):
         scroll.pack(fill="both", expand=True, padx=12, pady=(0, 4))
         scroll.grid_columnconfigure(0, weight=1)
 
-        for mod in optional_mods:
+        sorted_mods = sorted(
+            optional_mods,
+            key=lambda m: (m.mod_name or m.file_name or "(Unknown)").casefold(),
+        )
+        for mod in sorted_mods:
             var = tk.BooleanVar(value=mod.file_id not in _pre_skipped)
             self._vars[mod.file_id] = var
             name_text = mod.mod_name or mod.file_name or "(Unknown)"
@@ -1202,6 +1249,7 @@ class CollectionDetailDialog(tk.Frame):
         # --- Footer ---
         ftr = tk.Frame(self, bg=BG_HEADER, pady=8, bd=0, highlightthickness=0)
         ftr.pack(fill="x", side="bottom")
+        self._footer = ftr
 
         ctk.CTkButton(
             ftr, text="Close",
@@ -2465,6 +2513,105 @@ class CollectionDetailDialog(tk.Frame):
         except Exception as exc:
             self._log(f"Collection update: failed to write modlist.txt: {exc}")
 
+    def _append_reconcile_modlist(
+        self,
+        *,
+        modlist_path: Path,
+        install_order: "list[tuple[int, str]]",
+        pre_existing: "set[str]",
+    ) -> None:
+        """Re-apply the collection's before/after load order on an APPEND run.
+
+        Unlike the new-profile path, this preserves the existing modlist
+        verbatim — mods already present (``pre_existing``, lowercased folder
+        names) keep their exact position and enabled state. Only mods newly
+        installed by this run (those in ``install_order`` whose folder name is
+        NOT in ``pre_existing``) are inserted, positioned relative to their
+        collection-defined neighbours (the before/after rules are already
+        baked into the ``install_order`` sort keys via
+        _resolve_collection_priorities).
+
+        Insertion mirrors _reconcile_update_modlist: place each new mod just
+        before its nearest higher-priority neighbour present in the list, else
+        just after its nearest lower-priority neighbour, else at the top.
+        """
+        try:
+            existing = read_modlist(modlist_path) if modlist_path.is_file() else []
+        except Exception as exc:
+            self._log(f"Collection append: could not read modlist.txt: {exc}")
+            return
+
+        # New mods = install_order entries that were not already in the profile.
+        new_folders: list[tuple[int, str]] = [
+            (pos, folder) for pos, folder in install_order
+            if folder.lower() not in pre_existing
+        ]
+        if not new_folders:
+            self._log("Collection append: no newly-installed mods to reposition.")
+            return
+
+        # The installer (ensure_mod_preserving_position) has already appended the
+        # new mods somewhere in `existing`. Strip them out so we can re-insert at
+        # the correct collection-ordered slot without duplicating.
+        _new_lower = {folder.lower() for _, folder in new_folders}
+        result: list = [
+            e for e in existing
+            if e.is_separator or e.name.lower() not in _new_lower
+        ]
+
+        unplaced: list[str] = []
+        placeable: list[tuple[int, str]] = []
+        for pos, folder in new_folders:
+            (unplaced.append(folder) if pos < 0 else placeable.append((pos, folder)))
+        placeable.sort(key=lambda x: x[0])
+
+        sorted_io = sorted(install_order, key=lambda x: x[0])
+
+        def _find_result_index(folder_lower: str) -> int:
+            for i, e in enumerate(result):
+                if not e.is_separator and e.name.lower() == folder_lower:
+                    return i
+            return -1
+
+        for pos, folder in placeable:
+            insert_idx = None
+            # Right neighbour: nearest higher-priority (pos > this) folder present.
+            for npos, nfolder in sorted_io:
+                if npos <= pos or nfolder == folder:
+                    continue
+                idx = _find_result_index(nfolder.lower())
+                if idx >= 0:
+                    insert_idx = idx
+                    break
+            if insert_idx is None:
+                # Left neighbour: nearest lower-priority (pos < this) folder present.
+                left_candidates = [
+                    (npos, nfolder) for npos, nfolder in sorted_io
+                    if npos < pos and nfolder != folder
+                ]
+                for npos, nfolder in sorted(left_candidates, key=lambda x: -x[0]):
+                    idx = _find_result_index(nfolder.lower())
+                    if idx >= 0:
+                        insert_idx = idx + 1
+                        break
+            if insert_idx is None:
+                insert_idx = 0
+            result.insert(insert_idx, ModEntry(name=folder, enabled=True, locked=False))
+
+        # Unplaced (no schema position) go at the top.
+        for folder in reversed(unplaced):
+            result.insert(0, ModEntry(name=folder, enabled=True, locked=False))
+
+        try:
+            write_modlist(modlist_path, result)
+            self._log(
+                f"Collection append: re-applied load order "
+                f"({len(placeable)} placed, {len(unplaced)} unplaced at top; "
+                f"{len(pre_existing)} existing mods kept in place)"
+            )
+        except Exception as exc:
+            self._log(f"Collection append: failed to write modlist.txt: {exc}")
+
     def _run_install(self, mods, download_link_path, profile_dir, old_profile, downloader, app, total, overwrite_existing: "bool | None" = None, skipped_fids: "set[int] | None" = None, skipped_mods: "list | None" = None, skip_existing: bool = False):
         """Background thread: download then install each mod in collection-defined order.
 
@@ -2516,11 +2663,28 @@ class CollectionDetailDialog(tk.Frame):
                 pass
 
         self._game.set_active_profile_dir(profile_dir)
+        self._game.load_paths()
         modlist_path = profile_dir / "modlist.txt"
         plugins_path = profile_dir / "plugins.txt"
         staging_path = self._game.get_effective_mod_staging_path()
         installed = 0
         skipped = 0
+
+        # When appending into an existing profile (overwrite_existing is not
+        # None), capture the modlist as it stands BEFORE any new mods are
+        # installed. Mods already present here must never be moved; only mods
+        # newly installed by this run are repositioned (see
+        # _append_reconcile_modlist).
+        _is_append_run = overwrite_existing is not None
+        _append_pre_existing: "set[str]" = set()
+        if _is_append_run and modlist_path.is_file():
+            try:
+                _append_pre_existing = {
+                    e.name.lower() for e in read_modlist(modlist_path)
+                    if not e.is_separator
+                }
+            except Exception:
+                _append_pre_existing = set()
 
         # ------------------------------------------------------------------
         # Step 1: Download and parse collection.json for authoritative order
@@ -2639,7 +2803,8 @@ class CollectionDetailDialog(tk.Frame):
         # Step 2: Install each mod, tracking the folder names in order
         # ------------------------------------------------------------------
         # Pre-scan staging dir:
-        #   already_installed_by_fid : file_id → folder name (from meta.ini fileid)
+        #   already_installed_by_ids : (mod_id, file_id) → folder (from meta.ini)
+        #   already_installed_by_fid : file_id → folder, legacy modid=0 only
         #   staging_lower_map        : lower(folder_name) → actual folder name
         # Used together to skip mods already installed in a previous (partial) run.
         #
@@ -2648,10 +2813,18 @@ class CollectionDetailDialog(tk.Frame):
         # to only the mods that are explicitly listed in *this* profile's
         # modlist.txt — otherwise mods installed for unrelated profiles will
         # produce false-positive "already installed" matches and be silently
-        # skipped.  The file_id exact-match (already_installed_by_fid) is safe
-        # to populate from all folders, because a file_id collision across
-        # different mod pages is essentially impossible.
-        already_installed_by_fid: dict[int, str] = {}  # file_id → staging folder name
+        # skipped.  The (mod_id, file_id) exact-match is safe to populate from
+        # all folders, because that pair is globally unique (only a byte-identical
+        # file shares both ids) — file_id alone is not, so it is only trusted for
+        # legacy installs that lack a mod_id.
+        # (mod_id, file_id) → folder is the authoritative match: a mod is only
+        # "already installed" when BOTH ids match (same mod page AND same file).
+        # file_id alone is not globally unique — two different mod pages can
+        # share a file_id — so matching on file_id alone risks a false positive.
+        already_installed_by_ids: dict[tuple[int, int], str] = {}  # (mod_id, file_id) → folder
+        # Legacy fallback: installs whose meta.ini predates mod_id capture have
+        # modid=0; for those we still match on file_id alone (see _match_existing).
+        already_installed_by_fid: dict[int, str] = {}  # file_id → folder (modid=0 only)
         staging_lower_map: dict[str, str] = {}          # lower(name) → actual name
 
         # Build the set of mod folder names that are actually in this profile.
@@ -2679,15 +2852,30 @@ class CollectionDetailDialog(tk.Frame):
                     _parser = _cp.ConfigParser()
                     _parser.read(str(meta_ini), encoding="utf-8")
                     fid_str = _parser.get("General", "fileid", fallback="").strip()
+                    mid_str = _parser.get("General", "modid", fallback="").strip()
                     if fid_str and fid_str != "0":
                         # When skip_existing is set, only record mods that are
                         # actually in this profile's modlist (avoids cross-profile
                         # false positives).
                         if skip_existing and mod_dir.name.lower() not in _profile_mod_names:
                             continue
-                        already_installed_by_fid[int(fid_str)] = mod_dir.name
+                        _fid = int(fid_str)
+                        _mid = int(mid_str) if mid_str.isdigit() else 0
+                        if _mid > 0:
+                            already_installed_by_ids[(_mid, _fid)] = mod_dir.name
+                        else:
+                            already_installed_by_fid[_fid] = mod_dir.name
                 except Exception:
                     pass
+
+        def _match_existing(mod) -> str:
+            """Return the staging folder of an already-installed copy of *mod*,
+            matching on (mod_id, file_id) first and falling back to file_id alone
+            only for legacy installs that lack a mod_id. Returns "" if none."""
+            _mid = schema_file_id_to_mod_id.get(mod.file_id, 0) or getattr(mod, "mod_id", 0) or 0
+            if _mid > 0 and (_mid, mod.file_id) in already_installed_by_ids:
+                return already_installed_by_ids[(_mid, mod.file_id)]
+            return already_installed_by_fid.get(mod.file_id, "")
 
         # ------------------------------------------------------------------
         # Remove staging folders for unticked optional mods
@@ -2699,8 +2887,8 @@ class CollectionDetailDialog(tk.Frame):
                 if not mod.file_id or mod.file_id not in skipped_fids:
                     continue
 
-                # Match by file_id first (same as classify step)
-                folder_name = already_installed_by_fid.get(mod.file_id, "")
+                # Match by (mod_id, file_id) first (same as classify step)
+                folder_name = _match_existing(mod)
 
                 # Fallback: match by predicted folder name (same logic as classify)
                 if not folder_name:
@@ -2754,11 +2942,11 @@ class CollectionDetailDialog(tk.Frame):
                 skipped += 1
                 continue
 
-            # Check 1: fileid in meta.ini matches exactly
-            existing_folder: str = ""
-            if mod.file_id in already_installed_by_fid:
-                existing_folder = already_installed_by_fid[mod.file_id]
-            else:
+            # Check 1: (mod_id, file_id) in meta.ini matches exactly. Both ids
+            # must match — file_id alone isn't globally unique. Legacy installs
+            # with modid=0 fall back to file_id-only inside _match_existing.
+            existing_folder: str = _match_existing(mod)
+            if not existing_folder:
                 # Check 2: predicted folder name (logicalFilename / schema name / mod_name)
                 logical = schema_file_id_to_logical.get(mod.file_id, "") or ""
                 schema_name = schema_pos_to_name.get(schema_file_id_to_pos.get(mod.file_id, -1), "") or ""
@@ -2865,6 +3053,7 @@ class CollectionDetailDialog(tk.Frame):
         # downstream consumer needs this map to find every collection mod —
         # not just the freshly-installed ones.
         _install_results: dict[int, str] = dict(already_installed_by_fid)
+        _install_results.update({fid: folder for (_mid, fid), folder in already_installed_by_ids.items()})
         _fomod_deferred: list = []  # (mod, result, effective_domain) tuples deferred for post-install
         _bain_deferred: list = []   # BAIN mods deferred — processed before FOMODs
 
@@ -3801,6 +3990,16 @@ class CollectionDetailDialog(tk.Frame):
                     self._log(f"Collection install: wrote modlist.txt with {len(final_entries)} entries")
                 except Exception as exc:
                     self._log(f"Collection install: failed to write modlist.txt: {exc}")
+        elif _is_append_run and not _col_pause.is_set():
+            # Append run: re-apply the collection's before/after load order, but
+            # only reposition mods newly installed by this run — every mod that
+            # was already in the profile keeps its position and enabled state.
+            install_order.sort(key=lambda x: x[0])
+            self._append_reconcile_modlist(
+                modlist_path=modlist_path,
+                install_order=install_order,
+                pre_existing=_append_pre_existing,
+            )
 
         # ------------------------------------------------------------------
         # Step 3b: Install bundled folders + apply binary patches from the
@@ -3849,7 +4048,9 @@ class CollectionDetailDialog(tk.Frame):
 
         # ------------------------------------------------------------------
         # Step 4: Write plugins.txt / loadorder.txt from collection.json.
-        # Also skipped when appending — existing plugin order is preserved.
+        # The full plugins.txt rewrite + LOOT resort is skipped when appending
+        # (existing plugin order is preserved); the append branch below still
+        # writes the collection's group/plugin rules to userlist.yaml.
         #
         # Strategy:
         #   1. Write all plugin rules (after/before/group) and group definitions
@@ -3948,6 +4149,15 @@ class CollectionDetailDialog(tk.Frame):
                 )
             except Exception as exc:
                 self._log(f"Collection install: failed to write plugins.txt: {exc}")
+        elif schema_plugins and _is_append_run and not _col_pause.is_set():
+            # Append run: write the collection's group/plugin (before/after)
+            # rules to userlist.yaml so the author's intent is recorded, but do
+            # NOT re-run LOOT or rewrite plugins.txt — that would reorder the
+            # user's existing plugins.
+            try:
+                _apply_collection_groups(profile_dir, collection_schema, self._log)
+            except Exception as exc:
+                self._log(f"Collection append: failed to write userlist.yaml rules: {exc}")
 
         # ------------------------------------------------------------------
         # Final reconciliation: ensure every mod in modlist.txt is enabled
@@ -3956,9 +4166,11 @@ class CollectionDetailDialog(tk.Frame):
         # Skipped on pause — reconciliation will run on Resume once all
         # mods are actually installed. Also skipped on update runs — the
         # update reconcile above already placed new mods correctly without
-        # disturbing existing mod order or separators.
+        # disturbing existing mod order or separators. Skipped on append runs —
+        # _append_reconcile_modlist already placed the new mods without moving
+        # the user's existing mods (this reconcile would shove them around).
         # ------------------------------------------------------------------
-        if install_order and modlist_path.is_file() and not _col_pause.is_set() and not _is_update_run:
+        if install_order and modlist_path.is_file() and not _col_pause.is_set() and not _is_update_run and not _is_append_run:
             try:
                 _folder_to_key: dict[str, int] = {
                     folder: key for key, folder in install_order
@@ -4012,6 +4224,7 @@ class CollectionDetailDialog(tk.Frame):
 
         # Restore the original profile dir
         self._game.set_active_profile_dir(old_profile)
+        self._game.load_paths()
 
         # If cancelled, hand off to cleanup (runs on main thread via after()).
         if _col_cancel.is_set():
@@ -4340,9 +4553,32 @@ class CollectionDetailDialog(tk.Frame):
         game_name = getattr(self._game, "name", "") or ""
         allowed_targets = GAME_INI_TARGETS.get(game_name)
 
+        # Profile-specific INIs now live in the profile's "ini files" subdir,
+        # which is what _symlink_profile_ini_files links into My Games at deploy.
+        # Writing tweaks to the profile root no longer works, so route them into
+        # that subdir and make sure the feature is enabled so the symlink runs.
+        ini_target_dir = profile_dir
+        profile_name = profile_dir.name
+        get_ini_dir = getattr(self._game, "_profile_ini_dir", None)
+        if callable(get_ini_dir):
+            try:
+                ini_target_dir = get_ini_dir(profile_name)
+                ini_target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self._log(f"Collection INI tweaks: could not resolve profile "
+                          f"'ini files' folder ({exc}) — using profile root")
+                ini_target_dir = profile_dir
+        if not getattr(self._game, "profile_ini_files", False):
+            try:
+                self._game.set_profile_ini_files(True)
+                self._log("Collection INI tweaks: enabled profile-specific INI files")
+            except Exception as exc:
+                self._log(f"Collection INI tweaks: could not enable profile INI "
+                          f"files ({exc})")
+
         result = apply_collection_ini_tweaks(
             archive_root=archive_root,
-            profile_dir=profile_dir,
+            profile_dir=ini_target_dir,
             prefix_ini_dir=prefix_ini_dir,
             set_ini_key=_set_ini_key,
             read_ini_key=_read_ini_key,
@@ -5011,10 +5247,24 @@ class CollectionDetailDialog(tk.Frame):
                 pass
 
         self._game.set_active_profile_dir(profile_dir)
+        self._game.load_paths()
         modlist_path = profile_dir / "modlist.txt"
         staging_path = self._game.get_effective_mod_staging_path()
         installed = 0
         skipped = 0
+
+        # Append run: snapshot the modlist before any new mods land so we only
+        # reposition newly-installed mods (see _append_reconcile_modlist).
+        _is_append_run = overwrite_existing is not None
+        _append_pre_existing: "set[str]" = set()
+        if _is_append_run and modlist_path.is_file():
+            try:
+                _append_pre_existing = {
+                    e.name.lower() for e in read_modlist(modlist_path)
+                    if not e.is_separator
+                }
+            except Exception:
+                _append_pre_existing = set()
 
         # ------------------------------------------------------------------
         # Step 1: Parse collection.json (same as _run_install)
@@ -5138,6 +5388,9 @@ class CollectionDetailDialog(tk.Frame):
         # ------------------------------------------------------------------
         # Step 2: Classify already-installed mods (same as _run_install)
         # ------------------------------------------------------------------
+        # (mod_id, file_id) → folder is authoritative; file_id-only map is the
+        # legacy fallback for installs whose meta.ini predates mod_id capture.
+        already_installed_by_ids: dict[tuple[int, int], str] = {}
         already_installed_by_fid: dict[int, str] = {}
         staging_lower_map: dict[str, str] = {}
         _profile_mod_names: set[str] = set()
@@ -5162,12 +5415,26 @@ class CollectionDetailDialog(tk.Frame):
                     _parser = _cp.ConfigParser()
                     _parser.read(str(meta_ini), encoding="utf-8")
                     fid_str = _parser.get("General", "fileid", fallback="").strip()
+                    mid_str = _parser.get("General", "modid", fallback="").strip()
                     if fid_str and fid_str != "0":
                         if skip_existing and mod_dir.name.lower() not in _profile_mod_names:
                             continue
-                        already_installed_by_fid[int(fid_str)] = mod_dir.name
+                        _fid = int(fid_str)
+                        _mid = int(mid_str) if mid_str.isdigit() else 0
+                        if _mid > 0:
+                            already_installed_by_ids[(_mid, _fid)] = mod_dir.name
+                        else:
+                            already_installed_by_fid[_fid] = mod_dir.name
                 except Exception:
                     pass
+
+        def _match_existing(mod) -> str:
+            """(mod_id, file_id) match first; file_id-only fallback for legacy
+            installs lacking a mod_id. Returns "" if no copy is installed."""
+            _mid = schema_file_id_to_mod_id.get(mod.file_id, 0) or getattr(mod, "mod_id", 0) or 0
+            if _mid > 0 and (_mid, mod.file_id) in already_installed_by_ids:
+                return already_installed_by_ids[(_mid, mod.file_id)]
+            return already_installed_by_fid.get(mod.file_id, "")
 
         # Remove staging folders for unticked optional mods
         if skipped_fids and skipped_mods:
@@ -5176,7 +5443,7 @@ class CollectionDetailDialog(tk.Frame):
             for mod in skipped_mods:
                 if not mod.file_id or mod.file_id not in skipped_fids:
                     continue
-                folder_name = already_installed_by_fid.get(mod.file_id, "")
+                folder_name = _match_existing(mod)
                 if not folder_name:
                     logical = schema_file_id_to_logical.get(mod.file_id, "") or ""
                     schema_name = schema_pos_to_name.get(
@@ -5216,10 +5483,8 @@ class CollectionDetailDialog(tk.Frame):
             if not mod.file_id:
                 skipped += 1
                 continue
-            existing_folder = ""
-            if mod.file_id in already_installed_by_fid:
-                existing_folder = already_installed_by_fid[mod.file_id]
-            else:
+            existing_folder = _match_existing(mod)
+            if not existing_folder:
                 logical = schema_file_id_to_logical.get(mod.file_id, "") or ""
                 schema_name = schema_pos_to_name.get(schema_file_id_to_pos.get(mod.file_id, -1), "") or ""
                 candidates = []
@@ -5315,7 +5580,7 @@ class CollectionDetailDialog(tk.Frame):
                 _phase_staging = self._game.get_effective_mod_staging_path()
                 _known_folders: list[str] = []
                 _seen_folders: set[str] = set()
-                for _fname in already_installed_by_fid.values():
+                for _fname in (*already_installed_by_ids.values(), *already_installed_by_fid.values()):
                     if _fname and _fname not in _seen_folders:
                         _seen_folders.add(_fname)
                         _known_folders.append(_fname)
@@ -5671,11 +5936,22 @@ class CollectionDetailDialog(tk.Frame):
                         write_separator_locks(profile_dir, _locks)
                 except Exception as exc:
                     self._log(f"Manual install: failed to write modlist.txt: {exc}")
+        elif _is_append_run:
+            # Append: reposition only newly-installed mods per the collection's
+            # before/after order; existing mods keep their position.
+            install_order.sort(key=lambda x: x[0])
+            self._append_reconcile_modlist(
+                modlist_path=modlist_path,
+                install_order=install_order,
+                pre_existing=_append_pre_existing,
+            )
 
         # ------------------------------------------------------------------
         # Step 7: Write plugins.txt / loadorder.txt from collection.json.
         # Same strategy as _run_install step 4: write userlist rules first,
         # then run LOOT so it applies them, fall back to flat list if needed.
+        # The full rewrite is skipped on append; the append branch below still
+        # writes the collection's group/plugin rules to userlist.yaml.
         # ------------------------------------------------------------------
         schema_plugins: list[dict] = collection_schema.get("plugins", [])
         if schema_plugins and overwrite_existing is None:
@@ -5760,13 +6036,22 @@ class CollectionDetailDialog(tk.Frame):
                 )
             except Exception as exc:
                 self._log(f"Manual install: failed to write plugins.txt: {exc}")
+        elif schema_plugins and _is_append_run:
+            # Append: write the collection's group/plugin rules to userlist.yaml
+            # without re-running LOOT or rewriting plugins.txt.
+            try:
+                _apply_collection_groups(profile_dir, collection_schema, self._log)
+            except Exception as exc:
+                self._log(f"Manual install (append): failed to write userlist.yaml rules: {exc}")
 
         # ------------------------------------------------------------------
         # Step 8: Final reconciliation (skipped on update runs — the update
         # reconcile already placed new mods correctly without disturbing
-        # existing mod order or separators).
+        # existing mod order or separators; skipped on append runs —
+        # _append_reconcile_modlist already handled placement without moving
+        # existing mods).
         # ------------------------------------------------------------------
-        if install_order and modlist_path.is_file() and not _is_update_run:
+        if install_order and modlist_path.is_file() and not _is_update_run and not _is_append_run:
             try:
                 _folder_to_key = {folder: key for key, folder in install_order}
                 _existing = read_modlist(modlist_path)
@@ -5783,6 +6068,7 @@ class CollectionDetailDialog(tk.Frame):
                 pass
 
         self._game.set_active_profile_dir(old_profile)
+        self._game.load_paths()
 
         # Handle cancel
         if self._manual_cancel_event.is_set():
@@ -5834,6 +6120,21 @@ class CollectionDetailDialog(tk.Frame):
         # Schedule LOOT sort to run AFTER the filemap rebuild triggered by
         # _switch_to_profile has reconciled plugins.txt against disk.
         self._schedule_loot_after_filemap()
+
+        # A collection install does a lot of transient work (downloads, parsing,
+        # profile build). Hand the freed heap back to the OS so RSS settles back
+        # down instead of staying pinned by glibc. Deferred so the post-install
+        # refresh/sort settles first.
+        def _trim():
+            try:
+                from Utils.mem_release import release_memory
+                release_memory()
+            except Exception:
+                pass
+        try:
+            self.after(2000, _trim)
+        except Exception:
+            pass
 
     def _on_pause_install(self):
         """Called when the Pause button in the overlay is clicked."""
@@ -5922,6 +6223,7 @@ class CollectionDetailDialog(tk.Frame):
         # Restore any deployed mod files so we don't orphan files in the game folder
         if profile_dir is not None and profile_dir.is_dir() and game is not None and game.is_configured():
             game.set_active_profile_dir(profile_dir)
+            game.load_paths()
             try:
                 if hasattr(game, "restore"):
                     game.restore()
@@ -5936,6 +6238,7 @@ class CollectionDetailDialog(tk.Frame):
             except Exception as exc:
                 self._log(f"Cancel: restore_root_folder failed: {exc}")
             game.set_active_profile_dir(None)
+            game.load_paths()
 
         # Delete the collection profile directory
         if profile_dir is not None and profile_dir.is_dir():
@@ -6253,7 +6556,7 @@ class CollectionDetailDialog(tk.Frame):
 
         # Scrollable rows
         ROW_H = scaled(28)
-        MAX_VISIBLE = 4
+        MAX_VISIBLE = 3
         visible = min(len(self._offsite_mods), MAX_VISIBLE)
         rows_frame = tk.Frame(self._offsite_frame, bg=BG_PANEL, height=visible * ROW_H)
         rows_frame.pack(fill="x")
@@ -6315,8 +6618,15 @@ class CollectionDetailDialog(tk.Frame):
                 command=lambda u=_url: open_url(u),
             ).pack(side="right", padx=6, pady=3)
 
-        # Pack the offsite frame below the priority note
-        self._offsite_frame.pack(fill="x", side="top", after=self._priority_note)
+        # Pack the offsite frame directly above the footer. Using side="bottom"
+        # (rather than side="top") means Tk carves out the footer's space first,
+        # then this panel above it, so a long off-site list can never starve the
+        # footer buttons — the expanding treeview gives up the space instead.
+        footer = getattr(self, "_footer", None)
+        if footer is not None and footer.winfo_exists():
+            self._offsite_frame.pack(fill="x", side="bottom", before=footer)
+        else:
+            self._offsite_frame.pack(fill="x", side="bottom")
 
     def _update_open_missing_btn_visibility(self):
         """Show 'Open Missing on Nexus' only when collection is installed and has missing mods."""
@@ -6367,7 +6677,7 @@ class CollectionDetailDialog(tk.Frame):
         url = f"https://www.nexusmods.com/games/{self._game_domain}/collections/{slug}"
         if self._revision_number:
             url += f"/revisions/{self._revision_number}"
-        webbrowser.open(url)
+        open_url(url)
 
     def _on_open_missing_on_nexus(self):
         """Open Nexus pages for all mods in the collection that are not installed."""
@@ -6547,6 +6857,11 @@ class CollectionDetailDialog(tk.Frame):
                     final_loadorder = vanilla_prefix + loadorder_lines
                     loadorder_path.write_text("\n".join(final_loadorder) + "\n", encoding="utf-8")
                     self._log(f"Reset load order: wrote loadorder.txt with {len(final_loadorder)} plugins ({len(vanilla_prefix)} vanilla)")
+                    # Direct writes bypass write_plugins/write_loadorder — drop
+                    # the read cache so the next read re-parses (Utils/plugins).
+                    from Utils.plugins import invalidate_plugins_cache
+                    invalidate_plugins_cache(plugins_path)
+                    invalidate_plugins_cache(loadorder_path)
                 except Exception as exc:
                     self._log(f"Reset load order: failed to write plugins.txt: {exc}")
 
@@ -6649,7 +6964,7 @@ class CollectionsDialog(tk.Frame):
         self._page: int = 0
         self._loading: bool = False
         self._search_active: bool = False
-        self._img_cache: dict = {}
+        self._img_cache: LRUImageCache = LRUImageCache()
         self._img_loading: set = set()
         self._cols: int = _COLL_COLS
         self._loader: CTkLoader | None = None
@@ -6759,7 +7074,7 @@ class CollectionsDialog(tk.Frame):
         self._workshop_btn.pack(side="left", padx=4, pady=2)
 
         self._import_manifest_btn = ctk.CTkButton(
-            toolbar, text="Import Manifest", width=115, height=26,
+            toolbar, text="Import", width=90, height=26,
             fg_color=BTN_SUCCESS_DEEP, hover_color=BTN_SUCCESS_DEEP_HOV, text_color=TEXT_WHITE,
             font=FONT_HEADER, command=self._import_manifest,
         )
@@ -7008,7 +7323,10 @@ class CollectionsDialog(tk.Frame):
 
     def _clear_cards(self):
         for c in self._cards:
-            c.card.destroy()
+            # destroy_widget_tree (not card.destroy()) so nested CTk children
+            # unregister from CTk's global trackers — a plain card.destroy()
+            # leaks them. See destroy_widget_tree in mod_card.py.
+            destroy_widget_tree(c.card)
         self._cards.clear()
 
     def _find_installed_profile_dir(self, slug: str) -> Path | None:
@@ -7151,8 +7469,12 @@ class CollectionsDialog(tk.Frame):
     def _close_detail(self):
         panel = getattr(self, "_detail_panel", None)
         if panel is not None:
+            # Recursive CTk-safe teardown: the detail dialog is a plain tk.Frame
+            # holding a large CTk subtree (buttons, labels, revision picker). A
+            # bare panel.destroy() would strand every CTk child in CTk's global
+            # trackers — the main per-action leak when opening/closing details.
             try:
-                panel.destroy()
+                destroy_widget_tree(panel)
             except Exception:
                 pass
             self._detail_panel = None
@@ -7408,7 +7730,7 @@ class CollectionsDialog(tk.Frame):
         # alphabetically, otherwise Workshop exports lose priority information.
         entries = [
             e for e in reversed(read_modlist(modlist_path))
-            if e.enabled and not e.is_separator
+            if not e.is_separator
         ]
 
         if self._on_open_workshop:

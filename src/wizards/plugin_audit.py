@@ -1004,6 +1004,10 @@ class PluginAuditWizard(ctk.CTkFrame):
             new_lines.append(line)
 
         plugins_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        # Direct write bypasses write_plugins() — drop the read cache so the
+        # next read_plugins re-parses this file (see Utils/plugins cache).
+        from Utils.plugins import invalidate_plugins_cache
+        invalidate_plugins_cache(plugins_path)
 
         # Trigger plugin panel reload — same pattern as pgpatcher/_on_done
         try:

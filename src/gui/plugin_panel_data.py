@@ -788,18 +788,14 @@ class PluginPanelDataMixin:
             resolved.append((full_path, mod_name))
         return resolved
 
-    @staticmethod
-    def _parse_filemap(filemap_path: Path):
-        """Parse filemap.txt and return a list of (rel_path, mod_name) tuples."""
-        entries = []
-        with filemap_path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                rel_path, mod_name = line.split("\t", 1)
-                entries.append((rel_path, mod_name))
-        return entries
+    def _parse_filemap(self, filemap_path: Path):
+        """Parse filemap.txt → list[(rel_path, mod_name)].
+
+        Delegates to the panel's shared mtime-keyed cache so the Data and Ini
+        tabs reuse the same parse as plugin sync / master checking rather than
+        re-reading the (large) file. See PluginPanel._get_parsed_filemap.
+        """
+        return self._get_parsed_filemap(filemap_path)
 
     def _collect_open_folder_paths(self) -> "set[tuple[str, ...]]":
         """Return the path-tuples (stripped label segments) of every open folder node."""

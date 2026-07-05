@@ -58,6 +58,7 @@ from Utils.profile_state import (
     write_mod_strip_prefixes,
 )
 from Utils.filemap import OVERWRITE_NAME as _OVERWRITE_NAME
+from Utils import perftrace
 
 
 class PluginPanelModFilesMixin:
@@ -774,12 +775,26 @@ class PluginPanelModFilesMixin:
             return
         mod_name = self._mod_files_mod_name
         profile_dir = self._mod_files_profile_dir
-        excluded_keys = [
+        # The tree may only show a subset of the mod's files (search / ext /
+        # conflict filters). We can only authoritatively set exclusion state
+        # for keys that are actually present in the current tree; any saved
+        # exclusion whose file is filtered out must be preserved untouched.
+        visible_keys = {
+            key for key in (self._mf_iid_to_key.get(iid) for iid in self._mf_checked)
+            if key is not None
+        }
+        excluded_visible = {
             self._mf_iid_to_key[iid]
             for iid, checked in self._mf_checked.items()
             if not checked and self._mf_iid_to_key.get(iid) is not None
-        ]
+        }
         all_excluded = read_excluded_mod_files(profile_dir, None)
+        # Keep exclusions for files not currently shown, then merge in the
+        # state of the visible rows.
+        preserved = {
+            k for k in all_excluded.get(mod_name, set()) if k not in visible_keys
+        }
+        excluded_keys = preserved | excluded_visible
         if excluded_keys:
             all_excluded[mod_name] = sorted(excluded_keys)
         else:
@@ -1081,6 +1096,7 @@ class PluginPanelModFilesMixin:
         else:
             self.show_mod_files(self._mod_files_mod_name)
 
+    @perftrace.timed("modfiles.show_mod_files (click)")
     def show_mod_files(self, mod_name: str | None):
         """Populate the Mod Files tab for the given mod name."""
         # Switching back from a separator view: drop the read-only flag so
@@ -1146,32 +1162,47 @@ class PluginPanelModFilesMixin:
         full_index = None
         if self._mod_files_index_path is not None:
             from Utils.filemap import read_mod_index
-            full_index = read_mod_index(self._mod_files_index_path)
+            with perftrace.span("show_mod_files: read_mod_index"):
+                full_index = read_mod_index(self._mod_files_index_path)
 
-        # Load the raw file listing by scanning the mod folder directly so
-        # the tree shows the full on-disk structure regardless of currently-
-        # saved strip prefixes. This lets the user tick nested folders as
-        # the new top level without first needing a full rescan.
+        # The raw file listing (rel_key → rel_str, no strip applied) shows the
+        # full on-disk structure so the user can tick nested folders as the new
+        # top level. modindex.bin already stores exactly this (raw casing per
+        # mod — see project_index_raw_casing), so reuse it instead of re-scanning
+        # the mod folder from disk on every selection click. A live folder scan
+        # here cost ~800ms on file-heavy mods (cold cache). Fall back to a scan
+        # only when the mod isn't in the index (e.g. just installed, no refresh).
         files: dict[str, str] = {}   # rel_key → rel_str (raw, no strip applied)
-        mod_dir: Path | None = None
-        if self._game is not None:
-            if mod_name == _OVERWRITE_NAME and hasattr(self._game, "get_effective_overwrite_path"):
-                try:
-                    mod_dir = Path(self._game.get_effective_overwrite_path())
-                except Exception:
-                    mod_dir = None
-            elif hasattr(self._game, "get_effective_mod_staging_path"):
-                try:
-                    mod_dir = Path(self._game.get_effective_mod_staging_path()) / mod_name
-                except Exception:
-                    mod_dir = None
-        if mod_dir is not None and mod_dir.is_dir():
-            from Utils.filemap import _scan_dir
-            _name, _normal, _root, _invalid = _scan_dir(
-                mod_name, str(mod_dir),
-            )
+        # [Overwrite] content changes outside the index rebuild cycle (xEdit
+        # output, tool runs), so always scan it live rather than trusting the
+        # index. Regular mods are stable between rebuilds → reuse the index.
+        _idx_entry = (full_index.get(mod_name)
+                      if full_index and mod_name != _OVERWRITE_NAME else None)
+        if _idx_entry is not None:
+            _normal, _root = _idx_entry
             files.update(_normal)
             files.update(_root)
+        else:
+            mod_dir: Path | None = None
+            if self._game is not None:
+                if mod_name == _OVERWRITE_NAME and hasattr(self._game, "get_effective_overwrite_path"):
+                    try:
+                        mod_dir = Path(self._game.get_effective_overwrite_path())
+                    except Exception:
+                        mod_dir = None
+                elif hasattr(self._game, "get_effective_mod_staging_path"):
+                    try:
+                        mod_dir = Path(self._game.get_effective_mod_staging_path()) / mod_name
+                    except Exception:
+                        mod_dir = None
+            if mod_dir is not None and mod_dir.is_dir():
+                from Utils.filemap import _scan_dir
+                with perftrace.span("show_mod_files: _scan_dir (fallback)"):
+                    _name, _normal, _root, _invalid = _scan_dir(
+                        mod_name, str(mod_dir),
+                    )
+                files.update(_normal)
+                files.update(_root)
 
         # Extension counts for the filter side panel (pre-filter).
         ext_counts: dict[str, int] = {}

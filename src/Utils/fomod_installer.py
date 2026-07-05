@@ -19,7 +19,8 @@ from Utils.fomod_parser import (
 def evaluate_dependency(dep: Dependency, flag_state: dict[str, str],
                         installed_files: set[str],
                         active_files: set[str] | None = None,
-                        version_pass: bool = False) -> bool:
+                        version_pass: bool = False,
+                        loose_files: set[str] | None = None) -> bool:
     """
     Recursively evaluate a Dependency tree.
 
@@ -33,6 +34,12 @@ def evaluate_dependency(dep: Dependency, flag_state: dict[str, str],
                      Use for step visibility so steps with version gates are
                      still shown. For typeDescriptor pattern matching leave
                      False so patterns fall through to the default type.
+    loose_files:     Optional set of every deployed file's relative path
+                     (lower-case, forward-slash separators). Used to resolve
+                     <fileDependency> nodes that reference a loose asset path
+                     (e.g. "textures/foo.dds") rather than a plugin name. MO2
+                     evaluates fileDependency against the whole virtual file
+                     tree, not just plugins; this set restores that behaviour.
 
     Returns True if the condition is satisfied.
     """
@@ -40,7 +47,7 @@ def evaluate_dependency(dep: Dependency, flag_state: dict[str, str],
         if not dep.sub_deps:
             return True  # Empty composite = no restriction = pass
         results = [evaluate_dependency(d, flag_state, installed_files,
-                                        active_files, version_pass)
+                                        active_files, version_pass, loose_files)
                    for d in dep.sub_deps]
         if dep.operator.lower() == "or":
             return any(results)
@@ -50,8 +57,32 @@ def evaluate_dependency(dep: Dependency, flag_state: dict[str, str],
         return flag_state.get(dep.flag_name, "") == dep.flag_value
 
     if dep.dep_type == "file":
-        # Case-insensitive — FOMOD was designed for Windows
+        # Case-insensitive — FOMOD was designed for Windows.
         key = dep.file_name.lower()
+        # A fileDependency may reference an arbitrary loose asset path, not just
+        # a plugin name. Detect that (path separator, or an extension that isn't
+        # a plugin) and resolve it against the deployed file tree when we have
+        # one. MO2 checks the whole virtual tree here.
+        norm_key = key.replace("\\", "/")
+        looks_loose = ("/" in norm_key
+                       or not norm_key.endswith((".esp", ".esm", ".esl")))
+        if looks_loose and loose_files is not None:
+            present = norm_key in loose_files
+            # Loose assets have no enable/disable concept — present == active.
+            if dep.file_state == "Inactive":
+                return False
+            if dep.file_state == "Missing":
+                return not present
+            return present  # "Active"
+        if looks_loose and loose_files is None:
+            # No deployed file tree available to check a loose-asset gate.
+            # Match the version-gate philosophy: don't silently fail closed.
+            #   Active/Inactive  → satisfied when version_pass (lenient context)
+            #   Missing          → satisfied (we can't prove it's present)
+            if dep.file_state == "Missing":
+                return True
+            return version_pass
+
         present = key in installed_files
         if dep.file_state == "Active":
             # Active: file must be present AND enabled
@@ -82,7 +113,8 @@ def evaluate_dependency(dep: Dependency, flag_state: dict[str, str],
 
 def resolve_plugin_type(plugin: Plugin, flag_state: dict[str, str],
                         installed_files: set[str],
-                        active_files: set[str] | None = None) -> str:
+                        active_files: set[str] | None = None,
+                        loose_files: set[str] | None = None) -> str:
     """
     Evaluate a plugin's typeDescriptor to get its effective type string.
     For simple typeDescriptors returns the static type directly.
@@ -96,7 +128,8 @@ def resolve_plugin_type(plugin: Plugin, flag_state: dict[str, str],
         return td.plugin_type
 
     for dep, type_name in td.patterns:
-        if evaluate_dependency(dep, flag_state, installed_files, active_files):
+        if evaluate_dependency(dep, flag_state, installed_files, active_files,
+                               loose_files=loose_files):
             return type_name
 
     # No pattern matched. If the default is NotUsable but the pattern set
@@ -138,6 +171,7 @@ def check_module_dependencies(
     config: ModuleConfig,
     installed_files: set[str] | None = None,
     active_files: set[str] | None = None,
+    loose_files: set[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Evaluate <moduleDependencies> before the wizard runs.
@@ -154,7 +188,7 @@ def check_module_dependencies(
         return True, ""
     inst = installed_files or set()
     ok = evaluate_dependency(config.module_dependency, {}, inst, active_files,
-                             version_pass=True)
+                             version_pass=True, loose_files=loose_files)
     if ok:
         return True, ""
     return False, describe_dependency(config.module_dependency)
@@ -166,7 +200,8 @@ def check_module_dependencies(
 
 def get_visible_steps(config: ModuleConfig, flag_state: dict[str, str],
                       installed_files: set[str],
-                      active_files: set[str] | None = None) -> list[InstallStep]:
+                      active_files: set[str] | None = None,
+                      loose_files: set[str] | None = None) -> list[InstallStep]:
     """
     Filter config.steps to only those whose visible_condition is satisfied.
     Steps with no condition (None) are always visible.
@@ -178,7 +213,7 @@ def get_visible_steps(config: ModuleConfig, flag_state: dict[str, str],
             visible.append(step)
         elif evaluate_dependency(step.visible_condition, flag_state,
                                   installed_files, active_files,
-                                  version_pass=True):
+                                  version_pass=True, loose_files=loose_files):
             visible.append(step)
     return visible
 
@@ -189,7 +224,8 @@ def get_visible_steps(config: ModuleConfig, flag_state: dict[str, str],
 
 def get_default_selections(step: InstallStep, flag_state: dict[str, str],
                            installed_files: set[str],
-                           active_files: set[str] | None = None) -> dict[str, list[str]]:
+                           active_files: set[str] | None = None,
+                           loose_files: set[str] | None = None) -> dict[str, list[str]]:
     """
     Compute default plugin selections for a step based on group types and plugin types.
     Returns {group_name: [plugin_name, ...]}
@@ -203,7 +239,8 @@ def get_default_selections(step: InstallStep, flag_state: dict[str, str],
             continue
 
         gtype = group.group_type
-        plugin_types = [resolve_plugin_type(p, flag_state, installed_files, active_files)
+        plugin_types = [resolve_plugin_type(p, flag_state, installed_files,
+                                            active_files, loose_files)
                         for p in plugins]
 
         if gtype == "SelectAll":
@@ -281,7 +318,8 @@ def update_flags(step: InstallStep, selections: dict[str, list[str]],
 def resolve_files(config: ModuleConfig,
                   all_selections: dict[str, dict[str, list[str]]],
                   installed_files: set[str] | None = None,
-                  active_files: set[str] | None = None) -> list[tuple[str, str, bool]]:
+                  active_files: set[str] | None = None,
+                  loose_files: set[str] | None = None) -> list[tuple[str, str, bool]]:
     """
     Build the final file install list from required files + user selections
     + conditional file installs.
@@ -313,7 +351,7 @@ def resolve_files(config: ModuleConfig,
         if step.visible_condition is not None:
             if not evaluate_dependency(step.visible_condition, flag_state,
                                        inst_files, active_files,
-                                       version_pass=True):
+                                       version_pass=True, loose_files=loose_files):
                 continue
         # Accept both new index-keyed format (str(i)) and old name-keyed format
         # for backward compatibility with previously saved selection JSON.
@@ -321,7 +359,8 @@ def resolve_files(config: ModuleConfig,
         for group in step.groups:
             selected_names = set(step_selections.get(group.name, []))
             for plugin in group.plugins:
-                ptype = resolve_plugin_type(plugin, flag_state, inst_files, active_files)
+                ptype = resolve_plugin_type(plugin, flag_state, inst_files,
+                                            active_files, loose_files)
                 is_selected = (group.group_type == "SelectAll"
                                or plugin.name in selected_names)
                 if is_selected:
@@ -347,7 +386,8 @@ def resolve_files(config: ModuleConfig,
     # <conditionalFileInstalls> behind a version gate would install 0 files.
     for pattern in config.conditional_file_installs:
         if evaluate_dependency(pattern.dependency, flag_state, inst_files,
-                               active_files, version_pass=True):
+                               active_files, version_pass=True,
+                               loose_files=loose_files):
             for fi in pattern.files:
                 conditional.append((fi.priority, fi.source_path,
                                     fi.destination_path, fi.is_folder))
@@ -368,22 +408,47 @@ def resolve_files(config: ModuleConfig,
 # ---------------------------------------------------------------------------
 
 def validate_selections(step: InstallStep,
-                        selections: dict[str, list[str]]) -> list[str]:
+                        selections: dict[str, list[str]],
+                        flag_state: dict[str, str] | None = None,
+                        installed_files: set[str] | None = None,
+                        active_files: set[str] | None = None,
+                        loose_files: set[str] | None = None) -> list[str]:
     """
     Check if current selections satisfy each group's type constraint.
     Returns a list of error messages (empty = all valid).
+
+    When the resolution context (flag_state / installed_files / active_files)
+    is supplied, "select one/at-least-one" requirements are waived for groups
+    in which every plugin resolves to NotUsable — such a group is impossible
+    to satisfy and must not hard-block the install. This mirrors MO2, which
+    lets the user proceed past a degenerate all-NotUsable group.
     """
     errors: list[str] = []
+    inst = installed_files or set()
+    flags = flag_state or {}
 
     for group in step.groups:
         selected = selections.get(group.name, [])
         count = len(selected)
         gtype = group.group_type
 
-        if gtype == "SelectExactlyOne" and count != 1:
-            errors.append(f'"{group.name}": select exactly one option.')
-        elif gtype == "SelectAtLeastOne" and count < 1:
-            errors.append(f'"{group.name}": select at least one option.')
+        # A group is "satisfiable" only if at least one plugin is selectable
+        # (not NotUsable). Without the resolution context we assume it is, to
+        # preserve the original strict behaviour for callers that don't pass it.
+        if flag_state is None and installed_files is None and active_files is None:
+            satisfiable = True
+        else:
+            satisfiable = any(
+                resolve_plugin_type(p, flags, inst, active_files, loose_files) != "NotUsable"
+                for p in group.plugins
+            )
+
+        if gtype == "SelectExactlyOne":
+            if satisfiable and count != 1:
+                errors.append(f'"{group.name}": select exactly one option.')
+        elif gtype == "SelectAtLeastOne":
+            if satisfiable and count < 1:
+                errors.append(f'"{group.name}": select at least one option.')
         elif gtype == "SelectAtMostOne" and count > 1:
             errors.append(f'"{group.name}": select at most one option.')
         # SelectAny and SelectAll have no constraint to enforce here

@@ -64,6 +64,8 @@ CB_COL_W   = scaled(24)   # px reserved on the left for the per-row checkbox
 CB_SIZE    = scaled(14)   # checkbox square edge length (fits the shorter row)
 NAME_PAD_L = CB_COL_W + scaled(6)  # left padding for the filename text (after checkbox)
 NAME_PAD_R = scaled(8)    # gap between filename text and size column
+HEADER_ACTION_W = scaled(90)  # px reserved on the right of a section header for
+                              # the "Select all" / "Deselect all" click target
 
 _POOL_SIZE = 40  # pre-allocated canvas slots (covers ~40 visible rows)
 
@@ -71,7 +73,7 @@ _POOL_SIZE = 40  # pre-allocated canvas slots (covers ~40 visible rows)
 # .dazip / .override are Dragon Age package formats (renamed zips) — listed so
 # they show up in the Downloads tab and can be installed like any other archive.
 _ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz",
-                 ".dazip", ".override"}
+                 ".dazip", ".override", ".fomod"}
 
 from gui.text_utils import truncate_text_tk_call as _truncate_text_cached
 
@@ -344,6 +346,15 @@ class DownloadsPanel:
         # Per-archive checkbox state — keyed by Path so it survives pool reuse.
         self._checked: set[Path] = set()
         self._checked_change_cb: Optional[Callable[[], None]] = None
+        # Anchor for shift-click range selection — the archive Path of the
+        # last plainly-clicked row. Keyed by Path so it survives rescans /
+        # scroll; resolved back to a visible index at shift-click time.
+        self._range_anchor: Optional[Path] = None
+        # Whether the last plain click selected (True) or deselected (False)
+        # the anchor row. A following shift-click applies the same action to
+        # the whole range, so shift-click can extend either a selection or a
+        # deselection.
+        self._range_select: bool = True
 
         # Filter side panel state
         self._filter_panel_open: bool = False
@@ -706,6 +717,9 @@ class DownloadsPanel:
                     self._checked_change_cb()
                 except Exception:
                     pass
+        # Drop a stale range anchor that no longer exists on disk.
+        if self._range_anchor is not None and self._range_anchor not in present:
+            self._range_anchor = None
 
         # Refresh the dynamic filter lists (counts may have changed) and
         # recompute the visible view.
@@ -788,6 +802,25 @@ class DownloadsPanel:
 
         self._draw_marker_strip()
 
+    def _section_archive_paths(self, header_idx: int) -> list[Path]:
+        """Return every archive Path belonging to the section header at
+        visible index *header_idx* (the contiguous run of non-header rows
+        following it). Returns an empty list if *header_idx* is not a
+        section header or the section has no archives."""
+        n = len(self._visible_files)
+        if header_idx < 0 or header_idx >= n:
+            return []
+        if not self._visible_files[header_idx].is_section_header:
+            return []
+        paths: list[Path] = []
+        j = header_idx + 1
+        while j < n and not self._visible_files[j].is_section_header:
+            p = self._visible_files[j].path
+            if p is not None:
+                paths.append(p)
+            j += 1
+        return paths
+
     def _render_slot(self, c, s: int, di: int, cw: int, size_right: int,
                      btn_center_x: int, name_max_px: int, tk_call) -> None:
         """Configure pool slot *s* to display visible-row *di*.
@@ -812,6 +845,15 @@ class DownloadsPanel:
                         and entry.path is not None
                         and self._installed_filenames.is_archive_installed(entry.path.name))
 
+        # For headers, track whether every archive in the section is checked
+        # so the "Select all"/"Deselect all" label re-renders when it flips.
+        header_all_checked = False
+        if is_header:
+            section_paths = self._section_archive_paths(di)
+            header_all_checked = bool(section_paths) and all(
+                p in self._checked for p in section_paths
+            )
+
         # State key — covers every visual aspect that affects the slot.
         key = (
             id(entry),
@@ -821,6 +863,7 @@ class DownloadsPanel:
             is_installed,
             is_highlighted,
             is_checked,
+            header_all_checked,
             di == self._sel_idx,
             di,
             cw,
@@ -837,15 +880,32 @@ class DownloadsPanel:
         c.coords(self._pool_bg[s], 0, y0, cw, y1)
 
         if is_header:
-            # Section header: full-width header bg, bold centred text, no
-            # checkbox / size / install button.
+            # Section header: full-width header bg, bold left text, no
+            # checkbox / install button. The (otherwise unused) size text
+            # item is repurposed as a clickable "Select/Deselect all"
+            # action on the right edge of the row.
             c.itemconfigure(self._pool_bg[s], fill=BG_HEADER, state="normal")
             c.itemconfigure(self._pool_cb_rect[s], state="hidden")
             c.itemconfigure(self._pool_cb_mark[s], state="hidden")
-            c.itemconfigure(self._pool_size[s], state="hidden")
             c.itemconfigure(self._pool_btn_ids[s], state="hidden")
+
+            section_paths = self._section_archive_paths(di)
+            has_archives = bool(section_paths)
+            all_checked = has_archives and all(
+                p in self._checked for p in section_paths
+            )
+            action_text = "Deselect all" if all_checked else "Select all"
+            if has_archives:
+                c.coords(self._pool_size[s], cw - scaled(8), yc)
+                c.itemconfigure(self._pool_size[s], text=action_text,
+                                font=FONT_SMALL, fill=ACCENT, state="normal")
+            else:
+                c.itemconfigure(self._pool_size[s], state="hidden")
+
+            name_w = max(cw - scaled(16) - HEADER_ACTION_W, 20) if has_archives \
+                else max(cw - scaled(16), 20)
             label = _truncate_text_cached(
-                tk_call, entry.section_name, TK_FONT_HEADER, max(cw - scaled(16), 20),
+                tk_call, entry.section_name, TK_FONT_HEADER, name_w,
             )
             c.coords(self._pool_name[s], scaled(8), yc)
             c.itemconfigure(self._pool_name[s], text=label,
@@ -885,9 +945,12 @@ class DownloadsPanel:
         c.itemconfigure(self._pool_name[s], text=name,
                         font=FONT_NORMAL, fill=TEXT_MAIN, state="normal")
 
-        # File size
+        # File size — reset font/fill explicitly: this canvas item is
+        # reused as the header "Select all" label (FONT_SMALL/ACCENT), so
+        # restore the size styling when the slot flips to an archive row.
         c.coords(self._pool_size[s], size_right, yc)
-        c.itemconfigure(self._pool_size[s], text=size_str, state="normal")
+        c.itemconfigure(self._pool_size[s], text=size_str,
+                        font=FONT_SMALL, fill=TEXT_DIM, state="normal")
 
         # Install button
         is_installed = (fpath is not None
@@ -1134,58 +1197,104 @@ class DownloadsPanel:
 
         total = len(paths)
 
-        def _set_progress(done: int, label: str = "Installing") -> None:
-            if status_bar is None:
-                return
-            app.after(0, lambda d=done, lbl=label:
-                      status_bar.set_progress(d, total, title=f"{lbl} {d}/{total}"))
+        # Pooled install notification — one toast with a progress bar for the
+        # whole batch instead of one "Installed: X" toast per mod. Created on
+        # the main thread; the worker drives it via app.after.
+        from gui.ctk_components import CTkNotification
+        pooled_notif: list = [None]
 
+        def _make_pooled_notif():
+            try:
+                pooled_notif[0] = CTkNotification(
+                    app.winfo_toplevel(), state="info",
+                    message=f"Installing 0/{total} mods…",
+                    show_progress=True,
+                )
+            except Exception:
+                pooled_notif[0] = None
+        app.after(0, _make_pooled_notif)
+
+        def _update_pooled(done: int, label: str) -> None:
+            def _do():
+                n = pooled_notif[0]
+                if n is not None and n.winfo_exists():
+                    n.update_message(f"{label} {done}/{total} mods…")
+                    n.set_progress(done / total if total else 1.0)
+            app.after(0, _do)
+
+        def _finish_pooled(installed: int, failed: int) -> None:
+            def _do():
+                n = pooled_notif[0]
+                if n is None or not n.winfo_exists():
+                    return
+                if failed:
+                    n.update_message(
+                        f"Installed {installed}/{total} mods ({failed} failed)",
+                        state="warning")
+                else:
+                    n.update_message(f"Installed {installed} mod(s)", state="success")
+                n.set_progress(1.0)
+                n.after(4000, n.destroy)
+            app.after(0, _do)
+
+        # NB: this batch flow no longer drives the StatusBar progress popup —
+        # the pooled CTkNotification above is the single source of truth, so a
+        # second bottom-right overlay doesn't appear. We still pass a
+        # clear-progress callback to install_mod_from_archive so it can tidy any
+        # popup it might create internally.
         def _clear_progress() -> None:
             if status_bar is not None:
                 app.after(0, status_bar.clear_progress)
 
-        def _extract_progress(done: int, total_b: int, phase: str | None = None):
-            if status_bar is not None:
-                app.after(0, lambda d=done, t=total_b, p=phase:
-                          status_bar.set_progress(d, t, p, title="Extracting"))
-
         def _worker():
             deferred: list[Path] = []
             done = 0
+            installed = 0
+            failed = 0
             try:
                 # Phase A \u2014 non-FOMODs first.
                 for path in paths:
-                    _set_progress(done, "Installing")
+                    _update_pooled(done, "Installing")
                     self._log(f"Installing {path.name} \u2026")
+                    ok = False
                     try:
                         result = install_mod_from_archive(
                             str(path), app, self._log, game, mod_panel,
                             disable_extract=disable_extract,
-                            progress_fn=_extract_progress,
                             clear_progress_fn=_clear_progress,
                             defer_interactive_fomod=True,
+                            suppress_notification=True,
                         )
+                        ok = True
                     except Exception as exc:
                         self._log(f"Install failed: {path.name}: {exc}")
                         result = None
+                        failed += 1
                     if result == FOMOD_DEFERRED:
-                        deferred.append(path)
+                        deferred.append(path)  # counted in Phase B
+                    elif ok:
+                        installed += 1
                     done += 1
-                # Phase B \u2014 deferred FOMODs (interactive).
+                # Phase B \u2014 deferred FOMODs (interactive). These show their
+                # own wizard UI, so the pooled toast just tracks the count.
                 for path in deferred:
-                    _set_progress(done, "Installing FOMOD")
+                    _update_pooled(done, "Installing FOMOD")
                     self._log(f"Installing FOMOD {path.name} \u2026")
                     try:
                         install_mod_from_archive(
                             str(path), app, self._log, game, mod_panel,
                             disable_extract=disable_extract,
-                            progress_fn=_extract_progress,
                             clear_progress_fn=_clear_progress,
+                            suppress_notification=True,
                         )
+                        installed += 1
                     except Exception as exc:
                         self._log(f"FOMOD install failed: {path.name}: {exc}")
+                        failed += 1
+                    done += 1
             finally:
                 _clear_progress()
+                _finish_pooled(installed, failed)
 
                 def _finish():
                     self._checked.clear()
@@ -1761,13 +1870,73 @@ class DownloadsPanel:
         if idx < 0 or idx >= len(self._visible_files):
             return
         entry = self._visible_files[idx]
-        if entry.is_section_header or entry.path is None:
+        if entry.is_section_header:
+            # Clicking the "Select all" / "Deselect all" action on the
+            # right edge toggles every archive in that section.
+            if int(self._canvas.canvasx(event.x)) >= self._canvas_w - HEADER_ACTION_W:
+                self._toggle_section(idx)
+            return
+        if entry.path is None:
             return
         fpath = entry.path
+
+        # Shift-click — apply the anchor's last action (select or deselect)
+        # to every archive between the anchor row and this row inclusive.
+        # Section headers inside the range are skipped. Falls back to a
+        # plain toggle when there is no resolvable anchor.
+        if (event.state & 0x0001) and self._range_anchor is not None:
+            anchor_idx = self._visible_index_of(self._range_anchor)
+            if anchor_idx is not None:
+                lo, hi = sorted((anchor_idx, idx))
+                for e in self._visible_files[lo:hi + 1]:
+                    if e.is_section_header or e.path is None:
+                        continue
+                    if self._range_select:
+                        self._checked.add(e.path)
+                    else:
+                        self._checked.discard(e.path)
+                # Leave the anchor unchanged so the user can extend the
+                # range from the same origin with another shift-click.
+                self._redraw()
+                if self._checked_change_cb is not None:
+                    try:
+                        self._checked_change_cb()
+                    except Exception:
+                        pass
+                return
+
         if fpath in self._checked:
             self._checked.discard(fpath)
+            self._range_select = False
         else:
             self._checked.add(fpath)
+            self._range_select = True
+        self._range_anchor = fpath
+        self._redraw()
+        if self._checked_change_cb is not None:
+            try:
+                self._checked_change_cb()
+            except Exception:
+                pass
+
+    def _visible_index_of(self, path: Path) -> Optional[int]:
+        """Return the index of the archive *path* in the current visible
+        list, or None if it is not present (filtered out / removed)."""
+        for i, e in enumerate(self._visible_files):
+            if not e.is_section_header and e.path == path:
+                return i
+        return None
+
+    def _toggle_section(self, header_idx: int) -> None:
+        """Select all archives in the section at *header_idx*, or deselect
+        them all if they are already fully selected."""
+        section_paths = self._section_archive_paths(header_idx)
+        if not section_paths:
+            return
+        if all(p in self._checked for p in section_paths):
+            self._checked.difference_update(section_paths)
+        else:
+            self._checked.update(section_paths)
         self._redraw()
         if self._checked_change_cb is not None:
             try:

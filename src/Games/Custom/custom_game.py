@@ -373,50 +373,8 @@ class StandardCustomGame(BaseGame):
     # Persistence
     # ------------------------------------------------------------------
 
-    def load_paths(self) -> bool:
-        self._migrate_old_config()
-        if not self._paths_file.exists():
-            self._game_path = None
-            self._prefix_path = None
-            self._staging_path = None
-            return False
-        try:
-            data = json.loads(self._paths_file.read_text(encoding="utf-8"))
-            raw = data.get("game_path", "")
-            self._game_path = Path(raw) if raw else None
-            raw_pfx = data.get("prefix_path", "")
-            self._prefix_path = Path(raw_pfx) if raw_pfx else None
-            raw_mode = data.get("deploy_mode", "hardlink")
-            self._deploy_mode = {"symlink": LinkMode.SYMLINK, "copy":    LinkMode.SYMLINK}.get(
-                raw_mode, LinkMode.HARDLINK
-            )
-            raw_staging = data.get("staging_path", "")
-            self._staging_path = Path(raw_staging) if raw_staging else None
-            self._validate_staging()
-            return bool(self._game_path)
-        except (json.JSONDecodeError, OSError):
-            pass
-        self._game_path = None
-        self._prefix_path = None
-        self._staging_path = None
-        return False
-
-    def save_paths(self) -> None:
-        self._paths_file.parent.mkdir(parents=True, exist_ok=True)
-        mode_str = {LinkMode.SYMLINK: "symlink", LinkMode.COPY: "copy"}.get(
-            self._deploy_mode, "hardlink"
-        )
-        data = {
-            "game_path":    str(self._game_path)    if self._game_path    else "",
-            "prefix_path":  str(self._prefix_path)  if self._prefix_path  else "",
-            "deploy_mode":  mode_str,
-            "staging_path": str(self._staging_path) if self._staging_path else "",
-        }
-        self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-    def set_game_path(self, path: Path | str | None) -> None:
-        self._game_path = Path(path) if path else None
-        self.save_paths()
+    # load_paths / save_paths are inherited from BaseGame (profile-aware);
+    # custom games deploy via symlink/hardlink only.
 
     def set_staging_path(self, path: Path | str | None) -> None:
         self._staging_path = Path(path) if path else None

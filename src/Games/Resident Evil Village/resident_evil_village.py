@@ -48,7 +48,14 @@ from Utils.deploy import (
 )
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
-from Utils.re_pak_patcher import find_pak_files, hash_filepath, patch_pak_file, restore_pak_file
+from Utils.re_pak_patcher import (
+    find_pak_files,
+    hash_filepath,
+    patch_pak_file,
+    restore_from_root_manifest,
+    restore_pak_file,
+    update_root_manifest,
+)
 from Utils.tex_convert import convert_tex_v10_to_v34, tex_needs_conversion
 
 _PROFILES_DIR = get_profiles_dir()
@@ -119,6 +126,21 @@ class ResidentEvilVillage(BaseGame):
     def mod_supports_bundles(self) -> bool:
         return True
 
+    @property
+    def wizard_tools(self):
+        from Games.base_game import WizardTool
+        return self._base_wizard_tools() + [
+            WizardTool(
+                id="re_pak_restore",
+                label="Repair PAK files",
+                description=(
+                    "Restore vanilla PAK entries from the failsafe manifest in the "
+                    "game root. Use if the game won't load after mods were removed."
+                ),
+                dialog_class_path="wizards.re_pak_restore.RePakRestoreWizard",
+            ),
+        ]
+
     # -----------------------------------------------------------------------
     # Paths
     # -----------------------------------------------------------------------
@@ -161,6 +183,34 @@ class ResidentEvilVillage(BaseGame):
 
     def _backup_path_for_pak(self, pak_path: Path, profile: str = "default") -> Path:
         return self._pak_patches_dir(profile) / (pak_path.name + ".json")
+
+    def _all_pak_patch_dirs(self) -> list[Path]:
+        """Every profile's pak_patches/ dir that currently holds backups.
+
+        Restore must find the PAK backups regardless of which profile was
+        active when deploy patched the PAKs.  Deploy writes backups under the
+        active profile (e.g. ``profiles/MyProfile/pak_patches/``); a restore
+        that only looked in ``profiles/default/`` would silently leave every
+        zeroed PAK entry invalidated forever (vanilla files become
+        unloadable → black screen).  Scanning all profiles also rescues
+        backups orphaned by older builds that had that exact bug.
+        """
+        profiles_root = self.get_profile_root() / "profiles"
+        dirs: list[Path] = []
+        seen: set[Path] = set()
+        # Prefer the active/last-deployed profile first so its backups win.
+        preferred = None
+        if self._active_profile_dir is not None:
+            preferred = self._active_profile_dir / "pak_patches"
+        for cand in (preferred, *sorted(profiles_root.glob("*/pak_patches"))):
+            if cand is None:
+                continue
+            rcand = cand.resolve()
+            if rcand in seen or not cand.is_dir():
+                continue
+            seen.add(rcand)
+            dirs.append(cand)
+        return dirs
 
     # -----------------------------------------------------------------------
     # Deployment
@@ -276,6 +326,11 @@ class ResidentEvilVillage(BaseGame):
                     backup = self._backup_path_for_pak(pak, profile)
                     count = patch_pak_file(pak, hashes, backup, log_fn=_log)
                     total_patched += count
+                    # Mirror the backup into the game root as a failsafe so the
+                    # PAKs can be repaired even if Profiles/ is wiped while
+                    # deployed (see the PAK-restore wizard).
+                    if backup.exists():
+                        update_root_manifest(self._game_path, pak, backup, log_fn=_log)
                 if total_patched == 0:
                     _log(
                         "  [INFO] No matching PAK entries found for deployed files.\n"
@@ -298,11 +353,13 @@ class ResidentEvilVillage(BaseGame):
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
         cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
 
-        # Restore PAK entries from all backup files found under pak_patches/
+        # Restore PAK entries from every profile's pak_patches/ backups.
+        # Deploy writes backups under whichever profile was active, so restore
+        # must scan all profiles — looking only in default/ would permanently
+        # strand zeroed entries patched under a non-default profile.
         _log("Restore: restoring PAK entries from backups ...")
-        patches_dir = self._pak_patches_dir()
         restored_entries = 0
-        if patches_dir.exists():
+        for patches_dir in self._all_pak_patch_dirs():
             for backup_file in sorted(patches_dir.glob("*.json")):
                 try:
                     saved = json.loads(backup_file.read_text(encoding="utf-8"))
@@ -316,8 +373,23 @@ class ResidentEvilVillage(BaseGame):
                 patches_dir.rmdir()
             except OSError:
                 pass
+        # If the per-profile backups were missing (e.g. stranded by an older
+        # build, or Profiles/ partially wiped) fall back to the game-root
+        # failsafe manifest so the PAKs are still healed.
+        if restored_entries == 0:
+            manifest_restored = restore_from_root_manifest(self._game_path, log_fn=_log)
+            if manifest_restored:
+                _log(f"  Restored {manifest_restored} entr"
+                     f"{'y' if manifest_restored == 1 else 'ies'} from game-root manifest.")
+                restored_entries += manifest_restored
+
         if restored_entries == 0:
             _log("  No PAK backups found (nothing to restore).")
+
+        # NB the game-root manifest (.mm_pak_restore.json) is intentionally
+        # kept — it is an append-only ledger of every entry the manager has
+        # ever invalidated, so the "Repair PAK files" wizard can always re-heal
+        # the PAKs even if a future deploy/restore leaves them stranded.
 
         _log("Restore: removing mod files from game root and restoring vanilla backups ...")
         restore_filemap_from_root(

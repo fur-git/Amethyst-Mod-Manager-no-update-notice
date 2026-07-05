@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import threading
-import webbrowser
 import tkinter as tk
 import customtkinter as ctk
 
@@ -20,7 +19,7 @@ from Utils.config_paths import (
     get_profiles_dir,
     get_config_dir,
 )
-from Utils.xdg import xdg_open
+from Utils.xdg import open_url, xdg_open
 from Utils.ui_config import (
     load_ui_scale, save_ui_scale, detect_hidpi_scale,
     load_collection_settings, save_collection_settings,
@@ -28,6 +27,7 @@ from Utils.ui_config import (
     load_clear_archive_after_install, save_clear_archive_after_install,
     load_keep_fomod_archives, save_keep_fomod_archives,
     load_show_summary_tooltips, save_show_summary_tooltips,
+    load_hide_bsa_conflicts, save_hide_bsa_conflicts,
     load_rename_mod_after_install, save_rename_mod_after_install,
     load_restore_on_close, save_restore_on_close,
     load_allow_prerelease, save_allow_prerelease,
@@ -233,14 +233,14 @@ class StatusBar(ctk.CTkFrame):
             label_bar, text="Ko-Fi", width=55, height=16,
             fg_color="#7b2d8b", hover_color="#9a3aae",
             text_color="#ffffff", font=FONT_SMALL,
-            command=lambda: webbrowser.open("https://ko-fi.com/chrisdkn"),
+            command=lambda: open_url("https://ko-fi.com/chrisdkn"),
         ).pack(side="right", padx=(0, 2), pady=2)
 
         ctk.CTkButton(
             label_bar, text="Github", width=60, height=16,
             fg_color="#24292e", hover_color="#3a3f44",
             text_color="#ffffff", font=FONT_SMALL,
-            command=lambda: webbrowser.open("https://github.com/ChrisDKN/Amethyst-Mod-Manager"),
+            command=lambda: open_url("https://github.com/ChrisDKN/Amethyst-Mod-Manager"),
         ).pack(side="right", padx=(0, 2), pady=2)
 
         ctk.CTkButton(
@@ -369,7 +369,7 @@ class StatusBar(ctk.CTkFrame):
         app = self.winfo_toplevel()
         api = getattr(app, "_nexus_api", None)
         if api is None:
-            webbrowser.open(_AMM_URL)
+            open_url(_AMM_URL)
             return
 
         def _notify(state, message):
@@ -569,6 +569,12 @@ class StatusBar(ctk.CTkFrame):
             self._progress_popup._update_geometry = self._reposition_popup
             self._progress_popup._configure_bid = root.bind("<Configure>", self._reposition_popup, add="+")
             self._reposition_popup()
+            # An overlay (e.g. Bundle Options) may own the bottom-right corner —
+            # keep a freshly-created popup hidden; resume_all_download_popups
+            # re-shows it when the overlay closes.
+            mp = getattr(root, "_mod_panel", None)
+            if getattr(mp, "_dl_popups_hidden", False):
+                self._progress_popup.set_force_hidden(True)
         if total > 0:
             pb = self._progress_popup.progressbar
             if pb.cget("mode") == "indeterminate":
@@ -880,6 +886,12 @@ class SettingsPanel(ctk.CTkFrame):
             text="Show the Nexus summary when hovering a mod name.",
             font=FONT_SMALL, text_color=TEXT_DIM, anchor="w", justify="left",
         ).pack(anchor="w", pady=(2, 0))
+
+        self._hide_bsa_conflicts_var = tk.BooleanVar(value=load_hide_bsa_conflicts())
+        ctk.CTkCheckBox(
+            ui_sec, text="Hide BSA conflicts", variable=self._hide_bsa_conflicts_var,
+            font=FONT_NORMAL, text_color=TEXT_MAIN,
+        ).pack(anchor="w", pady=(10, 0))
 
         self._update_slider_state()
 
@@ -1605,6 +1617,7 @@ class SettingsPanel(ctk.CTkFrame):
         save_clear_archive_after_install(self._clear_archive_var.get())
         save_keep_fomod_archives(self._keep_fomod_archives_var.get())
         save_show_summary_tooltips(self._show_summary_tooltips_var.get())
+        save_hide_bsa_conflicts(self._hide_bsa_conflicts_var.get())
         save_rename_mod_after_install(self._rename_after_install_var.get())
         save_restore_on_close(self._restore_on_close_var.get())
         if hasattr(self, "_allow_prerelease_var"):
@@ -1635,6 +1648,7 @@ class SettingsPanel(ctk.CTkFrame):
         save_clear_archive_after_install(self._clear_archive_var.get())
         save_keep_fomod_archives(self._keep_fomod_archives_var.get())
         save_show_summary_tooltips(self._show_summary_tooltips_var.get())
+        save_hide_bsa_conflicts(self._hide_bsa_conflicts_var.get())
         save_rename_mod_after_install(self._rename_after_install_var.get())
         save_restore_on_close(self._restore_on_close_var.get())
         if hasattr(self, "_allow_prerelease_var"):

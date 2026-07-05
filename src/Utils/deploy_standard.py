@@ -10,6 +10,7 @@ from __future__ import annotations
 import concurrent.futures
 import errno
 import os
+import re as _re
 import shutil
 import time as _time
 from pathlib import Path
@@ -205,6 +206,16 @@ def _load_vanilla_deployed(path: Path) -> "set[str]":
 # *modified* plugin back into its owning mod folder, it tags that mod's
 # meta.ini so the GUI can show a "contains an xEdit-modified plugin" flag.
 _PLUGIN_EXTS = (".esp", ".esm", ".esl")
+
+# xEdit / QuickAutoClean writes the cleaned record to a temp file and queues a
+# rename to the real plugin name "on shutdown" (e.g.
+# ``AlternatePerspective.esp.save.2026_06_19_00_38_14`` -> ``…esp``).  If that
+# deferred rename hasn't landed by the time we walk Data/ (it races with xEdit's
+# own shutdown), the temp file is the only copy of the edit.  Recognise it so we
+# can finish the rename to the base plugin name rather than burying the temp in
+# overwrite/ as an unrecognised runtime file.  Matches ``.save.<timestamp>``
+# where the timestamp is digits and underscores.
+_XEDIT_SAVE_TEMP_RE = _re.compile(r"^(?P<base>.+)\.save\.[0-9_]+$", _re.IGNORECASE)
 
 
 def _tag_mod_xedit_modified(mod_dir: Path, plugin_name: str) -> None:
@@ -1190,6 +1201,33 @@ def restore_data_core(
                     if rel_str == _DEPLOY_MARKER_NAME:
                         continue  # our own deploy marker — removed with deploy_dir
                     rel_lower = rel_str.lower()
+                    # xEdit deferred-save temp (…esp.save.<timestamp>): its queued
+                    # rename to the real plugin name lost the race with our walk.
+                    # Re-point rel_str/rel_lower at the base plugin so the same
+                    # filemap/modindex/staging logic below routes the cleaned file
+                    # back to its owning mod, and finish xEdit's rename ourselves.
+                    _save_m = _XEDIT_SAVE_TEMP_RE.match(rel_str)
+                    if _save_m is not None:
+                        _base_rel = _save_m.group("base")
+                        _base_lower = _base_rel.lower()
+                        # Only adopt the base name when it's a plugin we recognise
+                        # (mod-owned or vanilla) — otherwise leave the temp alone
+                        # for the normal runtime-file handling.
+                        if (_base_lower in filemap_lower or _base_lower in modindex_lower
+                                or _base_lower in core_lower
+                                or _base_lower in vanilla_symlinked):
+                            _base_dst = _deploy_str + "/" + _base_rel
+                            try:
+                                # Complete the deferred rename. os.replace
+                                # overwrites any half-state at the base path
+                                # (e.g. a stale symlink xEdit left behind).
+                                os.replace(src_str, _base_dst)
+                                src_str = _base_dst
+                                st = _lstat(src_str)
+                                rel_str = _base_rel
+                                rel_lower = _base_lower
+                            except OSError:
+                                pass
                     _ds = deploy_stats.get(rel_lower)
                     if (_ds is not None and st.st_size == _ds[0]
                             and abs(st.st_mtime_ns - _ds[1]) <= _MTIME_TOLERANCE_NS):
@@ -1321,6 +1359,7 @@ def restore_data_core(
                                     _tag_mod_xedit_modified(
                                         _staging / target_mod, os.path.basename(rel_str))
                                 continue
+                            # Known mod file but no owner resolved — fall through to overwrite.
                         else:
                             continue  # no staging check — skip as before
                     # Genuine runtime-generated file (never in a mod) — goes to overwrite

@@ -53,7 +53,8 @@ def _fetch_latest_linux_asset(api_url: str) -> tuple[str, str, str]:
         api_url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "ModManager/1.0"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    from Utils.ca_bundle import get_ssl_context
+    with urllib.request.urlopen(req, timeout=15, context=get_ssl_context()) as resp:
         data = json.loads(resp.read().decode())
     tag = data.get("tag_name", "unknown")
     for asset in data.get("assets", []):
@@ -76,18 +77,31 @@ def _extract_to_dir(archive: Path, dest: Path) -> None:
             tf.extractall(dest)
     elif name_lower.endswith(".7z"):
         extracted = False
-        try:
-            subprocess.run(
-                ["7z", "x", str(archive), f"-o{dest}", "-y"],
-                check=True, capture_output=True,
+        # Prefer a native 7-zip binary (Flatpak bundles `7zz`, AppImage `7zzs`).
+        # py7zr is a last resort — it can't decode the BCJ2 filter.
+        _7z_bin = (
+            shutil.which("7zzs") or shutil.which("7zz")
+            or shutil.which("7z") or shutil.which("7za")
+        )
+        if _7z_bin:
+            result = subprocess.run(
+                [_7z_bin, "x", str(archive), f"-o{dest}", "-y"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             )
-            extracted = True
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
+            extracted = result.returncode == 0
+        if not extracted:
+            _bsdtar_bin = shutil.which("bsdtar")
+            if _bsdtar_bin:
+                result = subprocess.run(
+                    [_bsdtar_bin, "-xf", str(archive), "-C", str(dest)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                extracted = result.returncode == 0
         if not extracted:
             if py7zr is None:
                 raise RuntimeError(
-                    "Cannot extract .7z: 7z command not found and py7zr is not installed."
+                    "Cannot extract .7z: no native 7z/bsdtar command found "
+                    "and py7zr is not installed."
                 )
             with py7zr.SevenZipFile(archive, "r") as zf:
                 zf.extractall(dest)
@@ -168,7 +182,8 @@ def ensure_dtkit_binary(log_fn=None) -> Path:
     try:
         filename = url.split("/")[-1]
         dest_archive = tmp_dir / filename
-        urllib.request.urlretrieve(url, dest_archive)
+        from Utils.ca_bundle import download_file
+        download_file(url, dest_archive)
         _log(f"dtkit-patch: installing {filename}...")
         binary = _install_from_archive(dest_archive, _TOOLS_DIR)
     finally:

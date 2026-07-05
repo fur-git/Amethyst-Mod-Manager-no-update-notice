@@ -464,6 +464,9 @@ class NexusBrowserOverlay(tk.Frame):
         app_root: Optional[tk.Widget] = None,
         on_close: Optional[Callable] = None,
         on_open_settings: Optional[Callable] = None,
+        on_rehost: Optional[Callable] = None,
+        is_popped_out: bool = False,
+        initial_tab: str = "Browse",
     ):
         super().__init__(parent, bg=BG_DEEP)
         self._game_domain = game_domain
@@ -473,6 +476,13 @@ class NexusBrowserOverlay(tk.Frame):
         self._log = log_fn or (lambda msg: None)
         self._on_close = on_close
         self._on_open_settings = on_open_settings
+        # Called when the user clicks the popout/dock toggle. The launcher
+        # rebuilds the overlay in the other host (overlay vs. separate window),
+        # leaving the modlist visible underneath when popped out.
+        self._on_rehost = on_rehost
+        self._is_popped_out = is_popped_out
+        self._initial_tab = initial_tab if initial_tab in (
+            "Browse", "Tracked", "Endorsed", "Trending") else "Browse"
 
         self._build()
 
@@ -492,37 +502,60 @@ class NexusBrowserOverlay(tk.Frame):
                 font=FONT_BOLD, command=cmd,
             )
 
-        self._browse_btn = _btn("Browse", lambda: self._show_panel("Browse"), 90)
-        self._browse_btn.pack(side="left", padx=4, pady=5)
-        self._tracked_btn = _btn("Tracked", lambda: self._show_panel("Tracked"), 95)
-        self._tracked_btn.pack(side="left", padx=4, pady=5)
-        self._endorsed_btn = _btn("Endorsed", lambda: self._show_panel("Endorsed"), 105)
-        self._endorsed_btn.pack(side="left", padx=4, pady=5)
-        self._trending_btn = _btn("Trending", lambda: self._show_panel("Trending"), 100)
-        self._trending_btn.pack(side="left", padx=4, pady=5)
+        self._browse_btn = _btn("Browse", lambda: self._show_panel("Browse"), 78)
+        self._browse_btn.pack(side="left", padx=3, pady=5)
+        self._tracked_btn = _btn("Tracked", lambda: self._show_panel("Tracked"), 80)
+        self._tracked_btn.pack(side="left", padx=3, pady=5)
+        self._endorsed_btn = _btn("Endorsed", lambda: self._show_panel("Endorsed"), 90)
+        self._endorsed_btn.pack(side="left", padx=3, pady=5)
+        self._trending_btn = _btn("Trending", lambda: self._show_panel("Trending"), 85)
+        self._trending_btn.pack(side="left", padx=3, pady=5)
 
+        # Right-side buttons are packed first so they're never the ones clipped
+        # when the toolbar is too narrow (pack gives earlier widgets priority).
         ctk.CTkButton(
-            toolbar, text="🌐 Open on Nexus", width=120, height=30,
-            fg_color="#d98f40", hover_color="#e5a04d", text_color="white",
-            font=FONT_BOLD, command=self._on_open_nexus,
-        ).pack(side="left", padx=(12, 6), pady=5)
+            toolbar, text="✕ Close", width=80, height=36,
+            fg_color="#6b3333", hover_color="#8c4444", text_color="white",
+            font=FONT_BOLD, command=self._do_close,
+        ).pack(side="right", padx=(6, 12), pady=5)
+
+        # Popout / dock toggle. Hidden when no re-host handler is wired up.
+        if self._on_rehost is not None:
+            self._popout_btn = ctk.CTkButton(
+                toolbar, text=("⤡" if self._is_popped_out else "⤢"),
+                width=36, height=36, font=FONT_BOLD,
+                fg_color=BG_HEADER, hover_color=BG_HOVER_ROW,
+                text_color=TEXT_MAIN, corner_radius=4,
+                command=self._on_popout_toggle,
+            )
+            self._popout_btn.pack(side="right", padx=(0, 4), pady=5)
 
         if self._on_open_settings:
             _settings_icon = load_icon("settings.png", size=(16, 16))
             ctk.CTkButton(
                 toolbar, text="Settings" if _settings_icon else "⚙ Settings",
                 image=_settings_icon, compound="left",
-                width=100, height=30,
+                width=92, height=30,
                 fg_color="#da8e35", hover_color="#e5a04a", text_color="white",
                 font=FONT_BOLD, command=self._on_open_settings,
-            ).pack(side="left", padx=(0, 6), pady=5)
-
+            ).pack(side="right", padx=(0, 4), pady=5)
 
         ctk.CTkButton(
-            toolbar, text="✕ Close", width=85, height=36,
-            fg_color="#6b3333", hover_color="#8c4444", text_color="white",
-            font=FONT_BOLD, command=self._do_close,
-        ).pack(side="right", padx=(6, 12), pady=5)
+            toolbar, text="🌐 Open on Nexus", width=120, height=30,
+            fg_color="#d98f40", hover_color="#e5a04d", text_color="white",
+            font=FONT_BOLD, command=self._on_open_nexus,
+        ).pack(side="right", padx=(0, 6), pady=5)
+
+        if self._on_rehost is not None:
+            try:
+                from gui.ctk_tooltip import CTkToolTip
+                CTkToolTip(
+                    self._popout_btn,
+                    message="Dock back to main window" if self._is_popped_out
+                    else "Open in a separate window (keep browsing while sorting)",
+                )
+            except Exception:
+                pass
 
         # Content area — stacked panel frames
         content = tk.Frame(self, bg=BG_DEEP)
@@ -562,38 +595,37 @@ class NexusBrowserOverlay(tk.Frame):
             frame.grid_columnconfigure(0, weight=1)
             self._panel_frames[name] = frame
 
-        self._tracked_panel = TrackedModsPanel(
-            self._panel_frames["Tracked"],
-            log_fn=self._log,
-            get_api=_get_api,
-            get_game_domain=_get_game_domain,
-            install_fn=self._install_from_tracked,
-            get_installed_mod_ids=_get_installed_mod_ids,
-        )
-        self._endorsed_panel = EndorsedModsPanel(
-            self._panel_frames["Endorsed"],
-            log_fn=self._log,
-            get_api=_get_api,
-            get_game_domain=_get_game_domain,
-            install_fn=self._install_from_endorsed,
-            get_installed_mod_ids=_get_installed_mod_ids,
-        )
-        self._browse_panel = BrowseModsPanel(
-            self._panel_frames["Browse"],
-            log_fn=self._log,
-            get_api=_get_api,
-            get_game_domain=_get_game_domain,
-            install_fn=self._install_from_browse,
-            get_installed_mod_ids=_get_installed_mod_ids,
-        )
-        self._trending_panel = TrendingModsPanel(
-            self._panel_frames["Trending"],
-            log_fn=self._log,
-            get_api=_get_api,
-            get_game_domain=_get_game_domain,
-            install_fn=self._install_from_trending,
-            get_installed_mod_ids=_get_installed_mod_ids,
-        )
+        # Lazy construction: each tab panel is a full canvas/card grid (~3k
+        # widgets). Building all four up front spikes RSS ~700MB on open. Instead
+        # build only the tab the user actually views, on first _show_panel. The
+        # factories capture the per-panel install callback + shared getters.
+        self._panels: dict[str, object] = {}
+        self._panel_factories = {
+            "Browse": lambda f: BrowseModsPanel(
+                f, log_fn=self._log, get_api=_get_api,
+                get_game_domain=_get_game_domain,
+                install_fn=self._install_from_browse,
+                get_installed_mod_ids=_get_installed_mod_ids,
+            ),
+            "Tracked": lambda f: TrackedModsPanel(
+                f, log_fn=self._log, get_api=_get_api,
+                get_game_domain=_get_game_domain,
+                install_fn=self._install_from_tracked,
+                get_installed_mod_ids=_get_installed_mod_ids,
+            ),
+            "Endorsed": lambda f: EndorsedModsPanel(
+                f, log_fn=self._log, get_api=_get_api,
+                get_game_domain=_get_game_domain,
+                install_fn=self._install_from_endorsed,
+                get_installed_mod_ids=_get_installed_mod_ids,
+            ),
+            "Trending": lambda f: TrendingModsPanel(
+                f, log_fn=self._log, get_api=_get_api,
+                get_game_domain=_get_game_domain,
+                install_fn=self._install_from_trending,
+                get_installed_mod_ids=_get_installed_mod_ids,
+            ),
+        }
 
         # If not logged in, show a centered login prompt over the content area
         if self._api is None and self._on_open_settings:
@@ -620,8 +652,20 @@ class NexusBrowserOverlay(tk.Frame):
             ).pack(padx=32, pady=(0, 24))
             return
 
-        self._current_panel = "Browse"
-        self._show_panel("Browse")
+        self._current_panel = self._initial_tab
+        self._show_panel(self._initial_tab)
+
+    def _get_panel(self, name: str):
+        """Return the tab panel for *name*, building it on first access."""
+        panel = self._panels.get(name)
+        if panel is None:
+            factory = self._panel_factories.get(name)
+            frame = self._panel_frames.get(name)
+            if factory is None or frame is None:
+                return None
+            panel = factory(frame)
+            self._panels[name] = panel
+        return panel
 
     def _show_panel(self, name: str):
         """Switch to the Browse, Tracked, Endorsed, or Trending panel."""
@@ -639,14 +683,8 @@ class NexusBrowserOverlay(tk.Frame):
             (self._trending_btn, "Trending"),
         ]:
             btn.configure(fg_color=ACCENT_HOV if n == name else ACCENT)
-        # Auto-refresh the panel when switching to it
-        panel_map = {
-            "Browse": self._browse_panel,
-            "Tracked": self._tracked_panel,
-            "Endorsed": self._endorsed_panel,
-            "Trending": self._trending_panel,
-        }
-        panel = panel_map.get(name)
+        # Build the panel on first view, then refresh it.
+        panel = self._get_panel(name)
         if panel is not None and hasattr(panel, "refresh"):
             panel.refresh()
 
@@ -660,6 +698,18 @@ class NexusBrowserOverlay(tk.Frame):
             self._on_close()
         else:
             self.place_forget()
+
+    def _on_popout_toggle(self):
+        """Hand off to the launcher, which rebuilds the overlay in the other
+        host (docked overlay vs. separate window). The browser is stateless —
+        panels reload on show — so a fresh overlay is built in the new host,
+        carrying only which tab the user was on."""
+        if self._on_rehost is None:
+            return
+        going_to_popout = not self._is_popped_out
+        current_tab = getattr(self, "_current_panel", "Browse")
+        self.destroy()
+        self._on_rehost(going_to_popout, current_tab)
 
     def _install_from_tracked(self, entry):
         self._install_nexus_mod(
@@ -696,10 +746,9 @@ class NexusBrowserOverlay(tk.Frame):
         # Flip every panel's matching card to "Reinstall" once the install lands,
         # so the button updates without needing a manual refresh.
         def _on_complete():
-            for panel in (
-                self._browse_panel, self._tracked_panel,
-                self._endorsed_panel, self._trending_panel,
-            ):
+            # Only the panels that have actually been built (lazily) exist;
+            # un-viewed tabs refresh from scratch when first opened anyway.
+            for panel in self._panels.values():
                 try:
                     panel.mark_installed(mod_id)
                 except Exception:

@@ -193,8 +193,21 @@ def _parse_files(files_el: ET.Element) -> list[FileInstall]:
         if tag in ("file", "folder"):
             source = child.get("source", "")
             destination = child.get("destination")
-            if destination is None:
+            is_folder = (tag == "folder")
+            # Empty/absent `destination` has DIFFERENT meaning per element type:
+            #   <file>   → preserve the source's relative path (so a
+            #              <file source="meshes/x.nif" destination=""/> lands at
+            #              meshes/x.nif, not flattened to the root).
+            #   <folder> → copy the folder's *contents* to the destination root,
+            #              stripping the source wrapper (so
+            #              <folder source="Base" destination=""/> puts Base/SKSE/…
+            #              at SKSE/…). This MUST stay empty so the copier's
+            #              "no dst_rel → dest_root" path does the stripping.
+            # MO2 treats absent and empty identically within each element type.
+            if not is_folder and (destination is None or destination == ""):
                 destination = source
+            elif destination is None:
+                destination = ""
             result.append(FileInstall(
                 source=source,
                 destination=destination,
@@ -280,9 +293,12 @@ def _apply_order(items: list, order: str, key) -> list:
     """
     Honour FOMOD's `order` attribute on installSteps/optionalFileGroups/plugins.
 
-    Values (per XSD): "Explicit" (doc order — default), "Ascending", "Descending".
-    Sorting is by the element's `name` attribute, case-insensitive to match
-    MO2/Vortex. Items without a name sort last to keep behaviour stable.
+    Values (per XSD orderEnum): "Explicit" (document order — the XSD DEFAULT
+    when the attribute is absent), "Ascending", "Descending". MO2 preserves
+    author-defined order when `order` is omitted, so we must NOT alphabetize
+    by default. Sorting (when requested) is by the element's `name` attribute,
+    case-insensitive to match MO2/Vortex. Items without a name sort last to
+    keep behaviour stable.
     """
     if order == "Ascending":
         return sorted(items, key=lambda x: (not key(x), (key(x) or "").lower()))
@@ -332,7 +348,7 @@ def _parse_group(group_el: ET.Element) -> Group:
 
     plugins_el = _find(group_el, "plugins")
     if plugins_el is not None:
-        plugin_order = plugins_el.get("order", "Ascending")  # XSD default
+        plugin_order = plugins_el.get("order", "Explicit")  # XSD default
         parsed = [_parse_plugin(pe) for pe in _findall(plugins_el, "plugin")]
         group.plugins = _apply_order(parsed, plugin_order, lambda p: p.name)
 
@@ -365,7 +381,7 @@ def _parse_install_step(step_el: ET.Element) -> InstallStep:
     # Groups
     groups_el = _find(step_el, "optionalFileGroups")
     if groups_el is not None:
-        group_order = groups_el.get("order", "Ascending")  # XSD default
+        group_order = groups_el.get("order", "Explicit")  # XSD default
         parsed = [_parse_group(ge) for ge in _findall(groups_el, "group")]
         step.groups = _apply_order(parsed, group_order, lambda g: g.name)
 
@@ -428,6 +444,72 @@ def detect_fomod(extracted_root: str) -> Optional[tuple[str, str]]:
         break
 
     # 2. Fallback BFS (covers archives where fomod/ sits next to sibling files).
+    candidates: list[Path] = [root]
+    seen: set[Path] = {root}
+    for _ in range(6):
+        next_level: list[Path] = []
+        for d in candidates:
+            hit = _check(d)
+            if hit:
+                return hit
+            try:
+                for child in sorted(d.iterdir()):
+                    if child.is_dir() and child not in seen:
+                        seen.add(child)
+                        next_level.append(child)
+            except PermissionError:
+                continue
+        candidates = next_level
+
+    return None
+
+
+def detect_scripted_fomod(extracted_root: str) -> Optional[str]:
+    """Return the path to a ``fomod/`` folder that is a *scripted* (C#) FOMOD
+    installer, i.e. it has a ``script.cs`` / ``script.dll`` but NO
+    ``ModuleConfig.xml``.
+
+    The XML-based installer dialog cannot run these — the install proceeds as a
+    plain full-file copy.  Callers use this to warn the user that no install
+    options were shown and an XML version of the mod may exist.
+
+    NOTE: ``info.xml`` alone is NOT a scripted installer — it is optional
+    metadata (name/author/version) that plain mods (e.g. BodySlide) ship in a
+    ``fomod/`` folder with no ModuleConfig and no script. Only a real script
+    file counts.
+
+    Uses the same wrapper-peel + BFS search as :func:`detect_fomod` so it finds
+    the fomod/ folder wherever it sits.  Returns the fomod/ dir path, or None.
+    """
+    root = Path(extracted_root)
+
+    def _check(d: Path) -> Optional[str]:
+        try:
+            for child in d.iterdir():
+                if child.is_dir() and child.name.lower() == "fomod":
+                    names = {f.name.lower() for f in child.iterdir() if f.is_file()}
+                    if "moduleconfig.xml" in names:
+                        return None  # XML installer — handled by detect_fomod
+                    if names & {"script.cs", "script.dll"}:
+                        return str(child)
+        except PermissionError:
+            pass
+        return None
+
+    cur = root
+    for _ in range(20):
+        hit = _check(cur)
+        if hit:
+            return hit
+        try:
+            entries = [c for c in cur.iterdir()]
+        except PermissionError:
+            break
+        if len(entries) == 1 and entries[0].is_dir():
+            cur = entries[0]
+            continue
+        break
+
     candidates: list[Path] = [root]
     seen: set[Path] = {root}
     for _ in range(6):
@@ -550,7 +632,7 @@ def parse_module_config(xml_path: str) -> ModuleConfig:
     # Install steps
     steps_el = _find(root, "installSteps")
     if steps_el is not None:
-        step_order = steps_el.get("order", "Ascending")  # XSD default
+        step_order = steps_el.get("order", "Explicit")  # XSD default
         parsed = [_parse_install_step(se) for se in _findall(steps_el, "installStep")]
         config.steps = _apply_order(parsed, step_order, lambda s: s.name)
 

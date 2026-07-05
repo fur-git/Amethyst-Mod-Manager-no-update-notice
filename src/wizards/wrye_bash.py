@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from Utils.steam_finder import proton_run_command
 import tempfile
 import threading
 import urllib.request
@@ -180,7 +181,8 @@ class WryeBashWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp_path = Path(tmp.name)
 
-            urllib.request.urlretrieve(dl_url, tmp_path)
+            from Utils.ca_bundle import download_file
+            download_file(dl_url, tmp_path)
             self._set_label("_dl_status", "Extracting\u2026")
             self._log("Wrye Bash Wizard: download complete, extracting\u2026")
 
@@ -379,7 +381,7 @@ class WryeBashWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         self._log(f"Wrye Bash Wizard: launching {exe} via Proton" + (f" with -o C:\\wb_games\\{game_path.resolve().name}" if game_path else ""))
         try:
             proc = subprocess.Popen(
-                ["python3", str(proton_script), "run", str(exe)] + game_arg,
+                proton_run_command(proton_script, "run", str(exe)) + game_arg,
                 env=env,
                 cwd=str(exe.parent),
                 stdout=subprocess.DEVNULL,

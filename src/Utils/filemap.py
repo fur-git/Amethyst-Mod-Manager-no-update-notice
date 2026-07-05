@@ -34,6 +34,7 @@ import fnmatch
 import os
 import re
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path
@@ -43,6 +44,7 @@ import msgpack
 
 from Utils.atomic_write import atomic_writer
 from Utils.modlist import read_modlist
+from Utils import perftrace
 
 # Conflict status constants (returned per-mod in build_filemap result)
 CONFLICT_NONE    = 0   # no conflicts at all
@@ -183,6 +185,11 @@ def _scan_dir(
                         # state, not mod content — never include them in the
                         # filemap so they don't get deployed into the game.
                         if entry.name.startswith("prefix_"):
+                            continue
+                        # RE/Fluffy bundle option library — holds the original
+                        # option folders; only the materialised selection at the
+                        # mod root is deployed (see Utils/re_bundle.py).
+                        if entry.name == ".mm_bundle":
                             continue
                         if not _is_utf8_safe(entry.name):
                             invalid_names.append(prefix + entry.name + "/")
@@ -396,6 +403,25 @@ def _normalize_folder_cases(
     Accepts one or more dicts (e.g. normal and root) and builds canonical
     casing from all in one pass, then rewrites each in turn.
     """
+    # All files sharing a parent directory share the exact same folder-segment
+    # chain, so the canonical-casing work is per *directory*, not per file.
+    # A large modlist has ~12x more files than unique directories, so we collect
+    # the distinct parent-dir paths first and walk segments once per directory.
+    # ``dir_str`` is the original-cased parent path (everything before the final
+    # "/"); ``""`` is used for loose top-level files (no folder to normalize).
+    unique_dirs: dict[str, None] = {}
+    for all_files in all_files_list:
+        if not all_files:
+            continue
+        for files in all_files.values():
+            for rel_str in files.values():
+                slash = rel_str.rfind("/")
+                if slash >= 0:
+                    unique_dirs[rel_str[:slash]] = None
+
+    if not unique_dirs:
+        return
+
     # Collect canonical casing per folder segment, keyed by its full ancestor
     # path so that identically-named segments at different tree locations are
     # independent.  e.g. "textures/effects" vs "interface/photomode/overlays/effects"
@@ -403,50 +429,52 @@ def _normalize_folder_cases(
     # influence Particle Patch's lowercase effects.
     # Key: (lowercase_parent_path, lowercase_segment) -> canonical segment str
     canonical: dict[tuple[str, str], str] = {}
-    for all_files in all_files_list:
-        if not all_files:
-            continue
-        for files in all_files.values():
-            for rel_str in files.values():
-                parts = rel_str.split("/")
-                if len(parts) < 2:
-                    continue
-                parent = ""
-                for seg in parts[:-1]:
-                    ctx_key = (parent, seg.lower())
-                    if ctx_key not in canonical:
-                        canonical[ctx_key] = seg
-                    else:
-                        canonical[ctx_key] = _pick_canonical_segment(canonical[ctx_key], seg, strategy)
-                    parent = parent + seg.lower() + "/"
+    for dir_str in unique_dirs:
+        parent = ""
+        for seg in dir_str.split("/"):
+            ctx_key = (parent, seg.lower())
+            cur = canonical.get(ctx_key)
+            if cur is None:
+                canonical[ctx_key] = seg
+            else:
+                canonical[ctx_key] = _pick_canonical_segment(cur, seg, strategy)
+            parent = parent + seg.lower() + "/"
 
     if not canonical:
         return
 
-    # Rewrite rel_str values so every folder segment uses the canonical casing.
+    # Resolve each unique directory path to its canonical form once, then rewrite
+    # files by simple string replacement of the parent prefix.  Directories whose
+    # casing already matches the canonical pick map to themselves (None marker)
+    # so the file loop can skip them without re-walking segments.
+    dir_rewrite: dict[str, str | None] = {}
+    for dir_str in unique_dirs:
+        parent = ""
+        new_parts: list[str] = []
+        changed = False
+        for seg in dir_str.split("/"):
+            ctx_key = (parent, seg.lower())
+            c = canonical.get(ctx_key, seg)
+            if c != seg:
+                changed = True
+            new_parts.append(c)
+            parent = parent + seg.lower() + "/"
+        dir_rewrite[dir_str] = "/".join(new_parts) if changed else None
+
+    # Rewrite rel_str values for files whose parent directory's casing changed.
     for all_files in all_files_list:
         if not all_files:
             continue
         for files in all_files.values():
             for rel_key in files:
                 rel_str = files[rel_key]
-                if "/" not in rel_str:
+                slash = rel_str.rfind("/")
+                if slash < 0:
                     continue
-                parts = rel_str.split("/")
-                changed = False
-                parent = ""
-                new_parts = []
-                for seg in parts[:-1]:
-                    ctx_key = (parent, seg.lower())
-                    c = canonical.get(ctx_key, seg)
-                    if c != seg:
-                        changed = True
-                    new_parts.append(c)
-                    parent = parent + seg.lower() + "/"
-                if not changed:
+                new_dir = dir_rewrite.get(rel_str[:slash])
+                if new_dir is None:
                     continue
-                new_parts.append(parts[-1])
-                files[rel_key] = "/".join(new_parts)
+                files[rel_key] = new_dir + rel_str[slash:]
 
 
 def _apply_force_casing(
@@ -1021,6 +1049,14 @@ def build_filemap(
     # scan of filemap_winner per conflicting file in UE5 builds.
     conflict_staged: dict[str, str] = {}
 
+    # Hoist feature-flags out of the per-file hot loop. When a feature is
+    # unused (the common case) we skip its function call entirely on each of
+    # the ~100k+ files rather than calling a helper that immediately returns.
+    _has_excluded_loose = _loose_excl_re is not None
+    _has_unknown_top    = _allowed_top is not None
+    _has_ignore         = _ignore_re is not None
+
+    _merge_t0 = time.perf_counter()
     for name in priority_order:
         entry = index.get(name)
         if not entry:
@@ -1028,14 +1064,16 @@ def build_filemap(
         normal, _ = entry
         if not normal:
             continue
-        # Guard against surrogate-encoded filenames left in an old modindex.bin.
-        # (Old scans ran before the _scan_dir surrogate-skip fix.)  Skip the
-        # entire mod and log it so the user knows to Refresh / reinstall it.
-        bad_names = [rs for rs in normal.values() if not _is_utf8_safe(rs)]
-        if bad_names:
+        # Guard against surrogate-encoded filenames left in an old modindex.bin
+        # (pre surrogate-skip-fix). v4 indexes are written after that fix, so
+        # this is a legacy-only condition. Use a cheap any()-with-early-exit so
+        # the common all-UTF-8 mod stops at the first name; only build the full
+        # bad-name list (for the log) on the rare mod that actually trips it.
+        if any(not _is_utf8_safe(rs) for rs in normal.values()):
+            bad_names = [rs for rs in normal.values() if not _is_utf8_safe(rs)]
             if log_fn is not None:
                 log_fn(
-                    f"WARN: Mod \"{name}\" skipped \u2014 contains file(s) with "
+                    f"WARN: Mod \"{name}\" skipped — contains file(s) with "
                     f"non-UTF-8 name(s): {', '.join(bad_names[:5])}"
                 )
             continue
@@ -1048,11 +1086,11 @@ def build_filemap(
         for rel_key, rel_str in normal.items():
             if exc and rel_key in exc:
                 continue
-            if _is_excluded_loose(rel_key):
+            if _has_excluded_loose and _is_excluded_loose(rel_key):
                 continue
-            if _is_unknown_top_level(rel_key):
+            if _has_unknown_top and _is_unknown_top_level(rel_key):
                 continue
-            if _is_ignored(rel_key):
+            if _has_ignore and _is_ignored(rel_key):
                 continue
             had_file = True
             prev = _winner_ns.get(rel_key)
@@ -1082,10 +1120,12 @@ def build_filemap(
                 conflict_staged[ck] = rel_key
         if had_file:
             mods_with_files.add(name)
+    perftrace.mark("filemap: priority merge loop", time.perf_counter() - _merge_t0)
 
-    conflict_map = _compute_conflict_status(
-        priority_order, overrides, overridden_by, win_count, mods_with_files,
-    )
+    with perftrace.span("filemap: _compute_conflict_status"):
+        conflict_map = _compute_conflict_status(
+            priority_order, overrides, overridden_by, win_count, mods_with_files,
+        )
 
     # Normalize folder casing across the merged filemap so that two mods which
     # ship the same logical path with different casings (e.g. "archive/pc/Mod"
@@ -1098,6 +1138,7 @@ def build_filemap(
     #   "lower"        — pick variant with more lowercase letters
     #   "force_lower"  — every folder/filename forced lowercase
     #   "force_upper"  — every folder/filename-stem forced uppercase (extension stays lower)
+    _norm_t0 = time.perf_counter()
     if normalize_folder_case and (filemap or filemap_root):
         _strategy = filemap_casing if filemap_casing in _VALID_FILEMAP_CASINGS else FILEMAP_CASING_UPPER
         _norm_normal: dict[str, dict[str, str]] = {}
@@ -1116,6 +1157,7 @@ def build_filemap(
         for _mn, _files in _norm_root.items():
             for _rk, _rs in _files.items():
                 filemap_root[_rk] = (_rs, _mn)
+    perftrace.mark("filemap: normalize folder casing", time.perf_counter() - _norm_t0)
 
     # Build per-mod disabled-plugin sets for fast lookup (lowercase filenames, root-level only).
     # Cached by (id, fingerprint) to avoid rebuilding the lowercase sets on every
@@ -1139,7 +1181,8 @@ def build_filemap(
         count = sum(1 for _ in filemap_winner)  # approx — disabled_plugins may trim a few
         return count, conflict_map, overrides, overridden_by
 
-    count = _write_filemap(output_path, filemap, _disabled_lower)
+    with perftrace.span("filemap: _write_filemap (sort+disk)"):
+        count = _write_filemap(output_path, filemap, _disabled_lower)
 
     # Write filemap_root.txt for root-flagged mods.
     _root_filemap_path = output_path.parent / "filemap_root.txt"

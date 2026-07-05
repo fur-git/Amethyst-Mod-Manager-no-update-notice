@@ -29,7 +29,7 @@ Mod structure:
 import json
 from pathlib import Path
 
-from Games.base_game import BaseGame
+from Games.base_game import BaseGame, WizardTool
 from Utils.deploy import (
     CustomRule, LinkMode, deploy_filemap, deploy_core, move_to_core, restore_data_core,
     deploy_custom_rules, load_per_mod_strip_prefixes,
@@ -40,7 +40,6 @@ from Utils.deploy import (
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 from Utils.modsettings import write_modsettings, write_vanilla_modsettings
-from Utils.steam_finder import find_prefix
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -91,6 +90,10 @@ def _suppress_launcher_mod_warnings(larian_root: Path, log_fn=None) -> None:
 
 class BaldursGate3(BaseGame):
 
+    # patch_version is a configured option, so make it per-profile (stored as a
+    # paths.json extra via _load/_save_paths_extra).
+    profile_overridable_paths_extras = ("patch_version",)
+
     def __init__(self):
         self._game_path: Path | None = None
         self._prefix_path: Path | None = None
@@ -127,7 +130,20 @@ class BaldursGate3(BaseGame):
     @property
     def nexus_game_domain(self) -> str:
         return "baldursgate3"
-    
+
+    @property
+    def wizard_tools(self) -> list[WizardTool]:
+        return self._base_wizard_tools() + [
+            WizardTool(
+                id="modio_api_key",
+                label="mod.io API Key",
+                description="Enter a mod.io key to enable update checks for "
+                            "manually-installed mod.io mods.",
+                dialog_class_path="wizards.modio_settings.ModioSettingsWizard",
+                category="Update tracking",
+            ),
+        ]
+
     @property
     def mod_required_top_level_folders(self) -> set[str]:
         return {"data","bin","generated","public","video","mods"}
@@ -221,68 +237,24 @@ class BaldursGate3(BaseGame):
     # Configuration persistence
     # -----------------------------------------------------------------------
 
-    def load_paths(self) -> bool:
-        self._migrate_old_config()
-        if not self._paths_file.exists():
-            self._game_path = None
-            self._prefix_path = None
-            self._staging_path = None
-            return False
+    # load_paths / save_paths are inherited from BaseGame (profile-aware).
+    # patch_version is persisted via the _load/_save_paths_extra hooks.
+    def _load_paths_extra(self, data: dict) -> None:
         try:
-            data = json.loads(self._paths_file.read_text(encoding="utf-8"))
-            raw = data.get("game_path", "")
-            if raw:
-                self._game_path = Path(raw)
-            raw_pfx = data.get("prefix_path", "")
-            if raw_pfx:
-                self._prefix_path = Path(raw_pfx)
-            raw_mode = data.get("deploy_mode", "hardlink")
-            self._deploy_mode = {
-                "symlink": LinkMode.SYMLINK,
-                "copy":    LinkMode.SYMLINK,
-            }.get(raw_mode, LinkMode.HARDLINK)
-            raw_staging = data.get("staging_path", "")
-            if raw_staging:
-                self._staging_path = Path(raw_staging)
-            try:
-                pv = int(data.get("patch_version", 8))
-            except (TypeError, ValueError):
-                pv = 8
-            self._patch_version = pv if pv in (6, 7, 8) else 8
-            self._validate_staging()
-            if not self._prefix_path or not self._prefix_path.is_dir():
-                if not _NATIVE_LARIAN_ROOT.is_dir():
-                    found = find_prefix(self.steam_id)
-                    if found:
-                        self._prefix_path = found
-                        self.save_paths()
-            return bool(self._game_path)
-        except (json.JSONDecodeError, OSError):
-            pass
-        self._game_path = None
-        self._prefix_path = None
-        return False
+            pv = int(data.get("patch_version", 8))
+        except (TypeError, ValueError):
+            pv = 8
+        self._patch_version = pv if pv in (6, 7, 8) else 8
 
-    def save_paths(self) -> None:
-        self._paths_file.parent.mkdir(parents=True, exist_ok=True)
-        mode_str = {
-            LinkMode.SYMLINK: "symlink",
-            LinkMode.COPY:    "copy",
-        }.get(self._deploy_mode, "hardlink")
-        data = {
-            "game_path":    str(self._game_path)    if self._game_path    else "",
-            "prefix_path":  str(self._prefix_path)  if self._prefix_path  else "",
-            "deploy_mode":  mode_str,
-            "staging_path": str(self._staging_path) if self._staging_path else "",
-            "patch_version": self._patch_version,
-        }
-        self._paths_file.write_text(
-            json.dumps(data, indent=2), encoding="utf-8"
-        )
+    def _save_paths_extra(self) -> dict:
+        return {"patch_version": self._patch_version}
 
-    def set_game_path(self, path: Path | str | None) -> None:
-        self._game_path = Path(path) if path else None
-        self.save_paths()
+    # When the native Linux Larian build is present there is no Proton prefix to
+    # look up; otherwise fall back to the standard steam_id lookup.
+    def _find_prefix_for_load(self) -> "Path | None":
+        if _NATIVE_LARIAN_ROOT.is_dir():
+            return None
+        return super()._find_prefix_for_load()
 
     def set_staging_path(self, path: "Path | str | None") -> None:
         self._staging_path = Path(path) if path else None

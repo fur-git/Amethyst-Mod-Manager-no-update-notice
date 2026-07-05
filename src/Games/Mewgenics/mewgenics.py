@@ -128,8 +128,14 @@ def _restore_vanilla_from_backup(
 
 class Mewgenics(BaseGame):
 
+    # Mewgenics repacks archives, so it deploys by copying only (no symlink/
+    # hardlink) — preserve "copy" and fall back to it for unknown saved modes.
+    deploy_mode_supports_copy = True
+    deploy_mode_fallback = LinkMode.COPY
+
     def __init__(self) -> None:
         self._game_path: Path | None = None
+        self._prefix_path: Path | None = None
         self._staging_path: Path | None = None
         self._deploy_mode: LinkMode = LinkMode.COPY
         self.load_paths()
@@ -260,51 +266,8 @@ class Mewgenics(BaseGame):
     # Configuration persistence
     # -----------------------------------------------------------------------
 
-    def load_paths(self) -> bool:
-        self._migrate_old_config()
-        if not self._paths_file.exists():
-            return False
-        try:
-            data = json.loads(self._paths_file.read_text(encoding="utf-8"))
-            raw = data.get("game_path", "")
-            if raw:
-                self._game_path = Path(raw)
-            raw_staging = data.get("staging_path", "")
-            if raw_staging:
-                self._staging_path = Path(raw_staging)
-            raw_mode = data.get("deploy_mode", "copy")
-            self._deploy_mode = {
-                "symlink": LinkMode.SYMLINK,
-                "hardlink": LinkMode.HARDLINK,
-            }.get(raw_mode, LinkMode.COPY)
-            self._validate_staging()
-            return bool(self._game_path)
-        except (json.JSONDecodeError, OSError):
-            pass
-        self._game_path = None
-        self._staging_path = None
-        self._deploy_mode = LinkMode.COPY
-        return False
-
-    def save_paths(self) -> None:
-        self._paths_file.parent.mkdir(parents=True, exist_ok=True)
-        mode_str = {
-            LinkMode.SYMLINK: "symlink",
-            LinkMode.HARDLINK: "hardlink",
-            LinkMode.COPY: "copy",
-        }.get(self._deploy_mode, "copy")
-        data = {
-            "game_path": str(self._game_path) if self._game_path else "",
-            "staging_path": str(self._staging_path) if self._staging_path else "",
-            "deploy_mode": mode_str,
-        }
-        self._paths_file.write_text(
-            json.dumps(data, indent=2), encoding="utf-8"
-        )
-
-    def set_game_path(self, path: Path | str | None) -> None:
-        self._game_path = Path(path) if path else None
-        self.save_paths()
+    # load_paths / save_paths are inherited from BaseGame (profile-aware);
+    # deploy_mode_supports_copy + deploy_mode_fallback keep copy-only behaviour.
 
     def set_staging_path(self, path: Path | str | None) -> None:
         self._staging_path = Path(path) if path else None

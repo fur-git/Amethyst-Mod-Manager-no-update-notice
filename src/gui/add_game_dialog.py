@@ -117,6 +117,8 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         self._auto_deploy_var = tk.BooleanVar(value=False)
         self._archive_invalidation_var = tk.BooleanVar(value=True)
         self._profile_ini_files_var = tk.BooleanVar(value=False)
+        self._profile_saves_var = tk.BooleanVar(value=False)
+        self._prefix_numbering_var = tk.BooleanVar(value=True)
         self._patch_version_var = tk.StringVar(value="8")
         self._flatpak_symlink_warned = False
 
@@ -153,6 +155,10 @@ class ReconfigureGamePanel(ctk.CTkFrame):
             self._archive_invalidation_var.set(game.archive_invalidation)
             if hasattr(game, "profile_ini_files"):
                 self._profile_ini_files_var.set(game.profile_ini_files)
+            if hasattr(game, "profile_saves"):
+                self._profile_saves_var.set(game.profile_saves)
+            if hasattr(game, "prefix_numbering"):
+                self._prefix_numbering_var.set(game.prefix_numbering)
             if hasattr(game, "get_patch_version"):
                 self._patch_version_var.set(str(game.get_patch_version()))
         else:
@@ -182,6 +188,21 @@ class ReconfigureGamePanel(ctk.CTkFrame):
             title_bar, text=f"Reconfigure Game — {self._game.name}",
             font=FONT_BOLD, text_color=TEXT_MAIN, anchor="w"
         ).pack(side="left", padx=12, pady=8)
+
+        # Tell the user whether these settings are shared (default profile) or
+        # scoped to the currently-active non-default profile — saving from a
+        # non-default profile writes the game/prefix paths, deploy mode and the
+        # options below as that profile's own overrides (the Mod Staging Folder
+        # stays shared across all profiles).
+        _active = getattr(self._game, "_active_profile_dir", None)
+        if _active is not None and _active.name != "default":
+            _scope_text = f"Settings saved to profile: {_active.name} (this profile only)"
+        else:
+            _scope_text = "Editing shared settings (default profile)"
+        ctk.CTkLabel(
+            title_bar, text=_scope_text,
+            font=FONT_SMALL, text_color=TEXT_WARN, anchor="e"
+        ).pack(side="right", padx=12, pady=8)
 
         # Body
         _scroll = ctk.CTkScrollableFrame(
@@ -414,17 +435,33 @@ class ReconfigureGamePanel(ctk.CTkFrame):
 
         if hasattr(self._game, "profile_ini_files"):
             ctk.CTkCheckBox(
-                body, text="Use profile-specific INI files (placed in profile folder, symlinked to My Games on deploy)",
+                body, text="Use profile-specific INI files (placed in the profile's 'ini files' folder, symlinked to My Games on deploy)",
                 variable=self._profile_ini_files_var,
                 font=FONT_NORMAL, text_color=TEXT_MAIN,
                 fg_color=ACCENT, hover_color=ACCENT_HOV,
             ).grid(row=20, column=0, sticky="w", padx=16, pady=(0, 8))
 
+        if hasattr(self._game, "profile_saves") and getattr(self._game, "supports_profile_saves", True):
+            ctk.CTkCheckBox(
+                body, text="Use profile-specific saves (Saves folder in the profiles folder)",
+                variable=self._profile_saves_var,
+                font=FONT_NORMAL, text_color=TEXT_MAIN,
+                fg_color=ACCENT, hover_color=ACCENT_HOV,
+            ).grid(row=21, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        if hasattr(self._game, "prefix_numbering"):
+            ctk.CTkCheckBox(
+                body, text="Prepend load-order numbers to mod folders",
+                variable=self._prefix_numbering_var,
+                font=FONT_NORMAL, text_color=TEXT_MAIN,
+                fg_color=ACCENT, hover_color=ACCENT_HOV,
+            ).grid(row=25, column=0, sticky="w", padx=16, pady=(0, 8))
+
         if hasattr(self._game, "get_patch_version"):
             ctk.CTkLabel(
                 body, text="Game Patch Version",
                 font=FONT_BOLD, text_color=TEXT_SEP, anchor="w"
-            ).grid(row=21, column=0, sticky="ew", padx=16, pady=(6, 2))
+            ).grid(row=22, column=0, sticky="ew", padx=16, pady=(6, 2))
             ctk.CTkLabel(
                 body,
                 text=("Select the patch level your game is running. "
@@ -433,9 +470,9 @@ class ReconfigureGamePanel(ctk.CTkFrame):
                       "Patch 6 = legacy ModOrder schema)."),
                 font=FONT_SMALL, text_color=TEXT_DIM, wraplength=560,
                 anchor="w", justify="left",
-            ).grid(row=22, column=0, sticky="ew", padx=16, pady=(0, 4))
+            ).grid(row=23, column=0, sticky="ew", padx=16, pady=(0, 4))
             _patch_row = ctk.CTkFrame(body, fg_color="transparent")
-            _patch_row.grid(row=23, column=0, sticky="w", padx=16, pady=(0, 10))
+            _patch_row.grid(row=24, column=0, sticky="w", padx=16, pady=(0, 10))
             for label, value in (("Patch 8", "8"), ("Patch 7", "7"), ("Patch 6", "6")):
                 ctk.CTkRadioButton(
                     _patch_row, text=label,
@@ -1286,6 +1323,36 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         if self._found_path is None:
             return
 
+        # Block game/prefix path changes while deployed: the deployed mod files
+        # would be stranded in the OLD game folder (restore looks at the new
+        # path). Only blocks when a path actually changes — re-saving other
+        # settings while deployed is fine.
+        if self._game.is_configured() and self._game.get_deploy_active():
+            def _changed(old, new) -> bool:
+                if old and new:
+                    try:
+                        return Path(old).resolve() != Path(new).resolve()
+                    except Exception:
+                        return str(old) != str(new)
+                return bool(old) != bool(new)
+
+            cur_game = self._game.get_game_path()
+            cur_pfx = self._game.get_prefix_path()
+            if _changed(cur_game, self._found_path) or (
+                self._found_prefix is not None and _changed(cur_pfx, self._found_prefix)
+            ):
+                deployed = self._game.get_last_deployed_profile()
+                self._status_label.configure(
+                    text=(
+                        "Cannot change the game or prefix path while mods are "
+                        f"deployed (profile '{deployed}' is currently deployed). "
+                        "Restore the game first, then change the path."
+                    ),
+                    text_color=TEXT_ERR,
+                )
+                return
+        # ---------------------------------------------------------------------
+
         # Capture the staging root currently on disk, before any setters mutate
         # it. We need this to offer a migration if the staging location changed.
         old_profile_root: Optional[Path] = None
@@ -1377,6 +1444,10 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         self._game.archive_invalidation = self._archive_invalidation_var.get()
         if hasattr(self._game, "set_profile_ini_files"):
             self._game.set_profile_ini_files(self._profile_ini_files_var.get())
+        if hasattr(self._game, "set_profile_saves"):
+            self._game.set_profile_saves(self._profile_saves_var.get())
+        if hasattr(self._game, "prefix_numbering"):
+            self._game.prefix_numbering = self._prefix_numbering_var.get()
         if hasattr(self._game, "set_patch_version"):
             try:
                 self._game.set_patch_version(int(self._patch_version_var.get()))
@@ -1402,19 +1473,104 @@ class ReconfigureGamePanel(ctk.CTkFrame):
         _create_profile_structure(self._game)
         self.result = self._found_path
 
-        components = list(getattr(self._game, "winetricks_components", []))
-        prefix = self._game.get_prefix_path() if hasattr(self._game, "get_prefix_path") else None
-        if components and prefix and Path(prefix).is_dir():
-            def _install_components():
-                from Utils.protontricks import _install_via_winetricks
-                for comp in components:
-                    app_log(f"{self._game.name}: installing {comp} via winetricks …")
-                    ok = _install_via_winetricks(Path(prefix), comp, app_log)
-                    if not ok:
-                        app_log(f"{self._game.name}: {comp} install failed (see log above).")
-            threading.Thread(target=_install_components, daemon=True).start()
+        self._install_prefix_deps()
 
         self._on_done(self)
+
+    def _install_prefix_deps(self) -> None:
+        """Silently install this game's prefix dependencies in the background.
+
+        Two mechanisms, both skipped when no Proton prefix is available:
+          * ``auto_install_deps`` — vcredist / d3dcompiler_47 via the same
+            installers the Proton Tools menu uses (preferred; see base_game).
+          * ``winetricks_components`` — legacy winetricks verbs.
+        """
+        prefix = self._game.get_prefix_path() if hasattr(self._game, "get_prefix_path") else None
+        if not (prefix and Path(prefix).is_dir()):
+            return
+        prefix = Path(prefix)
+
+        deps = list(getattr(self._game, "auto_install_deps", []))
+        components = list(getattr(self._game, "winetricks_components", []))
+        if not deps and not components:
+            return
+
+        game = self._game
+
+        def _worker():
+            from Utils.protontricks import (
+                D3D_DEP_KEY,
+                VCREDIST_DEP_KEY,
+                _install_via_winetricks,
+                build_proton_env_for_game,
+                install_d3dcompiler_47,
+                install_vcredist,
+                is_dep_installed,
+            )
+            from Utils.steam_finder import game_steam_id
+
+            _proton: tuple = ()
+
+            def _ensure_proton():
+                nonlocal _proton
+                if not _proton:
+                    _proton = build_proton_env_for_game(game)
+                return _proton
+
+            installed: list[str] = []
+            skipped: list[str] = []
+            failed: list[str] = []
+
+            app_log(f"{game.name}: checking prefix dependencies …")
+
+            for dep in deps:
+                if dep == "vcredist":
+                    if is_dep_installed(prefix, VCREDIST_DEP_KEY):
+                        app_log(f"{game.name}: VC++ Redistributable already installed — skipping.")
+                        skipped.append("vcredist")
+                        continue
+                    proton_script, env = _ensure_proton()
+                    if proton_script is None:
+                        app_log(f"{game.name}: skipping vcredist — no Proton prefix available.")
+                        skipped.append("vcredist")
+                        continue
+                    app_log(f"{game.name}: auto-installing VC++ Redistributable …")
+                    ok = install_vcredist(proton_script, env, log_fn=app_log, prefix_path=prefix)
+                    (installed if ok else failed).append("vcredist")
+                elif dep == "d3dcompiler_47":
+                    if is_dep_installed(prefix, D3D_DEP_KEY):
+                        app_log(f"{game.name}: d3dcompiler_47 already installed — skipping.")
+                        skipped.append("d3dcompiler_47")
+                        continue
+                    app_log(f"{game.name}: auto-installing d3dcompiler_47 …")
+                    ok = install_d3dcompiler_47(
+                        game_steam_id(game), log_fn=app_log, prefix_path=prefix)
+                    (installed if ok else failed).append("d3dcompiler_47")
+                else:
+                    app_log(f"{game.name}: unknown auto_install dep '{dep}' — skipping.")
+                    skipped.append(dep)
+
+            for comp in components:
+                app_log(f"{game.name}: installing {comp} via winetricks …")
+                if _install_via_winetricks(prefix, comp, app_log):
+                    installed.append(comp)
+                else:
+                    app_log(f"{game.name}: {comp} install failed (see log above).")
+                    failed.append(comp)
+
+            summary = []
+            if installed:
+                summary.append(f"installed {', '.join(installed)}")
+            if skipped:
+                summary.append(f"skipped {', '.join(skipped)}")
+            if failed:
+                summary.append(f"FAILED {', '.join(failed)}")
+            app_log(
+                f"{game.name}: prefix dependency setup done"
+                + (f" — {'; '.join(summary)}." if summary else ".")
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Staging migration

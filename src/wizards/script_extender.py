@@ -53,7 +53,8 @@ def _fetch_latest_github_asset(api_url: str, archive_keywords: list[str]) -> tup
         api_url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "ModManager/1.0"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    from Utils.ca_bundle import get_ssl_context
+    with urllib.request.urlopen(req, timeout=15, context=get_ssl_context()) as resp:
         data = _json.loads(resp.read().decode())
     tag = data.get("tag_name", "unknown")
     for asset in data.get("assets", []):
@@ -104,20 +105,35 @@ def _extract_to_dir(archive: Path, dest: Path) -> None:
 
     elif name_lower.endswith(".7z"):
         extracted_via_cli = False
-        try:
-            subprocess.run(
-                ["7z", "x", str(archive), f"-o{dest}", "-y"],
-                check=True, capture_output=True,
+        # Prefer a native 7-zip binary — the Flatpak bundles `7zz` at
+        # /app/bin and the AppImage bundles `7zzs`. py7zr is a last resort:
+        # it can't decode the BCJ2 filter that SKSE-style archives use.
+        _7z_bin = (
+            shutil.which("7zzs") or shutil.which("7zz")
+            or shutil.which("7z") or shutil.which("7za")
+        )
+        if _7z_bin:
+            result = subprocess.run(
+                [_7z_bin, "x", str(archive), f"-o{dest}", "-y"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             )
-            extracted_via_cli = True
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
+            extracted_via_cli = result.returncode == 0
+
+        # bsdtar (libarchive) also handles BCJ2 and is broadly available.
+        if not extracted_via_cli:
+            _bsdtar_bin = shutil.which("bsdtar")
+            if _bsdtar_bin:
+                result = subprocess.run(
+                    [_bsdtar_bin, "-xf", str(archive), "-C", str(dest)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                extracted_via_cli = result.returncode == 0
 
         if not extracted_via_cli:
             if py7zr is None:
                 raise RuntimeError(
-                    "Cannot extract .7z archive: the 7z command was not found "
-                    "and py7zr is not installed."
+                    "Cannot extract .7z archive: no native 7z/bsdtar command "
+                    "was found and py7zr is not installed."
                 )
             with py7zr.SevenZipFile(archive, "r") as zf:
                 zf.extractall(dest)
@@ -386,7 +402,8 @@ class ScriptExtenderWizard(ctk.CTkFrame):
                         mode="determinate"
                     ) or self._dl_progress.set(p))
 
-            urllib.request.urlretrieve(url, dest, reporthook=_reporthook)
+            from Utils.ca_bundle import download_file
+            download_file(url, dest, reporthook=_reporthook)
             self._archive_path = dest
             self._log(f"Wizard: downloaded {filename}")
             self._dl_ui(self._dl_progress, lambda: self._dl_progress.stop())

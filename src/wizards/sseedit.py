@@ -26,8 +26,11 @@ the ``WizardTool.extra`` kwargs below (with SSEEdit defaults for back-compat).
 
 from __future__ import annotations
 
+import os
+import re as _re
 import shutil
 import subprocess
+from Utils.steam_finder import proton_run_command
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -52,6 +55,45 @@ from gui.theme import (
 _NEXUS_URL   = "https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files&file_id=495506"
 _EXE_NAME         = "SSEEdit.exe"
 _APP_DIR          = "SSEEdit"
+
+# xEdit / QuickAutoClean can save the cleaned plugin to a temp file and queue
+# the rename to the real name "on shutdown" (e.g.
+# ``AlternatePerspective.esp.save.2026_06_19_00_38_14`` -> ``…esp``).  Matches
+# ``<plugin>.save.<timestamp>`` so _finalize_xedit_saves can complete the rename.
+_XEDIT_SAVE_TEMP_RE = _re.compile(r"^(?P<base>.+)\.save\.[0-9_]+$", _re.IGNORECASE)
+
+
+def _finalize_xedit_saves(data_dir: Path, log_fn=None) -> int:
+    """Complete any pending xEdit ``<plugin>.save.<timestamp>`` renames in
+    *data_dir* so the cleaned plugin sits at its real name before we rebuild the
+    filemap/index.  Returns the number of temps finalised.
+
+    Only acts on the top level of Data/ (where xEdit writes plugins).  If both a
+    temp and the base name exist, the temp wins (it is the freshly-saved copy)
+    and replaces the base via ``os.replace`` (atomic, clobbers a stale symlink).
+    """
+    _log = log_fn or (lambda _: None)
+    finalised = 0
+    try:
+        entries = list(data_dir.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        m = _XEDIT_SAVE_TEMP_RE.match(entry.name)
+        if m is None:
+            continue
+        # Only finalise temps for actual plugins; ignore unrelated ".save." names.
+        base_name = m.group("base")
+        if not base_name.lower().endswith((".esp", ".esm", ".esl")):
+            continue
+        base_path = entry.with_name(base_name)
+        try:
+            os.replace(str(entry), str(base_path))
+            finalised += 1
+            _log(f"Finalised xEdit save: {entry.name} -> {base_name}")
+        except OSError as exc:
+            _log(f"WARN: could not finalise xEdit save {entry.name}: {exc}")
+    return finalised
 
 
 def _get_applications_dir(game: "BaseGame", app_dir: str = _APP_DIR) -> Path:
@@ -347,6 +389,65 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
                 pass
         self.after(0, _apply)
 
+    def _restore_after_xedit(self) -> None:
+        """Move any plugin xEdit edited in Data/ back into its owning mod folder
+        BEFORE the panel refresh rescans staging.
+
+        QuickAutoClean backs the original plugin up into ``Data/<tool> Backups/``
+        — which, under symlink-mode deploy, consumes the staging copy (the Data
+        entry was a symlink into staging) — and writes the cleaned plugin as a
+        fresh regular file in Data/.  If we let the wizard-close ``_reload``
+        rescan staging now, ``rebuild_mod_index`` finds the mod folder missing
+        its plugin and drops it from the index; the next Restore then can't
+        recognise the cleaned file and buries it in overwrite/.
+
+        Running ``restore()`` first walks Data/ while the index still knows the
+        plugin, so its orphan-rescue moves the cleaned file back into the mod
+        folder.  The rescan that follows then sees the restored plugin and keeps
+        it.  No-op for games without ``restore``; failures are logged, not
+        raised (a normal redeploy/restore can still recover).
+        """
+        game = self._game
+        if not hasattr(game, "restore"):
+            return
+        name = self._tool_display_name
+        # Restore against the last-deployed profile so the cleaned file lands in
+        # the right mod staging folder (mirrors the Deploy/Restore button flow).
+        saved_profile_dir = getattr(game, "_active_profile_dir", None)
+        restored_ok = False
+        try:
+            last_deployed = game.get_last_deployed_profile()
+            if last_deployed:
+                game.set_active_profile_dir(
+                    game.get_profile_root() / "profiles" / last_deployed
+                )
+                # Reload so the last-deployed profile's path overrides apply.
+                game.load_paths()
+            try:
+                game.restore(log_fn=lambda m: self._log(f"{name} Wizard: {m}"))
+                restored_ok = True
+            except RuntimeError as exc:
+                self._log(f"{name} Wizard: restore skipped: {exc}")
+        except Exception as exc:
+            self._log(f"{name} Wizard: post-edit restore failed: {exc}")
+        finally:
+            # Leave the active profile exactly as we found it so _reload_mod_panel
+            # rebuilds the profile the user actually has selected.
+            if saved_profile_dir is not None:
+                try:
+                    game.set_active_profile_dir(saved_profile_dir)
+                    game.load_paths()
+                except Exception:
+                    pass
+        # The game is no longer deployed — drop the deploy-active flag so the
+        # profile dropdown loses its green "deployed" highlight (mirrors what the
+        # Restore button does).  _on_done refreshes the menu colour afterwards.
+        if restored_ok:
+            try:
+                game.clear_deploy_active()
+            except Exception:
+                pass
+
     def _on_done(self):
         try:
             topbar = self.winfo_toplevel()._topbar
@@ -356,6 +457,12 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         if topbar is not None:
             try:
                 topbar.after(0, topbar._reload_mod_panel)
+                # _reload_mod_panel does NOT refresh the profile dropdown colour,
+                # so clear the green "deployed" highlight explicitly now that
+                # _restore_after_xedit dropped the deploy-active flag (mirrors the
+                # Restore button, which also calls this after _reload_mod_panel).
+                if hasattr(topbar, "_update_profile_menu_color"):
+                    topbar.after(0, topbar._update_profile_menu_color)
             except Exception:
                 pass
 
@@ -550,18 +657,12 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
 
     def _do_deploy(self):
         try:
-            from Utils.filemap import build_filemap
-            from Utils.deploy import (
-                LinkMode,
-                deploy_root_folder,
-                restore_root_folder,
-                load_per_mod_strip_prefixes,
-            )
-            from Utils.profile_state import read_excluded_mod_files
+            # Use the canonical deploy orchestration (same as the Deploy button)
+            # so root-flagged mods are deployed into the game root via
+            # filemap_root.txt + deploy_root_flagged_mods.
+            from Utils.deploy_pipeline import run_deploy_pipeline
 
-            game      = self._game
-            game_root = game.get_game_path()
-
+            game = self._game
             try:
                 root_win = self.winfo_toplevel()
                 profile  = root_win._topbar._profile_var.get()
@@ -571,64 +672,14 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             def _tlog(msg):
                 self.after(0, lambda m=msg: self._log(m))
 
-            # Activate the last-deployed profile for restore so rescued
-            # runtime files land in *that* profile's overwrite/ — not
-            # the shared default. Critical for profile_specific_mods.
-            last_deployed = game.get_last_deployed_profile()
-            if last_deployed:
-                game.set_active_profile_dir(
-                    game.get_profile_root() / "profiles" / last_deployed
-                )
+            success = run_deploy_pipeline(game, profile, log_fn=_tlog)
 
-            if getattr(game, "restore_before_deploy", True) and hasattr(game, "restore"):
-                try:
-                    game.restore(log_fn=_tlog)
-                except RuntimeError:
-                    pass
-            restore_rf = game.get_effective_root_folder_path()
-            if restore_rf.is_dir() and game_root:
-                restore_root_folder(restore_rf, game_root, log_fn=_tlog)
-
-            game.set_active_profile_dir(
-                game.get_profile_root() / "profiles" / profile
-            )
-
-            profile_root = game.get_profile_root()
-            staging      = game.get_effective_mod_staging_path()
-            modlist_path = profile_root / "profiles" / profile / "modlist.txt"
-            filemap_out  = staging.parent / "filemap.txt"
-
-            if modlist_path.is_file():
-                exc_raw = read_excluded_mod_files(modlist_path.parent, None)
-                exc = {k: set(v) for k, v in exc_raw.items()} if exc_raw else None
-                build_filemap(
-                    modlist_path, staging, filemap_out,
-                    strip_prefixes=game.mod_folder_strip_prefixes or None,
-                    per_mod_strip_prefixes=load_per_mod_strip_prefixes(modlist_path.parent),
-                    allowed_extensions=game.mod_install_extensions or None,
-                    root_deploy_folders=game.mod_root_deploy_folders or None,
-                    excluded_mod_files=exc,
-                    conflict_ignore_filenames=getattr(game, "conflict_ignore_filenames", None) or None,
-                )
-
-            deploy_mode = game.get_deploy_mode() if hasattr(game, "get_deploy_mode") else LinkMode.HARDLINK
-            game.deploy(log_fn=_tlog, profile=profile, mode=deploy_mode)
-
-            from Utils.wine_dll_config import deploy_game_wine_dll_overrides
-            pfx = game.get_prefix_path()
-            if pfx and pfx.is_dir():
-                deploy_game_wine_dll_overrides(game.name, pfx, game.wine_dll_overrides, log_fn=_tlog)
-
-            game.save_last_deployed_profile(profile)
-
-            target_rf  = game.get_effective_root_folder_path()
-            rf_allowed = getattr(game, "root_folder_deploy_enabled", True)
-            if rf_allowed and target_rf.is_dir() and game_root:
-                deploy_root_folder(target_rf, game_root, mode=deploy_mode, log_fn=_tlog)
-
-            self._set_label("_deploy_status", "Deploy complete.", color="#6bc76b")
-            self._refresh_topbar_deploy_state()
-            self.after(0, self._show_step_proton)
+            if success:
+                self._set_label("_deploy_status", "Deploy complete.", color="#6bc76b")
+                self._refresh_topbar_deploy_state()
+                self.after(0, self._show_step_proton)
+            else:
+                self._set_label("_deploy_status", "Deploy failed — see log.", color="#e06c6c")
 
         except Exception as exc:
             self._set_label("_deploy_status", f"Deploy error: {exc}", color="#e06c6c")
@@ -725,7 +776,7 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
         self._log(f"{name} Wizard: launching {exe} via Proton with {data_arg}")
         try:
             proc = subprocess.Popen(
-                ["python3", str(proton_script), "run", str(exe), data_arg],
+                proton_run_command(proton_script, "run", str(exe), data_arg),
                 env=env,
                 cwd=str(exe.parent),
                 stdout=subprocess.DEVNULL,
@@ -738,11 +789,31 @@ class SSEEditWizard(ProtonPrefixStepMixin, ctk.CTkFrame):
             )
             self.after(0, lambda: self._done_btn.configure(state="normal"))
             proc.wait()
+
             shutdown_prefix_wineserver(
                 proton_script, compat_data,
                 log_fn=lambda m: self._log(f"{name} Wizard: {m}"),
             )
+
+            # xEdit can write the cleaned plugin to a temp and queue the rename to
+            # its real name "on shutdown"; the wineserver is now down so any such
+            # rename has run.  Finalise any temp that slipped through before the
+            # restore/rebuild below.
+            _data_dir = game_path / "Data"
+            _n = _finalize_xedit_saves(
+                _data_dir, log_fn=lambda m: self._log(f"{name} Wizard: {m}"))
+            if _n:
+                self._log(f"{name} Wizard: finalised {_n} pending xEdit save(s).")
+
+            # Move any edited plugin back into its mod folder while the modindex
+            # still knows it — BEFORE the panel refresh rescans staging.  This is
+            # the core fix for QAC-cleaned plugins landing in overwrite/ (the
+            # rescan would otherwise drop the plugin because QAC consumed the
+            # staging copy into a Data-side backup).  Runs here on the worker
+            # thread so the UI doesn't hang.
+            self._restore_after_xedit()
             self._log(f"{name} Wizard: {name} closed.")
+
             self._set_label("_run_status", f"{name} finished.", color="#6bc76b")
             self.after(0, self._on_done)
         except Exception as exc:

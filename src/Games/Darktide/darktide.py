@@ -17,10 +17,12 @@ Mod structure:
   The folders 'base' (DML core) and 'dmf' (Darktide Mod Framework) are
   excluded from mod_load_order.txt automatically.
 
-  The game must be patched with dtkit-patch after every game update.
-  dtkit-patch is run automatically during deploy (--patch) and restore (--unpatch).
-  If the binary is not present it is downloaded from GitHub on first use.
-  A wizard is also available for manual control (see wizards/dtkit_patch.py).
+  The game must be patched with dtkit-patch after every game update. Patching
+  is owned solely by the dtkit-patch wizard (see wizards/dtkit_patch.py) — it is
+  deliberately NOT run during deploy/restore. Those steps don't manage
+  bundle_database.data or its dtkit .bak, so running --patch/--unpatch there can
+  desync the patched state from the backup (stranded/wrong-version .bak →
+  black-screen CTD). Users run the wizard after installing mods or game updates.
 """
 
 import json
@@ -43,7 +45,6 @@ from Utils.deploy import (
 )
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
-from Utils.dtkit_patch_helper import run_dtkit_patch as _dtkit_run
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -266,9 +267,6 @@ class Darktide(BaseGame):
         _log("Step 4: Writing mod_load_order.txt ...")
         self._write_mod_load_order(profile_dir, _log)
 
-        _log("Step 5: Patching game with dtkit-patch ...")
-        _dtkit_run(self._game_path, "--patch", _log)
-
         _log(
             f"Deploy complete. "
             f"{linked_mod} mod + {linked_core} vanilla "
@@ -311,9 +309,6 @@ class Darktide(BaseGame):
             _log(f"  Restored {restored} file(s). {core}/ removed.")
         else:
             _log(f"Restore: no {core}/ found — nothing to restore.")
-
-        _log("Restore: unpatching game with dtkit-patch ...")
-        _dtkit_run(self._game_path, "--unpatch", _log)
 
         _log("Restore complete.")
 

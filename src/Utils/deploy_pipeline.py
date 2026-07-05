@@ -356,6 +356,10 @@ def run_deploy_pipeline(
             game.set_active_profile_dir(
                 game.get_profile_root() / "profiles" / last_deployed
             )
+            # Reload so per-profile path overrides apply to the restore (the
+            # last-deployed profile may target a different game folder/prefix).
+            game.load_paths()
+            game_root = game.get_game_path()
         if getattr(game, "restore_before_deploy", True) and hasattr(game, "restore"):
             try:
                 if progress_fn is not None:
@@ -375,6 +379,9 @@ def run_deploy_pipeline(
         game.set_active_profile_dir(
             game.get_profile_root() / "profiles" / profile
         )
+        # Reload so the deploy uses the target profile's path overrides.
+        game.load_paths()
+        game_root = game.get_game_path()
 
         if on_pre_filemap is not None:
             on_pre_filemap()
@@ -465,3 +472,4 @@ def run_deploy_pipeline(
         game.set_active_profile_dir(
             game.get_profile_root() / "profiles" / profile
         )
+        game.load_paths()

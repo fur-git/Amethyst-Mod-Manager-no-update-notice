@@ -37,7 +37,6 @@ Staged mods live in ``Profiles/7 Days to Die/mods/<ModName>/``.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -47,7 +46,6 @@ from Games.base_game import BaseGame
 from Utils.deploy import LinkMode
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
-from Utils.steam_finder import find_prefix
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -75,6 +73,9 @@ _ASSETS_DEST = "7DaysToDie_Data"
 
 
 class SevenDaysToDie(BaseGame):
+
+    # 7DTD can deploy by copying, so the saved "copy" mode must be honoured.
+    deploy_mode_supports_copy = True
 
     def __init__(self) -> None:
         self._game_path: Path | None = None
@@ -168,61 +169,9 @@ class SevenDaysToDie(BaseGame):
     # Configuration persistence
     # -----------------------------------------------------------------------
 
-    def load_paths(self) -> bool:
-        self._migrate_old_config()
-        if not self._paths_file.exists():
-            self._game_path = None
-            self._prefix_path = None
-            self._staging_path = None
-            return False
-        try:
-            data = json.loads(self._paths_file.read_text(encoding="utf-8"))
-            raw = data.get("game_path", "")
-            if raw:
-                self._game_path = Path(raw)
-            raw_pfx = data.get("prefix_path", "")
-            if raw_pfx:
-                self._prefix_path = Path(raw_pfx)
-            raw_mode = data.get("deploy_mode", "hardlink")
-            self._deploy_mode = {
-                "symlink": LinkMode.SYMLINK,
-                "copy":    LinkMode.COPY,
-            }.get(raw_mode, LinkMode.HARDLINK)
-            raw_staging = data.get("staging_path", "")
-            if raw_staging:
-                self._staging_path = Path(raw_staging)
-            self._validate_staging()
-            if not self._prefix_path or not self._prefix_path.is_dir():
-                found = find_prefix(self.steam_id)
-                if found:
-                    self._prefix_path = found
-                    self.save_paths()
-            return bool(self._game_path)
-        except (json.JSONDecodeError, OSError):
-            pass
-        self._game_path = None
-        self._prefix_path = None
-        return False
-
-    def save_paths(self) -> None:
-        self._paths_file.parent.mkdir(parents=True, exist_ok=True)
-        mode_str = {
-            LinkMode.SYMLINK: "symlink",
-            LinkMode.COPY:    "copy",
-        }.get(self._deploy_mode, "hardlink")
-        data = {
-            "game_path":    str(self._game_path)    if self._game_path    else "",
-            "prefix_path":  str(self._prefix_path)  if self._prefix_path  else "",
-            "deploy_mode":  mode_str,
-            "staging_path": str(self._staging_path) if self._staging_path else "",
-        }
-        self._paths_file.write_text(
-            json.dumps(data, indent=2), encoding="utf-8"
-        )
-
-    def set_game_path(self, path: Path | str | None) -> None:
-        self._game_path = Path(path) if path else None
-        self.save_paths()
+    # load_paths / save_paths are inherited from BaseGame (profile-aware);
+    # deploy_mode_supports_copy preserves the "copy" deploy mode, and
+    # prefix_numbering is per-profile via the profile-aware _save_settings.
 
     def set_staging_path(self, path: Path | str | None) -> None:
         self._staging_path = Path(path) if path else None
@@ -241,6 +190,25 @@ class SevenDaysToDie(BaseGame):
     def set_deploy_mode(self, mode: LinkMode) -> None:
         self._deploy_mode = mode
         self.save_paths()
+
+    @property
+    def prefix_numbering(self) -> bool:
+        """If True (default), deployed Mods/ folders are prefixed with a
+        zero-padded ``NNNN_`` index derived from the modlist position so the
+        game's strict-alphabetical load order matches the manager's priority.
+
+        When False, mods are linked under their bare folder name (with any
+        author-supplied numeric prefix preserved) and load order falls back to
+        plain alphabetical order — useful for users who manage 7D2D ordering
+        themselves or whose mods rely on their original folder names.
+        """
+        return self._load_settings().get("prefix_numbering", True)
+
+    @prefix_numbering.setter
+    def prefix_numbering(self, value: bool) -> None:
+        data = self._load_settings()
+        data["prefix_numbering"] = bool(value)
+        self._save_settings(data)
 
     # -----------------------------------------------------------------------
     # Deployment
@@ -318,17 +286,28 @@ class SevenDaysToDie(BaseGame):
 
         done = 0
         total_steps = total_mods + total_data
+        use_prefix = self.prefix_numbering
+        if not use_prefix:
+            _log("  (Folder numbering disabled — linking mods under their "
+                 "original folder names; load order is plain alphabetical.)")
         for n, (_idx, staged_name, inner) in enumerate(mods_folders):
-            # mods_folders is in modlist order (idx 0 = highest priority), so
-            # n=0 needs the LARGEST NNNN to sort last alphabetically and win.
-            priority = total_mods - n
-            prefix = str(priority).zfill(_PRIORITY_WIDTH)
-            bare_name = _strip_existing_prefix(inner.name)
-            dst_name = f"{prefix}_{_safe_folder_name(bare_name)}"
+            if use_prefix:
+                # mods_folders is in modlist order (idx 0 = highest priority),
+                # so n=0 needs the LARGEST NNNN to sort last alphabetically and
+                # win on any conflicting XPath patch.
+                priority = total_mods - n
+                prefix = str(priority).zfill(_PRIORITY_WIDTH)
+                bare_name = _strip_existing_prefix(inner.name)
+                dst_name = f"{prefix}_{_safe_folder_name(bare_name)}"
+            else:
+                # Numbering off: preserve the mod's own folder name (including
+                # any author-supplied numeric prefix) so its intended ordering
+                # survives untouched.
+                dst_name = _safe_folder_name(inner.name)
             dst = mods_dir / dst_name
             try:
                 _deploy_mod_folder(inner, dst, mode)
-                _log(f"  [{priority:>4}] {staged_name} / {inner.name} → {dst_name}")
+                _log(f"  {staged_name} / {inner.name} → {dst_name}")
             except OSError as err:
                 _log(f"  ERROR: failed to deploy {staged_name}/{inner.name}: {err}")
             done += 1

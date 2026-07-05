@@ -30,6 +30,8 @@ from gui.theme import (
     TEXT_MAIN,
     TEXT_DIM,
     BORDER,
+    RED_BTN,
+    RED_HOV,
     FONT_NORMAL,
     FONT_BOLD,
     FONT_SMALL,
@@ -53,6 +55,7 @@ CATEGORY_ORDER = [
     "RSuite (experimental)",
     "Patchers & Cleanup",
     "Load Order & Config",
+    "INI Tweaks",
     "Other",
 ]
 
@@ -254,7 +257,13 @@ class WizardDialog(ctk.CTkToplevel):
             font=FONT_NORMAL, fg_color=BG_PANEL, border_color=BORDER,
             text_color=TEXT_MAIN,
         )
-        search_entry.pack(fill="x")
+        clear_btn = ctk.CTkButton(
+            search_frame, text="✕", width=32, font=FONT_BOLD,
+            fg_color=RED_BTN, hover_color=RED_HOV, text_color=TEXT_ON_ACCENT,
+            command=lambda: self._search_var.set(""),
+        )
+        clear_btn.pack(side="right", padx=(8, 0))
+        search_entry.pack(side="left", fill="x", expand=True)
         self._search_var.trace_add("write", lambda *_: self._render_rows(self._search_var.get()))
 
     def _render_rows(self, query: str) -> None:
@@ -284,6 +293,11 @@ class WizardDialog(ctk.CTkToplevel):
                 _add_category_header(self._body, category, first=(gi == 0))
             for tool in group_tools:
                 _add_tool_row(self._body, tool, self._open_tool)
+
+        # Reset the scroll position so filtered results are visible from the
+        # top instead of being stranded off-screen at the previous offset.
+        # Deferred so the canvas recomputes its scrollregion for the new rows first.
+        self.after_idle(lambda: self._body._parent_canvas.yview_moveto(0.0))
 
     def _bind_scroll(self, scrollable: ctk.CTkScrollableFrame) -> None:
         """Bind mousewheel to the dialog so scrolling works anywhere in the window."""
@@ -395,6 +409,7 @@ class WizardPanel(ctk.CTkFrame):
         self._rows_container.grid_columnconfigure(0, weight=1)
 
         canvas = body._parent_canvas
+        self._body_canvas = canvas
 
         def _scroll_up(e):   canvas.yview_scroll(-1, "units")
         def _scroll_down(e): canvas.yview_scroll(1, "units")
@@ -418,13 +433,27 @@ class WizardPanel(ctk.CTkFrame):
             font=FONT_NORMAL, fg_color=BG_PANEL, border_color=BORDER,
             text_color=TEXT_MAIN,
         )
-        search_entry.pack(fill="x", padx=12, pady=8)
+        clear_btn = ctk.CTkButton(
+            search_frame, text="✕", width=32, font=FONT_BOLD,
+            fg_color=RED_BTN, hover_color=RED_HOV, text_color=TEXT_ON_ACCENT,
+            command=lambda: self._search_var.set(""),
+        )
+        clear_btn.pack(side="right", padx=(0, 12), pady=8)
+        search_entry.pack(side="left", fill="x", expand=True, padx=(12, 8), pady=8)
         self._search_var.trace_add("write", lambda *_: self._render_rows(self._search_var.get()))
 
     def _bind_tree(self, widget):
-        if not LEGACY_WHEEL_REDUNDANT:
+        if LEGACY_WHEEL_REDUNDANT:
+            return
+        # Dedup so repeated walks (every search keystroke re-binds the
+        # surviving rows container) never stack add="+" handlers — that made a
+        # single notch scroll one unit per accumulated binding.
+        bound = self.__dict__.setdefault("_wheel_bound", set())
+        key = str(widget)
+        if key not in bound:
             widget.bind("<Button-4>", self._scroll_up, add="+")
             widget.bind("<Button-5>", self._scroll_down, add="+")
+            bound.add(key)
         for child in widget.winfo_children():
             self._bind_tree(child)
 
@@ -458,6 +487,11 @@ class WizardPanel(ctk.CTkFrame):
 
         if not LEGACY_WHEEL_REDUNDANT:
             self._bind_tree(self._rows_container)
+
+        # Reset the scroll position so filtered results are visible from the
+        # top instead of being stranded off-screen at the previous offset.
+        # Deferred so the canvas recomputes its scrollregion for the new rows first.
+        self.after_idle(lambda: self._body_canvas.yview_moveto(0.0))
 
     def _open_tool(self, tool: "WizardTool"):
         """Close the panel and open the tool's dedicated wizard."""
