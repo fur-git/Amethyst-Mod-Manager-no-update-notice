@@ -18,38 +18,58 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge upstream main
-        id: merge
+      - name: Sync upstream main
+        id: sync
         run: |
           git fetch https://github.com/ChrisDKN/Amethyst-Mod-Manager.git main:upstream-main
+
           if git merge-base --is-ancestor upstream-main HEAD; then
             echo "Already up to date with upstream."
-            echo "merged=false" >> "$GITHUB_OUTPUT"
-          else
-            git merge upstream-main --no-edit -m "Merge upstream ChrisDKN/Amethyst-Mod-Manager"
-            # GITHUB_TOKEN cannot push changes under .github/workflows/ (needs a PAT with
-            # workflow scope). This fork keeps its own CI files and only syncs app code.
-            git checkout ORIG_HEAD -- .github/workflows/
-            if ! git diff --cached --quiet; then
-              git commit -m "Keep fork workflow files after upstream merge"
-            fi
-            echo "merged=true" >> "$GITHUB_OUTPUT"
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          # Do not use git merge: any commit that touches .github/workflows/* is
+          # rejected on push with GITHUB_TOKEN, even if a later commit removes it.
+          keep=$(mktemp -d)
+          cp .github/workflows/sync-upstream.yml "$keep/"
+          cp .github/workflows/release.yml "$keep/"
+          cp scripts/apply_no_update_notice.py "$keep/"
+
+          git read-tree -u --reset upstream-main
+
+          mkdir -p .github/workflows scripts
+          cp "$keep/sync-upstream.yml" "$keep/release.yml" .github/workflows/
+          cp "$keep/apply_no_update_notice.py" scripts/
+          rm -f .github/workflows/build.yml .github/workflows/test-build.yml
+
+          python3 scripts/apply_no_update_notice.py
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes after sync."
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "Sync from upstream ChrisDKN/Amethyst-Mod-Manager"
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+
       - name: Reapply no-update-notice patch
+        if: steps.sync.outputs.synced != 'true'
         run: python3 scripts/apply_no_update_notice.py
 
       - name: Commit fork patch if needed
         id: patch
+        if: steps.sync.outputs.synced != 'true'
         run: |
-          if git diff --quiet; then
+          if git diff --quiet src/gui.py; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -58,5 +78,11 @@ jobs:
           echo "committed=true" >> "$GITHUB_OUTPUT"
 
       - name: Push to main
-        if: steps.merge.outputs.merged == 'true' || steps.patch.outputs.committed == 'true'
-        run: git push origin "HEAD:${{ github.ref_name }}"
+        if: steps.sync.outputs.synced == 'true' || steps.patch.outputs.committed == 'true'
+        run: |
+          if git diff --name-only origin/main..HEAD -- .github/workflows/ | grep -q .; then
+            echo "Refusing to push: commit would change workflow files (GITHUB_TOKEN cannot do that)."
+            git diff --name-only origin/main..HEAD -- .github/workflows/
+            exit 1
+          fi
+          git push origin "HEAD:${{ github.ref_name }}"
