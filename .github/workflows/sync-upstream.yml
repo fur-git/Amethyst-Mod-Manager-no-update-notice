@@ -69,11 +69,15 @@ jobs:
         id: patch
         if: steps.sync.outputs.synced != 'true'
         run: |
-          if git diff --quiet src/gui.py; then
+          patched=src/gui_qt/app.py
+          if [ ! -f "$patched" ]; then
+            patched=src/gui.py
+          fi
+          if git diff --quiet "$patched"; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git add src/gui.py
+          git add "$patched"
           git commit -m "Reapply no-update-notice: disable startup app-update check"
           echo "committed=true" >> "$GITHUB_OUTPUT"
 
