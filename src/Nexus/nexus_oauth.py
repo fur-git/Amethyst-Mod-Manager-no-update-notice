@@ -205,6 +205,29 @@ class OAuthTokens:
     expires_at:    float   # Unix timestamp
 
 
+class OAuthRefreshError(RuntimeError):
+    """Raised when a refresh-token exchange fails.
+
+    ``token_revoked`` is True when Nexus rejected the refresh token itself
+    (HTTP 400 / ``invalid_grant``) — i.e. the saved refresh token is dead and
+    the user must log in again. It is False for transient failures (network,
+    TLS, timeout, 5xx) where the token is probably still good and a later
+    retry may succeed.
+    """
+
+    def __init__(self, message: str, *, token_revoked: bool = False):
+        super().__init__(message)
+        self.token_revoked = token_revoked
+
+
+# Serialises refresh-token exchanges across threads. Nexus rotates the refresh
+# token on every successful refresh (the old one is revoked server-side), so
+# two concurrent refreshes with the same token would race — the second POST
+# gets a 400 and, worse, could overwrite the freshly-saved good token with a
+# now-revoked one. The lock + reload-under-lock below makes refresh atomic.
+_refresh_lock = threading.Lock()
+
+
 # ---------------------------------------------------------------------------
 # Keyring persistence
 # ---------------------------------------------------------------------------
@@ -347,45 +370,72 @@ def refresh_if_needed(tokens: OAuthTokens, client_id: str = CLIENT_ID, client_se
     """
     Return tokens unchanged if still valid, or perform a refresh token exchange.
 
-    Raises RuntimeError on refresh failure.
+    Thread-safe: the exchange is serialised so concurrent callers can't race on
+    Nexus's rotating refresh token (see ``_refresh_lock``). Callers pass a
+    possibly-stale snapshot; once inside the lock we re-load from storage and
+    re-check expiry, so a caller that was blocked while another thread refreshed
+    picks up the freshly-rotated token instead of POSTing the dead one.
+
+    Raises OAuthRefreshError on refresh failure. ``token_revoked`` on the raised
+    error distinguishes a dead refresh token (re-login required) from a
+    transient network failure (retry may work).
     """
     if time.time() < tokens.expires_at - _REFRESH_MARGIN_SECS:
         return tokens
 
-    app_log("OAuth: access token expiring soon, refreshing...")
-    try:
-        resp = requests.post(
-            _TOKEN_URL,
-            data={
-                "grant_type":    "refresh_token",
-                "refresh_token": tokens.refresh_token,
-                "client_id":     client_id,
-                "client_secret": client_secret,
-                "redirect_uri":  _REDIRECT_URI,
-            },
-            timeout=20,
-            verify=resolve_ca_bundle() or True,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.RequestException as exc:
-        if isinstance(exc, (requests.exceptions.SSLError,
-                            requests.exceptions.ConnectionError,
-                            requests.exceptions.Timeout)):
+    with _refresh_lock:
+        # Re-load under the lock: another thread may have just rotated the token
+        # while we were blocked. Prefer the stored token if it's fresher.
+        stored = load_oauth_tokens()
+        if stored is not None and stored.expires_at > tokens.expires_at:
+            tokens = stored
+            if time.time() < tokens.expires_at - _REFRESH_MARGIN_SECS:
+                # Another thread already refreshed for us.
+                return tokens
+
+        app_log("OAuth: access token expiring soon, refreshing...")
+        try:
+            resp = requests.post(
+                _TOKEN_URL,
+                data={
+                    "grant_type":    "refresh_token",
+                    "refresh_token": tokens.refresh_token,
+                    "client_id":     client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri":  _REDIRECT_URI,
+                },
+                timeout=20,
+                verify=resolve_ca_bundle() or True,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.HTTPError as exc:
+            # A 4xx here means Nexus rejected the refresh token itself (rotated
+            # out, revoked, or client mismatch) — the saved token is dead and
+            # the user must re-authenticate. 5xx is transient; leave the token.
+            status = getattr(exc.response, "status_code", None)
+            revoked = status is not None and 400 <= status < 500
+            app_log(f"OAuth: token refresh rejected (HTTP {status}); "
+                    f"{'refresh token is dead — re-login required' if revoked else 'server error, will retry later'}")
+            raise OAuthRefreshError(
+                f"OAuth token refresh failed: {exc}", token_revoked=revoked
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            # Network / TLS / timeout — token is probably still valid.
             app_log(f"OAuth: token refresh hit a connection error ({exc!r}); running diagnostics")
             _log_connection_diagnostics()
-        raise RuntimeError(f"OAuth token refresh failed: {exc}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"OAuth token refresh failed: {exc}") from exc
+            raise OAuthRefreshError(f"OAuth token refresh failed: {exc}") from exc
+        except Exception as exc:
+            raise OAuthRefreshError(f"OAuth token refresh failed: {exc}") from exc
 
-    new_tokens = OAuthTokens(
-        access_token=data["access_token"],
-        refresh_token=data.get("refresh_token", tokens.refresh_token),
-        expires_at=time.time() + data.get("expires_in", 3600),
-    )
-    save_oauth_tokens(new_tokens)
-    app_log("OAuth: token refreshed successfully")
-    return new_tokens
+        new_tokens = OAuthTokens(
+            access_token=data["access_token"],
+            refresh_token=data.get("refresh_token", tokens.refresh_token),
+            expires_at=time.time() + data.get("expires_in", 3600),
+        )
+        save_oauth_tokens(new_tokens)
+        app_log("OAuth: token refreshed successfully")
+        return new_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +454,52 @@ def _pkce_pair() -> tuple[str, str]:
 # Local callback HTTP server
 # ---------------------------------------------------------------------------
 
+# Logo shown on the browser callback page (the http://localhost:7890/callback
+# page the browser lands on after the user authorises). Inlined as a base64
+# data-URI so the page is self-contained — no second request back to the local
+# server. Uses src/icons/Logo.png (bundled into both the AppImage and Flatpak
+# source trees — src/appimage/ is NOT shipped, only used as an icon source at
+# build time). Loaded + cached once; None (and the page falls back to text-only)
+# if the asset isn't present in this build.
+_LOGO_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "icons", "Logo.png")
+_logo_data_uri: Optional[str] = None
+_logo_loaded = False
+
+
+def _callback_logo_uri() -> Optional[str]:
+    """Return the logo as a `data:image/png;base64,...` URI, or None if missing."""
+    global _logo_data_uri, _logo_loaded
+    if _logo_loaded:
+        return _logo_data_uri
+    _logo_loaded = True
+    try:
+        with open(_LOGO_PATH, "rb") as f:
+            _logo_data_uri = "data:image/png;base64," + base64.b64encode(f.read()).decode()
+    except Exception:
+        _logo_data_uri = None
+    return _logo_data_uri
+
+
+def _callback_page(title: str, message: str) -> str:
+    """Build the dark-themed browser callback page (logo + a short message)."""
+    uri = _callback_logo_uri()
+    logo = (f"<img src='{uri}' alt='' width='128' height='128' "
+            f"style='display:block;margin:0 auto 28px;'>") if uri else ""
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>Amethyst Mod Manager</title></head>"
+        "<body style='margin:0;min-height:100vh;display:flex;align-items:center;"
+        "justify-content:center;background:#1b1b1f;color:#f0f0f2;"
+        "font-family:sans-serif;text-align:center;'>"
+        "<div>"
+        f"{logo}"
+        f"<h2 style='margin:0 0 10px;font-weight:600;'>{title}</h2>"
+        f"<p style='margin:0;color:#a8a8b0;'>{message}</p>"
+        "</div></body></html>"
+    )
+
+
 class _CallbackServer:
     """
     Minimal single-request HTTP server that captures the OAuth redirect.
@@ -416,19 +512,6 @@ class _CallbackServer:
         code, state = srv.wait(timeout=300)
         srv.stop()
     """
-
-    _HTML_SUCCESS = (
-        "<html><body style='font-family:sans-serif;text-align:center;margin-top:60px'>"
-        "<h2>Authorised!</h2>"
-        "<p>You can close this tab and return to Amethyst Mod Manager.</p>"
-        "</body></html>"
-    )
-    _HTML_ERROR = (
-        "<html><body style='font-family:sans-serif;text-align:center;margin-top:60px'>"
-        "<h2>Authorisation failed</h2>"
-        "<p>Return to the app for details.</p>"
-        "</body></html>"
-    )
 
     def __init__(self):
         self._code:  Optional[str] = None
@@ -456,10 +539,16 @@ class _CallbackServer:
                 if "code" in params:
                     parent._code  = params["code"]
                     parent._state = params.get("state")
-                    body = parent._HTML_SUCCESS.encode()
+                    body = _callback_page(
+                        "Authorised!",
+                        "You can close this tab and return to Amethyst Mod Manager."
+                    ).encode()
                 else:
                     parent._error = params.get("error", "unknown")
-                    body = parent._HTML_ERROR.encode()
+                    body = _callback_page(
+                        "Authorisation failed",
+                        "Return to the app for details."
+                    ).encode()
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -613,7 +702,7 @@ class NexusOAuthClient:
         })
         auth_url = f"{_AUTHORIZE_URL}?{params}"
         self._on_status("Opening browser — please authorise in Nexus Mods...")
-        app_log(f"OAuth: opening auth URL")
+        app_log("OAuth: opening auth URL")
         open_url(auth_url)
 
         # 3. Wait for callback (5-minute timeout)

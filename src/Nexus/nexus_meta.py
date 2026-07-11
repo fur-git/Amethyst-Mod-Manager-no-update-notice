@@ -47,6 +47,7 @@ class NexusModMeta:
     author: str = ""                   # mod author
     nexus_name: str = ""               # mod name on Nexus (may differ from folder)
     installation_file: str = ""        # original archive filename
+    file_size: int = 0                 # original archive size in bytes
     installed: str = ""                # ISO-8601 timestamp
     nexus_url: str = ""                # full Nexus mod page URL
     description: str = ""              # short summary
@@ -126,6 +127,7 @@ _KEY_MAP: dict[str, str] = {
     "author":            "author",
     "nexusName":         "nexus_name",
     "installationFile":  "installation_file",
+    "fileSize":          "file_size",
     "installed":         "installed",
     "nexusUrl":          "nexus_url",
     "description":       "description",
@@ -149,7 +151,7 @@ _KEY_MAP: dict[str, str] = {
 }
 
 # Attributes that are ints
-_INT_FIELDS = {"mod_id", "file_id", "category_id", "latest_file_id"}
+_INT_FIELDS = {"mod_id", "file_id", "category_id", "latest_file_id", "file_size"}
 
 # Attributes that are bools
 _BOOL_FIELDS = {
@@ -225,6 +227,10 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
             # that build a fresh NexusModMeta to update other fields would
             # otherwise wipe it.
             if attr == "xedit_modified_plugins" and not value:
+                continue
+            # Same for the archive size: stamped once at install time; callers
+            # that build a fresh NexusModMeta must not zero it.
+            if attr == "file_size" and not value:
                 continue
             cp.set(_SECTION, ini_key, str(value).replace("%", "%%"))
 
@@ -327,31 +333,55 @@ def scan_installed_mods(staging_root: Path) -> list[NexusModMeta]:
     return results
 
 
+# (path, mtime) → rootFolder bit, so the per-toggle filemap rebuild doesn't
+# re-parse one meta.ini per enabled mod (~500 INI parses ≈ 0.5 s on a big
+# modlist just to find a couple of flagged mods). A meta edit bumps the mtime
+# and refreshes its entry; entries for removed mods are dropped on rebuild.
+_root_flag_cache: dict[str, tuple[float, bool]] = {}
+
+
 def collect_root_flagged_mods(modlist_path: Path, staging_root: Path,
                               log_fn=None) -> set[str]:
     """Return the set of enabled mods in *modlist_path* whose meta.ini sets
     rootFolder=true. Malformed meta.ini files are logged (if *log_fn* is
-    provided) and skipped."""
+    provided) and skipped. Per-file results are mtime-cached."""
     from Utils.modlist import read_modlist
 
     flagged: set[str] = set()
     if not modlist_path.is_file():
         return flagged
 
+    fresh_cache: dict[str, tuple[float, bool]] = {}
     for entry in read_modlist(modlist_path):
         if entry.is_separator or not entry.enabled:
             continue
         meta_path = staging_root / entry.name / "meta.ini"
-        if not meta_path.is_file():
+        try:
+            mtime = meta_path.stat().st_mtime
+        except OSError:
+            continue   # no meta.ini
+        key = str(meta_path)
+        cached = _root_flag_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            fresh_cache[key] = cached
+            if cached[1]:
+                flagged.add(entry.name)
             continue
         try:
-            if read_meta(meta_path).root_folder:
-                flagged.add(entry.name)
+            is_root = read_meta(meta_path).root_folder
         except Exception as e:
             if log_fn is not None:
                 log_fn(f"  WARN: could not read meta.ini for '{entry.name}': {e}")
             else:
                 app_log(f"collect_root_flagged_mods: meta.ini unreadable for '{entry.name}': {e}")
+            continue
+        fresh_cache[key] = (mtime, is_root)
+        if is_root:
+            flagged.add(entry.name)
+    # Replace (don't merge) so entries for removed/renamed mods don't
+    # accumulate across profile switches.
+    _root_flag_cache.clear()
+    _root_flag_cache.update(fresh_cache)
     return flagged
 
 

@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -19,6 +20,27 @@ from pathlib import Path
 from typing import Callable
 
 from Utils.app_log import safe_log as _safe_log
+
+from Utils.appimage_env import in_appimage, strip_appimage_vars
+
+
+def strip_appimage_env(env: dict) -> dict:
+    """Return *env* with AppImage-injected loader/bundle vars removed.
+
+    No-op outside the AppImage (from-source / flatpak callers keep their env
+    untouched). When bundled, these vars point into the AppImage's FUSE mount;
+    passing them to a Proton subprocess makes it load the bundle's libraries
+    and its blocked LD_LIBRARY_PATH sentinel instead of the host's, breaking
+    Proton's Vulkan GPU probe on startup.
+
+    The var list and strip logic live in :mod:`Utils.appimage_env` — the
+    single source of truth shared with ``xdg.host_env`` and
+    ``smapi_installer.clean_env``.
+    """
+    if not in_appimage():
+        return env
+    return strip_appimage_vars(env)
+
 
 _WINETRICKS_URL = "https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks"
 _CABEXTRACT_URL = "https://archlinux.org/packages/extra/x86_64/cabextract/download/"
@@ -168,35 +190,86 @@ def install_winetricks(log_fn: Callable[[str], None] | None = None) -> bool:
 
 
 def _get_proton_bin() -> str | None:
-    """Return the bin/ path of the newest available Proton installation, or None."""
-    proton_root = Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common"
-    if not proton_root.is_dir():
-        return None
-    candidates = sorted(
-        [p / "files" / "bin" for p in proton_root.iterdir()
-         if p.name.startswith("Proton") and (p / "files" / "bin" / "wine").is_file()],
-        key=lambda p: str(p),
-        reverse=True,
+    """Return the bin/ path of the newest available Proton installation, or None.
+
+    Uses steam_finder's discovery so non-standard layouts (~/.steam/steam,
+    Snap, extra libraries, compatibilitytools.d) all work. Flatpak-Steam
+    Protons are skipped: their wine binaries need the Steam sandbox's runtime
+    libraries and break when run bare (winetricks runs wine directly).
+    """
+    from Utils.steam_finder import (
+        list_installed_proton,
+        _proton_script_in_steam_flatpak,
     )
-    return str(candidates[0]) if candidates else None
+    for script in list_installed_proton():
+        if _proton_script_in_steam_flatpak(script):
+            continue
+        for sub in ("files/bin", "dist/bin"):
+            cand = script.parent / sub
+            if (cand / "wine").is_file():
+                return str(cand)
+    return None
+
+
+def _host_spawn_prefix() -> list[str] | None:
+    """Command prefix to run a program on the host system.
+
+    Returns ``[]`` outside a Flatpak sandbox (run directly), the
+    ``flatpak-spawn --host`` prefix inside one, or None when the host is
+    unreachable (sandboxed without flatpak-spawn / the Flatpak portal).
+    ``--directory=/`` avoids inheriting a sandbox-only cwd on the host.
+    """
+    if not os.path.exists("/.flatpak-info"):
+        return []
+    if shutil.which("flatpak-spawn"):
+        return ["flatpak-spawn", "--host", "--directory=/"]
+    return None
+
+
+def _resolve_protontricks() -> list[str] | None:
+    """Command prefix to invoke protontricks (native or flatpak), or None.
+
+    Inside our own Flatpak sandbox neither ``shutil.which("protontricks")``
+    nor the ``flatpak`` CLI can see the host, so both probes go through
+    ``flatpak-spawn --host`` (flatpak-spawn exits 127 when the host binary
+    is missing, which the ``!= 0`` checks treat as unavailable).
+    """
+    host = _host_spawn_prefix()
+    if host is None:
+        return None
+    if not host:
+        if shutil.which("protontricks") is not None:
+            return ["protontricks"]
+        if shutil.which("flatpak") is not None and subprocess.run(
+            ["flatpak", "info", "com.github.Matoking.protontricks"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            return ["flatpak", "run", "com.github.Matoking.protontricks"]
+        return None
+    if subprocess.run(
+        [*host, "sh", "-c", "command -v protontricks"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0:
+        return [*host, "protontricks"]
+    if subprocess.run(
+        [*host, "flatpak", "info", "com.github.Matoking.protontricks"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0:
+        return [*host, "flatpak", "run", "com.github.Matoking.protontricks"]
+    return None
 
 
 def _get_protontricks_cmd(steam_id: str) -> list[str] | None:
     """Return the protontricks command prefix for *steam_id*, or None if not found."""
-    if shutil.which("protontricks") is not None:
-        return ["protontricks", steam_id]
-    if shutil.which("flatpak") is not None and subprocess.run(
-        ["flatpak", "info", "com.github.Matoking.protontricks"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode == 0:
-        return ["flatpak", "run", "com.github.Matoking.protontricks", steam_id]
-    return None
+    base = _resolve_protontricks()
+    return [*base, steam_id] if base else None
 
 
 def _install_via_winetricks(
     prefix_path: Path,
     component: str,
     log_fn: Callable[[str], None],
+    timeout: int = 300,
 ) -> bool:
     """Install *component* directly via the bundled winetricks using WINEPREFIX."""
     if not _bundled_winetricks().is_file():
@@ -211,7 +284,7 @@ def _install_via_winetricks(
 
     winetricks = str(_bundled_winetricks())
 
-    env = os.environ.copy()
+    env = strip_appimage_env(os.environ.copy())
     env["WINEPREFIX"] = str(prefix_path)
 
     path_prefix = str(_get_tools_dir())
@@ -222,9 +295,11 @@ def _install_via_winetricks(
 
     log_fn(f"Installing {component} via winetricks (this may take a minute) …")
     try:
+        # -q = unattended: suppresses the per-DLL regsvr32 success dialogs
+        # (xact alone pops ~a dozen) and makes verb installers run silent.
         result = subprocess.run(
-            [winetricks, component],
-            capture_output=True, text=True, timeout=300, env=env,
+            [winetricks, "-q", component],
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
         if result.returncode == 0:
             log_fn(f"{component} installed successfully.")
@@ -233,7 +308,7 @@ def _install_via_winetricks(
             log_fn(f"{component} install failed: {result.stderr or result.stdout or 'unknown error'}")
             return False
     except subprocess.TimeoutExpired:
-        log_fn(f"{component} install timed out after 5 minutes.")
+        log_fn(f"{component} install timed out after {timeout // 60} minutes.")
         return False
     except Exception as exc:
         log_fn(f"{component} error: {exc}")
@@ -244,26 +319,84 @@ def _install_via_protontricks(
     steam_id: str,
     component: str,
     log_fn: Callable[[str], None],
+    timeout: int = 300,
 ) -> bool:
     """Install *component* via system protontricks against *steam_id*."""
     cmd = _get_protontricks_cmd(steam_id)
     if cmd is None:
         return False
-    cmd = cmd + [component]
+    # -q = unattended (forwarded to winetricks inside the prefix) — no
+    # regsvr32 popups, silent verb installers.
+    cmd = cmd + ["-q", component]
     log_fn(f"Installing {component} via protontricks (this may take a minute) …")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
             log_fn(f"{component} installed successfully.")
             return True
         log_fn(f"{component} install failed: {result.stderr or result.stdout or 'unknown error'}")
         return False
     except subprocess.TimeoutExpired:
-        log_fn(f"{component} install timed out after 5 minutes.")
+        log_fn(f"{component} install timed out after {timeout // 60} minutes.")
         return False
     except Exception as exc:
         log_fn(f"{component} error: {exc}")
         return False
+
+
+def winetricks_verb_dep_key(verb: str) -> str:
+    """Marker key for a generic winetricks verb (e.g. 'fontsmooth=rgb' → 'wt_fontsmooth_rgb')."""
+    return "wt_" + re.sub(r"\W+", "_", verb).strip("_")
+
+
+def install_winetricks_verb(
+    game,
+    verb: str,
+    log_fn: Callable[[str], None] | None = None,
+    *,
+    timeout: int = 300,
+) -> bool:
+    """Install a generic winetricks *verb* into *game*'s Proton prefix.
+
+    Uses the bundled winetricks with WINEPREFIX first (self-contained — no
+    protontricks needed on the system), falling back to system protontricks
+    against the game's Steam ID when winetricks fails or no prefix path is
+    configured. Success is recorded in the prefix's amethyst_deps.json so
+    repeat calls skip instantly. *timeout* is per attempt — pass a large
+    value for slow verbs like dotnet48.
+    """
+    _log = _safe_log(log_fn)
+    get_prefix = getattr(game, "get_prefix_path", None)
+    prefix = get_prefix() if callable(get_prefix) else None
+    if prefix is not None and not Path(prefix).is_dir():
+        prefix = None
+
+    key = winetricks_verb_dep_key(verb)
+    if prefix is not None and is_dep_installed(Path(prefix), key):
+        _log(f"{verb} already installed in this prefix — skipping.")
+        return True
+
+    def _mark():
+        if prefix is not None:
+            mark_dep_installed(Path(prefix), key)
+
+    if prefix is not None:
+        if _install_via_winetricks(Path(prefix), verb, _log, timeout):
+            _mark()
+            return True
+        _log("Falling back to protontricks …")
+
+    from Utils.steam_finder import game_steam_id
+    steam_id = game_steam_id(game)
+    if steam_id and _get_protontricks_cmd(steam_id) is not None:
+        if _install_via_protontricks(steam_id, verb, _log, timeout):
+            _mark()
+            return True
+        return False
+
+    if prefix is None:
+        _log(f"{verb}: no prefix path or working protontricks available — cannot install.")
+    return False
 
 
 def _download_verified(url: str, sha256: str, log_fn: Callable[[str], None]) -> bytes | None:
@@ -391,7 +524,8 @@ def build_proton_env_for_game(game) -> "tuple[Path, dict] | tuple[None, None]":
     steam_id = game_steam_id(game)
     proton_script = find_proton_for_game(steam_id) if steam_id else None
 
-    from gui.plugin_panel import _read_prefix_runner, _resolve_compat_data
+    from Utils.proton_prefix import read_prefix_runner as _read_prefix_runner, \
+        resolve_compat_data as _resolve_compat_data
     compat_data = _resolve_compat_data(prefix_path)
 
     if proton_script is None:
@@ -410,7 +544,7 @@ def build_proton_env_for_game(game) -> "tuple[Path, dict] | tuple[None, None]":
     if steam_root is None:
         return None, None
 
-    env = os.environ.copy()
+    env = strip_appimage_env(os.environ.copy())
     env["STEAM_COMPAT_DATA_PATH"] = str(compat_data)
     env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
     game_path = game.get_game_path() if hasattr(game, "get_game_path") else None
@@ -451,7 +585,8 @@ def install_vcredist(
         from Utils.steam_finder import proton_run_command
         proc = subprocess.run(
             proton_run_command(proton_script, "run",
-             str(cache_path), "/install", "/quiet", "/norestart"),
+             str(cache_path), "/install", "/quiet", "/norestart",
+             env=env),
             env=env, cwd=cache_path.parent,
         )
         # 0 = success, 1638 = already installed, 3010 = reboot required, 1641 = reboot initiated
@@ -469,11 +604,4 @@ def install_vcredist(
 
 def protontricks_available() -> bool:
     """Return True if protontricks (native or flatpak) is available on this system."""
-    if shutil.which("protontricks") is not None:
-        return True
-    if shutil.which("flatpak") is not None and subprocess.run(
-        ["flatpak", "info", "com.github.Matoking.protontricks"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode == 0:
-        return True
-    return False
+    return _resolve_protontricks() is not None

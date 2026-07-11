@@ -25,37 +25,7 @@ from typing import Callable
 from Utils.app_log import app_log
 
 
-# Env vars the AppImage runtime / sharun / our own launcher inject. These all
-# either point at /tmp/.mount_* (which disappears the moment the AppImage
-# exits) or are otherwise meaningful only inside the AppImage's own python.
-# Carrying them into a child process — especially a long-lived terminal the
-# user might later run `python3` from — turns into "ImportError: cannot
-# import name '_imaging' from 'PIL'" after the mount is gone.
-_APPIMAGE_LEAK_VARS = (
-    "APPDIR", "APPIMAGE", "ARGV0", "ARG0", "OWD", "URUNTIME",
-    "APPIMAGE_ARCH", "APPIMAGE_UUID",
-    "SHARUN_DIR", "SHARUN_WORKING_DIR", "SHARUN_ALLOW_SYS_VKICD",
-    "PYTHONPATH", "PYTHONHOME", "PYTHONDONTWRITEBYTECODE",
-    "MOD_MANAGER_GAMES",  # gui.py auto-points this at $APPDIR/.../Games
-    "GIO_LAUNCH_DESKTOP",
-    "GDK_PIXBUF_MODULEDIR", "GDK_PIXBUF_MODULE_FILE",
-    "GIO_MODULE_DIR",
-    "GSETTINGS_SCHEMA_DIR",
-    "GTK_PATH", "GTK_IM_MODULE_FILE",
-    "QT_PLUGIN_PATH",
-    "TERMINFO", "LIBTHAI_DICTDIR",
-    "PERLLIB", "PERL5LIB",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",
-    "LD_LIBRARY_PATH", "LD_PRELOAD",
-)
-
-
-def _strip_appimage_path_entries(value: str) -> str:
-    """Drop colon-separated entries that point at /tmp/.mount_*."""
-    if not value:
-        return value
-    parts = [p for p in value.split(":") if p and not p.startswith("/tmp/.mount_")]
-    return ":".join(parts)
+from Utils.appimage_env import strip_appimage_vars
 
 
 def host_env() -> dict[str, str]:
@@ -63,26 +33,17 @@ def host_env() -> dict[str, str]:
 
     Inside an AppImage, anylinux.so (LD_PRELOAD'd by quick-sharun) already
     drops some AppDir-pointing vars on execve, but it doesn't know about our
-    custom ones (MOD_MANAGER_GAMES) or about /tmp/.mount_* fragments inside
-    PATH / XDG_DATA_DIRS. So we strip them here too.
+    custom ones (MOD_MANAGER_GAMES, FONTCONFIG_FILE) or about /tmp/.mount_*
+    fragments inside PATH / XDG_DATA_DIRS — and it isn't built at all on some
+    build hosts (ANYLINUX_LIB=0). So we strip in Python too.
 
-    Outside an AppImage this also defends against stale env in shells the
+    Deliberately unconditional (unlike ``protontricks.strip_appimage_env``):
+    outside an AppImage this also defends against stale env in shells the
     user opened *from* a previous AppImage launch — `$PATH` still has
-    `/tmp/.mount_<dead>/bin` in it, etc.
+    `/tmp/.mount_<dead>/bin` in it, etc. The var list lives in
+    :mod:`Utils.appimage_env` (single source of truth).
     """
-    env = os.environ.copy()
-    for k in _APPIMAGE_LEAK_VARS:
-        env.pop(k, None)
-    # Strip /tmp/.mount_* entries from list-style vars rather than unsetting
-    # them outright — they may still hold useful host paths.
-    for k in ("PATH", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS"):
-        if k in env:
-            cleaned = _strip_appimage_path_entries(env[k])
-            if cleaned:
-                env[k] = cleaned
-            else:
-                env.pop(k, None)
-    return env
+    return strip_appimage_vars(os.environ.copy())
 
 
 def _in_flatpak() -> bool:
@@ -119,13 +80,20 @@ def xdg_download_dir() -> Path:
     return home / "Downloads"
 
 
-def _spawn_watched(
+def spawn_watched(
     cmd: list[str],
     label: str,
     log_fn: Callable[[str], None] | None,
     on_fail: Callable[[], None] | None = None,
 ) -> None:
-    """Run *cmd* in the background, log non-zero exits, optionally chain a fallback."""
+    """Run *cmd* in the background, log non-zero exits, optionally chain a fallback.
+
+    Public so other launchers (Utils/exe_launch.launch_via_steam) can reuse the
+    Flatpak-safe CWD handling and exit-code watching instead of calling
+    ``subprocess.Popen`` directly — a bare Popen of ``flatpak-spawn --host …``
+    succeeds even when the *host* command it forwards to is missing or fails,
+    which silently swallows launch errors.
+    """
     # Use a CWD the host definitely has. Inside Flatpak the sandbox CWD
     # (e.g. /app/share/amethyst-mod-manager) doesn't exist on the host, so
     # `flatpak-spawn --host` inherits it and the spawned host process fails
@@ -180,7 +148,7 @@ def xdg_open(path: str | Path, log_fn: Callable[[str], None] | None = None) -> N
         cmd = ["flatpak-spawn", "--host", "xdg-open", target]
     else:
         cmd = ["xdg-open", target]
-    _spawn_watched(cmd, f"xdg-open {target!r}", log_fn)
+    spawn_watched(cmd, f"xdg-open {target!r}", log_fn)
 
 
 def open_url(url: str, log_fn: Callable[[str], None] | None = None) -> None:
@@ -194,19 +162,19 @@ def open_url(url: str, log_fn: Callable[[str], None] | None = None) -> None:
     Each step's failure is logged and triggers the next.
     """
     if not _in_flatpak():
-        _spawn_watched(["xdg-open", url], f"xdg-open {url!r}", log_fn)
+        spawn_watched(["xdg-open", url], f"xdg-open {url!r}", log_fn)
         return
 
     def try_gio() -> None:
         if shutil.which("gio"):
-            _spawn_watched(["gio", "open", url], f"gio open {url!r}", log_fn,
+            spawn_watched(["gio", "open", url], f"gio open {url!r}", log_fn,
                            on_fail=try_xdg)
         else:
             try_xdg()
 
     def try_xdg() -> None:
         if shutil.which("xdg-open"):
-            _spawn_watched(["xdg-open", url], f"xdg-open {url!r}", log_fn)
+            spawn_watched(["xdg-open", url], f"xdg-open {url!r}", log_fn)
         else:
             msg = f"open_url: no working launcher for {url!r}"
             app_log(msg)
@@ -214,7 +182,7 @@ def open_url(url: str, log_fn: Callable[[str], None] | None = None) -> None:
                 log_fn(msg)
 
     if shutil.which("flatpak-spawn"):
-        _spawn_watched(
+        spawn_watched(
             ["flatpak-spawn", "--host", "xdg-open", url],
             f"flatpak-spawn xdg-open {url!r}",
             log_fn,
