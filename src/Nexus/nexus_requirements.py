@@ -190,6 +190,15 @@ def _alternative_satisfied_for_game(
     return False
 
 
+def _merge_reqs(
+    mod_level: list[NexusModRequirement],
+    file_level: list[NexusModRequirement],
+) -> list[NexusModRequirement]:
+    """Merge file-level missing requirements into mod-level ones (dedupe by mod_id)."""
+    seen = {r.mod_id for r in mod_level}
+    return mod_level + [r for r in file_level if r.mod_id not in seen]
+
+
 def check_missing_requirements(
     api: NexusAPI,
     staging_root: Path,
@@ -260,6 +269,13 @@ def check_missing_requirements(
 
     _log(f"Checking requirements for {len(by_mod_id)} Nexus mod(s)...")
 
+    # File-level requirements (v3 API) for all checkable mods, in one batch.
+    # {} on kill switch or any v3 failure — mod-level results are unaffected.
+    from Nexus.nexus_file_requirements import compute_file_level_missing
+    file_missing = compute_file_level_missing(
+        api, checkable, installed_mod_ids, game_domain,
+        external_set, alternatives_dict, log=_log)
+
     results: list[MissingRequirementInfo] = []
     checked = 0
     total = len(by_mod_id)
@@ -274,16 +290,6 @@ def check_missing_requirements(
         except Exception as exc:
             _log(f"  [{checked}/{total}] {representative.mod_name}: "
                  f"could not fetch requirements ({exc})")
-            continue
-
-        if not reqs:
-            # No requirements listed — clear any stale flag
-            if save_results:
-                for meta in metas:
-                    if meta.missing_requirements:
-                        meta.missing_requirements = ""
-                        meta_path = staging_root / meta.mod_name / "meta.ini"
-                        write_meta(meta_path, meta)
             continue
 
         # 4. Filter to Nexus-hosted requirements whose mod_id is not installed
@@ -302,6 +308,9 @@ def check_missing_requirements(
                 continue
             if req.mod_id not in installed_mod_ids:
                 missing.append(req)
+
+        # Merge in file-level (v3) missing requirements for this mod
+        missing = _merge_reqs(missing, file_missing.get(mod_id, []))
 
         # 5. Record results for each local mod entry under this mod_id
         for meta in metas:
@@ -345,14 +354,17 @@ def check_requirements_from_gql(
     progress_cb: Optional[ProgressCallback] = None,
     save_results: bool = True,
     enabled_only: Optional[set] = None,
+    api: Optional[NexusAPI] = None,
 ) -> list[MissingRequirementInfo]:
     """
     Check for missing requirements using pre-fetched GraphQL data.
 
-    Unlike ``check_missing_requirements``, this function makes no API calls —
-    it reads requirements from *gql_info* which was already retrieved by the
-    update checker's batch GraphQL call.  Both checks therefore share a single
-    set of GraphQL requests.
+    Unlike ``check_missing_requirements``, this function reads mod-level
+    requirements from *gql_info* which was already retrieved by the update
+    checker's batch GraphQL call, so both checks share a single set of
+    GraphQL requests.  When *api* is provided, file-level requirements are
+    additionally fetched from the v3 API (one or two batched calls) and
+    merged in.
 
     Parameters
     ----------
@@ -377,6 +389,10 @@ def check_requirements_from_gql(
         When provided, only mods whose folder name is in this set are
         checked.  All installed mod IDs are still used for dependency
         resolution regardless of this filter.
+    api :
+        Optional authenticated API client.  When provided, file-level
+        requirements (Nexus v3 API) are checked and merged with the
+        mod-level ones; when None, only mod-level requirements are checked.
 
     Returns
     -------
@@ -402,6 +418,17 @@ def check_requirements_from_gql(
     for meta in checkable:
         by_mod_id.setdefault(meta.mod_id, []).append(meta)
 
+    # File-level requirements (v3 API) for all checkable mods, in one batch.
+    # We fetch ALL of them (installed or not) so the View Requirements full list
+    # can show installed file-level deps too, then derive the *missing* subset
+    # locally — one batch of API calls instead of two. Only runs when the caller
+    # provides an API client; {} on kill switch or any v3 failure — mod-level
+    # results are unaffected.
+    file_all: dict[int, list[NexusModRequirement]] = {}
+    if api is not None:
+        from Nexus.nexus_file_requirements import compute_file_level_all
+        file_all = compute_file_level_all(api, checkable, game_domain, log=_log)
+
     results: list[MissingRequirementInfo] = []
 
     for mod_id, metas in by_mod_id.items():
@@ -410,15 +437,8 @@ def check_requirements_from_gql(
             # Not returned by GraphQL (hidden/deleted mod) — leave flags unchanged
             continue
 
-        reqs = info.requirements  # list[NexusModRequirement]
-
-        if not reqs:
-            if save_results:
-                for meta in metas:
-                    if meta.missing_requirements:
-                        meta.missing_requirements = ""
-                        write_meta(staging_root / meta.mod_name / "meta.ini", meta)
-            continue
+        # Full requirement pool: mod-level (GraphQL) + file-level (v3), deduped.
+        reqs = _merge_reqs(list(info.requirements), file_all.get(mod_id, []))
 
         missing: list[NexusModRequirement] = []
         for req in reqs:
@@ -433,6 +453,14 @@ def check_requirements_from_gql(
             if req.mod_id not in installed_mod_ids:
                 missing.append(req)
 
+        # Full requirements list (installed or not) — powers View Requirements.
+        # ';' in names would corrupt the pair format, swap for ','.
+        full_str = ";".join(
+            f"{max(r.mod_id, 0)}:{(r.mod_name or '').replace(';', ',')}"
+            for r in reqs
+        )
+        missing_str = ";".join(f"{r.mod_id}:{r.mod_name}" for r in missing)
+
         for meta in metas:
             if missing:
                 info_result = MissingRequirementInfo(
@@ -444,15 +472,11 @@ def check_requirements_from_gql(
                 names = ", ".join(r.mod_name for r in missing[:3])
                 suffix = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
                 _log(f"  ⚠ {meta.mod_name}: missing {names}{suffix}")
-                if save_results:
-                    meta.missing_requirements = ";".join(
-                        f"{r.mod_id}:{r.mod_name}" for r in missing
-                    )
-                    write_meta(staging_root / meta.mod_name / "meta.ini", meta)
-            else:
-                if save_results and meta.missing_requirements:
-                    meta.missing_requirements = ""
-                    write_meta(staging_root / meta.mod_name / "meta.ini", meta)
+            if save_results and (meta.missing_requirements != missing_str
+                                 or meta.nexus_requirements != full_str):
+                meta.missing_requirements = missing_str
+                meta.nexus_requirements = full_str
+                write_meta(staging_root / meta.mod_name / "meta.ini", meta)
 
     _log(f"Requirements check complete: {len(results)} mod(s) with missing dependencies.")
     return results

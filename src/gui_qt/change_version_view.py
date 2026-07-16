@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QT_TRANSLATE_NOOP
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
@@ -37,7 +37,14 @@ def _hl_colors(p: dict | None = None) -> dict[str, QColor]:
     }
 
 
-_COLS = ["File", "Version", "Category", "Size", ""]
+# Translated at display time (setHorizontalHeaderLabels); register for lupdate.
+_COLS = [
+    QT_TRANSLATE_NOOP("ChangeVersionView", "File"),
+    QT_TRANSLATE_NOOP("ChangeVersionView", "Version"),
+    QT_TRANSLATE_NOOP("ChangeVersionView", "Category"),
+    QT_TRANSLATE_NOOP("ChangeVersionView", "Size"),
+    "",
+]
 
 
 class _LegendBar(QWidget):
@@ -122,9 +129,15 @@ class ChangeVersionView(QWidget):
     _files_ready = Signal(object, object)
     # (archive | None, meta | None) from the download worker → UI thread.
     _download_done = Signal(object, object)
+    # (file, is_premium) from the premium-check worker → UI thread.
+    _premium_checked = Signal(object, object)
+    # Browser-download watch progress (bytes; 64-bit: >2GB files).
+    _watch_progress = Signal("qlonglong", "qlonglong")
+    # Premium API-download progress → shared popup card (key, name, done, total).
+    _api_progress = Signal(str, str, "qlonglong", "qlonglong")
 
     def __init__(self, api, game, mod_name, meta, install_fn,
-                 on_close, log_fn=None):
+                 on_close, log_fn=None, progress_fn=None):
         super().__init__()
         self._api = api
         self._game = game
@@ -133,11 +146,39 @@ class ChangeVersionView(QWidget):
         self._install_fn = install_fn or (lambda paths, metas=None: None)
         self._on_close = on_close or (lambda: None)
         self._log = log_fn or (lambda _m: None)
+        # progress_fn(key, name, downloaded, total) drives the shared "Nexus
+        # Download" popup card (same one the Nexus browser uses); total<0 marks
+        # this key finished. Defaults to a no-op if the host didn't supply one.
+        self._progress_fn = progress_fn or (lambda key, name, d, t: None)
+        self._dl_key = None    # popup card key while a manual watch is armed
         self._installing = False
+        # (file_id, watcher, install_btn) while a non-premium install waits
+        # for a browser download; the row's Install button shows Cancel.
+        self._manual_watch = None
+        self._pending_btn = None    # button of the install being prepped
+        # The destroyed hook must not touch self (C++ side is gone by then) —
+        # it captures these holders directly. _key_holder["k"] tracks the live
+        # popup-card key so a mid-watch tab close still clears the card.
+        self._watch_holder: dict = {}
+        self._key_holder: dict = {}
+
+        def _stop_watch(*_, h=self._watch_holder, kh=self._key_holder,
+                        pf=self._progress_fn):
+            for w in list(h.values()):
+                w.stop()
+            h.clear()
+            k = kh.pop("k", None)
+            if k is not None:
+                pf(k, "", 0, -1)
+        self.destroyed.connect(_stop_watch)
 
         self.setObjectName("ChangeVersionView")
         self._files_ready.connect(self._on_files_ready)
         self._download_done.connect(self._on_download_done)
+        self._premium_checked.connect(self._on_premium_checked)
+        self._watch_progress.connect(self._on_watch_progress)
+        self._api_progress.connect(
+            lambda k, n, d, t: self._progress_fn(k, n, int(d), int(t)))
 
         self._build()
         self._start_fetch()
@@ -175,7 +216,8 @@ class ChangeVersionView(QWidget):
 
         # File table.
         self._table = QTableWidget(0, len(_COLS))
-        self._table.setHorizontalHeaderLabels(_COLS)
+        self._table.setHorizontalHeaderLabels(
+            [self.tr(c) if c else "" for c in _COLS])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.NoSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -273,7 +315,7 @@ class ChangeVersionView(QWidget):
             # can't bleed into the button background.
             inst_btn.setStyleSheet(button_qss("BTN_SUCCESS", padding="4px 10px"))
             inst_btn.clicked.connect(
-                lambda _=False, ff=f: self._install_file(ff))
+                lambda _=False, ff=f, b=inst_btn: self._install_file(ff, b))
             cb.addWidget(inst_btn)
             cb.addStretch(1)
             self._table.setCellWidget(row, 4, cell)
@@ -309,22 +351,75 @@ class ChangeVersionView(QWidget):
         except Exception as exc:
             self._log(f"Nexus: could not save ignore flag — {exc}")
 
-    def _install_file(self, f):
+    def _domain_and_mod_id(self):
+        domain = getattr(self._game, "nexus_game_domain", "") or \
+            getattr(self._meta, "game_domain", "") or ""
+        return domain, int(getattr(self._meta, "mod_id", 0) or 0)
+
+    def _info_stub(self, domain, mod_id):
+        """A minimal mod_info-like fallback (used only if the API lookup
+        fails). Real installs pass a full NexusModInfo so author / uploader /
+        summary / category land in meta.ini — fetch the same here."""
+        class _Info:
+            pass
+        stub = _Info()
+        stub.mod_id = mod_id
+        stub.domain_name = domain
+        stub.name = getattr(self._meta, "nexus_name", "") or self._mod_name
+        return stub
+
+    def _install_file(self, f, btn=None):
+        if self._manual_watch is not None:
+            # Waiting for a browser download — any Install click stops that
+            # watch; the watched row's own button (showing Cancel) just stops.
+            watched_fid = self._manual_watch[0]
+            self.cancel_manual_watch()
+            if watched_fid == f.file_id:
+                return
         if self._installing:
             return
         self._installing = True
-        domain = getattr(self._game, "nexus_game_domain", "") or \
-            getattr(self._meta, "game_domain", "") or ""
-        mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
-        self._log(f"Nexus: downloading {f.file_name or f.name}…")
+        self._pending_btn = btn
 
-        # A minimal mod_info-like object for build_meta_from_download.
-        class _Info:
-            pass
-        info = _Info()
-        info.mod_id = mod_id
-        info.domain_name = domain
-        info.name = getattr(self._meta, "nexus_name", "") or self._mod_name
+        # Premium gate ([dev] force_manual_install honoured — same switch as
+        # the browser/collections): free accounts can't use the download API,
+        # so they get the browser-download watch flow instead.
+        def check():
+            premium = False
+            try:
+                premium = bool(self._api.validate().is_premium)
+                if premium:
+                    from Utils.ui_config import load_force_manual_install
+                    if load_force_manual_install():
+                        self._log("Nexus: [dev] force_manual_install — using "
+                                  "the manual browser-download flow.")
+                        premium = False
+            except Exception as exc:
+                self._log(f"Nexus: premium check failed ({exc}) — using the "
+                          "manual browser-download flow.")
+            safe_emit(self._premium_checked, f, premium)
+
+        threading.Thread(target=check, daemon=True,
+                         name="change-version-premium").start()
+
+    def _on_premium_checked(self, f, is_premium):
+        btn, self._pending_btn = self._pending_btn, None
+        if is_premium:
+            self._start_api_download(f)
+        else:
+            self._start_manual_flow(f, btn)
+
+    def _start_api_download(self, f):
+        domain, mod_id = self._domain_and_mod_id()
+        dl_label = f.file_name or f.name or self._mod_name
+        self._log(f"Nexus: downloading {dl_label}…")
+        stub = self._info_stub(domain, mod_id)
+        # Shared "Nexus Download" popup card (parity with the browser tab);
+        # cleared in _on_download_done. Indeterminate until first progress_cb.
+        self._dl_key = f"chv-api-{mod_id}-{f.file_id}"
+        self._key_holder["k"] = self._dl_key
+        dl_key = self._dl_key
+        self._progress_fn(dl_key, dl_label, 0, 0)
 
         def worker():
             archive = meta = None
@@ -338,9 +433,25 @@ class ChangeVersionView(QWidget):
                 result = NexusDownloader(self._api, download_dir=dest).download_file(
                     game_domain=domain, mod_id=mod_id, file_id=f.file_id,
                     dest_dir=dest, known_file_name=f.file_name,
-                    expected_size_bytes=size, progress_cb=lambda d, t: None)
+                    expected_size_bytes=size,
+                    progress_cb=lambda d, t: safe_emit(
+                        self._api_progress, dl_key, dl_label, int(d), int(t)))
                 if result.success and result.file_path is not None:
                     archive = str(result.file_path)
+                    # Fetch full mod info (author, uploader, summary, category)
+                    # so the change-version install stamps the same metadata as
+                    # a fresh install or reinstall. Use GraphQL (like the NXM /
+                    # browser path) so this costs NO REST rate-limit call — the
+                    # download itself already spends the one allowed call. Fall
+                    # back to the stub only if the lookup fails.
+                    info = stub
+                    try:
+                        fetched, _ = self._api.get_mod_and_file_info_graphql(
+                            domain, mod_id, f.file_id)
+                        if fetched is not None:
+                            info = fetched
+                    except Exception:
+                        pass
                     try:
                         meta = build_meta_from_download(
                             game_domain=domain, mod_id=mod_id, file_id=f.file_id,
@@ -356,8 +467,94 @@ class ChangeVersionView(QWidget):
 
         threading.Thread(target=worker, daemon=True, name="change-version-dl").start()
 
+    # ---- non-premium: file's download page + folder watch ------------------
+    def _start_manual_flow(self, f, btn):
+        """Non-premium install via the shared start_manual_install flow (skip
+        the browser when the archive is already downloaded, else open the
+        file's own download page + watch the download folders). *btn* becomes
+        a red Cancel while waiting."""
+        from Nexus.manual_download_watch import start_manual_install
+        self._installing = False
+        domain, mod_id = self._domain_and_mod_id()
+        fname = f.file_name or f.name or ""
+        # Drive the shared "Nexus Download" popup card (parity with the browser
+        # tab) — indeterminate until the watcher can see the in-flight download.
+        self._dl_key = f"chv-man-{mod_id}-{f.file_id}"
+        self._key_holder["k"] = self._dl_key
+        self._progress_fn(self._dl_key, fname, 0, 0)
+
+        # Callbacks run on the WATCHER thread — marshal via Signals.
+        def on_archive(path, meta, _file):
+            safe_emit(self._download_done, str(path), meta)
+
+        def on_progress(done, total):
+            safe_emit(self._watch_progress, int(done), int(total))
+
+        def on_timeout():
+            self._log(f"Nexus: stopped waiting for a browser download of "
+                      f"'{fname}' (nothing arrived).")
+            safe_emit(self._download_done, None, None)
+
+        watcher, already_downloaded = start_manual_install(
+            api=self._api, game_domain=domain, mod_id=mod_id, files=[f],
+            open_url_fn=self._open_url, log_fn=self._log, log_label=fname,
+            mod_info_fallback=self._info_stub(domain, mod_id),
+            on_archive=on_archive, on_progress=on_progress,
+            on_timeout=on_timeout)
+        if not already_downloaded:
+            self._status.setText(self.tr(
+                "Waiting for the browser download of '{0}' — click Cancel to "
+                "stop.").format(fname))
+            self._status.setVisible(True)
+            if btn is not None:
+                btn.setText(self.tr("Cancel"))
+                btn.setStyleSheet(button_qss("BTN_DANGER", padding="4px 10px"))
+        self._manual_watch = (f.file_id, watcher, btn)
+        self._watch_holder["w"] = watcher
+
+    def _on_watch_progress(self, done, total):
+        from Utils.cache_tools import format_size
+        self._status.setText(self.tr(
+            "Waiting for the browser download — {0} / {1}").format(
+            format_size(done), format_size(total)))
+        # Feed real bytes into the shared popup card (was indeterminate).
+        if self._dl_key is not None:
+            self._progress_fn(self._dl_key, self._mod_name, int(done), int(total))
+
+    def _end_manual_watch(self):
+        """Stop the watcher (if any) and restore the row button + status."""
+        # Clear this download's popup card (total<0 = finished/cancelled).
+        if self._dl_key is not None:
+            self._progress_fn(self._dl_key, "", 0, -1)
+            self._dl_key = None
+            self._key_holder.pop("k", None)
+        t, self._manual_watch = self._manual_watch, None
+        self._watch_holder.clear()
+        if t is None:
+            return
+        _fid, watcher, btn = t
+        watcher.stop()
+        if btn is not None:
+            btn.setText(self.tr("Install"))
+            btn.setStyleSheet(button_qss("BTN_SUCCESS", padding="4px 10px"))
+        self._status.setVisible(False)
+
+    def cancel_manual_watch(self, mod_id=None):
+        """Stop the pending browser-download watch: the Install-click toggle,
+        or the app when an nxm:// download for this mod arrives ('Download
+        with Mod Manager' — the nxm flow installs it, so the watch must not)."""
+        if self._manual_watch is None:
+            return
+        if mod_id is not None and \
+                int(mod_id) != int(getattr(self._meta, "mod_id", 0) or 0):
+            return
+        self._end_manual_watch()
+        self._log("Nexus: cancelled download detection.")
+
     def _on_download_done(self, archive, meta):
         self._installing = False
+        # Clears the popup card + (for the manual path) restores the row button.
+        self._end_manual_watch()
         if not archive:
             return
         self._log(f"Nexus: downloaded → {archive}; installing…")

@@ -68,6 +68,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     bain               -> set of mod names installed via BAIN (meta.is_bain)
     missing_reqs       -> set of mod names with un-ignored missing requirements
     descriptions[name] -> Nexus summary text for the name-column hover tooltip
+    authors[name]      -> Nexus uploader username (Author column, "" if none)
 
     *ignored_reqs* — requirement names the user has dismissed (per-profile); a
     mod is only flagged if it still has missing requirements outside this set.
@@ -83,6 +84,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     bain: set[str] = set()
     missing_reqs: set[str] = set()
     descriptions: dict[str, str] = {}
+    authors: dict[str, str] = {}
     # Requirement resolution is a two-pass job (Tk parity): collect every
     # installed Nexus mod_id first, then flag a mod only for requirement ids
     # that aren't present. Keyed on id, not name, so locally-seeded id-only
@@ -94,7 +96,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
         from Nexus.nexus_meta import read_meta
     except Exception:
         return (versions, installed, flags, categories, updates, fomod, bain,
-                missing_reqs, descriptions)
+                missing_reqs, descriptions, authors)
 
     # Per-profile user notes (Note flag) — one read for the whole list.
     notes: dict[str, str] = {}
@@ -136,6 +138,10 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
         if desc:
             descriptions[e.name] = desc
 
+        uploader = (getattr(meta, "uploaded_by", "") or "").strip()
+        if uploader:
+            authors[e.name] = uploader
+
         if getattr(meta, "is_fomod", False):
             fomod.add(e.name)
         if getattr(meta, "is_bain", False):
@@ -157,6 +163,13 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
             installed_ids.add(int(meta.mod_id))
         if getattr(meta, "missing_requirements", "") and e.name not in ignored_reqs:
             pairs = _parse_missing_req_pairs(meta.missing_requirements)
+            # Per-requirement ignores (meta.ini ignoredRequirements): those ids
+            # never raise the ⚠ flag, but stay in missing_requirements so the
+            # Missing Requirements panel still lists them (un-ignorable there).
+            ign_ids = {mid for mid, _ in _parse_missing_req_pairs(
+                getattr(meta, "ignored_requirements", "") or "")}
+            if ign_ids:
+                pairs = [pr for pr in pairs if pr[0] not in ign_ids]
             if pairs:
                 raw_missing_pairs[e.name] = pairs
         # Collection-install provenance (stamped in meta.ini at install time).
@@ -202,7 +215,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
             flags[name] = flags.get(name, 0) | FLAG_MISSING_REQS
 
     return (versions, installed, flags, categories, updates, fomod, bain,
-            missing_reqs, descriptions)
+            missing_reqs, descriptions, authors)
 
 
 # ---- mod folder sizes (Size column) — ported from gui/modlist_panel.py --------

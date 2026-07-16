@@ -10,7 +10,7 @@ Colours come from the active palette so themes carry over.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QRect, QSize, QEvent
+from PySide6.QtCore import Qt, QRect, QSize, QEvent, QT_TRANSLATE_NOOP
 from PySide6.QtGui import QColor, QFont, QPen, QBrush
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QToolTip
 
@@ -57,21 +57,40 @@ _ROOT_FLAGS = (FLAG_ROOT, FLAG_ROOT_RULE)
 # Flag bit → hover tooltip text (verbatim from the Tk modlist, ~5114). The two
 # root sources have DISTINCT text (meta root_folder vs a custom routing rule);
 # the note/xedit/missing tips are per-mod dynamic (see _flag_tip in the delegate).
+# Wrapped in self.tr() at show time (see _flag_tip); registered here for lupdate.
 _FLAG_TIPS = {
-    FLAG_NOTE: "Note",
-    FLAG_BUNDLE: "Click here to open bundle settings",
-    FLAG_MISSING_REQS: "Missing requirements",
-    FLAG_UPDATE: "Update available on Nexus Mods",
-    FLAG_MODIO_UPDATE: "Update available on mod.io",
-    FLAG_ENDORSED: "Endorsed",
-    FLAG_PRERTX: "Pre-RTX mod",
-    FLAG_COLLECTION_BUNDLED: "This mod is a collection bundled mod",
-    FLAG_COLLECTION_PATCHED: "This mod has diff patches applied by the collection install",
-    FLAG_MODIFIED_MF: "Modified in Mod Files tab",
-    FLAG_XEDIT: "Contains a plugin modified in xEdit",
-    FLAG_ROOT: "This mod is sent to the root folder",
-    FLAG_ROOT_RULE: "This mod contains files that route to the game root",
+    FLAG_NOTE: QT_TRANSLATE_NOOP("ModRowDelegate", "Note"),
+    FLAG_BUNDLE: QT_TRANSLATE_NOOP("ModRowDelegate", "Click here to open bundle settings"),
+    FLAG_MISSING_REQS: QT_TRANSLATE_NOOP("ModRowDelegate", "Missing requirements"),
+    FLAG_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on Nexus Mods"),
+    FLAG_MODIO_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on mod.io"),
+    FLAG_ENDORSED: QT_TRANSLATE_NOOP("ModRowDelegate", "Endorsed"),
+    FLAG_PRERTX: QT_TRANSLATE_NOOP("ModRowDelegate", "Pre-RTX mod"),
+    FLAG_COLLECTION_BUNDLED: QT_TRANSLATE_NOOP("ModRowDelegate", "This mod is a collection bundled mod"),
+    FLAG_COLLECTION_PATCHED: QT_TRANSLATE_NOOP("ModRowDelegate", "This mod has diff patches applied by the collection install"),
+    FLAG_MODIFIED_MF: QT_TRANSLATE_NOOP("ModRowDelegate", "Modified in Mod Files tab"),
+    FLAG_XEDIT: QT_TRANSLATE_NOOP("ModRowDelegate", "Contains a plugin modified in xEdit"),
+    FLAG_ROOT: QT_TRANSLATE_NOOP("ModRowDelegate", "This mod is sent to the root folder"),
+    FLAG_ROOT_RULE: QT_TRANSLATE_NOOP("ModRowDelegate", "This mod contains files that route to the game root"),
 }
+
+
+def _note_to_tooltip_html(note: str) -> str:
+    """Render a Markdown note as HTML for a rich-text tooltip.
+
+    Qt's QToolTip auto-detects rich text, so returning HTML makes headings,
+    bold/italic, lists and links render. QTextDocument.setMarkdown does the
+    conversion with no external dependency (GitHub dialect → tables, strikethrough,
+    task lists). Falls back to the plain (HTML-escaped) text if anything goes
+    wrong."""
+    try:
+        from PySide6.QtGui import QTextDocument
+        doc = QTextDocument()
+        doc.setMarkdown(note, QTextDocument.MarkdownDialectGitHub)
+        return doc.toHtml()
+    except Exception:
+        import html
+        return f'<div style="white-space:pre-wrap;">{html.escape(note)}</div>'
 
 # Conflict code → icon (lightning), painted in the Conflicts column (Tk parity).
 _CONFLICT_ICONS = {
@@ -92,15 +111,15 @@ _BSA_CONFLICT_ICONS = {
 # and BSA conflicts each get their own text; static so lupdate can extract them
 # (wrapped in self.tr() at show time — see _conflict_tip).
 _LOOSE_CONFLICT_TIPS = {
-    1:  "Loose file conflict - Winning",
-    -1: "Loose file conflict - Losing",
-    2:  "Loose file conflict - Partial",
-    3:  "Loose file conflict - Full",
+    1:  QT_TRANSLATE_NOOP("ModRowDelegate", "Loose file conflict - Winning"),
+    -1: QT_TRANSLATE_NOOP("ModRowDelegate", "Loose file conflict - Losing"),
+    2:  QT_TRANSLATE_NOOP("ModRowDelegate", "Loose file conflict - Partial"),
+    3:  QT_TRANSLATE_NOOP("ModRowDelegate", "Loose file conflict - Full"),
 }
 _BSA_CONFLICT_TIPS = {
-    1:  "BSA conflict - Winning",
-    -1: "BSA conflict - Losing",
-    2:  "BSA conflict - Partial",
+    1:  QT_TRANSLATE_NOOP("ModRowDelegate", "Archive conflict - Winning"),
+    -1: QT_TRANSLATE_NOOP("ModRowDelegate", "Archive conflict - Losing"),
+    2:  QT_TRANSLATE_NOOP("ModRowDelegate", "Archive conflict - Partial"),
 }
 
 def _contrasting_text_color(hex_bg: str) -> str:
@@ -154,6 +173,8 @@ class ModRowDelegate(QStyledItemDelegate):
         self.c_hl_higher = qc(p, "CONFLICT_HL_WIN")    # selection beats this mod (green)
         self.c_hl_lower = qc(p, "CONFLICT_HL_LOSE")    # this mod beats selection (red)
         self.c_hl_anchor = qc(p, "CONFLICT_HL_ANCHOR") # plugin-selected mod (orange)
+        self.c_hl_requires = qc(p, "REQ_HL_REQUIRES")        # selection requires this mod (purple)
+        self.c_hl_required_by = qc(p, "REQ_HL_REQUIRED_BY")  # this mod requires selection (blue)
         self.c_root_text = qc(p, "ROOT_SEP_FG")
         self.c_overwrite_text = qc(p, "OVERWRITE_SEP_FG")
         # Shared row/label fonts — paint() runs per visible cell, so build
@@ -205,6 +226,10 @@ class ModRowDelegate(QStyledItemDelegate):
                 p.fillRect(r, self.c_sel)
             elif sep_hl == 2:
                 p.fillRect(r, self.c_hl_anchor)
+            elif sep_hl == 3:
+                p.fillRect(r, self.c_hl_requires)
+            elif sep_hl == -3:
+                p.fillRect(r, self.c_hl_required_by)
             elif sep_hl == 1:
                 p.fillRect(r, self.c_hl_higher)
             elif sep_hl == -1:
@@ -232,6 +257,10 @@ class ModRowDelegate(QStyledItemDelegate):
             p.fillRect(r, self.c_sel)
         elif hl == 2:
             p.fillRect(r, self.c_hl_anchor); highlighted = True
+        elif hl == 3:
+            p.fillRect(r, self.c_hl_requires); highlighted = True
+        elif hl == -3:
+            p.fillRect(r, self.c_hl_required_by); highlighted = True
         elif hl == 1:
             p.fillRect(r, self.c_hl_higher); highlighted = True
         elif hl == -1:
@@ -514,17 +543,21 @@ class ModRowDelegate(QStyledItemDelegate):
 
     def _flag_tip(self, hit, index):
         """Tooltip for the hovered flag *hit*. The Note flag shows the actual
-        note text (Tk parity); everything else uses the static _FLAG_TIPS."""
+        note text rendered from Markdown (Tk parity + rich text); everything
+        else uses the static _FLAG_TIPS."""
         if hit == FLAG_NOTE:
             try:
                 model = index.model()
                 name = index.data(EntryRole).name
                 note = model.note_for(name) if hasattr(model, "note_for") else ""
                 if note:
-                    return note if len(note) <= 500 else note[:500] + "…"
+                    if len(note) > 500:
+                        note = note[:500].rstrip() + "…"
+                    return _note_to_tooltip_html(note)
             except Exception:
                 pass
-        return _FLAG_TIPS.get(hit)
+        tip = _FLAG_TIPS.get(hit)
+        return self.tr(tip) if tip else None
 
     def helpEvent(self, event, view, opt, index):
         """Show the per-flag tooltip when hovering a flag icon (Tk parity —

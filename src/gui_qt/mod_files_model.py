@@ -13,12 +13,18 @@ algorithms live in Utils.mod_files. The view drives saves on checkbox clicks.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex
+from PySide6.QtCore import (
+    Qt, QAbstractItemModel, QModelIndex, QT_TRANSLATE_NOOP)
 
 COL_NAME = 0
 COL_TOPLEVEL = 1
 COL_DISABLE = 2
-COLUMNS = ["File name", "Top Level", "Disable"]
+# Translated at display time in headerData; register literals for lupdate.
+COLUMNS = [
+    QT_TRANSLATE_NOOP("ModFilesModel", "File name"),
+    QT_TRANSLATE_NOOP("ModFilesModel", "Top Level"),
+    QT_TRANSLATE_NOOP("ModFilesModel", "Disable"),
+]
 
 # Custom roles.
 NodeRole = Qt.UserRole + 1       # the _Node
@@ -28,7 +34,7 @@ ConflictRole = Qt.UserRole + 2   # 0 none, 1 win (green), -1 lose (red)
 class _Node:
     __slots__ = ("name", "path", "rel_key", "rel_str", "is_dir", "children",
                  "parent", "checked", "conflict", "top_level", "synthetic",
-                 "stripped")
+                 "stripped", "meta")
 
     def __init__(self, name, path, *, is_dir, parent=None,
                  rel_key=None, rel_str=None):
@@ -44,6 +50,7 @@ class _Node:
         self.top_level = False      # Top Level column checked
         self.synthetic = False      # greyed strip placeholder
         self.stripped = False       # this path is itself stripped (greyed)
+        self.meta = False           # the mod's meta.ini row (view/edit only)
 
     def row(self) -> int:
         if self.parent is None:
@@ -108,14 +115,18 @@ class ModFilesModel(QAbstractItemModel):
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
-            return COLUMNS[section]
+            return self.tr(COLUMNS[section])
         return None
 
     def flags(self, index):
         if not index.isValid():
             return Qt.NoItemFlags
         f = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        if index.column() in (COL_TOPLEVEL, COL_DISABLE):
+        node: _Node = index.internalPointer()
+        # The meta.ini row is view/edit-only — it deploys nothing, so no
+        # Top Level / Disable checkboxes.
+        if not getattr(node, "meta", False) and \
+                index.column() in (COL_TOPLEVEL, COL_DISABLE):
             f |= Qt.ItemIsUserCheckable
         return f
 
@@ -133,7 +144,7 @@ class ModFilesModel(QAbstractItemModel):
         if role == Qt.DisplayRole and col == COL_NAME:
             return node.name
 
-        if role == Qt.CheckStateRole:
+        if role == Qt.CheckStateRole and not node.meta:
             if col == COL_TOPLEVEL:
                 return Qt.Checked if node.top_level else Qt.Unchecked
             if col == COL_DISABLE:

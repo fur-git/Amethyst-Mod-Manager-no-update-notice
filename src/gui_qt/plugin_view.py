@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import textwrap
 
-from PySide6.QtCore import Qt, QRect, QSize, QEvent, QTimer, QCoreApplication
+from PySide6.QtCore import (
+    Qt, QRect, QSize, QEvent, QTimer, QCoreApplication, QT_TRANSLATE_NOOP)
 from PySide6.QtGui import QColor, QFont, QPen, QBrush, QPainter, QAction
 from PySide6.QtWidgets import (
     QTreeView, QStyledItemDelegate, QStyle, QAbstractItemView,
-    QToolTip, QToolButton, QMenu,
+    QToolTip, QToolButton,
 )
 
 from gui_qt import column_state
@@ -35,10 +36,11 @@ _FLAG_SZ = 18
 _FLAG_GAP = 4
 
 # Header line for each master-check flag's bulleted tooltip (Tk parity).
+# Wrapped in self.tr() at show time (see _flag_tip); registered for lupdate.
 _MASTER_TIP_HEADERS = {
-    PF_MISSING: "Missing masters:",
-    PF_LATE: "Masters loaded after this plugin:",
-    PF_VMM: "Version mismatched masters:",
+    PF_MISSING: QT_TRANSLATE_NOOP("PluginDelegate", "Missing masters:"),
+    PF_LATE: QT_TRANSLATE_NOOP("PluginDelegate", "Masters loaded after this plugin:"),
+    PF_VMM: QT_TRANSLATE_NOOP("PluginDelegate", "Version mismatched masters:"),
 }
 
 # Flag bit → icon filename, painted left→right (order matches the Tk app:
@@ -298,10 +300,11 @@ class PluginDelegate(QStyledItemDelegate):
                 names = {PF_MISSING: row.missing_masters,
                          PF_LATE: row.late_masters,
                          PF_VMM: row.vmm_masters}.get(hit)
+            header = self.tr(_MASTER_TIP_HEADERS[hit])
             if names:
                 body = "\n".join(f"  - {n}" for n in names)
-                return f"{_MASTER_TIP_HEADERS[hit]}\n{body}"
-            return _MASTER_TIP_HEADERS[hit]
+                return f"{header}\n{body}"
+            return header
 
         if hit in (PF_LOOT, PF_DIRTY, PF_TAGS):
             if row is None or not row.loot_info:
@@ -426,10 +429,13 @@ class PluginView(QTreeView):
         self._build_column_menu_button(h)
         self._restore_column_state()
 
-        # Marker strip (coloured-tick gutter beside the scrollbar) — same as the
-        # modlist, driven by PHighlightRole.
-        from gui_qt.marker_strip import install_marker_strip
-        install_marker_strip(self, PHighlightRole)
+        from gui_qt.marker_strip import install_marker_strip, MarkerScrollBar
+        install_marker_strip(self, PHighlightRole, code_map={
+            -1: MarkerScrollBar._C_LOWER,    # loses conflict (red)
+            1: MarkerScrollBar._C_HIGHER,    # wins conflict (green)
+            2: MarkerScrollBar._C_ANCHOR,    # selected mod's plugins (orange)
+            3: MarkerScrollBar._C_MASTER,    # master of selected plugin (green)
+        })
         self._reposition_marker_strip()
 
         # Right-click context menu (mirrors modlist_view).
@@ -468,6 +474,12 @@ class PluginView(QTreeView):
             f"QToolButton {{ background: {bg}; border: none; padding: 0px; }}")
         btn.clicked.connect(self._show_column_menu)
         self._col_menu_btn = btn
+        # Hooks the window sets for the "Filters" submenu in the column menu:
+        # on_quick_filter(key, 0|1) applies a plugin status filter;
+        # quick_filter_state(key)->int reads its current tri-state for the
+        # check marks. (Mirrors the modlist column-menu quick filters.)
+        self.on_quick_filter = None
+        self.quick_filter_state = None
         self._position_column_menu_button()
         btn.show()
 
@@ -487,7 +499,8 @@ class PluginView(QTreeView):
         btn.raise_()
 
     def _show_column_menu(self):
-        menu = QMenu(self)
+        from gui_qt.modlist_view import _StayOpenMenu
+        menu = _StayOpenMenu(self)
         for col, name in enumerate(COLUMNS):
             if col in (COL_NAME, COL_LOCK):
                 continue   # Name always shown; Lock is icon-only (no label)
@@ -496,8 +509,28 @@ class PluginView(QTreeView):
             a.setChecked(not self.isColumnHidden(col))
             a.toggled.connect(lambda checked, c=col: self._set_column_visible(c, checked))
             menu.addAction(a)
+        # A "Filters" submenu giving quick access to the plugin "By status"
+        # filters from the Filters panel. Same include-mode (state 1) semantics;
+        # the window wires on_quick_filter so the panel stays in sync.
+        from gui_qt.modlist_filter import PLUGIN_STATUS_FILTERS
+        menu.addSeparator()
+        get = getattr(self, "quick_filter_state", None)
+        filters = _StayOpenMenu(self.tr("Filters"), menu)
+        for key, label in PLUGIN_STATUS_FILTERS:
+            # Labels are registered for translation under FilterSidePanel.
+            a = QAction(QCoreApplication.translate("FilterSidePanel", label), filters)
+            a.setCheckable(True)
+            a.setChecked(callable(get) and get(key) == 1)
+            a.toggled.connect(lambda checked, k=key: self._on_quick_filter(k, checked))
+            filters.addAction(a)
+        menu.addMenu(filters)
         btn = self._col_menu_btn
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _on_quick_filter(self, key: str, on: bool):
+        cb = getattr(self, "on_quick_filter", None)
+        if callable(cb):
+            cb(key, 1 if on else 0)
 
     def _set_column_visible(self, col: int, visible: bool):
         self.setColumnHidden(col, not visible)
