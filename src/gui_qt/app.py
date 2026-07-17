@@ -83,6 +83,11 @@ def _check_modio_updates(game, staging, log_fn, only_names=None):
 # loop exits so the whole UI rebuilds in the new language.
 _RESTART_REQUESTED = False
 
+# Sentinel emitted on _one_install_done when a FOMOD/BAIN archive was handed off
+# to a detached wizard tab: the pipeline advances to the next queued archive
+# without counting or renaming it (the detached wizard owns its own outcome).
+_WIZARD_HANDOFF = object()
+
 
 # Quick-configure submenu labels come from the GUI-free Utils.quick_configure and
 # are shown via self.tr(opt["label"]) / self.tr(clabel) in MainWindow — but
@@ -214,6 +219,13 @@ class MainWindow(QMainWindow):
     _install_done = Signal(int, int, object)   # (ok_count, total, names-list)
     _prepared_ready = Signal(object)           # (PreparedInstall|None)
     _one_install_done = Signal(object)         # (installed name|None)
+    # A detached FOMOD/BAIN wizard finished staging on a worker thread → UI
+    # thread reports the toast / rename prompt / modlist reload. Payload:
+    # (installed name|None, PreparedInstall, prev_name|None).
+    _wizard_finish_done = Signal(object, object, object)
+    # Parallel phase of a multi-archive install finished → UI thread starts the
+    # deferred FOMOD/BAIN phase. (installed-names list, deferred-paths list)
+    _install_batch_stage_done = Signal(object, object)
     # Worker asks the UI to show the Set-Prefix overlay; payload carries a
     # result holder + threading.Event the worker blocks on.
     _need_prefix = Signal(object)              # (dict with required/file_list/...)
@@ -356,10 +368,25 @@ class MainWindow(QMainWindow):
         self._bsa_op_done.connect(self._on_bsa_op_done)
         self._install_running = False
         self._pending_install_batches: list[dict] = []
+        # Detached FOMOD/BAIN wizards: an open wizard is pure UI wait (no
+        # staging), so it must NOT hold the install pipeline — each opens in its
+        # own uniquely-keyed tab and stages independently on finish. Counter for
+        # unique tab keys + a queue that serialises only the staging step (which
+        # mutates the shared game._active_profile_dir and MUST stay one-at-a-time
+        # against installs/deploys — the wrong-profile bug _install_paths guards).
+        self._wizard_seq = 0
+        self._staged_finish_queue: list = []
+        self._staged_finish_running = False
+        # Deploy/Restore requested while a detached-wizard staging job held the
+        # shared game — deferred here and re-run once the staged queue drains
+        # (installs have their own _pending_install_batches queue instead).
+        self._pending_after_staged: list = []
         self._active_downloads: dict[str, dict] = {}   # key → name/done/total/fin
         self._install_done.connect(self._on_install_done)
         self._prepared_ready.connect(self._on_prepared_ready)
         self._one_install_done.connect(self._on_one_install_done)
+        self._wizard_finish_done.connect(self._on_wizard_finish_done)
+        self._install_batch_stage_done.connect(self._on_install_batch_stage_done)
         self._need_prefix.connect(self._on_need_prefix_ui)
         self._mod_exists.connect(self._on_mod_exists_ui)
         self._confirm_cet.connect(self._on_confirm_cet_ui)
@@ -661,6 +688,11 @@ class MainWindow(QMainWindow):
         from Utils.flatpak_i386 import i386_support_missing
         if not i386_support_missing():
             return
+        from Utils.ui_config import load_suppress_i386_warning
+        if load_suppress_i386_warning():
+            self._append_log("[flatpak] 32-bit support missing but the warning "
+                             "is suppressed — skipping self-heal.")
+            return
         self._append_log("[flatpak] 32-bit support missing (Compat.i386 "
                          "extension not installed) — installing from Flathub …")
         self._i386_toast = self._notify(
@@ -696,10 +728,28 @@ class MainWindow(QMainWindow):
         else:
             from Utils.flatpak_i386 import MANUAL_INSTALL_CMD
             self._append_log(f"[flatpak] install manually: {MANUAL_INSTALL_CMD}")
-            self._notify(
-                self.tr("Could not install 32-bit support automatically — "
-                        "see the log for the manual command."),
-                state="warning", sticky=True,
+            from gui_qt.confirm_overlay import ConfirmOverlay
+
+            def _done(dont_show_again: bool):
+                if dont_show_again:
+                    from Utils.ui_config import save_suppress_i386_warning
+                    save_suppress_i386_warning(True)
+                    self._append_log("[flatpak] 32-bit support warning suppressed "
+                                     "at the user's request.")
+
+            ConfirmOverlay.show_over(
+                self,
+                self.tr("32-bit support could not be installed"),
+                self.tr(
+                    "Amethyst could not install 32-bit support automatically. "
+                    "Windows tools (and some games) may fail to run until it is "
+                    "installed. Run this on a terminal, then restart the app:\n\n"
+                    "{0}"
+                ).format(MANUAL_INSTALL_CMD),
+                _done,
+                confirm_label=self.tr("Don't show again"),
+                cancel_label=self.tr("OK"),
+                danger=False,
             )
 
     def _populate_selectors(self):
@@ -1257,9 +1307,9 @@ class MainWindow(QMainWindow):
         self._plugin_footer_btns: list = []
         for label, disp, key in [
             ("Sort Plugins", self.tr("Sort Plugins"), "BTN_SUCCESS"),
+            ("Refresh Plugins", self.tr("Refresh Plugins"), "BTN_INFO"),
             ("Groups", self.tr("Groups"), "BTN_INFO"),
             ("Plugin Rules", self.tr("Plugin Rules"), "BTN_INFO"),
-            ("Filters", self.tr("Filters"), "BTN_INFO"),
         ]:
             b = self._color_button(disp, _c(self._pal, key), compact=True)
             b.setFixedHeight(self._FOOT_BTN_H)
@@ -1268,10 +1318,15 @@ class MainWindow(QMainWindow):
             self._plugin_footer_btns.append(b)
         v.addLayout(btns)
         self._plugin_sort_btn = _made["Sort Plugins"]
+        self._plugin_refresh_btn = _made["Refresh Plugins"]
         self._plugin_groups_btn = _made["Groups"]
         self._plugin_rules_btn = _made["Plugin Rules"]
-        self._plugin_filters_btn = _made["Filters"]
+        self._plugin_filters_btn = self._color_button(
+            self.tr("Filters"), _c(self._pal, "BTN_INFO"), compact=True)
+        self._plugin_filters_btn.setFixedHeight(self._FOOT_BTN_H)
+        self._plugin_footer_btns.append(self._plugin_filters_btn)
         self._plugin_sort_btn.clicked.connect(self._on_sort_plugins)
+        self._plugin_refresh_btn.clicked.connect(self._on_refresh_plugins)
         self._plugin_groups_btn.clicked.connect(self._open_plugin_groups_tab)
         self._plugin_rules_btn.clicked.connect(self._open_plugin_rules_tab)
         self._plugin_filters_btn.clicked.connect(self._toggle_plugin_filters)
@@ -1292,6 +1347,7 @@ class MainWindow(QMainWindow):
             " border-radius: 4px; padding: 2px 8px; }")
         self._plugin_count = count
         search_row.addWidget(count)
+        search_row.addWidget(self._plugin_filters_btn)
 
         search = QLineEdit()
         search.setPlaceholderText(self.tr("Search plugins…"))
@@ -1329,18 +1385,23 @@ class MainWindow(QMainWindow):
         self._mf_expand_btn = self._text_button(self.tr("⊞ Expand all"), compact=True)
         self._mf_expand_btn.setFixedHeight(self._FOOT_BTN_H)
         self._mf_expand_btn.clicked.connect(self._on_mf_expand_clicked)
+        self._equalize_button_widths(self._mf_pack_btn, self._mf_unpack_btn)
+        btns.addWidget(self._mf_expand_btn)
         btns.addWidget(self._mf_pack_btn)
         btns.addWidget(self._mf_unpack_btn)
-        btns.addWidget(self._mf_filters_btn)
-        btns.addWidget(self._mf_expand_btn)
         v.addLayout(btns)
 
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        search_row.addWidget(self._mf_filters_btn)
         search = QLineEdit()
         search.setPlaceholderText(self.tr("Search files… (try !.dds)"))
         search.setClearButtonEnabled(True)
         search.textChanged.connect(
             lambda t: self._mod_files_view._on_search(t))
-        v.addWidget(search)
+        search_row.addWidget(search, 1)
+        v.addLayout(search_row)
         self._mod_files_search = search
         return bar
 
@@ -1361,15 +1422,19 @@ class MainWindow(QMainWindow):
         self._data_expand_btn = self._text_button(self.tr("⊞ Expand all"), compact=True)
         self._data_expand_btn.setFixedHeight(self._FOOT_BTN_H)
         self._data_expand_btn.clicked.connect(self._on_data_expand_clicked)
-        btns.addWidget(self._data_filters_btn)
         btns.addWidget(self._data_expand_btn)
         v.addLayout(btns)
 
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        search_row.addWidget(self._data_filters_btn)
         search = QLineEdit()
         search.setPlaceholderText(self.tr("Search files… (try !.dds)"))
         search.setClearButtonEnabled(True)
         search.textChanged.connect(lambda t: self._data_view._on_search(t))
-        v.addWidget(search)
+        search_row.addWidget(search, 1)
+        v.addLayout(search_row)
         self._data_search = search
         return bar
 
@@ -1412,18 +1477,24 @@ class MainWindow(QMainWindow):
             self.tr("Filters"), _c(self._pal, "BTN_INFO"), compact=True)
         self._dl_filters_btn.setFixedHeight(self._FOOT_BTN_H)
         self._dl_filters_btn.clicked.connect(self._toggle_downloads_filters)
+        self._equalize_button_widths(
+            self._dl_install_btn, self._dl_move_btn, self._dl_remove_btn)
         btns.addWidget(self._dl_install_btn)
         btns.addWidget(self._dl_move_btn)
         btns.addWidget(self._dl_remove_btn)
         btns.addWidget(self._dl_locations_btn)
-        btns.addWidget(self._dl_filters_btn)
         v.addLayout(btns)
 
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        search_row.addWidget(self._dl_filters_btn)
         search = QLineEdit()
         search.setPlaceholderText(self.tr("Search downloads…"))
         search.setClearButtonEnabled(True)
         search.textChanged.connect(lambda t: self._downloads_view._on_search(t))
-        v.addWidget(search)
+        search_row.addWidget(search, 1)
+        v.addLayout(search_row)
         self._dl_search = search
         return bar
 
@@ -1581,9 +1652,8 @@ class MainWindow(QMainWindow):
             self.tr("⊞ Expand all"), compact=True)
         self._tf_expand_btn.setFixedHeight(self._FOOT_BTN_H)
         self._tf_expand_btn.clicked.connect(self._on_tf_expand_clicked)
-        btns.addWidget(self._tf_content_btn)
-        btns.addWidget(self._tf_filters_btn)
         btns.addWidget(self._tf_expand_btn)
+        btns.addWidget(self._tf_content_btn)
         # A dim status label showing the active content-search keyword.
         self._tf_content_status = QLabel("")
         self._tf_content_status.setStyleSheet(
@@ -1593,11 +1663,16 @@ class MainWindow(QMainWindow):
         self._text_files_view.content_status_changed.connect(
             self._on_tf_content_status)
 
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        search_row.addWidget(self._tf_filters_btn)
         search = QLineEdit()
         search.setPlaceholderText(self.tr("Search files… (try !.dds)"))
         search.setClearButtonEnabled(True)
         search.textChanged.connect(lambda t: self._text_files_view._on_search(t))
-        v.addWidget(search)
+        search_row.addWidget(search, 1)
+        v.addLayout(search_row)
         self._tf_search = search
         return bar
 
@@ -2238,10 +2313,31 @@ class MainWindow(QMainWindow):
             self._update_overlay = None
 
         def _on_update():
-            from Utils.version_check import run_installer
-            run_installer(allow_prerelease=is_prerelease)
+            if mode == "flatpak":
+                from Utils.ui_config import load_allow_prerelease
+                from Utils.version_check import (
+                    flatpak_installed_from_remote, update_flatpak_from_remote,
+                    run_flatpak_installer,
+                )
+                allow_pre = load_allow_prerelease()
+                # Preferred path: installed from our hosted remote → native
+                # delta update. Fallback: bundle-installed → download the .flatpak.
+                if flatpak_installed_from_remote():
+                    ok = update_flatpak_from_remote(allow_prerelease=allow_pre)
+                else:
+                    ok = run_flatpak_installer(latest)
+                if not ok:
+                    # Host flatpak unreachable — fall back to the releases page
+                    # rather than silently closing with nothing happening.
+                    from Utils.xdg import open_url
+                    from Utils.version_check import _APP_UPDATE_RELEASES_URL
+                    open_url(_APP_UPDATE_RELEASES_URL)
+                    return
+            else:
+                from Utils.version_check import run_installer
+                run_installer(allow_prerelease=is_prerelease)
             # closeEvent handles the rest of the shutdown (NxmIPC etc.); the
-            # installer waits 2s before replacing the running AppImage.
+            # installer waits 2s before replacing the running app.
             self.close()
 
         def _cleared(overlay):
@@ -2951,6 +3047,14 @@ class MainWindow(QMainWindow):
         if self._col_install_running:
             self._notify(self.tr("A collection install is already running."), "warning")
             return
+        # A collection install swaps the shared game to a fresh profile — don't
+        # start one while a detached-wizard staging job is still touching the
+        # shared game (the wrong-profile hazard).
+        if getattr(self, "_staged_finish_running", False) \
+                or self._staged_finish_queue:
+            self._notify(self.tr("An install is finishing — try the collection "
+                                 "again in a moment."), "warning")
+            return
         game = self._gs.game
         if game is None or not game.is_configured():
             self._notify(self.tr("No configured game selected."), "warning")
@@ -3386,9 +3490,12 @@ class MainWindow(QMainWindow):
                 on_cancel=self._on_col_cancel_clicked)
         else:
             from gui_qt.collection_install_overlay import CollectionInstallOverlay
+            from Utils.ui_config import load_download_speed_limit
             self._col_install_overlay = CollectionInstallOverlay.show_over(
                 self, title, on_pause=self._on_col_pause_clicked,
-                on_cancel=self._on_col_cancel_clicked)
+                on_cancel=self._on_col_cancel_clicked,
+                limit_mbps=load_download_speed_limit(),
+                on_limit_change=self._on_col_limit_changed)
 
         callbacks = self._build_collection_callbacks()
 
@@ -3563,13 +3670,27 @@ class MainWindow(QMainWindow):
         if _game_name:
             from Utils.config_paths import get_fomod_selections_path
             _sel_path = get_fomod_selections_path(_game_name, payload["name"])
+        # Merge the live plugin-panel state (see the manual-install path below):
+        # plugins.txt can lag the model, so a FOMOD `state="Active"` dep wouldn't
+        # match until a save/sort. Union the panel's enabled/all sets.
+        _c_inst = set(payload.get("installed") or set())
+        _c_act = set(payload.get("active") or set())
+        try:
+            pm = getattr(self, "_plugin_model", None)
+            if pm is not None:
+                live_all = pm.all_lower()
+                live_active = pm.enabled_lower()
+                _c_inst |= live_all
+                _c_act = (_c_act | live_active) - (live_all - live_active)
+        except Exception:
+            pass
         view = FomodWizardView(payload["config"], payload["base"], payload["name"],
                                on_finish=lambda sel: _finish_ev(sel),
                                on_cancel=lambda: _finish_ev(None),
                                saved_selections=payload.get("saved"),
                                selections_path=_sel_path,
-                               installed_files=payload.get("installed"),
-                               active_files=payload.get("active"),
+                               installed_files=_c_inst,
+                               active_files=_c_act,
                                loose_files=payload.get("loose"))
         # Closing the tab (or a stop request) counts as cancel so we never hang.
         view.destroyed.connect(lambda *_: _finish_ev(None))
@@ -3632,6 +3753,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _on_col_limit_changed(self, mbps: float):
+        """Overlay speed-limit spinbox changed: apply to in-flight downloads
+        immediately (global token bucket) and persist for next time."""
+        from Utils import bandwidth_limit
+        from Utils.ui_config import save_download_speed_limit
+        bandwidth_limit.set_limit_mbps(mbps)
+        try:
+            save_download_speed_limit(mbps)
+        except Exception:
+            pass
+
     # ---- pause / cancel --------------------------------------------------
     def _on_col_pause_clicked(self):
         ctl = self._col_install_control
@@ -3684,6 +3816,10 @@ class MainWindow(QMainWindow):
         # Terminal states.
         self._col_install_running = False
         self._col_install_control = None
+        # A detached-wizard staging job may have been held off while this
+        # collection install ran (see _run_staged_finish guard) — drain it now.
+        if self._staged_finish_queue:
+            QTimer.singleShot(0, self._run_staged_finish)
         ov = self._col_install_overlay
 
         if kind == "cancelled":
@@ -5951,12 +6087,17 @@ class MainWindow(QMainWindow):
         note→note editor, bundle→Bundle Options."""
         from gui_qt.modlist_data import (
             FLAG_UPDATE, FLAG_MISSING_REQS, FLAG_NOTE, FLAG_MODIO_UPDATE,
-            FLAG_BUNDLE)
+            FLAG_BUNDLE, FLAG_RERUN_FOMOD)
         e = self._modlist_model.entry(row)
         if e is None or e.is_separator:
             return
         if flag == FLAG_UPDATE:
             self._open_change_version_tab(e.name)
+        elif flag == FLAG_RERUN_FOMOD:
+            # Re-run the FOMOD installer for this mod (its archive is re-extracted
+            # and the wizard reopens). Reinstall rewrites fomodPendingDeps, so the
+            # flag self-corrects once the now-relevant option is selected.
+            self._reinstall_mods([e.name])
         elif flag == FLAG_MODIO_UPDATE:
             from gui_qt.modlist_menu import _open_on_modio
             _open_on_modio(self._modlist_view, e.name)
@@ -6846,6 +6987,20 @@ class MainWindow(QMainWindow):
             self._deploy_rerun_pending = True
             self._auto_deploy_in_progress = False
             return
+        # A detached-wizard staging job mutates the shared game (staging root +
+        # active profile) — a deploy started now could resolve the wrong profile
+        # / race the staging tree. Defer until the staged queue drains; re-run
+        # from _on_wizard_finish_done. Coalesce duplicate deferrals per game.
+        if getattr(self, "_staged_finish_running", False) \
+                or self._staged_finish_queue:
+            self._auto_deploy_in_progress = False
+            if not any(getattr(cb, "_kind", None) == "deploy"
+                       for cb in self._pending_after_staged):
+                def _later(g=game, p=profile, s=silent):
+                    self._start_deploy(g, p, silent=s)
+                _later._kind = "deploy"
+                self._pending_after_staged.append(_later)
+            return
         self._deploy_running = True
         self._op_silent = silent
         self._op_is_restore = False
@@ -6998,6 +7153,20 @@ class MainWindow(QMainWindow):
         if self._deploy_running:
             self._notify(self.tr("A deploy is in progress — try again shortly."), "warning")
             return
+        # Defer behind a detached-wizard staging job (shared game mutation) — it
+        # re-runs once the staged queue drains (_on_wizard_finish_done). Coalesce
+        # duplicate restore requests.
+        if getattr(self, "_staged_finish_running", False) \
+                or self._staged_finish_queue:
+            if not any(getattr(cb, "_kind", None) == "restore"
+                       for cb in self._pending_after_staged):
+                def _later():
+                    self._on_restore()
+                _later._kind = "restore"
+                self._pending_after_staged.append(_later)
+            self._notify(self.tr("Restore queued — it will run after the "
+                                 "current install finishes."), "info")
+            return
         self._deploy_running = True
         self._op_is_restore = True
         self._op_title = "Restoring"
@@ -7119,6 +7288,12 @@ class MainWindow(QMainWindow):
         # finishes (the drain guards on _deploy_running/_install_running).
         if self._pending_install_batches and not self._deploy_rerun_pending:
             QTimer.singleShot(0, self._drain_pending_installs)
+        # A detached-wizard staging job may have queued behind this deploy —
+        # drain it once the deploy is fully settled (skipped if a coalesced
+        # re-deploy is about to run; _run_staged_finish re-guards on
+        # _deploy_running so it stays queued until that finishes too).
+        if self._staged_finish_queue and not self._deploy_rerun_pending:
+            QTimer.singleShot(0, self._run_staged_finish)
         # Coalesced re-deploy if mod state changed mid-deploy.
         if kind == "deploy" and self._deploy_rerun_pending:
             self._deploy_rerun_pending = False
@@ -7128,6 +7303,14 @@ class MainWindow(QMainWindow):
             if game is not None and game.is_configured():
                 QTimer.singleShot(
                     0, lambda g=game, p=self._gs.profile: self._start_deploy(g, p))
+            else:
+                # The re-deploy won't run (game gone/unconfigured) — the drains
+                # skipped above on _deploy_rerun_pending would otherwise strand
+                # the queues. Release them now.
+                if self._pending_install_batches:
+                    QTimer.singleShot(0, self._drain_pending_installs)
+                if self._staged_finish_queue:
+                    QTimer.singleShot(0, self._run_staged_finish)
         elif kind == "deploy":
             # Play-button deploy-before-launch: fire the pending launch only
             # after the FINAL (non-coalesced) deploy, and only on success.
@@ -7703,6 +7886,7 @@ class MainWindow(QMainWindow):
             profile_name=self._gs.profile or "default",
             run_deploy=self._wizard_run_deploy,
             refresh_modlist=self._on_refresh_modlist,
+            refresh_plugins=self._wizard_refresh_plugins,
         )
         try:
             view = spec.view_factory(
@@ -7725,6 +7909,20 @@ class MainWindow(QMainWindow):
         self._deploy_done_hooks.append(on_done)
         self._on_deploy()
         return True
+
+    def _wizard_refresh_plugins(self):
+        """Wizard hook: re-run LOOT to refresh plugin metadata without touching
+        the load order (the xEdit wizards call this after a clean/edit session
+        so dirty/message flags update). Deferred a beat so it runs after the
+        refresh_modlist() reload the wizard also fires — the LOOT refresh reads
+        the plugin model's rows, which that reload rebuilds."""
+        game = self._gs.game
+        if game is None or not game.is_configured():
+            return
+        if not getattr(game, "loot_sort_enabled", False):
+            return
+        # QTimer so it lands after the modlist refresh + plugin reload settle.
+        QTimer.singleShot(0, self._on_refresh_plugins)
 
     def _close_wizard_tab(self, key: str):
         if self._tabs.has_key(key):
@@ -7763,16 +7961,19 @@ class MainWindow(QMainWindow):
         if game is None or not game.is_configured():
             self._notify(self.tr("No configured game selected."), "warning")
             return
-        # Queue behind a running install OR deploy. Both mutate the SAME shared
-        # game object (_active_profile_dir + load_paths → get_effective_*_path);
-        # a deploy swaps the active profile to last_deployed/target mid-flight
-        # (deploy_pipeline), so an install started concurrently can stage its
-        # mod + write modindex.bin into the WRONG profile's tree — the mod then
-        # appears only after a Refresh (the intermittent "manual install didn't
-        # take" bug). Serialize instead. _on_install_done AND _on_op_done (deploy
-        # finished) both drain the queue.
+        # Queue behind a running install OR deploy OR a detached-wizard staging
+        # job. All three mutate the SAME shared game object (_active_profile_dir +
+        # load_paths → get_effective_*_path); a deploy swaps the active profile to
+        # last_deployed/target mid-flight (deploy_pipeline), so an install started
+        # concurrently can stage its mod + write modindex.bin into the WRONG
+        # profile's tree — the mod then appears only after a Refresh (the
+        # intermittent "manual install didn't take" bug). Serialize instead.
+        # _on_install_done, _on_op_done (deploy) AND _on_wizard_finish_done (staged
+        # finish) all drain the queue.
         if getattr(self, "_install_running", False) \
-                or getattr(self, "_deploy_running", False):
+                or getattr(self, "_deploy_running", False) \
+                or getattr(self, "_staged_finish_running", False) \
+                or self._staged_finish_queue:
             self._pending_install_batches.append({
                 "paths": list(paths), "metas": metas,
                 "previous_mod_name": previous_mod_name,
@@ -7780,7 +7981,8 @@ class MainWindow(QMainWindow):
                 "on_all_done": on_all_done,
                 "clear_archives": clear_archives})
             _busy = self.tr("install") if getattr(self, "_install_running", False) \
-                else self.tr("deploy")
+                else (self.tr("deploy") if getattr(self, "_deploy_running", False)
+                      else self.tr("install"))
             self._notify(
                 self.tr("Install queued — {0} will install after the current "
                         "{1} finishes.").format(Path(paths[0]).name, _busy), "info")
@@ -7805,6 +8007,10 @@ class MainWindow(QMainWindow):
         self._install_queue = list(paths)
         self._install_total = len(paths)
         self._install_ok = []
+        # Archives handed off to a detached FOMOD/BAIN wizard: they leave the
+        # pipeline immediately and report their own outcome later, so they count
+        # toward neither ok nor the failure tally (see _on_install_done summary).
+        self._install_handoffs = 0
         self._install_game = game
         self._install_profile_dir = profile_dir
         self._install_metas = dict(metas or {})
@@ -7814,7 +8020,14 @@ class MainWindow(QMainWindow):
         self._install_clear_archives = clear_archives
         self._notify(self.tr("Installing {0} mod(s)…").format(len(paths)) if len(paths) > 1
                      else self.tr("Installing {0}…").format(Path(paths[0]).name), "info")
-        self._install_next()
+        # Multi-archive batch (Downloads tab multi-select, Nexus batches):
+        # extract several archives at once like a collection install, deferring
+        # FOMOD/BAIN wizards to a sequential phase at the end. Change Version
+        # (previous_mod_name) is always a single archive; keep it sequential.
+        if len(paths) > 1 and previous_mod_name is None:
+            self._install_batch_parallel()
+        else:
+            self._install_next()
 
     def _make_need_prefix_cb(self):
         """Return an on_need_prefix(required, file_list, mod_name) callback for the
@@ -7967,6 +8180,159 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _install_batch_parallel(self):
+        """Phase 1 of a multi-archive install: prepare + install every
+        NON-interactive archive on a small worker pool (collection-install
+        style: max_extract_workers threads gated by the extraction memory
+        budget). Archives that need a wizard (FOMOD with steps, BAIN) are
+        deferred; _on_install_batch_stage_done then runs them one-by-one
+        through the existing sequential wizard handshake. Blocking UI prompts
+        (need-prefix, mod-already-exists) are serialised so only one overlay
+        shows at a time."""
+        import threading
+
+        paths = list(self._install_queue)
+        self._install_queue = []
+        total = self._install_total
+        ui_lock = threading.Lock()
+        raw_prefix_cb = self._make_need_prefix_cb()
+        raw_exists_cb = self._make_exists_cb()
+
+        def _serialized(cb):
+            def inner(*a, **k):
+                with ui_lock:
+                    return cb(*a, **k)
+            return inner
+
+        prefix_cb = _serialized(raw_prefix_cb)
+        exists_cb = _serialized(raw_exists_cb)
+
+        def driver():
+            from concurrent.futures import ThreadPoolExecutor
+            from Utils.mod_install import (prepare_archive, finish_install,
+                                           _archive_lists_fomod_config)
+            from Utils.extract_budget import (ExtractionMemoryBudget,
+                                              get_uncompressed_size)
+            try:
+                from Utils.ui_config import load_collection_settings
+                workers = int(load_collection_settings().get(
+                    "max_extract_workers", 4))
+            except Exception:
+                workers = 4
+            workers = max(1, min(workers, len(paths)))
+            budget = ExtractionMemoryBudget(max_workers=workers)
+            lock = threading.Lock()
+            ok_names: list = []
+            deferred: list = []
+            counters = {"done": 0}
+
+            def one(path):
+                name_for_log = Path(path).name
+                meta = self._install_metas.get(path)
+                forced = self._install_preferred.get(path, "")
+                est = 0
+                acquired = False
+                try:
+                    self._op_log.emit(f"Installing: {name_for_log}")
+                    # Archive listing already shows fomod/ModuleConfig.xml →
+                    # defer NOW, skipping an extract that would be thrown away
+                    # and repeated in the deferred phase (collection parity).
+                    if _archive_lists_fomod_config(path):
+                        self._op_log.emit(
+                            f"FOMOD installer detected: {name_for_log} — "
+                            "deferred to the end of the batch.")
+                        with lock:
+                            deferred.append(path)
+                        return
+                    est = get_uncompressed_size(path)
+                    budget.acquire(est)
+                    acquired = True
+                    prepared = prepare_archive(
+                        path, self._install_game, self._install_profile_dir,
+                        log_fn=lambda m: self._op_log.emit(str(m)),
+                        prebuilt_meta=meta, preferred_name=forced,
+                        on_need_prefix=prefix_cb)
+                    if prepared is None:
+                        return
+                    if (prepared.is_fomod() and prepared.fomod_has_steps()) \
+                            or prepared.is_bain():
+                        kind = "FOMOD" if prepared.is_fomod() else "BAIN"
+                        self._op_log.emit(
+                            f"{kind} installer detected: {prepared.mod_name} "
+                            "— deferred to the end of the batch.")
+                        prepared.cleanup()
+                        with lock:
+                            deferred.append(path)
+                        return
+                    if prepared.is_fomod():
+                        # FOMOD with no install steps → nothing to choose;
+                        # install headlessly (parity with _on_prepared_ready).
+                        self._op_log.emit(
+                            f"FOMOD has no install options: "
+                            f"{prepared.mod_name} — installing required files.")
+                    name = finish_install(
+                        prepared, None,
+                        log_fn=lambda m: self._op_log.emit(str(m)),
+                        on_exists=None if forced else exists_cb)
+                    if name:
+                        self._maybe_clear_archive(prepared)
+                        with lock:
+                            ok_names.append(name)
+                except Exception as exc:
+                    self._op_log.emit(f"Install error ({name_for_log}): {exc}")
+                finally:
+                    if acquired:
+                        budget.release(est)
+                    with lock:
+                        counters["done"] += 1
+                        done = counters["done"]
+                    self._op_progress.emit(done, total, "Installing")
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(one, paths))
+            self._install_batch_stage_done.emit(ok_names, deferred)
+
+        threading.Thread(target=driver, daemon=True).start()
+
+    def _on_install_batch_stage_done(self, names, deferred):
+        """UI thread: the parallel phase of a batch install finished. Run the
+        optional rename-after-install prompts for the phase-1 installs (one at
+        a time, as the sequential path does), then push the deferred FOMOD/BAIN
+        archives through the normal sequential queue — an empty deferred list
+        goes straight to the batch summary via _install_next."""
+        names = list(names or [])
+        deferred = list(deferred or [])
+
+        def _proceed():
+            if deferred:
+                self._op_log.emit(
+                    f"Installing {len(deferred)} deferred FOMOD/BAIN mod(s)…")
+            self._install_queue = deferred
+            self._install_next()
+
+        try:
+            from Utils.ui_config import load_rename_mod_after_install
+            rename_on = load_rename_mod_after_install()
+        except Exception:
+            rename_on = False
+        if not rename_on:
+            self._install_ok.extend(names)
+            _proceed()
+            return
+
+        def _chain(i):
+            if i >= len(names):
+                _proceed()
+                return
+
+            def _named(final, _next=i + 1):
+                self._install_ok.append(final)
+                _chain(_next)
+
+            self._maybe_prompt_rename(names[i], _named)
+
+        _chain(0)
+
     def _on_prepared_ready(self, prepared):
         if prepared is None:
             self._one_install_done.emit(None)
@@ -7980,31 +8346,72 @@ class MainWindow(QMainWindow):
                 f"FOMOD has no install options: {prepared.mod_name} — "
                 "installing required files.")
             self._run_finish_install(prepared, None)
-        elif prepared.is_fomod():
-            # Open the wizard tab; finish on the user's selections (or cancel).
-            # Hide the progress popup while the wizard is up (no work running).
-            if self._progress_popup is not None:
-                self._progress_popup.clear()
+        elif prepared.is_fomod() or prepared.is_bain():
+            # Interactive install (FOMOD wizard / BAIN picker): the user may take
+            # a long time choosing, but that wait does NO staging work. Hand the
+            # prepared archive off to a DETACHED, uniquely-keyed wizard tab so
+            # several can be open at once and the install pipeline is free to
+            # continue with the next queued archive. The pipeline treats this
+            # item as handed off (not counted here — the detached wizard reports
+            # its own outcome). Staging on finish is serialised separately.
+            self._open_wizard_install(prepared, from_queue=True)
+            # Release the pipeline slot: this item is no longer pending. Pass the
+            # handoff sentinel so _on_one_install_done just advances the queue
+            # without a rename prompt or an ok-count (the wizard owns those).
+            self._install_handoffs = getattr(self, "_install_handoffs", 0) + 1
+            self._one_install_done.emit(_WIZARD_HANDOFF)
+        else:
+            self._run_finish_install(prepared, None)
+
+    def _open_wizard_install(self, prepared, from_queue: bool):
+        """Open a DETACHED FOMOD/BAIN wizard for *prepared* in its own tab.
+
+        Unlike the old single-wizard flow, this does NOT hold the install
+        pipeline: the tab is uniquely keyed (fomod_wizard_N / bain_picker_N) so
+        multiple wizards coexist, and on finish the staging step runs through
+        _run_staged_finish (serialised against installs/deploys — the shared
+        game._active_profile_dir wrong-profile guard). Each wizard reports its
+        own toast + modlist reload; there is no shared _fomod_done flag.
+
+        *from_queue* is True when the archive came off the install queue (so its
+        source archive should honour 'clear archive after install' just like the
+        pipeline would); the flag is captured for the deferred staging call."""
+        self._wizard_seq += 1
+        seq = self._wizard_seq
+        clear_archives = getattr(self, "_install_clear_archives", True)
+        # Capture the Change-Version 'previous mod name' for THIS handoff (a
+        # single-archive Change Version can be a FOMOD): the pipeline's shared
+        # _install_prev_name is one-shot and would be cleared by later items, so
+        # bind it to the wizard now. Consumed once in _on_wizard_finish_done.
+        prev_name = getattr(self, "_install_prev_name", None) if from_queue else None
+        if prev_name is not None:
+            self._install_prev_name = None
+        done = {"v": False}   # per-wizard double-fire guard (finish/cancel/close)
+        # NB: the progress popup is intentionally NOT cleared here (unlike the old
+        # blocking flow) — the install pipeline keeps running behind this detached
+        # tab, so the popup still reflects that real ongoing work and clears itself
+        # when the pipeline finishes.
+
+        if prepared.is_fomod():
+            tab_key = f"fomod_wizard_{seq}"
             from gui_qt.fomod_wizard_view import FomodWizardView
 
-            self._fomod_done = False   # set True on finish/cancel to avoid double-fire
-
             def _finish(selections):
-                if self._fomod_done:
+                if done["v"]:
                     return
-                self._fomod_done = True
-                self._tabs.close_tab("fomod_wizard")
-                self._run_finish_install(prepared, selections)
+                done["v"] = True
+                self._tabs.close_tab(tab_key)
+                self._stage_wizard_finish(prepared, selections, None,
+                                          clear_archives, prev_name)
 
             def _cancel():
-                if self._fomod_done:
+                if done["v"]:
                     return
-                self._fomod_done = True
-                self._tabs.close_tab("fomod_wizard")
+                done["v"] = True
+                self._tabs.close_tab(tab_key)
                 self._op_log.emit(f"FOMOD install cancelled: {prepared.mod_name}")
                 prepared.cleanup()
                 self._notify(self.tr("Install cancelled: {0}").format(prepared.mod_name), "info")
-                self._one_install_done.emit(None)
 
             _sel_path = None
             _game_name = getattr(prepared.game, "name", "")
@@ -8013,6 +8420,28 @@ class MainWindow(QMainWindow):
                 _sel_path = get_fomod_selections_path(_game_name,
                                                       prepared.mod_name)
             _inst, _act, _loose = prepared.fomod_context
+            # prepared.fomod_context was read from plugins.txt/loadorder.txt on the
+            # worker thread. Those files can lag the LIVE plugin panel: a mod
+            # enabled in the model isn't persisted to plugins.txt until the next
+            # save (e.g. Sort Plugins), so a FOMOD `state="Active"` dep wouldn't
+            # match and its conditional option wouldn't auto-select until the user
+            # sorted. Merge the panel's live enabled/all sets so the wizard sees
+            # the true current state without needing a sort first.
+            try:
+                pm = getattr(self, "_plugin_model", None)
+                if pm is not None:
+                    live_all = pm.all_lower()
+                    live_active = pm.enabled_lower()
+                    _inst = set(_inst) | live_all
+                    # A plugin present in the panel but not enabled is genuinely
+                    # inactive — only add the live-enabled ones to active, and drop
+                    # any stale disk-active entry the panel now shows as disabled.
+                    _act = (set(_act) | live_active) - (live_all - live_active)
+            except Exception:
+                pass
+            self._append_log(
+                f"[fomod] {prepared.mod_name}: {len(_inst)} installed / "
+                f"{len(_act)} active plugin(s) for condition eval")
             view = FomodWizardView(prepared.fomod_config, prepared.fomod_base,
                                    prepared.mod_name, on_finish=_finish,
                                    on_cancel=_cancel,
@@ -8023,29 +8452,24 @@ class MainWindow(QMainWindow):
             # Closing the tab (× / detached-window close) cancels the install.
             view.destroyed.connect(lambda *_: _cancel())
             self._tabs.open_tab(view, self.tr("Install: {0}").format(prepared.mod_name),
-                                key="fomod_wizard")
-        elif prepared.is_bain():
-            # BAIN package: open the sub-package picker tab; finish on the user's
-            # selection (or cancel). Mirrors the FOMOD handshake above.
-            if self._progress_popup is not None:
-                self._progress_popup.clear()
+                                key=tab_key)
+        else:   # BAIN
+            tab_key = f"bain_picker_{seq}"
             from gui_qt.bain_picker_view import BainPickerView
 
-            self._bain_done = False   # guard against double-fire
-
             def _bfinish(result):
-                if self._bain_done:
+                if done["v"]:
                     return
-                self._bain_done = True
-                self._tabs.close_tab("bain_picker")
+                done["v"] = True
+                self._tabs.close_tab(tab_key)
                 if result is None:
                     self._op_log.emit(
                         f"BAIN install cancelled: {prepared.mod_name}")
                     prepared.cleanup()
                     self._notify(self.tr("Install cancelled: {0}").format(prepared.mod_name), "info")
-                    self._one_install_done.emit(None)
                     return
-                self._run_finish_install(prepared, None, bain_selections=result)
+                self._stage_wizard_finish(prepared, None, result,
+                                          clear_archives, prev_name)
 
             view = BainPickerView(
                 prepared.bain_subpkgs, prepared.bain_root, prepared.mod_name,
@@ -8055,9 +8479,7 @@ class MainWindow(QMainWindow):
             # Closing the tab (× / detached-window close) cancels the install.
             view.destroyed.connect(lambda *_: _bfinish(None))
             self._tabs.open_tab(view, self.tr("Install: {0}").format(prepared.mod_name),
-                                key="bain_picker")
-        else:
-            self._run_finish_install(prepared, None)
+                                key=tab_key)
 
     def _run_finish_install(self, prepared, selections, bain_selections=None):
         import threading
@@ -8087,6 +8509,123 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # -- detached-wizard staging --------------------------------------------
+    def _stage_wizard_finish(self, prepared, selections, bain_selections,
+                             clear_archives, prev_name=None):
+        """A detached FOMOD/BAIN wizard finished — enqueue its staging step.
+
+        Staging (finish_install) mutates the shared game (get_effective_mod_
+        staging_path reads the live active profile), so it MUST run one-at-a-time
+        against installs AND deploys — the same wrong-profile guard _install_paths
+        enforces. Wizards may finish in any order and while a pipeline install or
+        a deploy is running, so we queue here and drain via _run_staged_finish.
+
+        *prev_name* — a Change-Version 'previous mod name' captured for this
+        wizard; if the install lands a differently-named mod, the remove-previous
+        prompt fires from _on_wizard_finish_done."""
+        self._staged_finish_queue.append({
+            "prepared": prepared, "selections": selections,
+            "bain_selections": bain_selections,
+            "clear_archives": clear_archives, "prev_name": prev_name})
+        self._notify(self.tr("Installing {0}…").format(prepared.mod_name), "info")
+        self._run_staged_finish()
+
+    def _run_staged_finish(self):
+        """Drain one queued detached-wizard staging job if nothing else is
+        touching the shared game. Re-armed by _on_wizard_finish_done, and also by
+        _on_install_done / _on_op_done when a blocking install/deploy finishes."""
+        import threading
+
+        if not self._staged_finish_queue \
+                or self._staged_finish_running \
+                or getattr(self, "_install_running", False) \
+                or getattr(self, "_deploy_running", False) \
+                or getattr(self, "_col_install_running", False):
+            return
+        job = self._staged_finish_queue.pop(0)
+        self._staged_finish_running = True
+        prepared = job["prepared"]
+        selections = job["selections"]
+        bain_selections = job["bain_selections"]
+        prev_name = job.get("prev_name")
+        # Carry the clear-archive policy captured when this wizard opened (the
+        # pipeline's _install_clear_archives may have changed for a later batch).
+        self._install_clear_archives = job["clear_archives"]
+        # A just-finished worker may have left _active_profile_dir out of sync;
+        # re-assert it so get_effective_mod_staging_path resolves to the profile
+        # the dropdown shows (parity with _install_paths).
+        self._gs.reassert_active_profile()
+        self._ensure_feedback()
+
+        _forced = str(getattr(prepared, "archive", "")) in \
+            getattr(self, "_install_preferred", {})
+        exists_cb = None if _forced else self._make_exists_cb()
+
+        def worker():
+            from Utils.mod_install import finish_install
+            try:
+                name = finish_install(
+                    prepared, selections,
+                    log_fn=lambda m: self._op_log.emit(str(m)),
+                    progress_fn=lambda d, t, ph=None: self._op_progress.emit(d, t, ph),
+                    on_exists=exists_cb,
+                    bain_selections=bain_selections)
+            except Exception as exc:
+                self._op_log.emit(f"Install error ({prepared.mod_name}): {exc}")
+                name = None
+            if name:
+                self._maybe_clear_archive(prepared)
+            self._wizard_finish_done.emit(name, prepared, prev_name)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_wizard_finish_done(self, name, prepared, prev_name):
+        """UI thread: a detached-wizard staging job finished. Report it (toast /
+        optional rename prompt / remove-previous), reload, then drain the next
+        queued wizard job."""
+        self._staged_finish_running = False
+        if self._progress_popup is not None:
+            self._schedule_op_clear(1200)
+        if hasattr(self, "_downloads_view"):
+            self._downloads_view.mark_dirty()
+
+        def _drain_next():
+            # Another wizard may have finished while this one staged, and an
+            # install/deploy may have queued behind the staging lock.
+            self._run_staged_finish()
+            # Only release the deferred install/deploy/restore queues once the
+            # staged-finish queue is FULLY drained AND idle — a still-running or
+            # still-queued staging job holds the shared game, so releasing now
+            # would re-open the wrong-profile race we just guarded.
+            if not self._staged_finish_running and not self._staged_finish_queue:
+                if self._pending_install_batches:
+                    QTimer.singleShot(0, self._drain_pending_installs)
+                pending, self._pending_after_staged = self._pending_after_staged, []
+                for cb in pending:
+                    try:
+                        cb()
+                    except Exception as exc:
+                        self._append_log(f"[install] deferred action error: {exc}")
+
+        def _after_named(final):
+            self._reload_modlist()
+            self._reload_plugins()
+            self._notify(self.tr("Installed {0}").format(final), "success")
+            # Change Version landed a different-named version → offer to remove
+            # the previous version (Tk parity with _finish_one_install).
+            if prev_name and final != prev_name:
+                self._maybe_prompt_remove_previous(prev_name, final)
+            _drain_next()
+
+        if name:
+            self._maybe_prompt_rename(name, _after_named)
+        else:
+            self._reload_modlist()
+            self._reload_plugins()
+            # Failed/cancelled staging (finish_install returned None): keep the
+            # queue moving.
+            _drain_next()
+
     def _maybe_clear_archive(self, prepared):
         """Delete the source archive after a successful install, honouring the
         'Clear archive after install' / 'Keep FOMOD archives' settings (Tk
@@ -8112,6 +8651,12 @@ class MainWindow(QMainWindow):
             self._op_log.emit(f"Archive cleanup skipped: {exc}")
 
     def _on_one_install_done(self, name):
+        if name is _WIZARD_HANDOFF:
+            # Interactive archive handed off to a detached wizard tab — it owns
+            # its own outcome (toast/rename/reload on finish). Just advance the
+            # queue so the next archive installs while the wizard sits open.
+            self._install_next()
+            return
         if name:
             # Optional post-install rename prompt (Tk parity). Modal, before the
             # next queued install — keeps one dialog at a time.
@@ -8313,6 +8858,10 @@ class MainWindow(QMainWindow):
         # after this handler — and any on_all_done callback — completes).
         if self._pending_install_batches:
             QTimer.singleShot(0, self._drain_pending_installs)
+        # A detached-wizard staging job may have finished (or been requested)
+        # while this pipeline held the shared game — let it run now.
+        if self._staged_finish_queue:
+            QTimer.singleShot(0, self._run_staged_finish)
         if hasattr(self, "_install_btn"):
             self._install_btn.setEnabled(True)
         if self._progress_popup is not None:
@@ -8329,6 +8878,15 @@ class MainWindow(QMainWindow):
         if cb is not None:
             cb(ok, total, names)
             return
+        # Archives handed off to a detached wizard aren't done yet — they report
+        # their own toast on finish, so drop them from this batch's tally.
+        handoffs = getattr(self, "_install_handoffs", 0)
+        total = max(0, total - handoffs)
+        if total == 0:
+            # Nothing installed synchronously; every archive opened a wizard (or
+            # there was nothing to summarise). Let the wizards speak for
+            # themselves — no batch toast.
+            return
         if ok == total and ok > 0:
             if ok == 1:
                 self._notify(self.tr("Installed {0}").format(names[0]), "success")
@@ -8342,12 +8900,15 @@ class MainWindow(QMainWindow):
 
     def _drain_pending_installs(self):
         """Start the next install batch queued while an earlier install OR
-        deploy ran. If a callback/coalesced deploy already started work in the
-        meantime, leave the queue for the next _on_install_done / _on_op_done to
-        drain (both call here)."""
+        deploy OR a detached-wizard staging job ran. If a callback/coalesced
+        deploy already started work in the meantime, leave the queue for the next
+        _on_install_done / _on_op_done / _on_wizard_finish_done to drain (all
+        call here)."""
         if not self._pending_install_batches \
                 or getattr(self, "_install_running", False) \
-                or getattr(self, "_deploy_running", False):
+                or getattr(self, "_deploy_running", False) \
+                or getattr(self, "_staged_finish_running", False) \
+                or self._staged_finish_queue:
             return
         b = self._pending_install_batches.pop(0)
         self._install_paths(b["paths"], metas=b["metas"],
@@ -9306,6 +9867,102 @@ class MainWindow(QMainWindow):
             pass
         return out
 
+    def _build_rerun_fomod_mods(self) -> set:
+        """Mods that should show the rerun-FOMOD flag. Two conditions, both read
+        from meta.ini for FOMOD mods only (read_meta is mtime-cached, so cheap)
+        and evaluated against the currently-enabled plugins:
+
+          • `fomodPendingDeps` (UNSELECTED options' deps): flag when an AND-clause
+            becomes FULLY present — a patch you skipped is now relevant.
+          • `fomodActiveDeps` (SELECTED options' deps): flag when an AND-clause is
+            NO LONGER fully present — a patch you installed is now orphaned (its
+            required mod was removed/disabled).
+
+        See FLAG_RERUN_FOMOD."""
+        if not hasattr(self, "_modlist_model") or not hasattr(self, "_plugin_model"):
+            return set()
+        staging = self._gs.staging_dir()
+        if staging is None:
+            return set()
+        try:
+            enabled = self._plugin_model.enabled_lower()
+        except Exception:
+            return set()
+        # Narrow to FOMOD-installed mods when we know them (avoids reading meta for
+        # every mod); fall back to all mods if the set isn't populated yet.
+        candidates = getattr(self, "_mod_fomod", None) or self._modlist_model.mod_names()
+        # A DISABLED mod isn't deployed, so "rerun to fix it" is meaningless — and
+        # its own plugins leave the load order when disabled, which would break its
+        # self-referential fomodActiveDeps and falsely raise the flag. Skip them.
+        try:
+            enabled_mods = self._modlist_model.enabled_mod_names()
+            candidates = [m for m in candidates if m in enabled_mods]
+        except Exception:
+            pass
+        out: set[str] = set()
+        try:
+            from Nexus.nexus_meta import read_meta
+        except Exception:
+            return set()
+
+        def _member_holds(m: str) -> bool:
+            # "!name" = the plugin must be ABSENT (a state="Missing" gate);
+            # "name" = the plugin must be present + enabled.
+            if m.startswith("!"):
+                return m[1:] not in enabled
+            return m in enabled
+
+        def _and_clause(clause: str):
+            # A "+"-joined AND-clause → its lowercase members.
+            return [m.strip().lower() for m in clause.split("+") if m.strip()]
+
+        def _clause_holds(members) -> bool:
+            return bool(members) and all(_member_holds(m) for m in members)
+
+        def _option_conditions(raw: str):
+            # Each ";"-group is ONE option's condition, an OR-of-ANDs: "|"-joined
+            # AND-clauses. Yield the list of member-lists (the OR alternatives).
+            for cond in (raw or "").split(";"):
+                alts = [_and_clause(c) for c in cond.split("|")]
+                alts = [a for a in alts if a]
+                if alts:
+                    yield alts
+
+        def _option_met(alts) -> bool:
+            # OR: the option's condition holds if ANY alternative clause holds.
+            return any(_clause_holds(a) for a in alts)
+
+        def _has_present_member(alts) -> bool:
+            return any(not m.startswith("!") for a in alts for m in a)
+
+        for name in candidates:
+            try:
+                meta = read_meta(staging / name / "meta.ini")
+            except Exception:
+                continue
+            # Pending: an UNSELECTED option's condition is now satisfiable → rerun
+            # to pick up the newly-relevant patch. Require at least one PRESENT
+            # member across the option (a non-"!" literal) so a condition that only
+            # needs something ABSENT — true almost always — doesn't fire constantly.
+            if any(_option_met(alts) and _has_present_member(alts)
+                   for alts in _option_conditions(
+                       getattr(meta, "fomod_pending_deps", ""))):
+                out.add(name)
+                continue
+            # Active: a SELECTED option's condition is no longer satisfied (NONE of
+            # its OR alternatives hold) → rerun to drop the now-orphaned patch. For
+            # an OR option, having ONE of its plugins is still valid — don't fire.
+            if any(not _option_met(alts)
+                   for alts in _option_conditions(
+                       getattr(meta, "fomod_active_deps", ""))):
+                out.add(name)
+        return out
+
+    def _refresh_rerun_fomod_flags(self) -> None:
+        """Recompute + push the rerun-FOMOD overlay onto the modlist model."""
+        if hasattr(self, "_modlist_model"):
+            self._modlist_model.set_rerun_fomod_mods(self._build_rerun_fomod_mods())
+
     def _build_disabled_plugins_mods(self) -> set:
         """Mods that own at least one disabled plugin — union of plugins disabled
         in plugins.txt and plugins disabled via the Mod Files tab (Tk-parity
@@ -9612,10 +10269,26 @@ class MainWindow(QMainWindow):
         if entries and not meta_started:
             # No meta worker (staging unresolved) → kick the rebuild directly.
             self._rebuild_conflicts_async(rescan_index=rescan_index)
+        elif not entries and rescan_index:
+            # Empty modlist but an explicit rescan was requested (Refresh /
+            # install / toggle). The conflict rebuild is normally skipped when
+            # there are no mods (nothing to conflict), but the [Overwrite]
+            # pseudo-mod is INDEPENDENT of the real modlist: files can sit in
+            # overwrite/ (and in modindex.bin's [Overwrite] entry) with zero
+            # enabled mods. Skipping the rebuild here left a stale [Overwrite]
+            # index entry + stale filemap.txt that no Refresh could clear once
+            # the modlist was empty — the file kept showing in the Data tab and
+            # kept deploying (as a dangling symlink). Run the rebuild so the
+            # index and filemap are reconciled against the folder; it also
+            # writes an empty filemap when the last mod is removed.
+            # _on_conflicts_ready sets _switch_conflicts_done when the build
+            # lands, so the switch-marker bookkeeping below is still covered.
+            self._rebuild_conflicts_async(rescan_index=rescan_index)
         elif not entries and getattr(self, "_switch_t0", None) is not None:
-            # Empty profile → no conflict rebuild will follow, so the first
-            # plugin pass IS the final one; without this the switch marks
-            # would leak into the next unrelated plugin reload.
+            # Empty profile, no rescan (plain profile switch) → no conflict
+            # rebuild will follow, so the first plugin pass IS the final one;
+            # without this the switch marks would leak into the next unrelated
+            # plugin reload.
             self._switch_conflicts_done = True
 
     def _on_modlist_meta_ready(self, gen, payload):
@@ -9647,6 +10320,10 @@ class MainWindow(QMainWindow):
             self._modlist_model.set_meta(versions, installed, categories,
                                          descriptions, authors)
             self._modlist_model.set_flags(flags)
+        # Now that _mod_fomod + meta are current, refresh the rerun-FOMOD overlay
+        # (picks up a just-installed/updated mod's pending deps without waiting for
+        # the next plugin reload).
+        self._refresh_rerun_fomod_flags()
         # Prune any installed requirements from an open Missing Requirements panel
         # (this is the path the panel's own Install button lands on).
         view = getattr(self, "_missing_reqs_view", None)
@@ -9950,6 +10627,9 @@ class MainWindow(QMainWindow):
         self._refresh_plugin_stats()
         self._refresh_framework_banner()
         self._apply_plugins_supported()
+        # Rerun-FOMOD flag: an option's fileDependency plugin may have just become
+        # enabled/disabled — recompute the overlay against the fresh load order.
+        self._refresh_rerun_fomod_flags()
         # Userlist state → PF_USERLIST/PF_UL_CYCLE bits were already applied by
         # load_plugins; push the membership sets (context-menu predicates), the
         # group map (flags tooltip), and the userlist action callbacks.
@@ -10260,9 +10940,19 @@ class MainWindow(QMainWindow):
         self._refresh_userlist_flags()
 
     # ---- Sort Plugins (LOOT) ----------------------------------------------
-    def _on_sort_plugins(self):
+    def _on_refresh_plugins(self):
+        """Run LOOT to refresh plugin metadata (messages/dirty/tags/requirements)
+        WITHOUT reordering the load order — the ready handler skips the reorder
+        step when the context is flagged as a refresh."""
+        self._on_sort_plugins(refresh=True)
+
+    def _on_sort_plugins(self, _checked=False, *, refresh=False):
         """LOOT-sort the load order on a worker thread (reuses the Tk backend
-        LOOT/loot_sorter.sort_plugins). Result applied on the UI thread."""
+        LOOT/loot_sorter.sort_plugins). Result applied on the UI thread.
+
+        When *refresh* is True, LOOT still evaluates the plugins (yielding the
+        same metadata) but the resulting order is discarded — only the metadata
+        is written and the panel reloaded."""
         from LOOT.loot_sorter import is_available, unavailable_reason
         if not is_available():
             self._notify(self.tr("LOOT library not available — cannot sort."), "warning")
@@ -10314,6 +11004,7 @@ class MainWindow(QMainWindow):
             "plugin_names": plugin_names, "include_vanilla": include_vanilla,
             "profile_dir": pdir, "game_id": game.game_id,
             "game": game, "profile": self._gs.profile,
+            "refresh": refresh,
         }
 
         kw = dict(
@@ -10332,7 +11023,16 @@ class MainWindow(QMainWindow):
 
         self._sort_running = True
         self._plugin_sort_btn.setEnabled(False)
-        self._notify(self.tr("Running LOOT on {0} plugins…").format(len(plugin_names)), "info")
+        if hasattr(self, "_plugin_refresh_btn"):
+            self._plugin_refresh_btn.setEnabled(False)
+        if refresh:
+            self._notify(
+                self.tr("Refreshing LOOT metadata for {0} plugins…").format(
+                    len(plugin_names)), "info")
+        else:
+            self._notify(
+                self.tr("Running LOOT on {0} plugins…").format(
+                    len(plugin_names)), "info")
 
         from gui_qt.worker import run_in_worker
 
@@ -10352,10 +11052,15 @@ class MainWindow(QMainWindow):
         self._sort_running = False
         if hasattr(self, "_plugin_sort_btn"):
             self._plugin_sort_btn.setEnabled(True)
+        if hasattr(self, "_plugin_refresh_btn"):
+            self._plugin_refresh_btn.setEnabled(True)
         ctx = getattr(self, "_sort_ctx", None) or {}
         self._sort_ctx = None
+        is_refresh = bool(ctx.get("refresh"))
         if result is None:
-            self._notify(self.tr("LOOT sort failed — see log."), "error")
+            self._notify(
+                (self.tr("LOOT refresh failed — see log.") if is_refresh
+                 else self.tr("LOOT sort failed — see log.")), "error")
             return
         for w in getattr(result, "warnings", []) or []:
             self._append_log(f"[loot] warning: {w}")
@@ -10367,6 +11072,13 @@ class MainWindow(QMainWindow):
                             result.general_messages, game_id=ctx.get("game_id", ""))
         except Exception as exc:
             self._append_log(f"[loot] could not write loot.json: {exc}")
+
+        # Refresh mode: metadata is written, load order untouched. Just reload
+        # the panel so the new flags light up, then stop.
+        if is_refresh:
+            self._reload_plugins()
+            self._notify(self.tr("Plugin metadata refreshed."), "success")
+            return
 
         from gui_qt.plugin_state import apply_loot_sort, save_plugins
         new_rows, moved = apply_loot_sort(
@@ -11019,7 +11731,11 @@ class MainWindow(QMainWindow):
                     # the deploy swaps the shared game object's active profile
                     # and races the install worker's path resolution. The
                     # install's own _on_install_done reload re-triggers this.
-                    and not getattr(self, "_install_running", False)):
+                    and not getattr(self, "_install_running", False)
+                    # Same hazard for a detached-wizard staging job in flight —
+                    # _on_wizard_finish_done's reload re-triggers this.
+                    and not getattr(self, "_staged_finish_running", False)
+                    and not self._staged_finish_queue):
                 self._auto_deploy_in_progress = True
                 self._on_deploy(silent=True)
 
@@ -11291,6 +12007,13 @@ class MainWindow(QMainWindow):
             f" font-weight:600;}}"
             f"QPushButton:hover{{background:{color};}}")
         return b
+
+    def _equalize_button_widths(self, *buttons) -> None:
+        """Give every button the width of the widest one so a row of related
+        buttons (e.g. Pack/Unpack BSA) lines up regardless of label length."""
+        w = max((b.sizeHint().width() for b in buttons), default=0)
+        for b in buttons:
+            b.setMinimumWidth(w)
 
     def _icon_button(self, icon_name: str, tip: str = "") -> QToolButton:
         b = QToolButton()
