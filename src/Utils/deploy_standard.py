@@ -27,6 +27,7 @@ from Utils.deploy_shared import (
     _do_link_ex,
     _get_staging_source_path,
     _append_overwrite_log,
+    _log_case_collisions,
     _map_batched,
     _mkdir_leaves,
     _move_crash_safe,
@@ -196,7 +197,10 @@ _MTIME_TOLERANCE_NS = 2_000_000_000
 def _write_deploy_stats(stats_path: Path, entries: "list[str]", log_fn=None) -> None:
     """Atomically write deploy_stats.txt from pre-formatted lines."""
     try:
-        with atomic_writer(stats_path, "w") as fh:
+        # surrogateescape: the rel-path column derives from on-disk filenames
+        # whose non-UTF-8 bytes decode to surrogate code points; symmetric with
+        # _load_deploy_stats below so the round-trip never raises.
+        with atomic_writer(stats_path, "w", errors="surrogateescape") as fh:
             fh.write("# deploy_stats v1\n")
             for line in entries:
                 fh.write(line)
@@ -208,7 +212,7 @@ def _load_deploy_stats(stats_path: Path) -> "dict[str, tuple[int, int]]":
     """Read deploy_stats.txt into {rel_lower: (size, mtime_ns)}; {} if absent."""
     stats: dict[str, tuple[int, int]] = {}
     try:
-        with stats_path.open(encoding="utf-8") as fh:
+        with stats_path.open(encoding="utf-8", errors="surrogateescape") as fh:
             for line in fh:
                 if line.startswith("#"):
                     continue
@@ -237,7 +241,7 @@ _VANILLA_DEPLOYED_NAME = "vanilla_deployed.txt"
 def _write_vanilla_deployed(path: Path, rels: "list[str]", log_fn=None) -> None:
     """Atomically write the vanilla gap-fill manifest (one rel path per line)."""
     try:
-        with atomic_writer(path, "w") as fh:
+        with atomic_writer(path, "w", errors="surrogateescape") as fh:
             fh.write("# vanilla_deployed v1\n")
             for rel in rels:
                 fh.write(rel.replace("\\", "/") + "\n")
@@ -249,7 +253,7 @@ def _load_vanilla_deployed(path: Path) -> "set[str]":
     """Read the vanilla gap-fill manifest into a set of lowercased rel paths."""
     rels: set[str] = set()
     try:
-        with path.open(encoding="utf-8") as fh:
+        with path.open(encoding="utf-8", errors="surrogateescape") as fh:
             for line in fh:
                 if line.startswith("#"):
                     continue
@@ -504,7 +508,7 @@ def deploy_filemap(
     mod_index_cache: dict[Path, dict[str, Path]] = {}
 
     _t_resolve_start = _time.perf_counter()
-    with filemap_path.open(encoding="utf-8") as f:
+    with filemap_path.open(encoding="utf-8", errors="surrogateescape") as f:
         _tab_lines = [ln.rstrip("\n") for ln in f if "\t" in ln]
     total_lines = len(_tab_lines)
     line_idx = 0
@@ -523,6 +527,12 @@ def deploy_filemap(
     _slow_hits = 0
     # Cache mod_root Path objects — avoids 92k Path / operations for ~520 mods
     _mod_root_cache: dict[str, Path] = {}
+    # mod_index_cache mirror keyed by mod NAME so the per-line lookup hashes
+    # a str, not a Path (Path.__hash__/__eq__ dominated the loop profile).
+    # Value None = mod known to have no index; resynced after slow hits
+    # because _resolve_source builds indexes into mod_index_cache on miss.
+    _mod_index_by_name: dict = {}
+    _IDX_UNSET = object()
     # String-based caches for _resolve_root_path_str
     _deploy_dir_str = str(deploy_dir)
     _core_base_str = str(core_dir) if core_dir is not None else None
@@ -542,10 +552,16 @@ def deploy_filemap(
     # for the symlink. Keeping the resolved dst guarantees the symlink path
     # uses the same casing as the per-file tasks it replaces.
     _top_folder_sample: dict[tuple[str, str], tuple[str, str, str]] = {}
+    _mod_traversal: dict[str, bool] = {}
     for line in _tab_lines:
         rel_str, mod_name = line.split("\t", 1)
-        # Guard against path traversal in filemap entries.
-        if _has_traversal(rel_str) or _has_traversal(mod_name):
+        # Guard against path traversal in filemap entries. The mod-name
+        # verdict is cached per unique mod (~hundreds) instead of per line.
+        _bad_mod = _mod_traversal.get(mod_name)
+        if _bad_mod is None:
+            _bad_mod = _has_traversal(mod_name)
+            _mod_traversal[mod_name] = _bad_mod
+        if _bad_mod or _has_traversal(rel_str):
             _log(f"  WARN: skipping suspicious filemap entry — rel={rel_str!r} mod={mod_name!r}")
             continue
         rel_lower = rel_str.lower()
@@ -557,11 +573,12 @@ def deploy_filemap(
         line_idx += 1
 
         # --- Fast path: O(1) mod-index lookup (no syscall) ---
-        _mr = _mod_root_cache.get(mod_name)
-        if _mr is None:
+        _idx = _mod_index_by_name.get(mod_name, _IDX_UNSET)
+        if _idx is _IDX_UNSET:
             _mr = overwrite_dir if mod_name == _OVERWRITE_NAME else staging_root / mod_name
             _mod_root_cache[mod_name] = _mr
-        _idx = mod_index_cache.get(_mr)
+            _idx = mod_index_cache.get(_mr)
+            _mod_index_by_name[mod_name] = _idx
         src_str: str | None = None
         if _idx is not None:
             _hit = _idx.get(rel_lower)
@@ -577,6 +594,8 @@ def deploy_filemap(
             )
             if src_str is not None:
                 _slow_hits += 1
+                _mod_index_by_name[mod_name] = mod_index_cache.get(
+                    _mod_root_cache[mod_name])
         if src_str is None:
             _log(f"  WARN: source not found — {rel_str} ({mod_name})")
             continue
@@ -599,9 +618,24 @@ def deploy_filemap(
         effective_dir = _per_deploy.get(mod_name, deploy_dir)
         _core_s = _core_base_str if effective_dir is deploy_dir else None
         _eff_s = _deploy_dir_str if effective_dir is deploy_dir else str(effective_dir)
-        dst_str = _resolve_root_path_str(_eff_s, dst_rel, _dir_listing_cache,
-                                         core_base_str=_core_s,
-                                         resolved_dir_cache=_resolved_dir_cache)
+        # Inline _resolve_root_path_str's two O(1) outcomes (no dir part /
+        # resolved-dir cache hit) — most files share their parent dir, so
+        # this skips a function call per line. Must mirror its key exactly:
+        # base + "\x00" + dir-part-of-original-rel lowercased (lowercasing
+        # can change string length, so never slice the lowered rel instead).
+        _sp = dst_rel.rfind("/")
+        if _sp < 0:
+            dst_str = _eff_s + "/" + dst_rel
+        else:
+            _rd = _resolved_dir_cache.get(
+                _eff_s + "\x00" + dst_rel[:_sp].lower())
+            if _rd is not None:
+                dst_str = _rd + "/" + dst_rel[_sp + 1:]
+            else:
+                dst_str = _resolve_root_path_str(_eff_s, dst_rel,
+                                                 _dir_listing_cache,
+                                                 core_base_str=_core_s,
+                                                 resolved_dir_cache=_resolved_dir_cache)
         use_symlink = symlink_exts is not None and os.path.splitext(src_str)[1].lower() in symlink_exts
         override_mode = _per_mode.get(mod_name)
         is_custom_task = effective_dir is not deploy_dir
@@ -694,7 +728,10 @@ def deploy_filemap(
     def _write_custom_log(paths: "list[str]") -> None:
         try:
             if paths:
-                _custom_log_path.write_text("\n".join(paths), encoding="utf-8")
+                # surrogateescape: custom-deploy log holds absolute dest paths
+                # that carry surrogate-escaped on-disk filename bytes.
+                _custom_log_path.write_text("\n".join(paths), encoding="utf-8",
+                                            errors="surrogateescape")
             elif _custom_log_path.exists():
                 _custom_log_path.unlink()
         except OSError:
@@ -885,6 +922,8 @@ def deploy_filemap(
                 f"{_free // (1024 * 1024)} MB is free. Free up space, then "
                 f"deploy again (or run Restore).",
             )
+
+    _log_case_collisions(_dir_listing_cache, _log)
 
     # Pre-create all destination directories up front (single-threaded) to
     # avoid mkdir races inside the thread pool.
@@ -1245,7 +1284,8 @@ def restore_data_core(
         filemap_lower: set[str] = set()
         filemap_rel_to_mod: dict[str, str] = {}
         if filemap_path.is_file():
-            with filemap_path.open(encoding="utf-8") as _fm:
+            with filemap_path.open(encoding="utf-8",
+                                   errors="surrogateescape") as _fm:
                 for _line in _fm:
                     _line = _line.rstrip("\n")
                     if "\t" in _line:
@@ -1270,7 +1310,8 @@ def restore_data_core(
         _filemap_root_path = overwrite_dir.parent / "filemap_root.txt"
         if _filemap_root_path.is_file():
             _deploy_prefix = (deploy_dir.name + "/").lower()
-            with _filemap_root_path.open(encoding="utf-8") as _fmr:
+            with _filemap_root_path.open(encoding="utf-8",
+                                         errors="surrogateescape") as _fmr:
                 for _line in _fmr:
                     _line = _line.rstrip("\n")
                     if "\t" not in _line:
@@ -1322,6 +1363,7 @@ def restore_data_core(
         rescued_to_overwrite = 0
         rescued_edited_vanilla = 0
         kept_whitelisted = 0
+        discarded_empty = 0
         # Track rel_strs rescued to overwrite/ so we can update modindex.bin
         # by appending entries instead of re-walking the entire overwrite tree.
         rescued_overwrite_rels: list[str] = []
@@ -1426,6 +1468,14 @@ def restore_data_core(
                     if (st.st_ino == _core_ino or
                         (st.st_size == _core_sz and st.st_mtime_ns == _core_mt)):
                         continue  # untouched vanilla — restore from core
+                    if st.st_size == 0 and _core_sz > 0:
+                        # A 0-byte file is never a legitimate edit (xEdit
+                        # can't save an empty plugin)
+                        _log(f"  WARN: deployed {rel_str} is 0 bytes "
+                             f"(runtime-damaged?) — discarded; keeping the "
+                             f"vanilla backup.")
+                        discarded_empty += 1
+                        continue
                     core_dst = core_path.get(rel_lower)
                     if core_dst is not None:
                         try:
@@ -1444,6 +1494,14 @@ def restore_data_core(
                 # plugin — move it into core_dir at its rel path so the
                 # rmtree+rename below restores it to deploy_dir rather
                 # than burying it in overwrite/.
+                if st.st_size == 0:
+                    # Never restore a 0-byte "edited vanilla" — that's
+                    # runtime damage, not an edit (see GH#307 note above).
+                    _log(f"  WARN: deployed {rel_str} is 0 bytes "
+                         f"(runtime-damaged?) — discarded; verify game "
+                         f"files to restore the vanilla copy.")
+                    discarded_empty += 1
+                    continue
                 core_dst = _core_str + "/" + rel_str
                 try:
                     os.makedirs(os.path.dirname(core_dst), exist_ok=True)
@@ -1518,6 +1576,14 @@ def restore_data_core(
                                 continue
                         except OSError:
                             pass
+                        if st.st_size == 0:
+                            # A 0-byte deployed copy is runtime damage
+                            # (Wine/game truncating a deployed file
+                            _log(f"  WARN: deployed {rel_str} is 0 bytes "
+                                 f"(runtime-damaged?) — discarded; keeping "
+                                 f"the staging copy in '{target_mod}'.")
+                            discarded_empty += 1
+                            continue
                         _move_crash_safe(src_str, staging_path)
                         rescued += 1
                         rescued_to_mod += 1
@@ -1531,6 +1597,14 @@ def restore_data_core(
                                 _staging / target_mod, os.path.basename(rel_str))
                         continue
                     # xEdit orphan: staging missing — put file back in original mod or overwrite
+                    if st.st_size == 0:
+                        # Same 0-byte guard as above: don't plant an empty
+                        # file into a mod folder / overwrite where future
+                        # deploys would pick it up.
+                        _log(f"  WARN: deployed {rel_str} is 0 bytes "
+                             f"(runtime-damaged?) — discarded, not rescued.")
+                        discarded_empty += 1
+                        continue
                     target_mod = (
                         filemap_rel_to_mod.get(rel_lower)
                         or (modindex_rel_to_mods.get(rel_lower) or [None])[0]
@@ -1577,7 +1651,10 @@ def restore_data_core(
             # than rglob-ing the entire overwrite tree.
             if rescued_overwrite_rels:
                 try:
-                    from Utils.filemap import update_mod_index, read_mod_index
+                    from Utils.filemap import (
+                        update_mod_index, read_mod_index, _is_utf8_safe,
+                        _safe_log_str,
+                    )
                     # Default assumes overwrite_dir is the profile's top-level
                     # overwrite/ (so its parent is the profile root holding
                     # modindex.bin). Callers that pass a SUB-path of overwrite/
@@ -1600,14 +1677,34 @@ def restore_data_core(
                         if os.path.exists(_overwrite_str + "/" + _v):
                             new_normal[_k] = _v
                     for _rel_str in rescued_overwrite_rels:
+                        # Runtime files are GAME-created — their names can be
+                        # any bytes. A surrogate-escaped non-UTF-8 name can't
+                        # be msgpack-serialized and would abort the whole
+                        # index update; skip it (the file itself stays safely
+                        # in overwrite/, it just isn't indexed).
+                        if not _is_utf8_safe(_rel_str):
+                            _log(f"  WARN: rescued file has a non-UTF-8 name, "
+                                 f"not indexed: {_safe_log_str(_rel_str)}")
+                            continue
                         # Normalise separators for cross-platform safety
                         _rel_posix = _rel_str.replace("\\", "/")
                         new_normal[_rel_posix.lower()] = _rel_posix
-                    update_mod_index(_index_path, _OVERWRITE_NAME, new_normal, existing_root)
-                except Exception:
-                    pass
+                    update_mod_index(_index_path, _OVERWRITE_NAME, new_normal,
+                                     existing_root, log_fn=_log)
+                except Exception as _idx_err:
+                    # A failed update only loses the [Overwrite] refresh — but
+                    # say so instead of hiding it (a bare pass here masked
+                    # rescued files silently missing from the Data tab).
+                    try:
+                        _log(f"  WARN: could not update modindex.bin with "
+                             f"rescued file(s): {_idx_err}")
+                    except Exception:
+                        pass
         if kept_whitelisted:
             _log(f"  Left {kept_whitelisted} whitelisted file(s) in the game folder.")
+        if discarded_empty:
+            _log(f"  Discarded {discarded_empty} runtime-damaged 0-byte file(s) "
+                 f"(kept the good staging/backup copies).")
         print(f"  [TIMER] restore — rescue walk: {_time.perf_counter() - _t_rescue_start:.3f}s")
         # core_path was populated by the rescue walk above — one entry per
         # core file, so len() is our return-value count without a second walk.
@@ -1628,6 +1725,7 @@ def restore_data_core(
     # deployed files.  Leftover trash from a crash is removed by
     # sweep_deploy_trash (start of move_to_core/restore, and app startup).
     with _timer("restore — swap dirs"):
+        merge_needed = False
         if deploy_dir.is_dir():
             trash = deploy_dir.parent / (
                 f"{deploy_dir.name}{_TRASH_INFIX}{_time.time_ns()}")
@@ -1638,12 +1736,68 @@ def restore_data_core(
                      f"in the background).")
             except OSError:
                 # Rename refused (e.g. exotic mount) — fall back to the old
-                # foreground rmtree.
-                shutil.rmtree(deploy_dir)
-                _log(f"  Cleared {deploy_dir.name}/.")
-        shutil.move(str(core_dir), str(deploy_dir))
+                # foreground rmtree.  A partial rmtree failure (EACCES/EBUSY)
+                # must NOT escape here: that would abort the restore with a
+                # half-deleted deploy dir AND the vanilla files still
+                # stranded in core_dir.  Merge them back over the leftovers
+                # instead.
+                try:
+                    shutil.rmtree(deploy_dir)
+                    _log(f"  Cleared {deploy_dir.name}/.")
+                except OSError as rm_err:
+                    if deploy_dir.exists():
+                        merge_needed = True
+                        _log(f"  ERROR: could not fully clear "
+                             f"{deploy_dir.name}/ ({rm_err}) — restoring the "
+                             f"vanilla files over the leftovers.")
+                    else:
+                        _log(f"  Cleared {deploy_dir.name}/.")
+        if merge_needed:
+            _merge_restore_core(core_dir, deploy_dir, _log)
+        else:
+            shutil.move(str(core_dir), str(deploy_dir))
 
     return restored
+
+
+def _merge_restore_core(core_dir: Path, deploy_dir: Path, _log) -> None:
+    """Move core_dir's files into a partially-cleared deploy_dir one by one.
+
+    Fallback for when the whole-dir swap in restore_data_core could not run
+    (deploy_dir could not be fully deleted).  Each vanilla file replaces any
+    leftover at its path; files that cannot be moved stay safely in core_dir
+    (which is only removed once it has been fully emptied) so a later restore
+    can retry them.
+    """
+    failed = 0
+    core_str = str(core_dir)
+    deploy_str = str(deploy_dir)
+    for dp, _dns, fns in os.walk(core_str):
+        rel_dp = os.path.relpath(dp, core_str)
+        dst_dp = deploy_str if rel_dp == "." else os.path.join(deploy_str, rel_dp)
+        for fn in fns:
+            src = os.path.join(dp, fn)
+            dst = os.path.join(dst_dp, fn)
+            try:
+                os.makedirs(dst_dp, exist_ok=True)
+                if os.path.isdir(dst) and not os.path.islink(dst):
+                    # Leftover deployed dir shadowing a vanilla file path.
+                    shutil.rmtree(dst)
+                try:
+                    os.replace(src, dst)
+                except OSError:
+                    shutil.move(src, dst)
+            except (OSError, shutil.Error) as exc:
+                failed += 1
+                _log(f"  WARN: could not restore "
+                     f"{os.path.relpath(src, core_str)}: {exc}")
+    if failed:
+        _log(f"  ERROR: {failed} vanilla file(s) could not be restored and "
+             f"remain in {core_dir.name}/ — they will be retried on the "
+             f"next restore.")
+    else:
+        # Everything moved — drop the now-empty core_dir tree.
+        shutil.rmtree(core_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1656,6 +1810,7 @@ def undeploy_mod_files(
     game_root: "Path | None",
     index_path: Path,
     log_fn=None,
+    staging_root: "Path | None" = None,
 ) -> int:
     """Remove any files belonging to the given mods from the game's deploy
     directory and/or game root, using the modindex.bin to find them.
@@ -1672,6 +1827,14 @@ def undeploy_mod_files(
                  May be None if unknown / game not configured.
     index_path — path to modindex.bin (typically <profile_root>/modindex.bin)
     log_fn     — optional logging callable
+    staging_root — the mods staging folder.  When given, a deployed file is
+                 only unlinked after verifying it is actually the mod's copy:
+                 a hardlink to a staged file (same inode), a symlink into the
+                 mod's staging folder, or (copy-fallback deploys) a size+mtime
+                 match.  Without this check, a mod that shadows a vanilla file
+                 name (e.g. a patched FalloutNV.esm) would delete the REAL
+                 game file whenever the mod isn't the one deployed at that
+                 path — vanilla after a restore, or another mod's winner.
 
     Returns the total number of files removed.
     """
@@ -1687,7 +1850,31 @@ def undeploy_mod_files(
         return 0
 
     removed = 0
+    kept = 0
     dirs_to_prune: set[Path] = set()
+
+    # Per-mod identity of the staged files (built before the caller deletes
+    # staging): inodes for hardlink deploys, basename→(size, mtime) for the
+    # rare copy-fallback deploys, and the staging dir for symlink targets.
+    import stat as _stat
+    identities: "dict[str, tuple[set, dict, str]] | None" = None
+    if staging_root is not None:
+        identities = {}
+        for mod_name in mod_names:
+            mod_dir = staging_root / mod_name
+            inodes: set = set()
+            sizes: dict = {}
+            for dp, _dns, fns in os.walk(str(mod_dir)):
+                for fn in fns:
+                    try:
+                        st = os.lstat(os.path.join(dp, fn))
+                    except OSError:
+                        continue
+                    if _stat.S_ISREG(st.st_mode):
+                        inodes.add((st.st_dev, st.st_ino))
+                        sizes.setdefault(fn.lower(), []).append(
+                            (st.st_size, st.st_mtime))
+            identities[mod_name] = (inodes, sizes, str(mod_dir))
 
     # Collect every target up front, then unlink them in parallel.  Each task
     # is one lstat + (maybe) one unlink — the unlinks dominate cost across
@@ -1697,8 +1884,7 @@ def undeploy_mod_files(
     # deployed path may have merged into an existing folder's casing, and a
     # raw-cased unlink would miss it (leaving a leftover that a later restore
     # would mis-rescue to overwrite/).
-    import stat as _stat
-    targets: list[Path] = []
+    targets: list[tuple[Path, str]] = []
     _dir_listing_cache: dict[str, dict[str, str]] = {}
     _resolved_dir_cache: dict[str, str] = {}
     _deploy_dir_str = str(deploy_dir) if deploy_dir is not None else None
@@ -1716,10 +1902,10 @@ def undeploy_mod_files(
                 if not _path_under_root(target, deploy_dir):
                     _log(f"  SKIP (path traversal): {rel_str}")
                     continue
-                targets.append(Path(_resolve_root_path_str(
+                targets.append((Path(_resolve_root_path_str(
                     _deploy_dir_str, rel_str.replace("\\", "/"),
                     _dir_listing_cache, resolved_dir_cache=_resolved_dir_cache,
-                )))
+                )), mod_name))
 
         if game_root is not None and root_files:
             for rel_str in root_files.values():
@@ -1727,30 +1913,62 @@ def undeploy_mod_files(
                 if not _path_under_root(target, game_root):
                     _log(f"  SKIP (path traversal): {rel_str}")
                     continue
-                targets.append(Path(_resolve_root_path_str(
+                targets.append((Path(_resolve_root_path_str(
                     _game_root_str, rel_str.replace("\\", "/"),
                     _dir_listing_cache, resolved_dir_cache=_resolved_dir_cache,
-                )))
+                )), mod_name))
 
-    def _unlink_one(p: Path) -> tuple[int, Path | None, str | None]:
+    def _belongs_to_mod(p: Path, st, ident) -> bool:
+        """True when the on-disk file is verifiably the mod's deployed copy."""
+        inodes, sizes, mod_dir_str = ident
+        if _stat.S_ISLNK(st.st_mode):
+            # Symlink deploy: created as symlink(<abs staging file>, dst).
+            try:
+                link = os.readlink(p)
+            except OSError:
+                return False
+            tgt = os.path.normpath(os.path.join(os.path.dirname(str(p)), link))
+            prefix = mod_dir_str.rstrip(os.sep) + os.sep
+            if tgt.startswith(prefix):
+                return True
+            real_prefix = os.path.realpath(mod_dir_str).rstrip(os.sep) + os.sep
+            return os.path.realpath(tgt).startswith(real_prefix)
+        # Hardlink deploy: same inode as a staged file.
+        if (st.st_dev, st.st_ino) in inodes:
+            return True
+        # Copy-fallback deploy (cross-FS without symlink support): copy2
+        # preserves size + mtime (FAT stores mtime at 2s granularity).
+        for size, mtime in sizes.get(p.name.lower(), ()):
+            if st.st_size == size and abs(st.st_mtime - mtime) <= 2.0:
+                return True
+        return False
+
+    def _unlink_one(item: "tuple[Path, str]") -> tuple[int, int, Path | None, str | None]:
+        p, mod_name = item
         try:
             st = os.lstat(p)
         except OSError:
-            return 0, None, None
-        if _stat.S_ISLNK(st.st_mode) or _stat.S_ISREG(st.st_mode):
-            try:
-                os.unlink(p)
-                return 1, p.parent, None
-            except OSError as exc:
-                return 0, None, f"  WARN: could not remove deployed file {p}: {exc}"
-        return 0, None, None
+            return 0, 0, None, None
+        if not (_stat.S_ISLNK(st.st_mode) or _stat.S_ISREG(st.st_mode)):
+            return 0, 0, None, None
+        if identities is not None:
+            ident = identities.get(mod_name)
+            if ident is not None and not _belongs_to_mod(p, st, ident):
+                # Vanilla file or another mod's winner at this path — keep.
+                return 0, 1, None, None
+        try:
+            os.unlink(p)
+            return 1, 0, p.parent, None
+        except OSError as exc:
+            return 0, 0, None, f"  WARN: could not remove deployed file {p}: {exc}"
 
     if targets:
         import concurrent.futures
         from Utils.deploy_shared import _deploy_workers
         with concurrent.futures.ThreadPoolExecutor(max_workers=_deploy_workers()) as pool:
-            for n, parent, warn in pool.map(_unlink_one, targets):
+            for n, k, parent, warn in pool.map(_unlink_one, targets):
                 removed += n
+                kept += k
                 if parent is not None:
                     dirs_to_prune.add(parent)
                 if warn is not None:
@@ -1772,6 +1990,9 @@ def undeploy_mod_files(
 
     if removed:
         _log(f"  Undeployed {removed} file(s) for {len(mod_names)} mod(s).")
+    if kept:
+        _log(f"  Kept {kept} file(s) in the game folder that did not belong "
+             "to the removed mod(s) (vanilla or another mod's copy).")
     return removed
 
 

@@ -52,6 +52,50 @@ class Fallout_NV(Fallout_3):
                 category="Setup and Installers",
             ),
             WizardTool(
+                id="fnv_bsa_decompressor",
+                label="BSA Decompressor",
+                description="Decompress the vanilla BSA archives for faster loading (native Linux MPI installer) and add the result as a mod. Needs the FNV BSA Decompressor download from Nexus.",
+                dialog_class_path="wizards.bsa_decompressor.BSADecompressorWizard",
+                category="Setup and Installers",
+            ),
+            WizardTool(
+                id="fnv_esm_fixes",
+                label="Install Ultimate Edition ESM Fixes",
+                description="Patch the vanilla .esm masters with community bugfixes (native Linux MPI installer) and add the result as a mod. Needs the Ultimate Edition ESM Fixes Remastered download from Nexus.",
+                dialog_class_path="wizards.esm_fixes.ESMFixesWizard",
+                category="Setup and Installers",
+            ),
+            WizardTool(
+                id="fnv_viva_new_vegas",
+                label="Install Viva New Vegas",
+                description="Download the curated Viva New Vegas modlist profile and install it",
+                dialog_class_path="wizards.curated_profile.CuratedProfileWizard",
+                category="Setup and Installers",
+                extra={
+                    "profile_repo_path": "Profiles/FalloutNV/Viva_New_Vegas.amethyst",
+                    "display_name": "Viva New Vegas",
+                    "esm_fixes_step": True,
+                    "bsa_decompressor_step": True,
+                    "fnv_4gb_step": True,
+                    "info_url": "https://vivanewvegas.moddinglinked.com/",
+                },
+            ),
+            WizardTool(
+                id="fnv_viva_new_vegas_extended",
+                label="Install Viva New Vegas Extended",
+                description="Download the curated Viva New Vegas Extended modlist profile and install it",
+                dialog_class_path="wizards.curated_profile.CuratedProfileWizard",
+                category="Setup and Installers",
+                extra={
+                    "profile_repo_path": "Profiles/FalloutNV/Viva_New_Vegas_Extended.amethyst",
+                    "display_name": "Viva New Vegas Extended",
+                    "esm_fixes_step": True,
+                    "bsa_decompressor_step": True,
+                    "fnv_4gb_step": True,
+                    "info_url": "https://vivanewvegas.moddinglinked.com/",
+                },
+            ),
+            WizardTool(
                 id="run_bethini_fonv",
                 label="Run BethINI Pie",
                 description="Install BethINI Pie and configure Fallout New Vegas INI settings.",
@@ -66,6 +110,7 @@ class Fallout_NV(Fallout_3):
             *self._xedit_wizard_tools(
                 build="FNVEdit", id_suffix="fonv",
                 nexus_url="https://www.nexusmods.com/newvegas/mods/34703?tab=files",
+                nexus_file_id=1000128948,
             ),
         ]
 
@@ -113,6 +158,26 @@ class Fallout_NV(Fallout_3):
                 ]
 
     @property
+    def filemap_casing_pins(self) -> dict[str, str]:
+        return {
+            "nvse":"NVSE",
+            "plugins":"Plugins",
+        }
+
+    @property
+    def restore_whitelist(self) -> list:
+        # Keep the 4GB-patch backup exe in the game root across restores. It
+        # is created after the deploy snapshot (post_deploy or the wizard), so
+        # the runtime sweep would otherwise move it into Root_Folder/ whenever
+        # _undo_4gb_patch skips it — auto-patching turned off between deploy
+        # and restore, or a fresh unpatched exe after Steam verify-files.
+        from Utils.deploy import RestoreWhitelistRule
+        from Utils.fnv4gb_tools import BACKUP_NAME
+        return super().restore_whitelist + [
+            RestoreWhitelistRule(path="", filenames=[BACKUP_NAME]),
+        ]
+
+    @property
     def loot_masterlist_repo(self) -> str:
         return "falloutnv"
 
@@ -130,6 +195,81 @@ class Fallout_NV(Fallout_3):
     @property
     def _script_extender_exe(self) -> str:
         return "nvse_loader.exe"
+
+    # -----------------------------------------------------------------------
+    # Automatic 4GB patch on deploy
+    # -----------------------------------------------------------------------
+
+    def _load_paths_extra(self, data: dict) -> None:
+        super()._load_paths_extra(data)
+        self._auto_4gb_patch = data.get("auto_4gb_patch", True)
+
+    def _save_paths_extra(self) -> dict:
+        out = super()._save_paths_extra()
+        out["auto_4gb_patch"] = getattr(self, "_auto_4gb_patch", True)
+        return out
+
+    @property
+    def auto_4gb_patch(self) -> bool:
+        """Apply the 4GB patch automatically after each deploy (and revert it
+        on restore). Default on; the Configure Game / Quick Configure option
+        turns it off for users who manage the patch manually via the wizard."""
+        return getattr(self, "_auto_4gb_patch", True)
+
+    def set_auto_4gb_patch(self, value: bool) -> None:
+        self._auto_4gb_patch = bool(value)
+        self.save_paths()
+
+    def _auto_4gb_active(self) -> bool:
+        import os
+        return self.auto_4gb_patch and os.environ.get("AMM_FNV_AUTO_4GB") != "0"
+
+    def restore(self, log_fn=None, progress_fn=None) -> None:
+        self._undo_4gb_patch(log_fn)
+        super().restore(log_fn=log_fn, progress_fn=progress_fn)
+
+    def _undo_4gb_patch(self, log_fn=None) -> None:
+        """Put the vanilla exe back after a restore while automatic patching
+        is on (post_deploy re-applies it on the next deploy). Only swaps a
+        known patched exe with an existing backup; never fails the restore."""
+        _log = log_fn or (lambda _m: None)
+        if not self._auto_4gb_active():
+            return
+        game_root = self.get_game_path()
+        if game_root is None or not game_root.is_dir():
+            return
+        try:
+            from Utils.fnv4gb_tools import (
+                EXE_NAME, inspect_exe, restore_backup,
+            )
+            info = inspect_exe(game_root)
+            if info["state"] == "patched" and info["backup_exists"]:
+                restore_backup(game_root)
+                _log(f"4GB patch: restored original {EXE_NAME} from backup.")
+        except Exception as exc:
+            _log(f"WARN: 4GB patch revert failed: {exc}")
+
+    def post_deploy(self, log_fn=None) -> None:
+        _log = log_fn or (lambda _m: None)
+        if not self._auto_4gb_active():
+            return
+        game_root = self.get_game_path()
+        if game_root is None or not game_root.is_dir():
+            return
+        from Utils.fnv4gb_tools import (
+            BACKUP_NAME, EXE_NAME, apply_4gb_patch, inspect_exe,
+        )
+        info = inspect_exe(game_root)
+        state = info["state"]
+        if state == "patchable":
+            variant = apply_4gb_patch(game_root)
+            _log(f"4GB patch: auto-patched {EXE_NAME} ({variant} version) — "
+                 f"original kept as {BACKUP_NAME}.")
+        elif state == "unknown":
+            _log(f"4GB patch: skipped — unrecognised {EXE_NAME} version "
+                 f"(SHA-1 {info['hash']}). Verify game files, then use the "
+                 f"4GB Patch wizard.")
+        # "patched" / "missing" → nothing to do.
 
     # FalloutCustom.ini key/value set the TTW NVSE plugin expects (section, key,
     # value). Applied via _set_ini_key so existing keys are updated and missing

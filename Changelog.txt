@@ -1,10 +1,62 @@
+- v2.0.5
+### Game Support
+- Added Devil May Cry 5
+- Added Dragons Dogma 2
+### Additions
+- The wiki can now be viewed from within the manager
+- Added an argument field in the xedit wizards for adding additional command line arguments
+- Added an option to apply the 4gb patch to New vegas on deploy
+- Mods can now be dragged from the downloads tab to the modlist panel to install them
+- Added an option to xedit qac wizards to clean all dirty plugins automatically
+- Added an overrides tab for Baldur's Gate 3
+- Added 2 new light themes
+### Changes
+- Condensed the Nexus actions in the right click context menu into a sub menu
+- Tidied up the settings menu and define custom game menu
+- The plugins tab is no longer shown for games that do not use it
+- Mods in the "update files" category on Nexus now show up when installing from the nexus browser
+- The Smapi wizard now installs it automatically instead of needing user input
+- Updated Synthesis wizard to install .net 10 SDK
+- After checking a modlist for updates, If any updates are available a prompt will appear to auto run the quick updater
+- The xedit wizards can now not be closed while xedit is running
+- A warning is now shown when trying to deploy into an NTFS drive
+- Multiple tab types can now be viewed at once, A tab overlaying the modlist panel and a tab overlaying the plugins panel can be viewed at the same time
+### Bug Fixes
+- Fixed an issue where users with the "supporter" role could not download collections
+- Fixed an issue where fose (Fallout 3 script extender) was being installed incorrectly
+- Fixed an issue where plugins could not be disabled for older Bethesda titles
+- Fixed issues related to BSA/BA2 conflicts not displaying accurately 
+- Fixed the overwrite folder not deploying correctly for Ue5 games
+- Fixed an issue where restore could leave behind some empty folders
+- Fixed app tray icon not showing for some users
+- Fixed an issue where the loading splash in the nexus browser could become off center
+
+---
+
 - v2.0.4
-- File dependancies (plugins) in fomods are now saved to their meta.ini. If the plugin is later installed or removed a flag is shown as a reminder to reinstall the fomod
-- Added a refresh plugins button to gather loot meta data without sorting plugins. xedit wizards now refresh meta data automatically once they close
-- Fixed fomod flag not being applied to the meta.ini meaning new the show only fomod filter would not work on new fomod installs
-- Selecting and installing multiple mods in the downloads tab will now install them in parallel, like collections
-- When installing mods, they are no longer queued if a fomod window is open (This was necessary before 2.0 but the tab system means this is no longer needed)
+### Additions
 - Added the option to change download speed limits
+- Added a flatpak remote for easier flatpak updating
+- Added a BSA Decompresser wizard for Fallout new Vegas
+- Added a Ultimate ESM fixes wizard for Fallout new Vegas
+- Added a wizard to install Viva New Vegas
+- Added a refresh plugins button to gather loot meta data without sorting plugins. xedit wizards now refresh meta data automatically once they close
+- Added an option to supress the update notification
+### Changes
+- When deploying a game installed via heroic flatpak, heroic is granted permission to access the staging folder to allow it to read symlinked files.
+- File dependancies (plugins) in fomods are now saved to their meta.ini. If the plugin is later installed or removed a flag is shown as a reminder to reinstall the fomod
+- When installing mods, they are no longer queued if a fomod window is open (This was necessary before 2.0 but the tab system means this is no longer needed)
+- Selecting and installing multiple mods in the downloads tab will now install them in parallel, like collections
+- Exporting a profile now shows export progress
+- Reworked the Oblivion Remastered handler to be more in line with how other ue5 games are handled
+- Separated automated backups from manually created backups in the restore backup menu
+### Bug Fixes
+- Fixed fomod flag not being applied to the meta.ini meaning the show only fomod filter would not work on new fomod installs
+- Fixed an issue where vanilla files could be removed from the game folder when removing a mod that contained vanilla file overrides
+- Fixed an issue where mods would not have their category filled when installed via a collection or when an md5 lookup is used on the mod
+- Fixed folders being created in the home directory when the default staging folder was changed
+
+---
 
 - v2.0.3
 ### Game support

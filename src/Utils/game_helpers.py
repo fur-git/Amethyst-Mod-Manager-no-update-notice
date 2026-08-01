@@ -61,6 +61,114 @@ def foreign_deployed_plugin_basenames(game) -> set[str]:
         return set()
 
 
+def game_data_subpath(game) -> str:
+    """Relative path of the mod-deploy dir under the game root (posix
+    separators), or "" when they are the same directory, unconfigured, or the
+    deploy dir is not under the root.
+
+    Root-flagged mods deploy VERBATIM to the game root, so on a subfolder-deploy
+    game a root entry '<subpath>/foo.esp' (Morrowind: 'Data Files/foo.esp')
+    lands at exactly the same place as a normal top-level filemap entry
+    'foo.esp'. Consumers of filemap_root.txt (Data tab merge, plugins panel
+    recovery/resolver, plugins.txt sync) use this prefix to recognise those
+    entries instead of hiding them as game-root files.
+    """
+    try:
+        gp = game.get_game_path()
+        dp = game.get_mod_data_path()
+    except Exception:
+        return ""
+    if not gp or not dp:
+        return ""
+    try:
+        rel = Path(dp).relative_to(Path(gp))
+    except ValueError:
+        return ""
+    return "" if rel == Path(".") else rel.as_posix()
+
+
+def plugins_routing_ctx(game) -> "tuple | None":
+    """(resolve_fn, data_rel_lower) for games that route staged files through
+    deploy rules (UE5-style ``_resolve_entry``) AND load plugins from a folder
+    BELOW the deploy root — e.g. Oblivion Remastered's
+    ``Content/Dev/ObvData/Data``. None for every other game.
+
+    Such games can ship a plugin anywhere inside a mod (nested under a wrapper
+    like ``OblivionRemastered/Content/Dev/ObvData/Data/x.esp``) and the deploy
+    rules still place it in the plugins dir, so "plugin at the mod root" is the
+    wrong test for what belongs in plugins.txt — the routed destination is.
+    """
+    resolve = getattr(game, "_resolve_entry", None)
+    if resolve is None:
+        return None
+    try:
+        gp = game.get_game_path()
+        dp = (game.get_vanilla_plugins_path()
+              if hasattr(game, "get_vanilla_plugins_path") else None)
+    except Exception:
+        return None
+    if not gp or not dp:
+        return None
+    try:
+        rel = Path(dp).relative_to(Path(gp))
+    except ValueError:
+        return None
+    if rel == Path("."):
+        return None
+    return resolve, rel.as_posix().lower()
+
+
+def routed_plugin_name(ctx, staged_rel: str,
+                       exts: tuple) -> "str | None":
+    """Filename if *staged_rel* (a mod-relative staging path) deploys DIRECTLY
+    into the plugins data dir per *ctx* (from plugins_routing_ctx), else None.
+    A plugin nested BELOW the data dir (e.g. ``.../Data/optional/x.esp``) is
+    not loadable and returns None."""
+    resolve, data_rel_low = ctx
+    norm = staged_rel.replace("\\", "/")
+    name = norm.rsplit("/", 1)[-1]
+    if not name.lower().endswith(tuple(exts)):
+        return None
+    try:
+        dest, final_rel = resolve(norm)
+    except Exception:
+        return None
+    full = f"{dest}/{final_rel}" if dest else final_rel
+    parent = full.rsplit("/", 1)[0] if "/" in full else ""
+    return name if parent.lower() == data_rel_low else None
+
+
+def routed_mod_plugin_names(game, mod_dir: Path) -> list[str]:
+    """Plugin files anywhere inside *mod_dir* whose routed deploy destination
+    is the top level of the game's plugins data dir. [] for games without
+    routing rules (plugins_routing_ctx is None) or on any error.
+
+    Used by plugins.txt sync (enable/disable/remove) so nested plugins —
+    which DO deploy into the data dir — get the same plugins.txt treatment
+    as mod-root ones."""
+    ctx = plugins_routing_ctx(game)
+    if ctx is None:
+        return []
+    exts = tuple(e.lower() for e in
+                 (getattr(game, "plugin_extensions", []) or []))
+    if not exts or not mod_dir.is_dir():
+        return []
+    names: list[str] = []
+    try:
+        import os
+        for root, _dirs, files in os.walk(mod_dir):
+            rel_root = Path(root).relative_to(mod_dir).as_posix()
+            for fname in files:
+                if not fname.lower().endswith(exts):
+                    continue
+                rel = f"{rel_root}/{fname}" if rel_root != "." else fname
+                if routed_plugin_name(ctx, rel, exts):
+                    names.append(fname)
+    except OSError:
+        return names
+    return names
+
+
 def _vanilla_plugins_for_game(game) -> dict[str, str]:
     """Return {lowercase_name: original_name} for vanilla plugins."""
     result: dict[str, str] = {}
@@ -105,11 +213,19 @@ def _read_ccc_manifest(game, ccc_name: str, present: "set[str]") -> dict[str, st
     result: dict[str, str] = {}
     if not ccc_name:
         return result
+    candidates: list = []
+    # Starfield reads its .ccc from My Games first, then the game root
+    # (libloadorder 17.0.0 behavior); other games only ship it in the root.
+    if getattr(game, "ccc_in_my_games", False) and hasattr(game, "_mygames_paths"):
+        try:
+            candidates.extend(d / ccc_name for d in game._mygames_paths())
+        except Exception:
+            pass
     game_path = game.get_game_path()
-    if not game_path:
-        return result
-    ccc = game_path / ccc_name
-    if not ccc.is_file():
+    if game_path:
+        candidates.append(game_path / ccc_name)
+    ccc = next((c for c in candidates if c.is_file()), None)
+    if ccc is None:
         return result
     try:
         for line in ccc.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -119,28 +235,6 @@ def _read_ccc_manifest(game, ccc_name: str, present: "set[str]") -> dict[str, st
     except OSError:
         pass
     return result
-
-
-def _cc_plugins_for_game(game) -> dict[str, str]:
-    """Return {lowercase_name: original_name} for Creation Club plugins only.
-
-    These are the plugins listed in the game's .ccc manifest AND present in the
-    Data folder. Unlike base-game/DLC masters, active CC plugins need to be
-    written into plugins.txt for a correct load order (see plugins_include_cc).
-    """
-    ccc_name = getattr(game, "vanilla_ccc_filename", None)
-    if not ccc_name:
-        return {}
-    data_dir = game.get_vanilla_plugins_path() if hasattr(game, "get_vanilla_plugins_path") else None
-    present: set[str] = set()
-    if data_dir and data_dir.is_dir():
-        try:
-            present = {entry.name.lower() for entry in data_dir.iterdir() if entry.is_file()}
-        except OSError:
-            pass
-    if not present:
-        return {}
-    return _read_ccc_manifest(game, ccc_name, present)
 
 
 def _load_games() -> list[str]:
@@ -334,24 +428,3 @@ def _clear_game_config(game_name: str) -> None:
     game = _GAMES.get(game_name)
     if game is not None:
         game.load_paths()
-
-
-def _handle_missing_profile_root(topbar, game_name: str) -> None:
-    """Profile/staging folder was deleted: clear game config, refresh list, switch to another game or clear last_game."""
-    _clear_game_config(game_name)
-    game_names = _load_games()
-    topbar._game_menu.configure(values=game_names)
-    if game_names and game_names[0] != "No games configured":
-        topbar._game_var.set(game_names[0])
-        if hasattr(topbar, "_profile_menu") and topbar._profile_menu is not None:
-            profiles = _profiles_for_game(game_names[0])
-            topbar._profile_menu.configure(values=profiles)
-            topbar._profile_var.set(profiles[0])
-        topbar._reload_mod_panel()
-    else:
-        get_last_game_path().unlink(missing_ok=True)
-        topbar._game_var.set("No games configured")
-        if hasattr(topbar, "_profile_menu") and topbar._profile_menu is not None:
-            topbar._profile_menu.configure(values=["default"])
-            topbar._profile_var.set("default")
-        topbar._reload_mod_panel()

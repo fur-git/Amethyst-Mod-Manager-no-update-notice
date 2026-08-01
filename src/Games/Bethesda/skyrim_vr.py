@@ -18,9 +18,11 @@ class SkyrimVR(Fallout_3):
     vanilla_plugins = [
         "Skyrim.esm", "Update.esm",
         "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm",
+        "SkyrimVR.esm",
     ]
     vanilla_dlc_plugins: list[str] = []
-    vanilla_ccc_filename = "Skyrim.ccc"
+    # Skyrim VR has no Creation Club support and ships no Skyrim.ccc
+    # (libloadorder/Vortex parity: hardcoded masters + SkyrimVR.esm only).
     synthesis_registry_name = "Skyrim VR"
 
     @property
@@ -53,6 +55,7 @@ class SkyrimVR(Fallout_3):
             *self._xedit_wizard_tools(
                 build="TES5VREdit", id_suffix="skyrimvr", qac=False,
                 nexus_url="https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files",
+                nexus_file_id=495506,
             ),
             WizardTool(
                 id="run_skygen_skyrimvr",
@@ -108,6 +111,8 @@ class SkyrimVR(Fallout_3):
             CustomRule(dest="", filenames=["sksevr_loader.exe"], flatten=True, loose_only=True),
             CustomRule(dest="", filenames=["sksevr*.dll"], flatten=True, loose_only=True),
             CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
+            CustomRule(dest="", folders=["bindings"], flatten=True, loose_only=True),
+            CustomRule(dest="", folders=["src"], flatten=True, loose_only=True),
             self._saves_routing_rule([".ess"]),
         ]
 

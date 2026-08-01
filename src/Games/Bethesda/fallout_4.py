@@ -14,8 +14,6 @@ class Fallout_4(Fallout_3):
     _archive_list_needs_mod_bsas = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
-    # CC plugins (Fallout4.ccc) must be written into plugins.txt for load order.
-    plugins_include_cc = True
     supports_esl_flag = True
     vanilla_plugins = [
         "Fallout4.esm",
@@ -79,6 +77,7 @@ class Fallout_4(Fallout_3):
             *self._xedit_wizard_tools(
                 build="FO4Edit", id_suffix="fo4",
                 nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
+                nexus_file_id=312782,
             ),
         ]
 

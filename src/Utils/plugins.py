@@ -21,11 +21,9 @@ Order in the file defines load order (line 0 = first loaded).
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from Utils.atomic_write import write_atomic_text
 
 @dataclass
 class PluginEntry:
@@ -69,6 +67,32 @@ def _normalise_ext(name: str) -> str:
     return name[:dot] + name[dot:].lower()
 
 
+def _read_text_game_compat(path: Path) -> str:
+    """Read a plugins/loadorder file tolerating either encoding.
+
+    The game rewrites plugins.txt in Windows-1252 (loadorder.txt is UTF-8);
+    we historically wrote UTF-8. ASCII content is byte-identical in both, so
+    try UTF-8 first and fall back to cp1252 — a game-rewritten file with a
+    non-ASCII plugin name must never crash the loader.
+    """
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def _plugins_txt_encoding(text: str) -> str:
+    """Encoding for a plugins.txt payload: cp1252 when the engine can read it
+    (Bethesda engines parse plugins.txt as Windows-1252 — MO2/Vortex/LOOT write
+    it that way), UTF-8 as a lossless fallback for names cp1252 can't hold."""
+    try:
+        text.encode("cp1252")
+        return "cp1252"
+    except UnicodeEncodeError:
+        return "utf-8"
+
+
 def read_plugins(path: Path, star_prefix: bool = True) -> list[PluginEntry]:
     """
     Parse plugins.txt and return entries in file order (index 0 = first loaded).
@@ -94,7 +118,7 @@ def read_plugins(path: Path, star_prefix: bool = True) -> list[PluginEntry]:
             # Rebuild fresh objects so callers can mutate the list safely.
             return [PluginEntry(name=n, enabled=en) for n, en in cached[1]]
     parsed: list[tuple[str, bool]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in _read_text_game_compat(path).splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -130,7 +154,8 @@ def write_plugins(path: Path, entries: list[PluginEntry], star_prefix: bool = Tr
         lines = [(f"*{e.name}" if e.enabled else e.name) for e in entries]
     else:
         lines = [e.name for e in entries if e.enabled]
-    write_atomic_text(path, "\n".join(lines) + ("\n" if lines else ""))
+    text = "\n".join(lines) + ("\n" if lines else "")
+    write_atomic_text(path, text, encoding=_plugins_txt_encoding(text))
     # Refresh the parse cache from what we just wrote so a same-mtime-resolution
     # write (e.g. exFAT's coarse timestamps) can't serve stale data on the next
     # read. We cache under both star_prefix variants of the parsed content.
@@ -150,6 +175,23 @@ def write_plugins(path: Path, entries: list[PluginEntry], star_prefix: bool = Tr
         _plugins_parse_cache.pop((str(path), False), None)
 
 
+def insert_by_loadorder(entries: list[PluginEntry], entry: PluginEntry,
+                        lo_pos: dict[str, int]) -> None:
+    """Insert *entry* at the slot loadorder.txt remembers for it.
+
+    Placed before the first existing entry that *lo_pos* (lowercase name →
+    loadorder.txt index) orders later, so a re-added plugin returns to its
+    old load-order slot. Names without a position append at the end."""
+    pos = lo_pos.get(entry.name.lower())
+    if pos is not None:
+        for i, existing in enumerate(entries):
+            epos = lo_pos.get(existing.name.lower())
+            if epos is not None and epos > pos:
+                entries.insert(i, entry)
+                return
+    entries.append(entry)
+
+
 def deploy_plugins_copy(directory: Path, filename: str, content: str, log_fn=None) -> None:
     """Write `content` into `directory / filename` as a real file (not a symlink).
 
@@ -164,7 +206,9 @@ def deploy_plugins_copy(directory: Path, filename: str, content: str, log_fn=Non
     try:
         if target.exists() or target.is_symlink():
             target.unlink()
-        target.write_text(content, encoding="utf-8")
+        # The engine parses plugins.txt as Windows-1252 — write the copy it
+        # actually reads in that encoding whenever the content allows it.
+        target.write_text(content, encoding=_plugins_txt_encoding(content))
         _log(f"  Wrote {filename} → {target}")
     except OSError as exc:
         _log(f"  WARN: could not write {target}: {exc}")
@@ -199,7 +243,7 @@ def read_loadorder(path: Path) -> list[str]:
         if cached is not None and cached[0] == mtime:
             return list(cached[1])  # fresh list; names are immutable str
     names: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in _read_text_game_compat(path).splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             names.append(line)
@@ -295,100 +339,6 @@ def prune_plugins_from_filemap(
     return removed
 
 
-def sync_plugins_from_data_dir(
-    data_dir: Path,
-    plugins_path: Path,
-    plugin_extensions: list[str],
-    star_prefix: bool = True,
-) -> int:
-    """
-    Scan the game's Data directory for root-level plugin files and append any
-    not already in plugins.txt (e.g. vanilla ESMs like Fallout4.esm).
-    Returns the count of newly added plugins.
-    """
-    if not plugin_extensions or not data_dir.is_dir():
-        return 0
-
-    exts_lower = {ext.lower() for ext in plugin_extensions}
-    existing = read_plugins(plugins_path, star_prefix=star_prefix)
-    known_lower = {e.name.lower() for e in existing}
-    if not star_prefix:
-        known_lower.update(n.lower() for n in read_loadorder(plugins_path.parent / "loadorder.txt"))
-
-    new_entries: list[PluginEntry] = []
-    for entry in data_dir.iterdir():
-        if entry.is_file() and entry.suffix.lower() in exts_lower:
-            if entry.name.lower() not in known_lower:
-                new_entries.append(PluginEntry(name=entry.name, enabled=True))
-                known_lower.add(entry.name.lower())
-
-    if new_entries:
-        write_plugins(plugins_path, existing + new_entries, star_prefix=star_prefix)
-
-    return len(new_entries)
-
-
-def sync_plugins_from_overwrite_dir(
-    overwrite_dir: Path,
-    plugins_path: Path,
-    plugin_extensions: list[str],
-    star_prefix: bool = True,
-) -> int:
-    """
-    Scan the overwrite folder for root-level plugin files and append any
-    not already in plugins.txt. Also updates loadorder.txt so new plugins
-    appear in the plugins panel.
-
-    Scans both overwrite root and overwrite/Data/ (Bethesda games mirror
-    the Data folder structure when rescuing runtime-created files).
-
-    The filemap is built from modindex.bin, which only updates overwrite on
-    Refresh. Tools like xEdit or Bodyslide may write plugins directly to
-    overwrite without triggering a refresh. This direct scan ensures those
-    plugins still get added to plugins.txt and loadorder.txt.
-
-    Returns the count of newly added plugins.
-    """
-    if not plugin_extensions or not overwrite_dir.is_dir():
-        return 0
-
-    exts_lower = {ext.lower() for ext in plugin_extensions}
-    existing = read_plugins(plugins_path, star_prefix=star_prefix)
-    known_lower = {e.name.lower() for e in existing}
-    if not star_prefix:
-        known_lower.update(n.lower() for n in read_loadorder(plugins_path.parent / "loadorder.txt"))
-
-    def scan_directory(directory: Path) -> list[PluginEntry]:
-        entries: list[PluginEntry] = []
-        if not directory.is_dir():
-            return entries
-        for entry in directory.iterdir():
-            if entry.is_file() and entry.suffix.lower() in exts_lower:
-                if entry.name.lower() not in known_lower:
-                    entries.append(PluginEntry(name=entry.name, enabled=True))
-                    known_lower.add(entry.name.lower())
-        return entries
-
-    new_entries: list[PluginEntry] = []
-    new_entries.extend(scan_directory(overwrite_dir))
-    new_entries.extend(scan_directory(overwrite_dir / "Data"))
-
-    if new_entries:
-        write_plugins(plugins_path, existing + new_entries, star_prefix=star_prefix)
-        # Update loadorder.txt so the plugins panel shows them
-        loadorder_path = plugins_path.parent / "loadorder.txt"
-        saved_order = read_loadorder(loadorder_path)
-        lo_lower = {n.lower() for n in saved_order}
-        appended = [e.name for e in new_entries if e.name.lower() not in lo_lower]
-        if appended:
-            write_loadorder(
-                loadorder_path,
-                [PluginEntry(name=n, enabled=True) for n in saved_order + appended],
-            )
-
-    return len(new_entries)
-
-
 def sync_plugins_from_filemap(
     filemap_path: Path,
     plugins_path: Path,
@@ -452,161 +402,3 @@ def sync_plugins_from_filemap(
         write_plugins(plugins_path, existing + new_entries, star_prefix=star_prefix)
 
     return len(new_entries)
-
-
-def sync_plugins_from_filemap_combined(
-    filemap_path: Path,
-    plugins_path: Path,
-    plugin_extensions: list[str],
-    data_dir: Path | None = None,
-    disabled_plugins: dict[str, list[str]] | None = None,
-    star_prefix: bool = True,
-    filemap_entries: "list[tuple[str, str]] | None" = None,
-) -> tuple[int, int]:
-    """Single-pass replacement for prune_plugins_from_filemap() followed by
-    sync_plugins_from_filemap() + disabled-plugin pruning.
-
-    On large profiles (1300+ plugins) the separate calls each open filemap.txt
-    and each read plugins.txt, costing ~450 ms combined. This variant reads
-    filemap.txt once, reads plugins.txt once, computes the new plugin list,
-    and writes plugins.txt at most once.
-
-    filemap_entries — optional pre-parsed list[(rel_path, mod_name)] (e.g. from
-    PluginPanel._get_parsed_filemap). When supplied, the ~74k-line file is not
-    re-read here; the caller's shared mtime-cached parse is reused instead.
-
-    Returns (removed_count, added_count).
-    """
-    if not plugin_extensions:
-        return 0, 0
-
-    exts_lower = {ext.lower() for ext in plugin_extensions}
-
-    # --- 1. Collect root-level plugins present in the filemap, keyed by lower name.
-    filemap_names: dict[str, str] = {}   # lower -> original-case filename
-    filemap_mod_for: dict[str, str] = {} # lower -> owning mod name
-
-    def _consume(rel_path: str, mod_name: str) -> None:
-        rel_path = rel_path.replace("\\", "/")
-        if "/" in rel_path:
-            return
-        # Cheap suffix test — avoid Path() allocation per line.
-        dot = rel_path.rfind(".")
-        if dot < 0:
-            return
-        if rel_path[dot:].lower() not in exts_lower:
-            return
-        low = rel_path.lower()
-        if low not in filemap_names:
-            filemap_names[low] = rel_path
-            filemap_mod_for[low] = mod_name
-
-    if filemap_entries is not None:
-        for rel_path, mod_name in filemap_entries:
-            _consume(rel_path, mod_name)
-    elif filemap_path.is_file():
-        with filemap_path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                rel_path, mod_name = line.split("\t", 1)
-                _consume(rel_path, mod_name)
-
-    # --- 2. Vanilla plugins in the game's Data dir are always kept.
-    in_data_dir: set[str] = set()
-    if data_dir and data_dir.is_dir():
-        vanilla_dir = data_dir.parent / (data_dir.name + "_Core")
-        scan_dir = vanilla_dir if vanilla_dir.is_dir() else data_dir
-        for entry in scan_dir.iterdir():
-            if entry.is_file() and entry.suffix.lower() in exts_lower:
-                in_data_dir.add(entry.name.lower())
-
-    # --- 3. Per-mod disabled-plugin set (lowercased).
-    disabled_lower: set[str] = set()
-    if disabled_plugins:
-        for mod_name, names in disabled_plugins.items():
-            for n in names:
-                disabled_lower.add(n.lower())
-
-    # --- 4. Read plugins.txt once.
-    existing = read_plugins(plugins_path, star_prefix=star_prefix)
-    existing_lower = {e.name.lower() for e in existing}
-
-    # For legacy (non-star) games, a user-disabled plugin is absent from
-    # plugins.txt but still present in loadorder.txt. Use loadorder as the
-    # "already known" gate so disabled plugins aren't re-added as enabled.
-    known_lower = set(existing_lower)
-    if not star_prefix:
-        known_lower.update(n.lower() for n in read_loadorder(plugins_path.parent / "loadorder.txt"))
-
-    # --- 5. Prune: keep entries present in filemap or vanilla data_dir.
-    keep = set(filemap_names.keys()) | in_data_dir
-    kept = [e for e in existing if e.name.lower() in keep]
-    removed = len(existing) - len(kept)
-
-    # --- 6. Add: filemap plugins the user hasn't seen yet (and not disabled).
-    new_entries: list[PluginEntry] = []
-    for low, original in filemap_names.items():
-        if low in known_lower:
-            continue
-        if low in disabled_lower:
-            continue
-        # Normalise extension to lowercase for case-sensitive filesystems.
-        dot = original.rfind(".")
-        normalised = original[:dot] + original[dot:].lower() if dot >= 0 else original
-        new_entries.append(PluginEntry(name=normalised, enabled=True))
-        known_lower.add(low)
-
-    if removed or new_entries:
-        write_plugins(plugins_path, kept + new_entries, star_prefix=star_prefix)
-
-    return removed, len(new_entries)
-
-
-def read_disabled_plugins(path: Path) -> dict[str, list[str]]:
-    """Read disabled_plugins.json. Returns {} if absent or corrupt."""
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {k: v for k, v in data.items() if isinstance(v, list)}
-    except Exception:
-        pass
-    return {}
-
-
-def write_disabled_plugins(path: Path, data: dict[str, list[str]]) -> None:
-    """Write disabled_plugins.json atomically."""
-    write_atomic_text(path, json.dumps(data, indent=2, ensure_ascii=False))
-
-
-def read_excluded_mod_files(path: Path) -> dict[str, list[str]]:
-    """Read excluded mod files. If *path* is …/excluded_mod_files.json, delegates to profile_state.
-
-    Format: {mod_name: [rel_key_lower, ...]}
-    """
-    if path.name == "excluded_mod_files.json":
-        from Utils.profile_state import read_excluded_mod_files as _read_ps
-
-        return _read_ps(path.parent, None)
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {k: v for k, v in data.items() if isinstance(v, list)}
-    except Exception:
-        pass
-    return {}
-
-
-def write_excluded_mod_files(path: Path, data: dict[str, list[str]]) -> None:
-    """Write excluded mod files. If *path* is …/excluded_mod_files.json, delegates to profile_state."""
-    if path.name == "excluded_mod_files.json":
-        from Utils.profile_state import write_excluded_mod_files as _write_ps
-
-        _write_ps(path.parent, data)
-        return
-    write_atomic_text(path, json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))

@@ -34,18 +34,31 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None) -> N
         return
     index_path = staging_root.parent / "modindex.bin"
 
-    # 1. Undeploy deployed files first.
+    # 1. Undeploy deployed files first — but only when a deployment is
+    #    actually active: after a restore the game folder holds the REAL
+    #    game files, and a mod that shadows vanilla names (e.g. a patched
+    #    FalloutNV.esm) would otherwise delete them.  undeploy_mod_files
+    #    additionally verifies per file (via staging_root) that the deployed
+    #    copy belongs to the mod before unlinking it.
     try:
-        from Utils.deploy import undeploy_mod_files
-        undeploy_mod_files(
-            mod_names,
-            game.get_mod_data_path(),
-            game.get_game_path(),
-            index_path,
-            log_fn=log,
-        )
-    except Exception as exc:
-        log(f"undeploy during remove failed: {exc}")
+        deploy_active = bool(game.get_deploy_active())
+    except Exception:
+        deploy_active = True
+    if deploy_active:
+        try:
+            from Utils.deploy import undeploy_mod_files
+            undeploy_mod_files(
+                mod_names,
+                game.get_mod_data_path(),
+                game.get_game_path(),
+                index_path,
+                log_fn=log,
+                staging_root=staging_root,
+            )
+        except Exception as exc:
+            log(f"undeploy during remove failed: {exc}")
+    else:
+        log("no deployment is active — skipping undeploy of removed mod(s).")
 
     # 2. Remove the mods' plugins from plugins.txt / loadorder.txt.
     try:
@@ -91,6 +104,15 @@ def _remove_plugins_for_mods(game, profile_dir: Path, staging_root: Path,
             for f in folder.iterdir():
                 if f.is_file() and f.suffix.lower() in plugin_exts:
                     to_remove.add(f.name.lower())
+            # Rule-routing games (Oblivion Remastered): nested plugins that
+            # deploy to the top of the data dir were synced into plugins.txt
+            # too — strip those names as well.
+            try:
+                from Utils.game_helpers import routed_mod_plugin_names
+                for n in routed_mod_plugin_names(game, folder):
+                    to_remove.add(n.lower())
+            except Exception:
+                pass
     if not to_remove:
         return
     from Utils.plugins import (

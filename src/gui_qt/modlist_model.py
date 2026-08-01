@@ -14,6 +14,9 @@ from PySide6.QtCore import (
     QT_TRANSLATE_NOOP,
 )
 
+# Crash-proof diagnostic prints (Flatpak stdout can raise BrokenPipeError and
+# kill worker threads). See Utils.app_log.safe_print.
+from Utils.app_log import safe_print as print  # noqa: A004
 from Utils.modlist import ModEntry, read_modlist
 from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
 from gui_qt.modlist_sort import (
@@ -92,6 +95,11 @@ class ModListModel(QAbstractTableModel):
         # always writes from _natural.
         self._natural: list[ModEntry] = entries or []
         self._entries: list[ModEntry] = self._natural
+        # Mod names as of the last load from disk. save() needs it to tell a
+        # user removal (was in baseline, now gone → drop) from an entry an
+        # install worker added after we loaded (in neither → keep).
+        self._baseline_names: set[str] = {
+            e.name for e in self._natural if not e.is_separator}
         # Active column sort ("name"/"category"/…/"priority") + direction.
         self._sort_key: str | None = None
         self._sort_ascending: bool = True
@@ -159,6 +167,9 @@ class ModListModel(QAbstractTableModel):
         # Custom separator background colours, keyed by the internal
         # `..._separator` name (matches the Tk / profile_state storage key).
         self._sep_colors: dict[str, str] = {}
+        # Custom deployment overrides ({"path","raw","mode","merge"}), keyed by
+        # the internal name — drives the path badge painted on the separator.
+        self._sep_deploy: dict[str, dict] = {}
         # Per-row memo for _separator_highlight (block walk is O(block size)
         # and data() asks per paint). Cleared on highlight/collapse/entry edits.
         self._sep_hl_cache: dict[int, int] = {}
@@ -182,6 +193,8 @@ class ModListModel(QAbstractTableModel):
         self._natural = self._with_boundaries(entries)
         self._entries = self._derive_display()
         self._sep_hl_cache.clear()
+        self._baseline_names = {
+            e.name for e in entries if not e.is_separator}
         self.endResetModel()
 
     # ---- column sorting -----------------------------------------------------
@@ -721,11 +734,14 @@ class ModListModel(QAbstractTableModel):
 
     # ---- separators -------------------------------------------------------
     def set_separator_state(self, collapsed: set[str], locks: dict[str, bool],
-                            colors: dict[str, str] | None = None):
+                            colors: dict[str, str] | None = None,
+                            deploy_paths: dict[str, dict] | None = None):
         self._collapsed = set(collapsed or set())
         self._sep_locks = dict(locks or {})
         if colors is not None:
             self._sep_colors = dict(colors)
+        if deploy_paths is not None:
+            self._sep_deploy = dict(deploy_paths)
         self._sep_hl_cache.clear()
 
     def is_collapsed(self, sep_name: str) -> bool:
@@ -745,6 +761,18 @@ class ModListModel(QAbstractTableModel):
             self._sep_colors[sep_name] = color
         else:
             self._sep_colors.pop(sep_name, None)
+
+    def sep_deploy_info(self, sep_name: str) -> dict:
+        """Deployment override ({"path","raw","mode","merge"}) for a separator,
+        keyed by its internal `..._separator` name, or {} if none."""
+        return self._sep_deploy.get(sep_name) or {}
+
+    def set_sep_deploy_info(self, sep_name: str, info: dict | None) -> None:
+        """Set/clear a separator's deployment override (None/empty clears it)."""
+        if info:
+            self._sep_deploy[sep_name] = dict(info)
+        else:
+            self._sep_deploy.pop(sep_name, None)
 
     def toggle_collapse(self, row: int) -> set[str]:
         e = self._entries[row]
@@ -832,7 +860,13 @@ class ModListModel(QAbstractTableModel):
         aren't user-collapsible (Tk excludes them from the toggle set), so a
         stale '[Overwrite]' in the persisted collapsed set must NOT hide the
         ungrouped mods that sit between Overwrite and the first real separator.
+
+        While the 'hide separators' filter is active the separators aren't shown
+        at all, so their collapse state is meaningless — every mod stays visible
+        (a collapsed separator must not swallow its mods behind a hidden header).
         """
+        if self._separators_hidden:
+            return set()
         hidden: set[int] = set()
         collapsing = False
         for i, e in enumerate(self._entries):
@@ -849,6 +883,21 @@ class ModListModel(QAbstractTableModel):
         while end < len(self._entries) and not self._entries[end].is_separator:
             end += 1
         return range(sep_row + 1, end)
+
+    def sep_block_priority_range(self, sep_row: int) -> str:
+        """Priority range of the mods a separator owns, for the collapsed-
+        separator Priority column (Tk parity — e.g. "0 - 20", or "5" when the
+        block holds a single mod). Empty when the block has no mods."""
+        prios = [
+            self._priority_for_row(r)
+            for r in self.sep_block_rows(sep_row)
+            if not self._entries[r].is_separator
+        ]
+        prios = [p for p in prios if p >= 0]
+        if not prios:
+            return ""
+        lo, hi = min(prios), max(prios)
+        return str(lo) if lo == hi else f"{lo} - {hi}"
 
     def sep_block_summary(self, block) -> tuple[int, set, set]:
         """(flag-bit union, loose conflict codes, BSA conflict codes) for the
@@ -887,14 +936,28 @@ class ModListModel(QAbstractTableModel):
         # Every structural edit (drag, remove, add-separator, set_priority…)
         # funnels through here — row→block mapping may have changed.
         self._sep_hl_cache.clear()
-        from Utils.modlist import write_modlist
+        from Utils.modlist import read_modlist, write_modlist, modlist_lock
         from Utils.perftrace import span
         # ALWAYS write the natural order — the display list may be a sorted /
         # inverted permutation (and contains the divider in reverse mode).
         body = [e for e in self._natural if e.name not in _PINNED_NAMES]
         try:
-            with span("modlist.write_modlist"):
-                write_modlist(self.modlist_path, body)
+            # This model can be a stale snapshot — a background install writes
+            # its new entry before our _reload_modlist lands — so writing body
+            # verbatim would erase it. Take prepend_mod's lock and keep any
+            # on-disk mod we've never seen; entries known at load but gone from
+            # body were removed by the user and stay removed.
+            with span("modlist.write_modlist"), modlist_lock(self.modlist_path):
+                body_names = {e.name for e in body}
+                known = body_names | self._baseline_names
+                external = [e for e in read_modlist(self.modlist_path)
+                            if not e.is_separator and e.name not in known]
+                if external:
+                    print(f"[gui_qt] modlist save: preserving "
+                          f"{len(external)} externally added entr(y/ies): "
+                          f"{', '.join(e.name for e in external[:5])}",
+                          flush=True)
+                write_modlist(self.modlist_path, external + body)
         except Exception as exc:
             print(f"[gui_qt] modlist save failed: {exc}", flush=True)
             self.save_failed.emit(f"Modlist save failed: {exc}")

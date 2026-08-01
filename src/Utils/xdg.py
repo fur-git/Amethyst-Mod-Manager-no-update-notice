@@ -85,6 +85,7 @@ def spawn_watched(
     label: str,
     log_fn: Callable[[str], None] | None,
     on_fail: Callable[[], None] | None = None,
+    log_success: bool = False,
 ) -> None:
     """Run *cmd* in the background, log non-zero exits, optionally chain a fallback.
 
@@ -93,12 +94,22 @@ def spawn_watched(
     ``subprocess.Popen`` directly — a bare Popen of ``flatpak-spawn --host …``
     succeeds even when the *host* command it forwards to is missing or fails,
     which silently swallows launch errors.
+
+    *log_success* also logs the rc=0 hand-off. A clean exit of e.g.
+    ``xdg-open steam://…`` only proves the URL was handed to a handler — the
+    launcher can still silently drop it — so game-launch chains record the
+    hand-off to make "our side worked, launcher ignored it" diagnosable from
+    a user's session log.
     """
     # Use a CWD the host definitely has. Inside Flatpak the sandbox CWD
     # (e.g. /app/share/amethyst-mod-manager) doesn't exist on the host, so
     # `flatpak-spawn --host` inherits it and the spawned host process fails
     # to start with "Failed to change to directory".
     cwd = os.path.expanduser("~") if os.path.isdir(os.path.expanduser("~")) else "/"
+    # A fallback chain hops threads (the next candidate is tried from _watch),
+    # so carry the launch report across explicitly — see Utils/launch_report.
+    from Utils import launch_report
+    rep = launch_report.current()
     try:
         proc = subprocess.Popen(
             cmd,
@@ -113,8 +124,11 @@ def spawn_watched(
         if log_fn:
             log_fn(msg)
         if on_fail:
-            on_fail()
+            with launch_report.bind(rep):
+                on_fail()
         return
+    if rep is not None:
+        rep.mark_spawned()
 
     def _watch() -> None:
         _, err = proc.communicate()
@@ -126,7 +140,13 @@ def spawn_watched(
             if log_fn:
                 log_fn(msg)
             if on_fail:
-                on_fail()
+                with launch_report.bind(rep):
+                    on_fail()
+        elif log_success:
+            msg = f"{label}: handed off via {cmd[0]} (rc=0)"
+            app_log(msg)
+            if log_fn:
+                log_fn(msg)
 
     threading.Thread(target=_watch, daemon=True).start()
 

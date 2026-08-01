@@ -3,8 +3,7 @@ GUI-neutral core of the Plugin Audit wizard.
 
 Moved out of wizards/plugin_audit.py (which imports customtkinter) so the Qt
 wizard view can share it: the plugin-header/new-record scanners, the
-load-order/profile/priority/patch-index helpers (shared with SkyGen via
-Utils.plugin_scan_common), the AuditEntry model, and standalone
+load-order/profile/priority/patch-index helpers, the AuditEntry model, and standalone
 scan/disable/cleanup functions ported from the Tk wizard's methods.
 """
 
@@ -377,20 +376,6 @@ def _build_patch_index(mods_path: Path) -> Tuple[Set[str], Set[str]]:
     return bos_patched, sp_patched
 
 
-def _get_priority_for_plugin(plugin_name: str, mods_path: Path,
-                              priorities: Dict[str, int]) -> int:
-    """Amethyst mod priority for the plugin's owner. -1 if not found."""
-    if not mods_path or not mods_path.is_dir():
-        return -1
-    for mod_dir in mods_path.iterdir():
-        if not mod_dir.is_dir():
-            continue
-        for sub in (mod_dir, mod_dir / "Data"):
-            if (sub / plugin_name).is_file():
-                return priorities.get(mod_dir.name, -1)
-    return -1
-
-
 def _has_skygen_ini(plugin_name: str, mods_path: Optional[Path]) -> bool:
     """True if a SkyGen INI for this plugin exists in the SkyGen output directories."""
     if not mods_path or not mods_path.is_dir():
@@ -604,7 +589,8 @@ def disable_plugins(game: "BaseGame", selected: "list[str]") -> "tuple[int, str]
     if not plugins_path.is_file():
         return 0, "plugins.txt not found — cannot disable."
 
-    lines = plugins_path.read_text(encoding="utf-8").splitlines()
+    from Utils.plugins import _plugins_txt_encoding, _read_text_game_compat
+    lines = _read_text_game_compat(plugins_path).splitlines()
     selected_lower = {n.lower() for n in selected}
     new_lines: list[str] = []
     disabled = 0
@@ -617,7 +603,8 @@ def disable_plugins(game: "BaseGame", selected: "list[str]") -> "tuple[int, str]
                 disabled += 1
                 continue
         new_lines.append(line)
-    plugins_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    text = "\n".join(new_lines) + "\n"
+    plugins_path.write_text(text, encoding=_plugins_txt_encoding(text))
     from Utils.plugins import invalidate_plugins_cache
     invalidate_plugins_cache(plugins_path)
     return disabled, f"Disabled {disabled} plugin(s)."

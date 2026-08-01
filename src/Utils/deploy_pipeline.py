@@ -168,11 +168,11 @@ def _log_deploy_context(game, profile: str, profile_dir: Path,
     if deploy_mode is LinkMode.SYMLINK and game_root:
         _app = flatpak_runtime_app(Path(game_root))
         if _app and (staging is None or flatpak_runtime_app(Path(staging)) != _app):
-            log_fn(f"  WARNING: game runs inside the {_app} flatpak — "
-                   f"symlinked mods may be invisible to it. If mods don't "
-                   f"load, run: flatpak override --user {_app} "
-                   f"--filesystem='{staging}':ro  or switch the deploy "
-                   f"method to Hardlink (same drive) in game settings.")
+            log_fn(f"  NOTE: game runs inside the {_app} flatpak — sandbox "
+                   f"access to the staging/profile folders is granted "
+                   f"automatically so symlinked mods resolve. If mods still "
+                   f"don't load, restart the launcher or run: flatpak "
+                   f"override --user {_app} --filesystem='{staging}'")
     log_fn("=" * 60)
 
 
@@ -359,7 +359,13 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                     log_fn=log_fn,
                 )
             except Exception as idx_err:
-                log_fn(f"Index rescan warning: {idx_err}")
+                # Make the consequence explicit: a failed index write is the
+                # root cause of the whole "no conflicts / no plugins / mod
+                # missing from Data tab" symptom family, and this line is its
+                # only trace.
+                log_fn(f"WARN: modindex.bin was NOT rewritten — mods may be "
+                       f"missing from conflicts/plugins/Data tab until a "
+                       f"Refresh succeeds. Cause: {idx_err}")
         norm_case = (
             getattr(game, "normalize_folder_case", True)
             and load_normalize_folder_case()
@@ -389,6 +395,7 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                 root_deploy_folders=game.mod_root_deploy_folders or None,
                 excluded_mod_files=exc,
                 conflict_ignore_filenames=getattr(game, "conflict_ignore_filenames", None) or None,
+                conflict_ignore_foldernames=getattr(game, "conflict_ignore_foldernames", None) or None,
                 excluded_loose_filenames=getattr(game, "excluded_loose_filenames", None) or None,
                 allowed_top_level_folders=(
                     getattr(game, "mod_required_top_level_folders", None) or None
@@ -424,6 +431,7 @@ def run_deploy_pipeline(
     progress_fn: Optional[ProgressFn] = None,
     root_folder_enabled: bool = True,
     confirm_cet: Optional[Callable[[], bool]] = None,
+    confirm_windows_fs: Optional[Callable[[], bool]] = None,
     do_backup: bool = True,
     on_pre_filemap: Optional[Callable[[], None]] = None,
 ) -> bool:
@@ -439,6 +447,11 @@ def run_deploy_pipeline(
     confirm_cet
         Optional blocking confirmation prompt (Cyberpunk CET symlink check).
         Return False to abort the deploy. None means "always proceed".
+    confirm_windows_fs
+        Optional blocking advisory when deploy folders sit on a Windows
+        filesystem (NTFS/exFAT — see Utils.fs_check; GH#307). Called before
+        any state is touched, so returning False is a clean no-op cancel.
+        None means "always proceed".
     do_backup
         If True, run `create_backup` for the profile dir before deploy.
     on_pre_filemap
@@ -454,6 +467,11 @@ def run_deploy_pipeline(
     mount_err = check_paths_mounted(game)
     if mount_err:
         log_fn(f"Deploy aborted: {mount_err}")
+        return False
+
+    if confirm_windows_fs is not None and not confirm_windows_fs():
+        log_fn("Deploy: cancelled — deploy folders are on a Windows "
+               "filesystem (NTFS/exFAT) and the warning was declined.")
         return False
 
     import time as _time
@@ -563,6 +581,21 @@ def run_deploy_pipeline(
                     game.restore(log_fn=log_fn)
             except RuntimeError as restore_err:
                 log_fn(f"Restore before deploy failed: {restore_err} — continuing.")
+        # Games launched by a flatpak launcher (Heroic flatpak et al.) run in
+        # its sandbox and can't follow symlinks whose targets aren't mounted
+        # there — grant staging/profile access up front (GH#275).
+        try:
+            from Utils.flatpak_sandbox import ensure_symlink_target_access
+            ensure_symlink_target_access(
+                game,
+                game_root=Path(game_root) if game_root else None,
+                staging=_safe(game.get_effective_mod_staging_path),
+                profile_dir=profile_dir,
+                log_fn=log_fn,
+            )
+        except Exception as exc:
+            log_fn(f"  WARN: flatpak sandbox access check failed: {exc}")
+
         _log_deploy_context(game, profile, profile_dir, deploy_mode,
                             log_fn=log_fn)
 
@@ -659,6 +692,11 @@ def run_deploy_pipeline(
         # Launcher swap last so SE/SKSE/etc. dlls are present first.
         if hasattr(game, "swap_launcher"):
             game.swap_launcher(log_fn)
+
+        try:
+            game.post_deploy(log_fn=log_fn)
+        except Exception as pd_err:
+            log_fn(f"post_deploy warning: {pd_err}")
 
         _tag = " (incremental)" if incr_plan is not None else ""
         log_fn(f"Deploy finished OK in {_time.perf_counter() - _t_start:.1f}s "

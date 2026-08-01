@@ -6,6 +6,10 @@ TkStyleHeader owns column resizing; column state persists via column_state.
 
 from __future__ import annotations
 
+# Crash-proof diagnostic prints (Flatpak stdout can raise BrokenPipeError and
+# kill worker threads). See Utils.app_log.safe_print.
+from Utils.app_log import safe_print as print  # noqa: A004
+
 from PySide6.QtCore import Qt, QTimer, QRect, QPoint, QCoreApplication, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QAction
 from PySide6.QtWidgets import (
@@ -49,6 +53,10 @@ COL_MINS = {
 }
 NAME_MIN = COL_MINS[COL_NAME]
 
+# MIME type for archive paths dragged from the Downloads tab (newline-joined,
+# utf-8). Dropping them on the modlist installs at the drop position.
+ARCHIVE_DROP_MIME = "application/x-amethyst-archive-paths"
+
 # Columns shown by default on a fresh INI (no persisted state). Tk parity:
 # Category, Installed, Size are hidden until the user enables them; Author
 # (Nexus uploader) is likewise opt-in.
@@ -84,7 +92,12 @@ class ModListView(QTreeView):
         # the edges is fast/continuous like the Tk app. See _press/_move/_release.
         self.setDragDropMode(QAbstractItemView.NoDragDrop)
         self.setDragEnabled(False)
-        self.setAcceptDrops(False)
+        # Qt-native drops stay on for EXTERNAL drags only (archives dragged
+        # from the Downloads tab → install at the drop position). The internal
+        # reorder never uses Qt DnD, so the two cannot collide.
+        self.setAcceptDrops(True)
+        self.on_archives_dropped = None   # callback(paths: list[str], slot: int)
+        self._extern_drop = False         # an archive drag is over the view
 
         # Drag state.
         self._drag_rows: list[int] = []   # source rows being carried (block)
@@ -268,7 +281,7 @@ class ModListView(QTreeView):
         btn.setCursor(Qt.ArrowCursor)
         btn.setFocusPolicy(Qt.NoFocus)
         btn.setAutoRaise(True)
-        btn.setToolTip(self.tr("Show / hide columns"))
+        btn.setToolTip(self.tr("Show / Hide columns"))
         # Opaque header-coloured background so it sits cleanly over the Mod Name
         # header text; hover/press come from the global QToolButton QSS.
         bg = _c(active_palette(), "BG_HEADER")
@@ -331,13 +344,17 @@ class ModListView(QTreeView):
             ("filter_show_enabled", self.tr("Enabled")),
             ("filter_show_disabled", self.tr("Disabled")),
             ("filter_hide_separators", self.tr("Hide separators")),
+            # Already translated under FilterSidePanel (it's a STATUS_FILTERS
+            # label) — reuse that entry rather than minting a ModListView copy.
+            ("filter_has_updates",
+             QCoreApplication.translate("FilterSidePanel", "Mods with updates")),
         ):
             self._add_quick_filter_action(menu, key, label)
         # The remaining "By status" filters live in a submenu so the top level
         # stays short. Same include-mode semantics as the quick filters above.
         from gui_qt.modlist_filter import STATUS_FILTERS
         _QUICK = {"filter_show_enabled", "filter_show_disabled",
-                  "filter_hide_separators"}
+                  "filter_hide_separators", "filter_has_updates"}
         more = _StayOpenMenu(self.tr("More status filters"), menu)
         for key, label in STATUS_FILTERS:
             if key in _QUICK:
@@ -392,18 +409,19 @@ class ModListView(QTreeView):
     def load_separator_state(self):
         """Read collapsed/lock state for the active profile into the model and
         apply row hiding. Called by the window after a modlist reload."""
-        collapsed, locks, colors = set(), {}, {}
+        collapsed, locks, colors, deploy_paths = set(), {}, {}, {}
         if self.profile_dir is not None:
             try:
                 from Utils.profile_state import (
                     read_collapsed_seps, read_separator_locks,
-                    read_separator_colors)
+                    read_separator_colors, read_separator_deploy_paths)
                 collapsed = read_collapsed_seps(self.profile_dir)
                 locks = read_separator_locks(self.profile_dir)
                 colors = read_separator_colors(self.profile_dir)
+                deploy_paths = read_separator_deploy_paths(self.profile_dir)
             except Exception:
                 pass
-        self.model().set_separator_state(collapsed, locks, colors)
+        self.model().set_separator_state(collapsed, locks, colors, deploy_paths)
         self._apply_separator_spanning()
         self.apply_collapse()
 
@@ -712,6 +730,28 @@ class ModListView(QTreeView):
         # Re-apply any active highlight against the fresh maps.
         self._refresh_self_highlights()
 
+    def selectAll(self) -> None:
+        """Ctrl+A → select every *visible*, non-separator mod row. Qt's default
+        selects the whole model (hidden rows + separators too), which is wrong
+        while a filter / hide-separators is active: separators that aren't shown
+        must not become part of the selection."""
+        m = self.model()
+        sm = self.selectionModel()
+        if m is None or sm is None:
+            return
+        root = self.rootIndex()
+        from PySide6.QtCore import QItemSelection, QItemSelectionModel
+        sel = QItemSelection()
+        for r in range(m.rowCount()):
+            if self.isRowHidden(r, root):
+                continue
+            if m.entry(r).is_separator:
+                continue
+            idx = m.index(r, 0)
+            sel.select(idx, idx)
+        sm.select(sel, QItemSelectionModel.ClearAndSelect
+                  | QItemSelectionModel.Rows)
+
     def selected_mod_names(self) -> set[str]:
         """Names of the selected mods. A selected separator contributes all the
         mods in its block (Tk parity)."""
@@ -955,9 +995,40 @@ class ModListView(QTreeView):
         # Handle the Name-column description tooltip ourselves; anything else
         # (flags / conflicts cell tooltips) falls through to the delegate's
         # helpEvent via the base implementation.
-        if event.type() == QEvent.ToolTip and self._name_tooltip(event):
+        if event.type() == QEvent.ToolTip and (
+                self._lock_tooltip(event) or self._name_tooltip(event)):
             return True
         return super().viewportEvent(event)
+
+    def _lock_tooltip(self, help_event) -> bool:
+        """Tk parity: hovering a separator's lock box explains what it does.
+        Returns True if shown."""
+        idx = self.indexAt(help_event.pos())
+        if not idx.isValid():
+            return False
+        m = self.model()
+        row = idx.row()
+        e = m.entry(row) if 0 <= row < m.rowCount() else None
+        from gui_qt.modlist_model import _PINNED_NAMES
+        if e is None or not e.is_separator or e.name in _PINNED_NAMES:
+            return False
+        delegate = self.itemDelegate()
+        lock = getattr(delegate, "_lock_rect", None)
+        if lock is None:
+            return False
+        # Separator rows span the full width; build a full-width row rect so the
+        # lock rect (computed from its right edge) lands where the delegate drew.
+        row_rect = self.visualRect(m.index(row, COL_NAME))
+        row_rect.setLeft(0)
+        row_rect.setWidth(self.viewport().width())
+        lk = lock(row_rect)
+        if not lk.contains(help_event.pos()):
+            return False
+        QToolTip.showText(
+            help_event.globalPos(),
+            self.tr("Lock Separator - Mods in this separator are attached to it"),
+            self, lk)
+        return True
 
     def _name_tooltip(self, help_event) -> bool:
         """Show the hovered mod's description tooltip. Returns True if shown."""
@@ -1095,9 +1166,60 @@ class ModListView(QTreeView):
         self._apply_separator_spanning()
         self.apply_collapse()
 
+    # ---- external drop: archives from the Downloads tab --------------------
+    def _is_archive_drag(self, event) -> bool:
+        return (self.on_archives_dropped is not None
+                and event.mimeData().hasFormat(ARCHIVE_DROP_MIME))
+
+    def dragEnterEvent(self, event):
+        if self._is_archive_drag(event):
+            self._extern_drop = True
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._extern_drop:
+            # Reuse the internal-reorder slot maths + blue indicator, and the
+            # same edge autoscroll (Qt DnD keeps delivering moves while the
+            # timer scrolls underneath the cursor).
+            self._last_mouse_y = int(event.position().y())
+            self._update_drop_slot(self._last_mouse_y)
+            if not self._scroll_timer.isActive():
+                self._scroll_timer.start()
+            self.viewport().update()
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        if self._extern_drop:
+            self._end_extern_drop()
+            return
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        if self._extern_drop:
+            self._update_drop_slot(int(event.position().y()))
+            slot = self._drop_slot
+            raw = bytes(event.mimeData().data(ARCHIVE_DROP_MIME)).decode("utf-8")
+            paths = [p for p in raw.split("\n") if p]
+            self._end_extern_drop()
+            event.acceptProposedAction()
+            if paths and slot >= 0:
+                self.on_archives_dropped(paths, slot)
+            return
+        super().dropEvent(event)
+
+    def _end_extern_drop(self):
+        self._extern_drop = False
+        self._drop_slot = -1
+        self._scroll_timer.stop()
+        self.viewport().update()
+
     # ---- continuous autoscroll (Tk cadence: fast, proportional to depth) ---
     def _autoscroll_tick(self):
-        if not self._drag_active:
+        if not (self._drag_active or self._extern_drop):
             self._scroll_timer.stop()
             return
         h = self.viewport().height()
@@ -1126,10 +1248,12 @@ class ModListView(QTreeView):
     def paintEvent(self, event):
         super().paintEvent(event)
         # Sticky separator band (hidden during a drag — it would cover the
-        # drop zone while autoscrolling toward the top).
-        if not self._drag_active:
+        # drop zone while autoscrolling toward the top). An external archive
+        # drag (Downloads tab) paints the same indicator.
+        dragging = self._drag_active or self._extern_drop
+        if not dragging:
             self._paint_sticky_separator()
-        if not self._drag_active or self._drop_slot < 0:
+        if not dragging or self._drop_slot < 0:
             return
         m = self.model()
         n = m.rowCount()

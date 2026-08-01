@@ -47,6 +47,16 @@ class EnderalSE(Fallout_3):
     def loot_game_type(self) -> str:
         return "SkyrimSE"
 
+    # SSE engine is 64-bit — without these the Fallout_3 branch's d3d9/32-bit
+    # ReShade config is inherited and the wizard installs a 32-bit d3d9.dll.
+    @property
+    def reshade_dll(self) -> str:
+        return "dxgi.dll"
+
+    @property
+    def reshade_arch(self) -> int:
+        return 64
+
     @property
     def loot_masterlist_repo(self) -> str:
         return "enderal"
@@ -95,6 +105,7 @@ class EnderalSE(Fallout_3):
             *self._xedit_wizard_tools(
                 build="EnderalSEEdit", id_suffix="enderalse",
                 nexus_url="https://www.nexusmods.com/enderalspecialedition/mods/78?tab=files",
+                nexus_file_id=2793,
                 discord_mode="EnderalSE",
             ),
         ]

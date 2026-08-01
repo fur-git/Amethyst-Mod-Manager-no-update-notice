@@ -133,7 +133,7 @@ def active_for(deploy_dir) -> "IncrementalPlan | None":
 def write_deployed_filemap(path: Path, entries, log_fn=None) -> None:
     """Atomically write the deployed rel→mod record (one entry per line)."""
     try:
-        with atomic_writer(path, "w") as fh:
+        with atomic_writer(path, "w", errors="surrogateescape") as fh:
             fh.write("# deployed_filemap v1\n")
             for rel_str, mod_name in entries:
                 fh.write(f"{rel_str}\t{mod_name}\n")
@@ -145,7 +145,7 @@ def load_deployed_filemap(path: Path) -> "dict[str, tuple[str, str]]":
     """Read deployed_filemap.txt into {rel_lower: (rel_str, mod)}; {} if absent."""
     out: dict[str, tuple[str, str]] = {}
     try:
-        with path.open(encoding="utf-8") as fh:
+        with path.open(encoding="utf-8", errors="surrogateescape") as fh:
             for line in fh:
                 if line.startswith("#") or "\t" not in line:
                     continue
@@ -599,17 +599,30 @@ def _record_overwrite_index(overwrite_dir: Path, rels: "list[str]", _log) -> Non
     """Append rescued rels to modindex.bin under [Overwrite] (mirror of the
     restore_data_core bookkeeping) so the next filemap build sees them."""
     try:
-        from Utils.filemap import read_mod_index, update_mod_index
+        from Utils.filemap import (
+            read_mod_index, update_mod_index, _is_utf8_safe, _safe_log_str,
+        )
         index_path = overwrite_dir.parent / "modindex.bin"
         existing = read_mod_index(index_path) or {}
         existing_normal, existing_root = existing.get(_OVERWRITE_NAME, ({}, {}))
         new_normal: dict[str, str] = dict(existing_normal)
         for rel_str in rels:
+            # Game-created names can be arbitrary bytes; a non-UTF-8 name
+            # can't be msgpack-serialized and would abort the whole update.
+            if not _is_utf8_safe(rel_str):
+                _log(f"  WARN: rescued file has a non-UTF-8 name, "
+                     f"not indexed: {_safe_log_str(rel_str)}")
+                continue
             rel_posix = rel_str.replace("\\", "/")
             new_normal[rel_posix.lower()] = rel_posix
-        update_mod_index(index_path, _OVERWRITE_NAME, new_normal, existing_root)
-    except Exception:
-        pass
+        update_mod_index(index_path, _OVERWRITE_NAME, new_normal,
+                         existing_root, log_fn=_log)
+    except Exception as idx_err:
+        try:
+            _log(f"  WARN: could not update modindex.bin with rescued "
+                 f"file(s): {idx_err}")
+        except Exception:
+            pass
 
 
 def _verify(new_tasks: dict, final_placed: "set[str]", eff_mode_fn,

@@ -184,6 +184,101 @@ def load_custom_game_definitions() -> list[dict]:
     return defs
 
 
+# ---------------------------------------------------------------------------
+# Built-in presets — ready-made starting templates offered in the define-custom-
+# game editor's "Load Preset" dropdown (alongside the user's own definitions).
+# These are never written to disk on their own; selecting one just prefills the
+# form.  The user still supplies a unique name and executable path.
+# ---------------------------------------------------------------------------
+
+BUILTIN_GAME_TEMPLATES: list[dict] = [
+    {
+        "name": "BepInEx",
+        "game_id": "",
+        "exe_name": "",
+        "deploy_type": "standard",
+        "mod_data_path": "BepInEx/plugins",
+        "steam_id": "",
+        "nexus_game_domain": "",
+        "image_url": "",
+        "mod_folder_strip_prefixes": ["BepInEx", "plugins"],
+        "conflict_ignore_filenames": [],
+        "conflict_ignore_foldernames": [],
+        "mod_folder_strip_prefixes_post": [],
+        "mod_install_prefix": "",
+        "mod_required_top_level_folders": [],
+        "mod_auto_strip_until_required": False,
+        "mod_required_file_types": [],
+        "mod_install_as_is_if_no_match": False,
+        "restore_before_deploy": True,
+        "normalize_folder_case": True,
+        "filemap_casing": "upper",
+        "wine_dll_overrides": {"winhttp": "native,builtin"},
+        "custom_routing_rules": [
+            {"dest": "", "filenames": ["winhttp.dll"], "flatten": True},
+            {"dest": "", "filenames": ["version.dll"], "flatten": True},
+            {"dest": "", "filenames": ["run_bepinex.sh"], "flatten": True},
+            {"dest": "", "filenames": ["libdoorstop.dylib"], "flatten": True},
+            {"dest": "", "filenames": ["doorstop_config.ini"], "flatten": True},
+            {"dest": "BepInEx", "folders": ["config"], "loose_only": True, "flatten": True},
+            {"dest": "BepInEx", "folders": ["core"], "loose_only": True, "flatten": True},
+            {"dest": "BepInEx", "folders": ["patchers"], "loose_only": True, "flatten": True},
+            {"dest": "BepInEx", "folders": ["plugins"], "loose_only": True, "flatten": True},
+        ],
+        "restore_whitelist": [],
+        "custom_frameworks": {"BepInEx": "winhttp.dll"},
+    },
+    {
+        "name": "UE5 (ue4ss)",
+        "game_id": "",
+        "exe_name": "GAMEID/Binaries/Win64/EXENAME.exe",
+        "deploy_type": "ue5",
+        "mod_data_path": "GAMEID",
+        "steam_id": "",
+        "nexus_game_domain": "",
+        "image_url": "",
+        "mod_folder_strip_prefixes": [
+            "GAMEID", "Content", "Paks", "~mods", "Binaries", "Win64",
+        ],
+        "conflict_ignore_filenames": ["LICENSE", "*.md"],
+        "conflict_ignore_foldernames": [],
+        "mod_folder_strip_prefixes_post": [],
+        "mod_install_prefix": "",
+        "mod_required_top_level_folders": [],
+        "mod_auto_strip_until_required": False,
+        "mod_required_file_types": [],
+        "mod_install_as_is_if_no_match": False,
+        "restore_before_deploy": True,
+        "normalize_folder_case": True,
+        "filemap_casing": "upper",
+        "wine_dll_overrides": {"dwmpapi": "native,builtin"},
+        "custom_routing_rules": [
+            {"dest": "Content/Splash", "filenames": ["Splash.bmp"], "flatten": True},
+            {"dest": "Content/Movies", "extensions": [".mp4"], "include_siblings": True},
+            {"dest": "Mods", "folders": ["VTSpectator"], "flatten": True},
+            {"dest": "Content/Paks", "folders": ["LogicMods"], "flatten": True},
+            {"dest": "Binaries/Win64", "folders": ["ue4ss"], "flatten": True},
+            {"dest": "Content/Paks/~mods", "extensions": [".pak"],
+             "companion_extensions": [".ucas", ".utoc"], "include_siblings": True},
+            {"dest": "Binaries/Win64", "extensions": [".asi"],
+             "companion_extensions": [".ini"]},
+            {"dest": "Binaries/Win64/ue4ss/Mods", "folders": ["scripts"], "include_siblings": True},
+            {"dest": "Binaries/Win64/ue4ss/Mods", "filenames": ["enabled.txt"], "include_siblings": True},
+            {"dest": "Binaries/Win64/ue4ss/Mods", "folders": ["dlls"], "include_siblings": True},
+            {"dest": "Binaries/Win64/ue4ss/Mods", "filenames": ["mods.txt"], "flatten": True},
+        ],
+        "restore_whitelist": [],
+        "custom_frameworks": {"UE4SS": "Binaries/Win64/dwmapi.dll"},
+    },
+]
+
+
+def load_builtin_game_templates() -> list[dict]:
+    """Return deep copies of the built-in preset templates (safe to mutate)."""
+    import copy
+    return [copy.deepcopy(t) for t in BUILTIN_GAME_TEMPLATES]
+
+
 def save_custom_game_definition(defn: dict) -> Path:
     """Write a custom game definition to JSON.  Returns the file path."""
     folder = get_custom_games_dir()
@@ -371,6 +466,10 @@ class StandardCustomGame(BaseGame):
         return _defn_to_set(self._defn, "conflict_ignore_filenames")
 
     @property
+    def conflict_ignore_foldernames(self) -> set[str]:
+        return _defn_to_set(self._defn, "conflict_ignore_foldernames")
+
+    @property
     def normalize_folder_case(self) -> bool:
         return bool(self._defn.get("normalize_folder_case", True))
 
@@ -381,13 +480,17 @@ class StandardCustomGame(BaseGame):
 
     @property
     def filemap_casing_pins(self) -> dict[str, str]:
+        # Start from any base-class defaults (BaseGame -> none; UE5Game ->
+        # scripts -> Scripts for UE4SS), then let user-defined pins in the
+        # definition override on conflict.
+        pins = dict(super().filemap_casing_pins)
         raw = self._defn.get("filemap_casing_pins")
-        if not isinstance(raw, dict):
-            return {}
-        return {
-            str(k).lower(): str(v)
-            for k, v in raw.items() if isinstance(v, str) and v
-        }
+        if isinstance(raw, dict):
+            pins.update({
+                str(k).lower(): str(v)
+                for k, v in raw.items() if isinstance(v, str) and v
+            })
+        return pins
 
     @property
     def mod_folder_strip_prefixes_post(self) -> set[str]:
@@ -797,6 +900,10 @@ class Ue5CustomGame(UE5Game):
         return _defn_to_set(self._defn, "conflict_ignore_filenames")
 
     @property
+    def conflict_ignore_foldernames(self) -> set[str]:
+        return _defn_to_set(self._defn, "conflict_ignore_foldernames")
+
+    @property
     def normalize_folder_case(self) -> bool:
         return bool(self._defn.get("normalize_folder_case", True))
 
@@ -807,13 +914,17 @@ class Ue5CustomGame(UE5Game):
 
     @property
     def filemap_casing_pins(self) -> dict[str, str]:
+        # Start from any base-class defaults (BaseGame -> none; UE5Game ->
+        # scripts -> Scripts for UE4SS), then let user-defined pins in the
+        # definition override on conflict.
+        pins = dict(super().filemap_casing_pins)
         raw = self._defn.get("filemap_casing_pins")
-        if not isinstance(raw, dict):
-            return {}
-        return {
-            str(k).lower(): str(v)
-            for k, v in raw.items() if isinstance(v, str) and v
-        }
+        if isinstance(raw, dict):
+            pins.update({
+                str(k).lower(): str(v)
+                for k, v in raw.items() if isinstance(v, str) and v
+            })
+        return pins
 
     @property
     def mod_folder_strip_prefixes_post(self) -> set[str]:
@@ -863,97 +974,10 @@ class Ue5CustomGame(UE5Game):
         return {}
 
     # ------------------------------------------------------------------
-    # UE5 routing — generic UE5 rules (pak → Content/Paks/~mods,
-    # ue4ss → Binaries/Win64/ue4ss, lua → Binaries/Win64/Mods, etc.)
+    # UE5 routing — the user's custom_routing_rules are converted to
+    # UE5Rules and prepended by UE5Game.ue5_routing_rules; the built-in
+    # defaults below act as fallbacks when no custom rule matched.
     # ------------------------------------------------------------------
-
-    @property
-    def ue5_routing_rules(self) -> list[UE5Rule]:
-        # User-defined custom routing rules go FIRST so they take priority
-        # over the built-in UE5 defaults.  Each CustomRule may have multiple
-        # folders, so expand into one UE5Rule per folder.  Extension-only
-        # rules produce a single UE5Rule with no folder.
-        rules: list[UE5Rule] = []
-        for cr in self.custom_routing_rules:
-            if cr.to_prefix:
-                # UE5 manifest deploy can't route into the prefix; those rules
-                # are honoured separately by deploy_custom_rules.
-                continue
-            if cr.folders:
-                for folder in cr.folders:
-                    norm_folder = folder.replace("\\", "/").strip("/")
-                    exts = list(cr.extensions)
-                    fnames = list(cr.filenames)
-                    if "/" in norm_folder:
-                        # Multi-segment: primary prefix rule. When flatten is
-                        # ON, strip everything ABOVE the last segment so the
-                        # matched folder (last segment) + contents land under
-                        # dest. Parent of "Content/Paks/LogicMods" → strip
-                        # "Content/Paks".
-                        parent_strip = norm_folder.rsplit("/", 1)[0]
-                        rules.append(UE5Rule(
-                            dest=cr.dest, extensions=exts,
-                            prefix=norm_folder, filenames=fnames,
-                            strip=[parent_strip],
-                            loose_only=cr.loose_only,
-                            flatten=cr.flatten,
-                            include_siblings=cr.include_siblings,
-                        ))
-                        # Also generate prefix rules for common UE5 packaging
-                        # prefixes above the target folder (Paks, Content,
-                        # Content/Paks). Strip the prefix above the matched
-                        # folder for the flatten=True case.
-                        ue5_prefixes = ["Paks", "Content/Paks", "Content"]
-                        for ue_pfx in ue5_prefixes:
-                            full = f"{ue_pfx}/{norm_folder}"
-                            if full.lower() == norm_folder.lower():
-                                continue
-                            # Parent above the matched folder = ue_pfx +
-                            # everything above the last segment of norm_folder.
-                            full_parent = f"{ue_pfx}/{parent_strip}"
-                            rules.append(UE5Rule(
-                                dest=cr.dest, extensions=exts,
-                                prefix=full, filenames=fnames,
-                                strip=[full_parent],
-                                loose_only=cr.loose_only,
-                                flatten=cr.flatten,
-                                include_siblings=cr.include_siblings,
-                            ))
-                    else:
-                        # Single-segment: match the folder name anywhere in
-                        # the path; the prefix above it is auto-stripped so
-                        # the matched folder + contents land under dest.
-                        # (folder_anywhere replaces the previous
-                        # folder=/prefix= variants.)
-                        rules.append(UE5Rule(
-                            dest=cr.dest, extensions=exts,
-                            folder_anywhere=norm_folder, filenames=fnames,
-                            loose_only=cr.loose_only,
-                            flatten=cr.flatten,
-                            include_siblings=cr.include_siblings,
-                        ))
-            elif cr.filenames:
-                rules.append(UE5Rule(
-                    dest=cr.dest,
-                    extensions=list(cr.extensions),
-                    filenames=list(cr.filenames),
-                    loose_only=cr.loose_only,
-                    flatten=cr.flatten,
-                    include_siblings=cr.include_siblings,
-                ))
-            else:
-                rules.append(UE5Rule(
-                    dest=cr.dest,
-                    extensions=list(cr.extensions),
-                    loose_only=cr.loose_only,
-                    flatten=cr.flatten,
-                    include_siblings=cr.include_siblings,
-                ))
-
-        # Built-in UE5 defaults follow — they act as fallbacks when no
-        # custom rule matched.  Pulled from the shared base implementation.
-        rules.extend(super().ue5_routing_rules)
-        return rules
 
     @property
     def _ue5_post_passthrough_rules(self) -> list[UE5Rule]:
@@ -996,108 +1020,6 @@ class Ue5CustomGame(UE5Game):
     def ue5_default_dest(self) -> str:
         return ""
 
-    # ------------------------------------------------------------------
-    # Companion routing — same-folder, same-stem siblings ride along with
-    # a primary CustomRule match that declares ``companion_extensions``.
-    # Prefix routing (to_prefix=True) and the _PREFIX_SKIP_DEST sentinel
-    # are handled by UE5Game.
-    # ------------------------------------------------------------------
-
-    def _resolve_filemap_entries(self, entries):
-        resolved = super()._resolve_filemap_entries(entries)
-        return self._apply_companion_routing(entries, resolved)
-
-    def _apply_companion_routing(self, entries, resolved):
-        """Re-route same-folder same-stem siblings to ride along with a primary
-        match from a user CustomRule that declares ``companion_extensions``.
-
-        The UE5 base pipeline has no companion concept, so companion files
-        (e.g. ``Foo.ini`` next to ``Foo.asi``) fall through to whatever default
-        rule catches their extension. This pass detects each companion, looks
-        up its primary's resolution in ``resolved``, and overrides the
-        companion's entry with the same ``(dest_rel, final_rel-stem-swapped)``.
-        """
-        user_rules = [r for r in self.custom_routing_rules
-                      if r.companion_extensions and not r.to_prefix]
-        if not user_rules:
-            return resolved
-        from Utils.deploy_custom_rules import _match_single_rule, _normalise_rule
-        import os
-        # Index resolved entries by (staged_rel, mod_name) so we can overwrite.
-        idx_by_key: dict[tuple[str, str], int] = {
-            (sr, mn): i for i, (sr, mn, _d, _f) in enumerate(resolved)
-        }
-        # Group entries by (mod_name, parent_lower) for same-folder lookup.
-        groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
-        for sr, mn in entries:
-            norm = sr.replace("\\", "/")
-            parent_lower = norm.rsplit("/", 1)[0].lower() if "/" in norm else ""
-            groups.setdefault((mn, parent_lower), []).append((sr, norm))
-        # Match each user rule against entries to find its primaries; ride
-        # along companions for each one.
-        claimed: set[tuple[str, str]] = set()
-        for rule in user_rules:
-            _r, folders, exts, filenames = _normalise_rule(rule)
-            companions = sorted(
-                {c.lower() for c in rule.companion_extensions},
-                key=len, reverse=True,
-            )
-            for sr, mn in entries:
-                if (sr, mn) in claimed:
-                    continue
-                norm = sr.replace("\\", "/")
-                rel_lower = norm.lower()
-                hit = _match_single_rule(rel_lower, rule, folders, exts, filenames)
-                if hit is None:
-                    continue
-                _strip_len, matched_ext = hit
-                claimed.add((sr, mn))
-                primary_idx = idx_by_key.get((sr, mn))
-                if primary_idx is None:
-                    continue
-                _psr, _pmn, primary_dest, primary_final = resolved[primary_idx]
-                parent_lower = norm.rsplit("/", 1)[0].lower() if "/" in norm else ""
-                name_lower = norm.rsplit("/", 1)[-1].lower()
-                if matched_ext and name_lower.endswith(matched_ext):
-                    stem_lower = name_lower[: -len(matched_ext)]
-                else:
-                    stem_lower, _ = os.path.splitext(name_lower)
-                stem_dot = stem_lower + "."
-                # primary_final's basename may differ in case from name_lower
-                # (e.g. flattened rules). Use the primary_final's actual base.
-                primary_final_norm = primary_final.replace("\\", "/")
-                primary_final_parent, _, primary_final_name = \
-                    primary_final_norm.rpartition("/")
-                for sib_sr, sib_norm in groups.get((mn, parent_lower), []):
-                    if (sib_sr, mn) in claimed:
-                        continue
-                    sib_name_lower = sib_norm.rsplit("/", 1)[-1].lower()
-                    if sib_name_lower == name_lower:
-                        continue
-                    if not sib_name_lower.startswith(stem_dot):
-                        continue
-                    sib_ext = next(
-                        (c for c in companions
-                         if sib_name_lower.endswith(c)
-                         and len(sib_name_lower) > len(c)),
-                        None,
-                    )
-                    if sib_ext is None:
-                        continue
-                    # Build the companion's final_rel by swapping the primary's
-                    # filename for the companion's filename, preserving any
-                    # parent directory structure the primary kept.
-                    sib_base = sib_norm.rsplit("/", 1)[-1]
-                    companion_final = (
-                        f"{primary_final_parent}/{sib_base}"
-                        if primary_final_parent else sib_base
-                    )
-                    sib_idx = idx_by_key.get((sib_sr, mn))
-                    if sib_idx is None:
-                        continue
-                    resolved[sib_idx] = (sib_sr, mn, primary_dest, companion_final)
-                    claimed.add((sib_sr, mn))
-        return resolved
 
 # ---------------------------------------------------------------------------
 # Factory

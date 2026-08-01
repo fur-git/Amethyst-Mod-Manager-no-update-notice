@@ -24,7 +24,7 @@ from gui_qt.safe_emit import safe_emit
 from gui_qt.theme_qt import active_palette, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
 from Utils.ttw_tools import (
-    EXE_NAME, GITHUB_REPO_URL, MODPUB_URL, OUTPUT_NAME,
+    GITHUB_REPO_URL, MODPUB_URL, OUTPUT_NAME,
     find_fo3_install, find_ttw_installer, ttw_mod_dir,
 )
 
@@ -111,65 +111,13 @@ class TTWView(WizardViewBase):
         game = self._game
 
         def worker():
-            import json
-            import os
-            import shutil
-            import tempfile
-            import urllib.request
-            from Utils.ca_bundle import download_file, get_ssl_context
-            from Utils.ttw_tools import applications_dir
-            from Utils.wizard_archives import extract_archive
+            from Utils.ttw_tools import download_installer
             _wlog = lambda m: self._log(f"TTW Wizard: {m}")
             try:
-                req = urllib.request.Request(
-                    "https://api.github.com/repos/SulfurNitride/"
-                    "TTW_Linux_Installer/releases/latest",
-                    headers={"Accept": "application/vnd.github+json",
-                             "User-Agent": "ModManager/1.0"})
-                with urllib.request.urlopen(req, timeout=15,
-                                            context=get_ssl_context()) as resp:
-                    data = json.loads(resp.read().decode())
-                tag = data.get("tag_name", "unknown")
-                url = None
-                for asset in data.get("assets", []):
-                    name = asset.get("name", "").lower()
-                    if "linux" in name and name.endswith((".zip", ".tar.gz")):
-                        url = asset["browser_download_url"]
-                        break
-                if not url:
-                    raise RuntimeError(self.tr(
-                        "No Linux installer asset found in the "
-                        "latest TTW release ({0}).").format(tag))
-
-                _wlog(f"downloading TTW installer {tag} from {url}")
-                safe_emit(self._dl_status_sig,
-                          self.tr("Downloading TTW installer {0}…").format(tag),
-                          "")
-                tmp_dir = Path(tempfile.mkdtemp())
-                archive = tmp_dir / Path(url).name
-                try:
-                    download_file(url, archive)
-                    dest = applications_dir(game)
-                    dest.mkdir(parents=True, exist_ok=True)
-                    safe_emit(self._dl_status_sig,
-                              self.tr("Extracting installer…"), "")
-                    _wlog(f"extracting {archive.name} → {dest}")
-                    paths = extract_archive(archive, dest)
-                    _wlog(f"extracted {len([p for p in paths if p.is_file()])} "
-                          "file(s).")
-                finally:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-                exe = dest / EXE_NAME
-                if not exe.is_file():
-                    raise RuntimeError(self.tr(
-                        "{0} not found after extraction at {1}.").format(
-                            EXE_NAME, dest))
-                try:
-                    os.chmod(exe, 0o755)
-                except OSError:
-                    pass
-                self._exe = exe
+                self._exe = download_installer(
+                    game,
+                    status_fn=lambda m: safe_emit(self._dl_status_sig, m, ""),
+                    log_fn=_wlog)
                 safe_emit(self._dl_status_sig,
                           self.tr("Installer ready."), GREEN)
                 safe_emit(self._dl_done_sig, True)

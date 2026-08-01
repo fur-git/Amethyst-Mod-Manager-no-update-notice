@@ -99,7 +99,7 @@ class DataView(QWidget):
         tbl = QHBoxLayout(tb)
         tbl.setContentsMargins(8, 4, 8, 4)
         self._label = QLabel(self.tr("Deployed files"))
-        self._label.setStyleSheet("color:#aaa;")
+        self._label.setObjectName("HeaderCaption")
         tbl.addWidget(self._label, 1)
         v.addWidget(tb)
 
@@ -182,7 +182,14 @@ class DataView(QWidget):
             mtime = self.filemap_path.stat().st_mtime
         except OSError:
             return []
-        key = (str(self.filemap_path), mtime, id(self.game))
+        # filemap_root.txt feeds the tree too (root-deployed games) and can
+        # change alone (root-flag toggle) — key on its mtime as well.
+        try:
+            root_mtime = (self.filemap_path.parent
+                          / "filemap_root.txt").stat().st_mtime
+        except OSError:
+            root_mtime = 0.0
+        key = (str(self.filemap_path), mtime, root_mtime, id(self.game))
         if self._resolved_cache is not None and self._resolved_cache[0] == key:
             return self._resolved_cache[1]
         entries = dtlogic.load_data_entries(
@@ -200,12 +207,15 @@ class DataView(QWidget):
         self.scan_status_changed.emit(True)
         index_path = self.index_path
         profile_dir = self.profile_dir
+        # Same gate as the Mod Files tab: both views share one single-slot
+        # conflict cache, so they must pass the same argument or thrash it.
+        bsa_index_path = mflogic.bsa_conflict_index_path(self.game, index_path)
 
         def worker():
             try:
                 entries = self._resolved_entries()
                 contested, _winner = mflogic.build_conflict_cache(
-                    index_path, profile_dir)
+                    index_path, profile_dir, bsa_index_path=bsa_index_path)
             except Exception:
                 safe_emit(self._data_ready, gen, [], set())
                 return

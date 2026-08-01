@@ -46,15 +46,33 @@ class QtWizardContext:
     run_deploy(on_done) starts a deploy through the app's deploy machinery
     (mutex/coalesce + progress popup); on_done(ok: bool) fires on the UI
     thread when the final deploy completes. Returns False if a deploy could
-    not be started. refresh_modlist() re-syncs the mods folder + reloads the
+    not be started. run_restore(on_done) is its counterpart for restoring the
+    modlist (same machinery; False when a restore can't start) — wizards that
+    write files into the game root (4GB patch backup exe, FO3 downgrade)
+    restore first, because files created while a profile is deployed are
+    missing from the deploy snapshot and the next restore would sweep them
+    into overwrite/ as runtime files.
+    refresh_modlist() re-syncs the mods folder + reloads the
     panels (footer Refresh).  refresh_plugins() re-runs LOOT to refresh plugin
     metadata WITHOUT reordering the load order (footer Refresh Plugins) — used by
     the xEdit wizards after a clean/edit session so dirty/message flags update.
+    import_manifest(manifest, source_stem, bundle_zip) opens the Profile-import
+    tab (the collection detail + install pipeline) for an already-parsed
+    Amethyst manifest — used by the curated-profile wizard. current_profile()
+    returns the LIVE active profile name (profile_name is frozen at open, so a
+    wizard spanning a profile switch — e.g. a profile import — reads this).
+    nexus_api() returns the app's shared NexusAPI (or None when not logged
+    in) — call it on the GUI thread; used by the MPI wizards' hands-free
+    archive fetch (premium direct download / download-folder watch).
     """
     profile_name: str = "default"
     run_deploy: Callable | None = None
+    run_restore: Callable | None = None
     refresh_modlist: Callable | None = None
     refresh_plugins: Callable | None = None
+    import_manifest: Callable | None = None
+    current_profile: Callable | None = None
+    nexus_api: Callable | None = None
 
 
 # Deliberately dropped from the Qt app (not even shown greyed out).
@@ -191,6 +209,14 @@ REGISTRY: dict[str, QtWizardSpec] = {
         QtWizardSpec(_param("wizards_qt.texture_tool_view", "TextureToolView", tool="parallaxr")),
     "wizards.ttw.TTWInstallerWizard":
         QtWizardSpec(_simple("wizards_qt.ttw_view", "TTWView")),
+    "wizards.bsa_decompressor.BSADecompressorWizard":
+        QtWizardSpec(_simple("wizards_qt.bsa_decompressor_view",
+                             "BSADecompressorView")),
+    "wizards.esm_fixes.ESMFixesWizard":
+        QtWizardSpec(_simple("wizards_qt.esm_fixes_view", "ESMFixesView")),
+    "wizards.curated_profile.CuratedProfileWizard":
+        QtWizardSpec(_simple("wizards_qt.curated_profile_view",
+                             "CuratedProfileView")),
     "wizards.dtkit_patch.DtkitPatchWizard":
         QtWizardSpec(_simple("wizards_qt.dtkit_patch_view", "DtkitPatchView")),
     "Games.Morrowind.mgexe_wizard.MGEXEWizard":
