@@ -47,7 +47,12 @@ jobs:
           mkdir -p .github/workflows scripts
           cp "$keep/sync-upstream.yml" "$keep/release.yml" .github/workflows/
           cp "$keep/apply_no_update_notice.py" scripts/
-          rm -f .github/workflows/build.yml .github/workflows/test-build.yml
+          # Keep only this fork's workflows. Upstream workflows cannot be pushed
+          # by GITHUB_TOKEN and upstream may add new workflow files at any time.
+          find .github/workflows -maxdepth 1 -type f \
+            ! -name sync-upstream.yml \
+            ! -name release.yml \
+            -delete
 
           python3 scripts/apply_no_update_notice.py
 
