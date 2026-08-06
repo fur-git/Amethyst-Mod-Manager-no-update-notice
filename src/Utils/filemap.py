@@ -348,6 +348,7 @@ def _build_incr_fingerprint(
     filemap_casing_pins,
     conflict_key_fn,
     root_folder_mods,
+    root_mod_files,
     utf8_bad: frozenset,
 ) -> tuple:
     """Everything (besides the modlist itself) that the merge output depends on.
@@ -378,6 +379,10 @@ def _build_incr_fingerprint(
         tuple(sorted((filemap_casing_pins or {}).items())),
         conflict_key_fn is None,
         frozenset(root_folder_mods or ()),
+        tuple(sorted(
+            (m, frozenset(v))
+            for m, v in (root_mod_files or {}).items()
+        )),
         utf8_bad,
     )
 
@@ -728,6 +733,7 @@ def _try_incremental(
     pf: _PathFilters,
     utf8_bad: frozenset,
     root_folder_mods,
+    root_mod_files: dict[str, frozenset[str]],
     disabled_lower: dict[str, frozenset[str]],
     disabled_frozen: frozenset,
     output_path: Path,
@@ -761,7 +767,8 @@ def _try_incremental(
             "excluded_loose_filenames", "allowed_top_level_folders",
             "excluded_mod_files", "normalize_folder_case", "filemap_casing",
             "filemap_casing_pins",
-            "no_conflict_key_fn", "root_folder_mods", "utf8_bad",
+            "no_conflict_key_fn", "root_folder_mods", "root_mod_files",
+            "utf8_bad",
         )
         _bad = [
             _fp_names[i] if i < len(_fp_names) else str(i)
@@ -843,12 +850,14 @@ def _try_incremental(
                 st.files_count.pop(m, None)
                 continue
             is_root = m in root_set
-            prov_ns = st.providers_root if is_root else st.providers
-            cont_ns = st.contested_root if is_root else st.contested
-            t_ns = touched_root if is_root else touched
+            rfm = None if is_root else root_mod_files.get(m)
             for rel_key in entry[0]:
                 if not pf.accepts(m, rel_key):
                     continue
+                entry_root = is_root or (rfm is not None and rel_key in rfm)
+                prov_ns = st.providers_root if entry_root else st.providers
+                cont_ns = st.contested_root if entry_root else st.contested
+                t_ns = touched_root if entry_root else touched
                 stack = prov_ns.get(rel_key)
                 if stack is None:
                     raise _IncrFallback(f"missing provider stack for {rel_key!r}")
@@ -893,13 +902,15 @@ def _try_incremental(
                            f"check for a symlinked/unreadable folder or Refresh")
                 continue
             is_root = m in root_set
-            prov_ns = st.providers_root if is_root else st.providers
-            cont_ns = st.contested_root if is_root else st.contested
-            t_ns = touched_root if is_root else touched
+            rfm = None if is_root else root_mod_files.get(m)
             acc = 0
             for rel_key in entry[0]:
                 if not pf.accepts(m, rel_key):
                     continue
+                entry_root = is_root or (rfm is not None and rel_key in rfm)
+                prov_ns = st.providers_root if entry_root else st.providers
+                cont_ns = st.contested_root if entry_root else st.contested
+                t_ns = touched_root if entry_root else touched
                 acc += 1
                 stack = prov_ns.get(rel_key)
                 if stack is None:
@@ -1109,6 +1120,54 @@ def _try_incremental(
     finally:
         if not dry_run:
             st0.lock.release()
+
+
+def index_key_for_raw(raw_key: str,
+                      strip_prefixes=None,
+                      strip_path_prefixes: "list[str] | None" = None) -> str:
+    """Index key for a mod-relative RAW path — the one translation between the
+    tab's raw-keyed state and index space. Keep in step with _scan_dir."""
+    rel = raw_key.replace("\\", "/")
+    if strip_path_prefixes:
+        rel_lower = rel.lower()
+        for p in sorted(strip_path_prefixes, key=len, reverse=True):
+            p_lower = p.lower()
+            if rel_lower == p_lower or rel_lower.startswith(p_lower + "/"):
+                rel = rel[len(p):].lstrip("/")
+                break
+    if strip_prefixes and "/" in rel:
+        strips = {s.lower() for s in strip_prefixes}
+        while "/" in rel:
+            first_seg, remainder = rel.split("/", 1)
+            if first_seg.lower() in strips:
+                rel = remainder
+            else:
+                break
+    return rel.lower()
+
+
+def mod_strip_args(mod_name: str, strip_prefixes=None,
+                   per_mod_strip_prefixes: dict | None = None,
+                   root_folder_mods=None) -> tuple:
+    """(strip_prefixes, strip_path_prefixes) for one mod — mirrors the
+    _strip_for_mod / _path_prefixes_for_mod pair. Root mods get none."""
+    if root_folder_mods and mod_name in root_folder_mods:
+        return frozenset(), []
+    base = frozenset(s.lower() for s in (strip_prefixes or ()))
+    mod_strip = (per_mod_strip_prefixes or {}).get(mod_name)
+    if not mod_strip:
+        return base, []
+    segments = frozenset(s.lower() for s in mod_strip if "/" not in s)
+    return base | segments, [s for s in mod_strip if "/" in s]
+
+
+def index_keys_for_mod(raw_keys, mod_name: str, strip_prefixes=None,
+                       per_mod_strip_prefixes: dict | None = None,
+                       root_folder_mods=None) -> set[str]:
+    """Translate a mod's RAW per-file keys into index/filemap key space."""
+    strips, paths = mod_strip_args(mod_name, strip_prefixes,
+                                   per_mod_strip_prefixes, root_folder_mods)
+    return {index_key_for_raw(k, strips, paths) for k in raw_keys}
 
 
 def _scan_dir(
@@ -1643,6 +1702,45 @@ def _pin_rel_str(rel_str: str, pins: dict[str, str]) -> str:
     return "/".join(parts) if changed else rel_str
 
 
+def canonicalize_dir_casing(
+    rel_paths: "list[str]",
+    strategy: str = FILEMAP_CASING_UPPER,
+    pins: "dict[str, str] | None" = None,
+) -> "dict[str, str]":
+    """Map each rel path to the same path with case-variant FOLDER segments
+    unified to one canonical casing. Filenames are never touched.
+
+    Exposed so the installer can merge ONE mod's ``meshes/`` + ``Meshes/`` in
+    staging using exactly the pick the filemap makes at deploy time — otherwise
+    staging and the Data tab would disagree about which casing won.
+    force_lower/force_upper collapse to their picking direction here: staging
+    only merges variants, it never renames files.
+    """
+    if strategy == FILEMAP_CASING_FORCE_LOWER:
+        strategy = FILEMAP_CASING_LOWER
+    elif strategy == FILEMAP_CASING_FORCE_UPPER:
+        strategy = FILEMAP_CASING_UPPER
+    elif strategy not in _VALID_FILEMAP_CASINGS:
+        strategy = FILEMAP_CASING_UPPER
+    unique_dirs: dict[str, None] = {}
+    for rel in rel_paths:
+        slash = rel.rfind("/")
+        if slash >= 0:
+            unique_dirs[rel[:slash]] = None
+    dir_rewrite = _apply_canonical(
+        _collect_canonical(unique_dirs, strategy), unique_dirs)
+    out: dict[str, str] = {}
+    for rel in rel_paths:
+        new = rel
+        slash = rel.rfind("/")
+        if slash >= 0:
+            nd = dir_rewrite.get(rel[:slash])
+            if nd is not None:
+                new = nd + rel[slash:]
+        out[rel] = _pin_rel_str(new, pins) if pins else new
+    return out
+
+
 def _apply_casing_pins_tuplemap(
     pins: dict[str, str],
     *tuple_maps: dict[str, tuple[str, str]],
@@ -1916,6 +2014,7 @@ def rebuild_mod_index(
     exclude_dirs: frozenset[str] | None = None,
     log_fn: "Callable[[str], None] | None" = None,
     root_folder_mods: set[str] | None = None,
+    follow_toplevel_links_under: "Path | None" = None,
 ) -> None:
     """Scan every mod folder under staging_root and rewrite the full index.
 
@@ -1929,6 +2028,12 @@ def rebuild_mod_index(
     ``Data``) must NOT be applied: a SKSE-style mod ships ``Data/Scripts/...``
     plus loose ``.exe`` files at top level; stripping ``Data/`` would dump the
     Scripts subtree at the game root instead of inside ``<game>/Data/``.
+
+    follow_toplevel_links_under — when set, a top-level symlinked mod dir is
+    followed IF its resolved target lives under this root (callers pass the
+    game's profiles/ dir so Profile Group links resolve); anything else keeps
+    the historical skip+WARN. _scan_dir never follows nested symlinks, so a
+    link smuggled inside a mod (malicious archive) stays un-indexed.
     """
     _strip = frozenset(s.lower() for s in strip_prefixes) if strip_prefixes else frozenset()
     _per_mod = per_mod_strip_prefixes or {}
@@ -1958,12 +2063,29 @@ def rebuild_mod_index(
                         continue
                     scan_targets.append((entry.name, entry.path))
                 elif entry.is_dir(follow_symlinks=True):
-                    # A SYMLINK pointing at a directory: the modlist sync adopts
-                    # it (pathlib is_dir follows links), but this index scan skips
-                    # it (follow_symlinks=False) — so the mod appears in the list
-                    # yet deploys nothing. This is the top-suspect cause of
-                    # "copied mod is invisible / has no plugins". Record + warn.
-                    skipped_nondir.append(entry.name)
+                    # A SYMLINK pointing at a directory. Followed only when the
+                    # caller passed follow_toplevel_links_under AND the resolved
+                    # target is contained in it (Profile Group links into member
+                    # profiles). Otherwise: the modlist sync adopts it (pathlib
+                    # is_dir follows links) but this index scan skips it — so
+                    # the mod appears in the list yet deploys nothing. Record +
+                    # warn in that case.
+                    followed = False
+                    if follow_toplevel_links_under is not None:
+                        if not _is_utf8_safe(entry.name):
+                            skipped_badname.append(entry.name)
+                            continue
+                        try:
+                            resolved = Path(entry.path).resolve(strict=True)
+                            resolved.relative_to(
+                                Path(follow_toplevel_links_under).resolve())
+                        except (OSError, ValueError, RuntimeError):
+                            pass
+                        else:
+                            scan_targets.append((entry.name, entry.path))
+                            followed = True
+                    if not followed:
+                        skipped_nondir.append(entry.name)
     except OSError as scan_err:
         # Staging root unreadable (unmounted SD card, permission loss).
         # Writing an index from this state would WIPE every mod's entry —
@@ -2403,6 +2525,10 @@ def build_filemap(
     exclude_dirs: frozenset[str] | None = None,
     log_fn: "Callable[[str], None] | None" = None,
     root_folder_mods: set[str] | None = None,
+    root_mod_files: dict[str, set[str]] | None = None,
+    follow_toplevel_links_under: "Path | None" = None,
+    identity_ck_prefix: str | None = None,
+    conflict_extras: dict | None = None,
 ) -> tuple[int, dict[str, int], dict[str, set[str]], dict[str, set[str]]]:
     """
     Build filemap.txt from the current modlist.
@@ -2445,6 +2571,10 @@ def build_filemap(
     files are treated as if the mod does not have them, so the next
     lower-priority mod that has the same file wins instead.
 
+    root_mod_files — per-mod index keys routed to the game-root namespace
+    (filemap_root.txt) instead of the Data one.  Exclusions win over root tags;
+    whole-mod root flags make per-file tags redundant.
+
     Returns:
         (count, conflict_map, overrides, overridden_by)
     """
@@ -2453,6 +2583,11 @@ def build_filemap(
         {k.lower(): v for k, v in filemap_casing_pins.items()}
         if filemap_casing_pins else {}
     )
+
+    # Per-mod root-tagged rel_keys — frozen once for O(1) merge-loop membership.
+    _root_files: dict[str, frozenset[str]] = {
+        m: frozenset(v) for m, v in (root_mod_files or {}).items() if v
+    }
 
     entries = read_modlist(modlist_path)
 
@@ -2479,6 +2614,7 @@ def build_filemap(
             exclude_dirs=exclude_dirs,
             log_fn=log_fn,
             root_folder_mods=root_folder_mods,
+            follow_toplevel_links_under=follow_toplevel_links_under,
         )
         index = read_mod_index(index_path) or {}
 
@@ -2505,7 +2641,8 @@ def build_filemap(
                 conflict_ignore_foldernames,
                 excluded_loose_filenames, allowed_top_level_folders,
                 excluded_mod_files, normalize_folder_case, filemap_casing,
-                _pins, conflict_key_fn, root_folder_mods, _utf8_bad,
+                _pins, conflict_key_fn, root_folder_mods, _root_files,
+                _utf8_bad,
             )
     if not _incr_on:
         _drop_incr_state(_output_key)
@@ -2557,7 +2694,7 @@ def build_filemap(
         with perftrace.span("filemap: incremental fast path"):
             _fast = _try_incremental(
                 _output_key, _incr_fp, priority_order, index, _pf, _utf8_bad,
-                root_folder_mods, _disabled_lower, _disabled_frozen,
+                root_folder_mods, _root_files, _disabled_lower, _disabled_frozen,
                 output_path, normalize_folder_case, filemap_casing,
                 log_fn, dry_run=_verify,
             )
@@ -2597,6 +2734,17 @@ def build_filemap(
     # Parallel index ck → staged rel_key for the current winner. Avoids an O(n)
     # scan of filemap_winner per conflicting file in UE5 builds.
     conflict_staged: dict[str, str] = {}
+    # Identity-key bookkeeping (BG3 pak UUIDs). _path_pairs holds every
+    # (loser, winner) relation that came from a real path collision, so the
+    # identity-only ones can be subtracted exactly — a pair that conflicts BOTH
+    # ways keeps its loose-file status.
+    # Identity keys (BG3 pak UUIDs): _path_pairs records every (loser, winner)
+    # from a REAL path collision so identity-only ones can be subtracted exactly
+    # — a pair conflicting both ways keeps its loose-file status.
+    _ident_on = bool(identity_ck_prefix) and conflict_key_fn is not None
+    _ident_pfx = identity_ck_prefix or ""
+    _path_pairs: set[tuple[str, str]] = set()
+    _ident_pops: dict[str, int] = {}
 
     # Hoist feature-flags out of the per-file hot loop. When a feature is
     # unused (the common case) we skip its function call entirely on each of
@@ -2672,6 +2820,7 @@ def build_filemap(
         had_file = False
         _acc = 0
         _is_root_mod = bool(root_folder_mods and name in root_folder_mods)
+        _rf = None if _is_root_mod else _root_files.get(name)
         # Pick which namespace this mod writes into.
         _winner_ns = filemap_root_winner if _is_root_mod else filemap_winner
         _map_ns    = filemap_root        if _is_root_mod else filemap
@@ -2689,6 +2838,15 @@ def build_filemap(
             if _has_folder_ignore and _dir_ignored(rel_key):
                 continue
             had_file = True
+            if _rf is not None:
+                # Per-file root tags: rebind the namespaces per entry (same
+                # switch as whole-mod root flags). Only mods with tags pay.
+                if rel_key in _rf:
+                    _winner_ns, _map_ns = filemap_root_winner, filemap_root
+                    _prov_ns, _cont_ns = _prov_root, _contested_root
+                else:
+                    _winner_ns, _map_ns = filemap_winner, filemap
+                    _prov_ns, _cont_ns = _prov, _contested
             if _incr_on:
                 _stack = _prov_ns.get(rel_key)
                 if _stack is None:
@@ -2704,6 +2862,8 @@ def build_filemap(
                 win_count[prev] = win_count.get(prev, 0) - 1
                 overrides[name].add(prev)
                 overridden_by[prev].add(name)
+                if _ident_on:
+                    _path_pairs.add((prev, name))
                 if _incr_on:
                     # Each overwrite event IS one consecutive pair — the same
                     # relation the incremental pair refcounts maintain.
@@ -2714,11 +2874,19 @@ def build_filemap(
             _map_ns[rel_key] = (rel_str, name)
             win_count[name] = win_count.get(name, 0) + 1
             # Effective-deploy-path conflict detection only applies to normal mods.
-            # Root-flagged mods deploy verbatim to game_root, no conflict_key_fn transform.
-            if not _is_root_mod and conflict_key_fn is not None:
+            # Root-flagged mods and root-tagged files deploy verbatim to
+            # game_root, no conflict_key_fn transform.
+            if (not _is_root_mod and conflict_key_fn is not None
+                    and (_rf is None or rel_key not in _rf)):
                 ck = conflict_key_fn(name, rel_key).lower()
                 prev_ck = conflict_winner.get(ck)
-                if prev_ck is not None and prev_ck != name:
+                _is_ident = (prev_ck is not None and _ident_on
+                             and ck.startswith(_ident_pfx))
+                # An identity key drops the earlier file even when the SAME mod
+                # owns it (two paks of one module in a mod folder — or in the
+                # overwrite folder, which is one pseudo-mod). Path keys keep the
+                # historical mod != mod rule.
+                if prev_ck is not None and (prev_ck != name or _is_ident):
                     prev_staged = conflict_staged.get(ck)
                     if (prev_staged is not None
                             and prev_staged != rel_key
@@ -2726,8 +2894,15 @@ def build_filemap(
                         filemap_winner.pop(prev_staged, None)
                         filemap.pop(prev_staged, None)
                         win_count[prev_ck] = win_count.get(prev_ck, 0) - 1
-                    overrides[name].add(prev_ck)
-                    overridden_by[prev_ck].add(name)
+                        if _is_ident:
+                            # Losing an identity contest isn't a file conflict —
+                            # give the win back when scoring path-only status.
+                            _ident_pops[prev_ck] = _ident_pops.get(prev_ck, 0) + 1
+                    if prev_ck != name:
+                        overrides[name].add(prev_ck)
+                        overridden_by[prev_ck].add(name)
+                        if _ident_on and not _is_ident:
+                            _path_pairs.add((prev_ck, name))
                 conflict_winner[ck] = name
                 conflict_staged[ck] = rel_key
         if had_file:
@@ -2740,6 +2915,21 @@ def build_filemap(
         conflict_map = _compute_conflict_status(
             priority_order, overrides, overridden_by, win_count, mods_with_files,
         )
+        if _ident_on and conflict_extras is not None:
+            # Same classification minus identity-only relations (and the wins
+            # they cost) — the caller paints THIS as the loose-file icon, so an
+            # identity clash doesn't light up two icons. overrides/overridden_by
+            # stay whole, so cross-panel highlights still link the mods.
+            _p_over = {n: {o for o in s if (o, n) in _path_pairs}
+                       for n, s in overrides.items()}
+            _p_overby = {n: {o for o in s if (n, o) in _path_pairs}
+                         for n, s in overridden_by.items()}
+            _p_wins = dict(win_count)
+            for _m, _c in _ident_pops.items():
+                _p_wins[_m] = _p_wins.get(_m, 0) + _c
+            conflict_extras["path_conflict_map"] = _compute_conflict_status(
+                priority_order, _p_over, _p_overby, _p_wins, mods_with_files,
+            )
 
     # Normalize folder casing across the merged filemap so that two mods which
     # ship the same logical path with different casings (e.g. "archive/pc/Mod"

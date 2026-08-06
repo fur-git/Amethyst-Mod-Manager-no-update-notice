@@ -73,13 +73,25 @@ def install_dotnet_runtime(
     """
     from Utils.ca_bundle import download_file
     from Utils.config_paths import get_dotnet_cache_dir
-    from Utils.protontricks import dotnet_dep_key, mark_dep_installed
+    from Utils.protontricks import (
+        dotnet_dep_key, mark_dep_installed, prefix_downgrade_warning,
+        run_prefix_installer,
+    )
 
     _status = status_fn or (lambda _m: None)
 
     dl_url = DOTNET_URLS.get(version)
     if dl_url is None:
         log_fn(f"no download URL known for .NET {version}.")
+        return False
+
+    # Older Proton driving a newer prefix hangs under runinprefix — refuse with
+    # the fix instead of sitting on a dead progress bar (GH#333).
+    compat_data = env.get("STEAM_COMPAT_DATA_PATH")
+    stale_prefix = prefix_downgrade_warning(proton_script, compat_data)
+    if stale_prefix:
+        _status(f".NET {version}: prefix needs a downgrade first.")
+        log_fn(f".NET {version}: {stale_prefix}")
         return False
 
     cache_path = get_dotnet_cache_dir() / f"windowsdesktop-runtime-{version}-win-x64.exe"
@@ -91,29 +103,36 @@ def install_dotnet_runtime(
     else:
         log_fn(f"using cached .NET {version} installer.")
 
-    _status(f"Installing .NET {version} (silent)…\n(this may take a few minutes)")
+    _status(f"Installing .NET {version} (silent)…\n(this can take a minute or two)")
     log_fn(f"installing .NET {version} in prefix (silent) …")
-    proc = subprocess.run(
+    rc, output = run_prefix_installer(
         # runinprefix: no steam.exe shim, so the silent install doesn't show
         # the game as "Running" in Steam (the prefix already exists here).
         proton_run_command(proton_script, "runinprefix",
                            str(cache_path), "/quiet", "/norestart",
                            env=env),
-        env=env, cwd=str(cache_path.parent),
+        env, cache_path.parent,
+        label=f".NET {version}", log_fn=log_fn,
+        proton_script=proton_script, compat_data=compat_data,
     )
-    if proc.returncode not in DOTNET_OK_CODES:
-        log_fn(f".NET {version} installer exited with code {proc.returncode}.")
+    if rc is None:
+        _status(f".NET {version} install timed out — see log.")
+        return False                    # run_prefix_installer logged the abort
+    if rc not in DOTNET_OK_CODES:
+        log_fn(f".NET {version} installer exited with code {rc}.")
+        if output:
+            log_fn(f".NET {version} output:\n{output}")
         return False
 
     if prefix_path and Path(prefix_path).is_dir():
         mark_dep_installed(Path(prefix_path), dep_key or dotnet_dep_key(version))
 
-    if proc.returncode == 1:
+    if rc == 1:
         _status(f".NET {version} already installed — continuing.")
         log_fn(f".NET {version} already installed (installer exit 1) — marking done.")
     else:
         _status(f".NET {version} installed successfully.")
-        log_fn(f".NET {version} installed (exit {proc.returncode}).")
+        log_fn(f".NET {version} installed (exit {rc}).")
     return True
 
 
@@ -163,6 +182,8 @@ def resolve_proton_env(game, log_fn: LogFn = _noop):
         game_steam_id,
         find_steam_root_for_proton_script,
     )
+    from Utils.umu_launcher import ensure_umu_run
+    ensure_umu_run(log_fn)
 
     prefix_path = game.get_prefix_path()
     if prefix_path is None or not prefix_path.is_dir():
@@ -206,6 +227,17 @@ def resolve_proton_env(game, log_fn: LogFn = _noop):
                        f"{proton_script.parent.name}.")
 
     if proton_script is None:
+        # Faugus records the game's runner in games.json.
+        try:
+            from Utils.faugus_finder import find_faugus_proton_for_prefix
+            proton_script = find_faugus_proton_for_prefix(prefix_path)
+        except Exception:
+            proton_script = None
+        if proton_script is not None:
+            log_fn(f"Proton Tools: using Faugus-configured Proton "
+                   f"{proton_script.parent.name}.")
+
+    if proton_script is None:
         preferred_runner = read_prefix_runner(compat_data)
         proton_script = find_any_installed_proton(preferred_runner)
         if proton_script is None:
@@ -220,7 +252,11 @@ def resolve_proton_env(game, log_fn: LogFn = _noop):
 
     steam_root = find_steam_root_for_proton_script(proton_script)
     if steam_root is None:
-        log_fn("Proton Tools: could not determine Steam root for the selected Proton tool.")
+        from Utils.steam_finder import steamless_launch_error
+        reason = steamless_launch_error()
+        log_fn(f"Proton Tools: {reason}" if reason else
+               "Proton Tools: could not determine Steam root for the "
+               "selected Proton tool.")
         return None, None
 
     from Utils.protontricks import strip_appimage_env
@@ -411,6 +447,18 @@ def install_xact(game, log_fn: LogFn = _noop) -> bool:
     for verb in ("xact", "xact_x64"):
         ok = install_winetricks_verb(game, verb, log_fn=log_fn) and ok
     return ok
+
+
+def install_lavfilters(game, log_fn: LogFn = _noop) -> bool:
+    """Install LAV Filters (winetricks ``lavfilters``) into the game's prefix.
+
+    Registers real DirectShow decoders so games that stream their radio/music
+    through DirectShow (Fallout 3 / New Vegas) play it instead of running
+    silent. Unattended and skip-if-recorded, so re-running is instant.
+    The verb runs a Windows installer under Wine — allow it longer than the
+    300 s default the DLL-drop verbs get."""
+    from Utils.protontricks import install_winetricks_verb
+    return install_winetricks_verb(game, "lavfilters", log_fn=log_fn, timeout=60)
 
 
 def install_dotnet(game, version: str, log_fn: LogFn = _noop) -> bool:

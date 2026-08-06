@@ -694,8 +694,9 @@ def find_umu_run() -> Path | None:
 
     Preference: a system install on PATH (umu-launcher package), then the
     copy Lutris downloads into its runtime (native install, then Flatpak
-    Lutris's data dir), then Heroic's copy (modern Heroic launches Proton
-    games through umu too). The launcher copies are self-contained zipapps
+    Lutris's data dir), then Faugus's downloaded copy, then Heroic's copy
+    (modern Heroic and Faugus launch Proton games through umu too). The
+    launcher copies are self-contained zipapps
     with a ``python3`` shebang, so they run fine outside their launcher.
     """
     cand = shutil.which("umu-run")
@@ -709,15 +710,38 @@ def find_umu_run() -> Path | None:
         p = data_dir / "lutris" / "runtime" / "umu" / "umu-run"
         if p.is_file():
             return p
+    # Faugus downloads its own copy into its data dir (host-visible for both
+    # the native and flatpak flavors).
+    for data_dir in (_XDG_DATA, _HOME / ".local" / "share",
+                     _HOME / ".var" / "app" / "io.github.Faugus.faugus-launcher"
+                     / "data"):
+        p = data_dir / "faugus-launcher" / "umu-run"
+        if p.is_file():
+            return p
     # Heroic: a downloaded copy under its tools dir, or the build bundled
     # next to legendary/gogdl (resources/app.asar.unpacked/build/bin/...;
     # globbed since the arch/platform nesting has moved between releases).
+    # Current Heroic downloads umu to tools/runtimes/umu/ (alongside the EAC
+    # and BattlEye runtimes); older releases used tools/umu/. Missing the
+    # current path was GH#320's second failure: with no Steam and no Lutris,
+    # Heroic's copy is the only umu on the box, so not finding it dropped
+    # every launch onto a raw Proton call that cannot work without Steam.
     heroic_flatpak = _HOME / ".var" / "app" / "com.heroicgameslauncher.hgl"
     for config_dir in (_XDG_CONFIG, _HOME / ".config",
                        heroic_flatpak / "config"):
-        p = config_dir / "heroic" / "tools" / "umu" / "umu-run"
-        if p.is_file():
-            return p
+        tools = config_dir / "heroic" / "tools"
+        for rel in (("runtimes", "umu", "umu-run"), ("umu", "umu-run")):
+            p = tools.joinpath(*rel)
+            if p.is_file():
+                return p
+        # Future-proofing: any other nesting Heroic may move umu to.
+        try:
+            hit = next((h for h in tools.glob("*/umu/umu-run") if h.is_file()),
+                       None)
+        except OSError:
+            hit = None
+        if hit is not None:
+            return hit
     for app_root in (
         Path("/opt/Heroic"),
         Path("/var/lib/flatpak/app/com.heroicgameslauncher.hgl/current"
@@ -735,7 +759,14 @@ def find_umu_run() -> Path | None:
                 hit = None
             if hit is not None:
                 return hit
-    return None
+    # Our own on-demand copy, last: whatever Heroic/Lutris/the distro package
+    # maintains is that owner's to keep current, so prefer theirs over ours.
+    try:
+        from Utils.umu_launcher import bundled_umu_run
+        ours = bundled_umu_run()
+    except Exception:
+        return None
+    return ours if ours.is_file() else None
 
 
 def umu_run_command(umu_bin: Path, *args: str,

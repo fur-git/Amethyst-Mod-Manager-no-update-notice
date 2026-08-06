@@ -68,18 +68,33 @@ def _lutris_available(game) -> bool:
         return False
 
 
+def _faugus_available(game) -> bool:
+    """True when a Faugus install exists and the game has an exe to match
+    against it (same exe-name-keyed detection as Lutris)."""
+    if not getattr(game, "exe_name", None):
+        return False
+    try:
+        from Utils.faugus_finder import find_faugus_roots
+        return bool(find_faugus_roots())
+    except Exception:
+        return False
+
+
 class _ScanSignals(QObject):
     # Scan results carry everything the worker discovered so the worker thread
     # never writes view attributes directly (the slots run on the GUI thread).
-    game_found = Signal(object, str, object, object, object)
-    # ^ (path|None, source, prefix|None, lutris_slug|None, heroic_app|None)
+    game_found = Signal(object, str, object, object, object, object)
+    # ^ (path|None, source, prefix|None, lutris_slug|None, heroic_app|None,
+    #    faugus_gameid|None)
     drive_scan_found = Signal(object)       # (path|None) — full-drive Scan button
-    prefix_found = Signal(object, object)   # (path|None, lutris_slug|None)
+    prefix_found = Signal(object, object, object)
+    # ^ (path|None, lutris_slug|None, faugus_gameid|None)
     # Browse (portal) picks — fired from the portal WORKER thread, so they must
     # be marshalled to the GUI thread via a Signal before touching any widget.
     game_picked = Signal(object)            # (path|None)
     prefix_picked = Signal(object)          # (path|None)
     staging_picked = Signal(object)         # (path|None)
+    saves_picked = Signal(object)           # (path|None)
     # Remove-instance / clean-game-folder workers → GUI thread. Both do heavy
     # disk work (restore + rmtree / full game-dir scan) that used to freeze
     # the UI when run in the click handler.
@@ -105,7 +120,9 @@ class ConfigureGameView(QWidget):
         self._found_prefix: Path | None = None
         self._found_lutris_slug: str | None = None
         self._found_heroic_app: str | None = None
+        self._found_faugus_gameid: str | None = None
         self._custom_staging: Path | None = None
+        self._custom_saves: Path | None = None
 
         # Closing the tab deleteLater()'s the view while scan workers may still
         # be running; the guards drop late slot runs so they never touch
@@ -121,6 +138,7 @@ class ConfigureGameView(QWidget):
         self._sig.game_picked.connect(g(self._on_game_picked))
         self._sig.prefix_picked.connect(g(self._on_prefix_picked))
         self._sig.staging_picked.connect(g(self._on_staging_picked))
+        self._sig.saves_picked.connect(g(self._on_saves_picked))
         self._sig.remove_done.connect(g(self._on_remove_finished))
         self._sig.clean_done.connect(g(self._on_clean_finished))
         self._sig.staging_scanned.connect(g(self._on_staging_scanned))
@@ -316,7 +334,8 @@ class ConfigureGameView(QWidget):
         v.addWidget(self._section_header(self.tr("Proton Prefix (compatdata/pfx)")))
         has_prefix_src = bool(getattr(g, "steam_id", None)
                               or _heroic_app_names(g)
-                              or _lutris_available(g))
+                              or _lutris_available(g)
+                              or _faugus_available(g))
         self._prefix_status = self._status(
             self.tr("Scanning for prefix…") if has_prefix_src
             else self.tr("No launcher ID — prefix not applicable."),
@@ -349,6 +368,26 @@ class ConfigureGameView(QWidget):
         row.addWidget(self._small_btn(self.tr("Open"), lambda: self._open_path(
             Path(self._staging_edit.text()) if self._staging_edit.text() else None)))
         row.addWidget(self._small_btn(self.tr("Reset to default"), self._reset_staging))
+        row.addStretch(1)
+        v.addLayout(row)
+        v.addWidget(self._divider())
+
+        # --- Saves folder override -------------------------------------------
+        # The Saves tab normally locates saves from the Ludusavi manifest. Games
+        # it does not cover, or covers with a Windows-only path while running a
+        # native Linux build, need to be told where to look.
+        v.addWidget(self._section_header(self.tr("Saves Folder (optional)")))
+        self._saves_status = self._status(
+            self.tr("Detected automatically."), "TEXT_DIM")
+        v.addWidget(self._saves_status)
+        self._saves_edit = self._path_edit()
+        self._saves_edit.editingFinished.connect(self._on_saves_typed)
+        v.addWidget(self._saves_edit)
+        row = QHBoxLayout()
+        row.addWidget(self._small_btn(self.tr("Browse manually…"), self._browse_saves))
+        row.addWidget(self._small_btn(self.tr("Open"), lambda: self._open_path(
+            Path(self._saves_edit.text()) if self._saves_edit.text() else None)))
+        row.addWidget(self._small_btn(self.tr("Clear"), self._clear_saves))
         row.addStretch(1)
         v.addLayout(row)
         v.addStretch(1)
@@ -492,6 +531,13 @@ class ConfigureGameView(QWidget):
                 self._staging_status.setText(self.tr("Custom staging folder configured."))
             else:
                 self._staging_edit.setText(str(g.get_mod_staging_path()))
+            saves_override = (g.get_save_path_override()
+                              if hasattr(g, "get_save_path_override") else None)
+            if saves_override:
+                self._custom_saves = Path(saves_override)
+                self._saves_edit.setText(str(saves_override))
+                self._saves_status.setText(self.tr("Custom saves folder configured."))
+                self._saves_status.setStyleSheet(f"color:{self._c('TEXT_OK')};")
             # option values
             self._set_check("script_extender_swap",
                             getattr(g, "script_extender_swap", True))
@@ -693,18 +739,20 @@ class ConfigureGameView(QWidget):
     def _set_game(self, path: Path, configured=False, source="steam"):
         self._found_path = path
         self._game_edit.setText(str(path))
-        # Steam/Heroic/Lutris library detection already verified the exe lives
-        # here, so trust those sources. For manual browse / drive-scan / typed
+        # Steam/Heroic/Lutris/Faugus library detection already verified the exe
+        # lives here, so trust those sources. For manual browse / drive-scan / typed
         # paths the folder is whatever the user picked — verify the exe is
         # actually inside and warn (rather than silently claiming "Found") if
         # it isn't.
-        if source in ("steam", "heroic", "lutris") or configured:
+        if source in ("steam", "heroic", "lutris", "faugus") or configured:
             if configured:
                 msg, tone = "Game already configured. You can update the path below.", "TEXT_OK"
             elif source == "heroic":
                 msg, tone = "Found via Heroic Games Launcher.", "TEXT_OK"
             elif source == "lutris":
                 msg, tone = self.tr("Found via Lutris."), "TEXT_OK"
+            elif source == "faugus":
+                msg, tone = self.tr("Found via Faugus Launcher."), "TEXT_OK"
             else:
                 msg, tone = "Found via Steam libraries.", "TEXT_OK"
         else:
@@ -756,6 +804,10 @@ class ConfigureGameView(QWidget):
         text = self._staging_edit.text().strip()
         self._custom_staging = Path(text) if text else None
 
+    def _on_saves_typed(self):
+        text = self._saves_edit.text().strip()
+        self._custom_saves = Path(text) if text else None
+
     # ---- browse / open ----------------------------------------------------
     def _browse_game(self):
         # pick_folder's callback fires on the portal WORKER thread — marshal to
@@ -782,6 +834,26 @@ class ConfigureGameView(QWidget):
         from Utils.portal_filechooser import pick_folder
         pick_folder("Select mod staging folder",
                     lambda path: self._sig.staging_picked.emit(path))
+
+    def _browse_saves(self):
+        # Same worker-thread caveat as _browse_game — marshal via the signal.
+        from Utils.portal_filechooser import pick_folder
+        pick_folder("Select saves folder",
+                    lambda path: self._sig.saves_picked.emit(path))
+
+    def _on_saves_picked(self, path):
+        if not path:
+            return
+        self._custom_saves = Path(path)
+        self._saves_edit.setText(str(path))
+        self._saves_status.setText(self.tr("Custom saves folder selected."))
+        self._saves_status.setStyleSheet(f"color:{self._c('TEXT_OK')};")
+
+    def _clear_saves(self):
+        self._custom_saves = None
+        self._saves_edit.clear()
+        self._saves_status.setText(self.tr("Detected automatically."))
+        self._saves_status.setStyleSheet(f"color:{self._c('TEXT_DIM')};")
 
     def _on_staging_picked(self, path):
         if not path:
@@ -855,6 +927,7 @@ class ConfigureGameView(QWidget):
         found_prefix = None
         lutris_slug = None
         heroic_app = None
+        faugus_gameid = None
         game_name = getattr(g, "name", repr(g))
         app_log(f"[Configure Game] Auto-detecting: {game_name}")
         try:
@@ -898,6 +971,16 @@ class ConfigureGameView(QWidget):
                         app_log(f"[Configure Game] Found via Lutris ({exe}): {found}")
                         break
             if not found:
+                from Utils.faugus_finder import find_faugus_game_info_by_exe
+                app_log(f"[Configure Game] Checking Faugus (exe names: {exe_names})")
+                for exe in exe_names:
+                    info = find_faugus_game_info_by_exe(exe)
+                    if info:
+                        found, found_prefix, faugus_gameid = info
+                        source = "faugus"
+                        app_log(f"[Configure Game] Found via Faugus ({exe}): {found}")
+                        break
+            if not found:
                 libs = find_steam_libraries()
                 app_log(f"[Configure Game] Steam libraries found: "
                         f"{libs if libs else 'none'}")
@@ -931,19 +1014,26 @@ class ConfigureGameView(QWidget):
         if not found:
             app_log(f"[Configure Game] Game location not auto-detected for: {game_name}")
         safe_emit(self._sig.game_found, found, source, found_prefix,
-                  lutris_slug, heroic_app)
+                  lutris_slug, heroic_app, faugus_gameid)
 
-    def _on_game_found(self, found, source, prefix, lutris_slug, heroic_app):
+    def _on_game_found(self, found, source, prefix, lutris_slug, heroic_app,
+                       faugus_gameid):
         if lutris_slug:
             self._found_lutris_slug = lutris_slug
         if heroic_app:
             self._found_heroic_app = heroic_app
+        if faugus_gameid:
+            self._found_faugus_gameid = faugus_gameid
         if found:
             self._set_game(Path(found), source=source)
             if prefix is not None:
                 self._set_prefix(Path(prefix))
             elif self._has_prefix_src:
                 self._start_prefix_scan()
+        elif getattr(self._game, "auto_drive_scan", False):
+            # Store-less games (manual downloads) can never be found by the
+            # library scan — the drive scan IS their auto-detection.
+            self._start_drive_scan()
         else:
             self._game_status.setText(
                 self.tr("Not found automatically. Browse manually to locate the game folder."))
@@ -1001,40 +1091,61 @@ class ConfigureGameView(QWidget):
     def _start_prefix_scan(self):
         self._prefix_status.setText(self.tr("Scanning for Proton prefix…"))
         self._prefix_status.setStyleSheet(f"color:{self._c('TEXT_WARN')};")
-        threading.Thread(target=self._prefix_scan_worker, daemon=True).start()
+        # Read the game path here, on the main thread, so the Steam lookup can
+        # tell which library owns the app (a stale compatdata in another library
+        # would otherwise win).
+        try:
+            game_path = self._found_path or (self._game.get_game_path()
+                                             if self._game else None)
+        except Exception:
+            game_path = None
+        threading.Thread(target=self._prefix_scan_worker, args=(game_path,),
+                         daemon=True).start()
 
-    def _prefix_scan_worker(self):
+    def _prefix_scan_worker(self, game_path=None):
         g = self._game
         found = None
         lutris_slug = None
+        faugus_gameid = None
         try:
             from Utils.steam_finder import find_prefix
             from Utils.heroic_finder import find_heroic_prefix
             sid = getattr(g, "steam_id", None)
             ids = [sid] + [str(s) for s in getattr(g, "alt_steam_ids", []) or [] if s]
             for s in [x for x in ids if x]:
-                found = find_prefix(s)
+                found = find_prefix(s, game_path)
                 if found:
                     break
             if not found and _heroic_app_names(g):
                 found = find_heroic_prefix(_heroic_app_names(g))
+            exe_names = [getattr(g, "exe_name", None)] + list(
+                getattr(g, "exe_name_alts", []) or [])
+            exe_names = [e for e in exe_names if e]
             if not found:
                 from Utils.lutris_finder import find_lutris_game_info_by_exe
-                exe_names = [getattr(g, "exe_name", None)] + list(
-                    getattr(g, "exe_name_alts", []) or [])
-                for exe in [e for e in exe_names if e]:
+                for exe in exe_names:
                     info = find_lutris_game_info_by_exe(exe)
                     if info and info[1] is not None:
                         found = info[1]
                         lutris_slug = info[2]
                         break
+            if not found:
+                from Utils.faugus_finder import find_faugus_game_info_by_exe
+                for exe in exe_names:
+                    info = find_faugus_game_info_by_exe(exe)
+                    if info and info[1] is not None:
+                        found = info[1]
+                        faugus_gameid = info[2]
+                        break
         except Exception:
             found = None
-        safe_emit(self._sig.prefix_found, found, lutris_slug)
+        safe_emit(self._sig.prefix_found, found, lutris_slug, faugus_gameid)
 
-    def _on_prefix_found(self, found, lutris_slug):
+    def _on_prefix_found(self, found, lutris_slug, faugus_gameid):
         if lutris_slug:
             self._found_lutris_slug = lutris_slug
+        if faugus_gameid:
+            self._found_faugus_gameid = faugus_gameid
         if found:
             self._set_prefix(Path(found))
         else:
@@ -1132,10 +1243,14 @@ class ConfigureGameView(QWidget):
             g.set_lutris_slug(self._found_lutris_slug)
         if self._found_heroic_app and hasattr(g, "set_heroic_app_name"):
             g.set_heroic_app_name(self._found_heroic_app)
+        if self._found_faugus_gameid and hasattr(g, "set_faugus_gameid"):
+            g.set_faugus_gameid(self._found_faugus_gameid)
         if hasattr(g, "set_deploy_mode"):
             g.set_deploy_mode(mode)
         if hasattr(g, "set_staging_path"):
             g.set_staging_path(self._custom_staging)
+        if hasattr(g, "set_save_path_override"):
+            g.set_save_path_override(self._custom_saves)
         if hasattr(g, "set_script_extender_swap") and "script_extender_swap" in self._opt_checks:
             g.set_script_extender_swap(self._opt_checks["script_extender_swap"].isChecked())
         if hasattr(g, "set_auto_4gb_patch") and "auto_4gb_patch" in self._opt_checks:
@@ -1297,7 +1412,9 @@ class ConfigureGameView(QWidget):
                 install_d3dcompiler_47,
                 install_vcredist,
                 is_dep_installed,
+                winetricks_verb_dep_key,
             )
+            from Utils.proton_tools import install_lavfilters
             from Utils.steam_finder import game_steam_id
 
             _proton: tuple = ()
@@ -1337,6 +1454,16 @@ class ConfigureGameView(QWidget):
                     ok = install_d3dcompiler_47(
                         game_steam_id(game), log_fn=app_log, prefix_path=prefix)
                     (installed if ok else failed).append("d3dcompiler_47")
+                elif dep == "lavfilters":
+                    # Same installer the Proton Tools menu entry uses, so a
+                    # manual install and this one share the skip marker.
+                    if is_dep_installed(prefix, winetricks_verb_dep_key("lavfilters")):
+                        app_log(f"{game.name}: LAV Filters already installed — skipping.")
+                        skipped.append("lavfilters")
+                        continue
+                    app_log(f"{game.name}: auto-installing LAV Filters (radio/music codecs) …")
+                    ok = install_lavfilters(game, log_fn=app_log)
+                    (installed if ok else failed).append("lavfilters")
                 else:
                     app_log(f"{game.name}: unknown auto_install dep '{dep}' — skipping.")
                     skipped.append(dep)

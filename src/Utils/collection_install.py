@@ -48,8 +48,8 @@ from Utils.ui_config import (
     load_collection_settings, load_clear_archive_after_install,
     load_keep_fomod_archives)
 from Nexus.nexus_download import (
-    DownloadResult, _find_cached_archive, delete_archive_and_sidecar,
-    _get_downloads_dir)
+    DownloadResult, _find_cached_archive, _clean_nexus_stem,
+    delete_archive_and_sidecar, _get_downloads_dir)
 from Nexus.nexus_meta import build_meta_from_download
 
 
@@ -237,7 +237,7 @@ def cleanup_cancelled_install(game, profile_dir: "Path | None", *,
 # ---------------------------------------------------------------------------
 def run_collection_install(
         *, game, api, downloader, mods: list, download_link_path: str,
-        profile_dir: Path, old_profile_dir: "Path | None",
+        profile_dir: "Path | None", old_profile_dir: "Path | None",
         collection_slug: str, revision_number: "int | None" = None,
         collection_total_size: int = 0,
         collection_schema_cache: "dict | None" = None,
@@ -248,6 +248,7 @@ def run_collection_install(
         with_bundled: bool = True,
         update_context: "dict | None" = None,
         manual_mode: bool = False,
+        download_only: bool = False,
         append_card_info: "dict | None" = None,
         callbacks: "CollectionInstallCallbacks | None" = None,
         control: "CollectionInstallControl | None" = None) -> None:
@@ -273,6 +274,9 @@ def run_collection_install(
     (``callbacks.on_manual_mod``) + download-folder poll; the user downloads
     each archive in a browser (or picks it / skips via ``control.manual_queue``)
     and the same install consumers take it from there.
+    ``download_only``: fetch every manifest archive into the download cache and
+    install NOTHING — no extraction, staging or profile writes. ``profile_dir``
+    is then None and the run ends once the download pipeline drains.
     """
     cb = callbacks or CollectionInstallCallbacks()
     ctl = control or CollectionInstallControl()
@@ -284,18 +288,24 @@ def run_collection_install(
     _set_status = cb.on_status
     _set_progress = cb.on_progress
 
-    game.set_active_profile_dir(profile_dir)
-    game.load_paths()
-    modlist_path = profile_dir / "modlist.txt"
-    plugins_path = profile_dir / "plugins.txt"
-    staging_path = game.get_effective_mod_staging_path()
+    # download_only never touches a profile: no active-profile swap (that would
+    # repoint the live game object), and the paths stay None so a missed write
+    # raises instead of landing in the user's real profile.
+    if download_only:
+        modlist_path = plugins_path = staging_path = None
+    else:
+        game.set_active_profile_dir(profile_dir)
+        game.load_paths()
+        modlist_path = profile_dir / "modlist.txt"
+        plugins_path = profile_dir / "plugins.txt"
+        staging_path = game.get_effective_mod_staging_path()
     installed = 0
     skipped = 0
     total = len(mods)
 
     _is_append_run = overwrite_existing is not None
     _append_pre_existing: "set[str]" = set()
-    if _is_append_run and modlist_path.is_file():
+    if _is_append_run and modlist_path is not None and modlist_path.is_file():
         try:
             _append_pre_existing = {
                 e.name.lower() for e in read_modlist(modlist_path)
@@ -326,7 +336,7 @@ def run_collection_install(
                 f"{len(collection_schema.get('plugins', []))} plugins)")
         except Exception as exc:
             log(f"Collection install: could not download collection.json: {exc}")
-    if not collection_schema and not _is_append_run:
+    if not collection_schema and not _is_append_run and profile_dir is not None:
         # Last resort (continue/update runs): the profile's saved manifest from
         # the original install. Never on append — that file belongs to the
         # profile's primary collection, not the one being appended.
@@ -342,7 +352,9 @@ def run_collection_install(
             "back to GraphQL and FOMOD/BAIN choices canNOT be auto-applied "
             "(installers will prompt at the end)")
 
-    if _is_append_run:
+    if download_only:
+        pass            # no profile to record the manifest into
+    elif _is_append_run:
         # Append: record under installed_collections/ — do NOT clobber the
         # profile's primary collection.json (the update path diffs against it).
         from Utils.installed_collections import record_appended_collection
@@ -463,8 +475,10 @@ def run_collection_install(
     # the cleaned-up title of a skipped optional (e.g. "X - AE" cleans to "X").
     staging_folder_fid: dict[str, int] = {}
 
+    # download_only leaves these paths None, so the pre-scan and the
+    # unticked-optional removal below are both inert.
     _profile_mod_names: set[str] = set()
-    if modlist_path.is_file():
+    if modlist_path is not None and modlist_path.is_file():
         try:
             for entry in read_modlist(modlist_path):
                 _profile_mod_names.add(entry.name.lower())
@@ -472,7 +486,7 @@ def run_collection_install(
             pass
 
     import configparser as _cp
-    if staging_path.exists():
+    if staging_path is not None and staging_path.exists():
         for mod_dir in staging_path.iterdir():
             if not mod_dir.is_dir():
                 continue
@@ -521,7 +535,7 @@ def run_collection_install(
         return candidates
 
     # Remove staging folders for unticked optional mods
-    if skipped_fids and skipped_mods:
+    if skipped_fids and skipped_mods and staging_path is not None:
         import shutil as _shutil_skip
         _removed_folders: list[str] = []
         for mod in skipped_mods:
@@ -559,7 +573,7 @@ def run_collection_install(
                         _removed_folders.append(folder_name)
                     except Exception as exc:
                         log(f"Collection install: failed to remove '{folder_name}': {exc}")
-        if _removed_folders and modlist_path.is_file():
+        if _removed_folders and modlist_path is not None and modlist_path.is_file():
             try:
                 _removed_set = set(_removed_folders)
                 entries = [e for e in read_modlist(modlist_path)
@@ -670,6 +684,13 @@ def run_collection_install(
     _DONE_SENTINEL = None
     import os as _os_col
     _COL_TIMING = bool(_os_col.environ.get("MM_COL_TIMING"))
+    # Wall-clock run start. _maybe_delete_archive only ever deletes archives
+    # whose mtime is at/after this — i.e. fetched DURING this run. An archive
+    # that predates the run was detected on disk (another manager's download
+    # folder, an earlier manual download, a previous run's cache) and must
+    # survive 'Clear archive after install' — the manager didn't download it.
+    import time as _wall_time
+    _run_started_ts = _wall_time.time()
 
     _dl_results: dict[int, tuple] = {}
     _dl_lock = threading.Lock()
@@ -701,6 +722,12 @@ def run_collection_install(
     _EMIT_INTERVAL = 0.1
     _dl_last_emit: dict[int, float] = {}
 
+    def _status_line(downloaded: int, done: int) -> str:
+        """Overlay progress line; download_only has no install half."""
+        if download_only:
+            return f"Downloaded {downloaded}/{total}…"
+        return f"Downloaded {downloaded}/{total}, installed {done}/{total}…"
+
     _col_cancel = ctl.cancel
     _col_pause = ctl.pause
     _col_stop = ctl.stop
@@ -711,7 +738,7 @@ def run_collection_install(
     _external_archive_paths: set[str] = set()
 
     _install_lock = threading.Lock()
-    _install_counters = {"installed": 0, "skipped": 0, "done": 0}
+    _install_counters = {"installed": 0, "skipped": 0, "done": 0, "downloaded": 0}
     _install_results: dict[int, str] = dict(already_installed_by_fid)
     _install_results.update(
         {fid: folder for (_mid, fid), folder in already_installed_by_ids.items()})
@@ -949,10 +976,10 @@ def run_collection_install(
                 _archive_use_count[_akey] = _archive_use_count.get(_akey, 0) + 1
             _inst_done = _install_counters["done"]
         try:
-            _set_status(f"Downloaded {_pre_done + done}/{total}, "
-                        f"installed {_pre_done + _inst_done}/{total}…")
+            _set_status(_status_line(_pre_done + done, _pre_done + _inst_done))
             cb.on_dl_mod_finish(mod.file_id)
-            if result and result.success and result.file_path:
+            # No extract queue in download_only — nothing is ever extracted.
+            if result and result.success and result.file_path and not download_only:
                 cb.on_extract_queue(mod.file_id,
                                     mod.mod_name or mod.file_name or "")
         except Exception as exc:
@@ -997,6 +1024,22 @@ def run_collection_install(
                 _install_counters["skipped"] += 1
                 _install_counters["done"] += 1
             cb.on_extract_remove(mod.file_id)
+            return
+
+        if download_only:
+            # The cached archive IS the result. Returning here also skips
+            # _maybe_delete_archive, so 'Clear archive after install' can never
+            # delete what we just fetched.
+            with _install_lock:
+                _record_outcome(mod, "downloaded", Path(result.file_path).name)
+                _install_counters["downloaded"] += 1
+                _install_counters["done"] += 1
+                done_so_far = _install_counters["done"]
+            cb.on_extract_remove(mod.file_id)
+            with _dl_lock:
+                dl_done_now = _dl_done
+            _set_status(_status_line(_pre_done + dl_done_now, _pre_done + done_so_far))
+            _set_progress((_pre_done + done_so_far) / total if total else 1.0)
             return
 
         archive_path = str(result.file_path)
@@ -1076,15 +1119,14 @@ def run_collection_install(
 
         with _dl_lock:
             dl_done_now = _dl_done
-        _set_status(f"Downloaded {_pre_done + dl_done_now}/{total}, "
-                    f"installed {_pre_done + done_so_far}/{total}…")
+        _set_status(_status_line(_pre_done + dl_done_now, _pre_done + done_so_far))
         _set_progress((_pre_done + done_so_far) / total if total else 1.0)
         if mod.file_id and folder_name:
             cb.on_row_installed(mod.file_id)
 
     def _maybe_delete_archive(archive_path: str, was_fomod: bool) -> None:
-        """Decrement archive use-count; delete at zero honoring settings. Caller
-        must hold _install_lock."""
+        """Decrement archive use-count; delete at zero honoring settings, but
+        never an archive that predates the run. Caller must hold _install_lock."""
         if archive_path not in _archive_use_count:
             return
         _archive_use_count[archive_path] -= 1
@@ -1097,12 +1139,21 @@ def run_collection_install(
             # it was a FOMOD and the user keeps FOMOD archives (the user just
             # downloaded it by hand — leaving it behind clutters ~/Downloads).
             _should_clear = not (was_fomod and _keep_fomod_archives_cfg)
-        if (_archive_use_count[archive_path] == 0 and _should_clear
+        if not (_archive_use_count[archive_path] == 0 and _should_clear
                 and archive_path not in _external_archive_paths):
-            try:
-                delete_archive_and_sidecar(Path(archive_path))
-            except Exception as _del_exc:
-                log(f"Collection install: could not remove archive '{archive_path}': {_del_exc}")
+            return
+        try:
+            _pre_existing = Path(archive_path).stat().st_mtime < _run_started_ts
+        except OSError:
+            _pre_existing = True  # can't prove we downloaded it — keep it
+        if _pre_existing:
+            log(f"Collection install: kept pre-existing archive "
+                f"'{Path(archive_path).name}' (not downloaded by this run)")
+            return
+        try:
+            delete_archive_and_sidecar(Path(archive_path))
+        except Exception as _del_exc:
+            log(f"Collection install: could not remove archive '{archive_path}': {_del_exc}")
 
     def _install_consumer():
         while True:
@@ -1169,32 +1220,69 @@ def run_collection_install(
         return (f"https://www.nexusmods.com/{_manual_domain(mod)}/mods/{_mid}"
                 f"?tab=files&file_id={mod.file_id}")
 
+    # file_id → (real archive filename, size_bytes) from the Nexus files API.
+    # The manifest's file_name/logicalFilename is display-quality only (a
+    # share-code export writes the staging FOLDER name there), so it neither
+    # shows the user the archive they're about to download nor reliably
+    # matches it on disk. Best-effort: ("", 0) when offline/unresolvable.
+    _manual_real_file: dict[int, tuple[str, int]] = {}
+
+    def _resolve_manual_file(mod) -> "tuple[str, int]":
+        cached = _manual_real_file.get(mod.file_id)
+        if cached is not None:
+            return cached
+        real_name, real_size = "", 0
+        _mid = schema_file_id_to_mod_id.get(mod.file_id, 0) or mod.mod_id
+        try:
+            if api is not None and _mid and mod.file_id:
+                files = api.get_mod_files(_manual_domain(mod), _mid)
+                for f in files.files:
+                    if f.file_id == mod.file_id:
+                        fn = (f.file_name or "").strip()
+                        if fn and "/" not in fn:
+                            real_name = fn
+                        real_size = int(f.size_in_bytes
+                                        or (f.size_kb or 0) * 1024 or 0)
+                        break
+        except Exception as exc:
+            log(f"Manual install: file lookup failed for mod {_mid} "
+                f"file {mod.file_id} — {exc}")
+        _manual_real_file[mod.file_id] = (real_name, real_size)
+        return real_name, real_size
+
     def _wait_for_manual_file(mod) -> "Path | None":
         """Poll download folders until the mod's archive appears, or the user
-        picks a file / skips (optional mods only) / pauses / cancels."""
+        picks a file / skips / pauses / cancels."""
         scan_dirs = _scan_dirs(include_all=True)
         _eff_mod_id = schema_file_id_to_mod_id.get(mod.file_id, 0) or mod.mod_id
+        _real_name, _real_size = _resolve_manual_file(mod)
         _exp_size = (schema_file_id_to_size.get(mod.file_id, 0)
-                     or getattr(mod, "size_bytes", 0) or 0)
+                     or getattr(mod, "size_bytes", 0) or 0
+                     or _real_size)
         _exp_md5 = (schema_file_id_to_md5.get(mod.file_id, "")
                     or (getattr(mod, "md5", "") or "").strip().lower())
+        # Match on the real upload's display stem when known — the manifest
+        # name may be a mod-page or staging-folder label that shares no stem
+        # with the archive the browser actually saves.
+        _match_name = (_clean_nexus_stem(
+                           Path(_real_name).stem,
+                           str(_eff_mod_id) if _eff_mod_id else "")
+                       if _real_name else (mod.file_name or mod.mod_name or ""))
         while not _col_stop.is_set():
             try:
                 item = ctl.manual_queue.get_nowait()
                 if item is None:
-                    if getattr(mod, "optional", False):
-                        return None  # skip
-                else:
-                    p = Path(item)
-                    if p.is_file():
-                        return p
+                    return None  # skip
+                p = Path(item)
+                if p.is_file():
+                    return p
             except _queue.Empty:
                 pass
             for folder in scan_dirs:
                 if not folder.is_dir():
                     continue
                 found, is_complete = _find_cached_archive(
-                    folder, mod.file_name or mod.mod_name or "",
+                    folder, _match_name,
                     _exp_size, _eff_mod_id, mod.file_id,
                     expected_md5=_exp_md5)
                 if found and is_complete:
@@ -1214,7 +1302,8 @@ def run_collection_install(
                 continue
 
             _this_phase = schema_file_id_to_phase.get(mod.file_id, 0)
-            if _current_phase is not None and _this_phase != _current_phase:
+            if (_current_phase is not None and _this_phase != _current_phase
+                    and not download_only):
                 # All earlier-phase installs must land before a later-phase
                 # FOMOD reads plugins.txt (Tk _write_phase_plugins_txt parity).
                 _install_queue.join()
@@ -1222,6 +1311,7 @@ def run_collection_install(
                     f"phase {_current_phase} → {_this_phase}")
             _current_phase = _this_phase
 
+            _real_name, _real_size = _resolve_manual_file(mod)
             cb.on_manual_mod({
                 "idx": _pre_done + i + 1,
                 "total": total,
@@ -1229,8 +1319,9 @@ def run_collection_install(
                 "installed_base": installed,
                 "name": mod.mod_name or f"Mod {mod.mod_id}",
                 "size": (schema_file_id_to_size.get(mod.file_id, 0)
-                         or getattr(mod, "size_bytes", 0) or 0),
-                "file_name": mod.file_name or "",
+                         or getattr(mod, "size_bytes", 0) or 0
+                         or _real_size),
+                "file_name": _real_name or mod.file_name or "",
                 "optional": bool(getattr(mod, "optional", False)),
                 "url": _manual_url(mod),
                 "upcoming": [(m.mod_name or f"Mod {m.mod_id}", _manual_url(m))
@@ -1260,11 +1351,14 @@ def run_collection_install(
             with _dl_lock:
                 _dl_done += 1
             with _install_lock:
-                # Counted but NOT marked external → deleted after install
-                # (Tk manual parity; see _maybe_delete_archive).
+                # Counted but NOT marked external → deleted after install IF
+                # it appeared during this run (fresh hand-download; Tk manual
+                # parity — declutters ~/Downloads). Archives that predate the
+                # run are kept by _maybe_delete_archive's mtime guard.
                 _akey = str(archive)
                 _archive_use_count[_akey] = _archive_use_count.get(_akey, 0) + 1
-            cb.on_extract_queue(mod.file_id, mod.mod_name or mod.file_name or "")
+            if not download_only:
+                cb.on_extract_queue(mod.file_id, mod.mod_name or mod.file_name or "")
             _enqueue_install(mod, result, mod_domain)
 
     # ---- launch pipeline ---------------------------------------------
@@ -1272,7 +1366,8 @@ def run_collection_install(
         if manual_mode:
             _set_status(f"Waiting for manual downloads — {_dl_total} mod(s)…")
         else:
-            _set_status(f"Downloading & installing {_dl_total} mod(s)…")
+            _set_status(f"Downloading {_dl_total} mod(s)…" if download_only
+                        else f"Downloading & installing {_dl_total} mod(s)…")
         _set_progress(_pre_done / total if total else 0.0)
         if not manual_mode:
             # Download strictly smallest→largest: all workers pull from the head
@@ -1334,16 +1429,38 @@ def run_collection_install(
         for t in _consumer_threads:
             t.join()
 
-        _process_deferred(
-            _bain_deferred, _fomod_deferred, game, profile_dir, api,
-            schema_mods, schema_file_id_to_phase, schema_file_id_to_pos,
-            schema_file_id_to_mod_id, schema_file_id_to_install_type,
-            schema_file_id_to_category,
-            schema_file_id_to_logical, schema_pos_to_name, schema_file_id_to_suffix,
-            fomod_by_file_id, bain_by_file_id, _install_results,
-            _install_counters, _install_lock, _archive_use_count,
-            _external_archive_paths, _col_stop, _slug, overwrite_existing,
-            _write_preliminary_plugins_txt, _maybe_delete_archive, cb, log, _set_status)
+        # download_only extracts nothing, so nothing can be deferred.
+        if not download_only:
+            _process_deferred(
+                _bain_deferred, _fomod_deferred, game, profile_dir, api,
+                schema_mods, schema_file_id_to_phase, schema_file_id_to_pos,
+                schema_file_id_to_mod_id, schema_file_id_to_install_type,
+                schema_file_id_to_category,
+                schema_file_id_to_logical, schema_pos_to_name, schema_file_id_to_suffix,
+                fomod_by_file_id, bain_by_file_id, _install_results,
+                _install_counters, _install_lock, _archive_use_count,
+                _external_archive_paths, _col_stop, _slug, overwrite_existing,
+                _write_preliminary_plugins_txt, _maybe_delete_archive, cb, log, _set_status)
+
+    if download_only:
+        # Everything below (mod index, bundled assets, modlist/plugins/filemap,
+        # reconciliation, separators, the staged-files verification) writes to a
+        # profile this run never created.
+        _downloaded = _install_counters["downloaded"]
+        skipped += _install_counters["skipped"]     # failed/stopped downloads
+        log(f"Collection download: {_downloaded} archive(s) downloaded, "
+            f"{skipped} skipped, {total} total — nothing installed "
+            f"(Download only).")
+        if _col_cancel.is_set():
+            cb.on_cancelled(None)
+            return
+        # Pause can't be resumed here (a resume point needs a profile), so report
+        # it as stopped-early rather than letting it read as a complete run.
+        _set_status(f"Stopped — downloaded {_downloaded}/{total}."
+                    if _col_pause.is_set()
+                    else f"Downloaded {_downloaded}/{total} — nothing installed.")
+        cb.on_done(_downloaded, skipped, total, "")
+        return
 
     installed += _install_counters["installed"]
     skipped += _install_counters["skipped"]

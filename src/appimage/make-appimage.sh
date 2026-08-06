@@ -80,14 +80,23 @@ fi
 #                   libQt6Core never enters the wrapper's ldd trace. We force
 #                   it here AND hand quick-sharun the Qt libs/plugins directly
 #                   (see the resolution block before the quick-sharun call).
-# ALWAYS_SOFTWARE=1 forces software rendering (matches upstream)
+# DEPLOY_OPENGL=0   do NOT bundle Mesa (dri drivers + libgallium, tens of MB);
+#                   DEPLOY_QT=1 would default it on. The glvnd dispatch libs
+#                   (libGLX/libEGL/libOpenGL) ride along as Qt deps regardless
+#                   and load the HOST's vendor driver at runtime. Never use
+#                   ALWAYS_SOFTWARE=1 here: it writes a dlopen blocklist
+#                   (libGLX_mesa.so* etc.) into the AppImage's .env that stops
+#                   glvnd finding ANY driver, so Qt hits qFatal("Could not
+#                   initialize GLX") and the GL probe aborts — no 3D preview
+#                   anywhere. Hosts where the host-driver mix truly fails are
+#                   caught gracefully by gui_qt/gl_support.py's child probe.
 # ANYLINUX_LIB=1    builds anylinux.so (LD_PRELOAD env-scrubber for child procs)
 export ARCH VERSION OUTPATH APPDIR
 export ICON="${ASSETS_DIR}/mod-manager.png"
 export DESKTOP="${ASSETS_DIR}/mod-manager.desktop"
 export DEPLOY_PYTHON=1
 export DEPLOY_QT=1
-export ALWAYS_SOFTWARE=1
+export DEPLOY_OPENGL=0
 export ANYLINUX_LIB=1
 
 # SteamOS strips glibc headers from /usr/include; quick-sharun's anylinux.so
@@ -175,9 +184,11 @@ _qt_args=()
 # Core Qt libs PySide6 needs — Gui triggers the plugin-deployment block,
 # Network triggers tls/. XcbQpa (X11) and WaylandClient are the platform
 # abstraction libs the platform plugins link; quick-sharun traces them
-# transitively but listing them removes any doubt. OpenGL: Qt Widgets GL.
+# transitively but listing them removes any doubt. OpenGL + OpenGLWidgets:
+# QOpenGLWidget (nif viewer) lives in libQt6OpenGLWidgets — without it the
+# loader falls back to the host's /usr/lib copy and dies on Qt_6_PRIVATE_API.
 for _l in libQt6Core libQt6Gui libQt6Widgets libQt6DBus libQt6Network \
-          libQt6XcbQpa libQt6WaylandClient libQt6OpenGL; do
+          libQt6XcbQpa libQt6WaylandClient libQt6OpenGL libQt6OpenGLWidgets; do
     for _so in /usr/lib/"$_l".so*; do
         [ -e "$_so" ] && _qt_args+=("$_so")
     done

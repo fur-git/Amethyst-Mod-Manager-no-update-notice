@@ -4,6 +4,7 @@ subdir('BepInEx')
 subdir('Bethesda')
 subdir('Custom')
 subdir('Cyberpunk 2077')
+subdir('Daggerfall Unity')
 subdir('Darktide')
 subdir('Dragon Age Origins')
 subdir('Jagged Alliance 3')
@@ -21,4 +22,11 @@ subdir('Stardew Valley')
 subdir('The Sims 4')
 subdir('The Witcher 3')
 
-py.install_sources('__init__.py', 'base_game.py', 'heroic_appnames.py', 'ue5_game.py', subdir: 'Games')
+py.install_sources(
+  '__init__.py',
+  'base_game.py',
+  'heroic_appnames.py',
+  'ludusavi_saves.json',
+  'ue5_game.py',
+  subdir: 'Games',
+)

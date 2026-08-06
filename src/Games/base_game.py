@@ -134,6 +134,20 @@ class BaseGame(ABC):
     )
     profile_overridable_paths_extras: tuple[str, ...] = ()
 
+    # User-set save folder, persisted in paths.json as "save_path_override".
+    # The Saves tab resolves locations from the Ludusavi manifest, which can
+    # miss a game entirely or list only a Windows path for a game with a native
+    # Linux build (Daggerfall Unity). A class-level default keeps this working
+    # for handlers whose __init__ does not chain to BaseGame.
+    _save_path_override: "Path | None" = None
+
+    # Profile Groups (Utils/profile_groups.py): merged deploy of several
+    # profiles. A group is an ordinary profile-specific profile whose mods/
+    # is a per-mod symlink farm, so any handler that deploys from filemap.txt
+    # + the mod index supports it unchanged. Set False only for a handler
+    # that cannot (none currently do).
+    profile_groups_supported: bool = True
+
     # -----------------------------------------------------------------------
     # Identity
     # -----------------------------------------------------------------------
@@ -170,6 +184,17 @@ class BaseGame(ABC):
         (e.g. Steam vs Epic/Heroic).  Checked after ``exe_name``.
         """
         return []
+
+    @property
+    def auto_drive_scan(self) -> bool:
+        """
+        When True, the Configure-Game view falls back to the all-drives exe
+        scan automatically if no launcher/store library detects the game.
+        For games with no storefront at all (manual downloads like Daggerfall
+        Unity) the library scan can never succeed, so the drive scan is the
+        real auto-detection.
+        """
+        return False
 
     @property
     def default_deploy_mode(self) -> str:
@@ -581,6 +606,21 @@ class BaseGame(ABC):
             return k
 
         return _normalise
+
+    @property
+    def pak_uuid_conflicts(self) -> bool:
+        """True when .pak files contest by the module UUID inside them (BG3)."""
+        return False
+
+    def make_filemap_conflict_key_fn(self, staging: "Path", index_path: "Path",
+                                     log_fn=None, fallback=None):
+        """Return a (mod_name, rel_key) -> conflict key callable, or None.
+
+        For games whose conflict identity lives inside the file (BG3 pak UUIDs).
+        Implementations MUST delegate unclaimed files to *fallback*, the
+        path-based key fn the pipeline would otherwise use.
+        """
+        return None
 
     @property
     def normalize_folder_case(self) -> bool:
@@ -1336,6 +1376,15 @@ class BaseGame(ABC):
                 pass
         return self.get_mod_staging_path()
 
+    def get_save_path_override(self) -> "Path | None":
+        """Return the user's manual save folder, or None to use the manifest."""
+        return self._save_path_override
+
+    def set_save_path_override(self, path: "Path | str | None") -> None:
+        """Set (or clear with None) the manual save folder and persist it."""
+        self._save_path_override = Path(path) if path else None
+        self.save_paths()
+
     def get_effective_overwrite_path(self) -> Path:
         """Return the overwrite directory for the active profile.
 
@@ -1705,13 +1754,18 @@ class BaseGame(ABC):
         """Locate a Proton prefix for this game during load_paths().
 
         Tries ``steam_id`` first, then any ``alt_steam_ids``, then a Lutris
-        install matching the handler's exe name. Subclasses with other
-        non-Steam prefix sources (Heroic-only games, etc.) can override.
+        install matching the handler's exe name, then a Faugus install the
+        same way. Subclasses with other non-Steam prefix sources
+        (Heroic-only games, etc.) can override.
+
+        The game path is passed through so the Steam lookup can tell which
+        library owns the app — without it a stale compatdata in another
+        library can win.
         """
         for sid in [self.steam_id, *self.alt_steam_ids]:
             if not sid:
                 continue
-            found = _find_steam_prefix(sid)
+            found = _find_steam_prefix(sid, getattr(self, "_game_path", None))
             if found:
                 return found
         try:
@@ -1721,6 +1775,17 @@ class BaseGame(ABC):
                 if not exe:
                     continue
                 info = find_lutris_game_info_by_exe(exe)
+                if info is not None and info[1] is not None:
+                    return info[1]
+        except Exception:
+            pass
+        try:
+            from Utils.faugus_finder import find_faugus_game_info_by_exe
+            for exe in [getattr(self, "exe_name", None),
+                        *(getattr(self, "exe_name_alts", []) or [])]:
+                if not exe:
+                    continue
+                info = find_faugus_game_info_by_exe(exe)
                 if info is not None and info[1] is not None:
                     return info[1]
         except Exception:
@@ -1756,6 +1821,8 @@ class BaseGame(ABC):
             raw_staging = data.get("staging_path", "")
             if raw_staging:
                 self._staging_path = Path(raw_staging)
+            raw_saves = data.get("save_path_override", "")
+            self._save_path_override = Path(raw_saves) if raw_saves else None
             self._load_paths_extra(data)
             self._validate_staging()
             # Overlay any per-profile overrides on top of the default's values
@@ -1770,6 +1837,8 @@ class BaseGame(ABC):
                     # deliberate per-profile choice, so persist it globally rather
                     # than as a spurious override on a non-default profile.
                     self._save_global_prefix(found)
+            else:
+                self._heal_wrong_library_prefix()
             _ensure_lutris_prefix_compat(self._prefix_path)
             return bool(self._game_path)
         except (json.JSONDecodeError, OSError):
@@ -1777,6 +1846,53 @@ class BaseGame(ABC):
         self._game_path = None
         self._prefix_path = None
         return False
+
+    def _profile_overrides_prefix(self) -> bool:
+        """True when the active non-default profile pins its own prefix_path."""
+        if self._is_default_profile():
+            return False
+        try:
+            from Utils.profile_state import read_profile_settings
+            pset = read_profile_settings(self._active_profile_dir)
+        except Exception:
+            return False
+        return bool(isinstance(pset.get("prefix_path"), str) and pset["prefix_path"])
+
+    def _heal_wrong_library_prefix(self) -> None:
+        """Repoint a saved Steam prefix that lives in the wrong library.
+
+        Multi-library users who moved a game between drives can end up with a
+        stale ``compatdata/<id>`` in the old library. It is a real directory, so
+        load_paths() keeps it forever — auto-detection only runs when the saved
+        prefix is missing. Only Steam compatdata paths whose owning library is
+        known and different are touched; everything else is left alone.
+        """
+        prefix = self._prefix_path
+        if prefix is None:
+            return
+        if self._profile_overrides_prefix():
+            # A per-profile prefix is a deliberate choice — never second-guess it.
+            return
+        try:
+            from Utils.steam_finder import (prefix_is_in_wrong_library,
+                                            find_prefix as _fp)
+            for sid in [self.steam_id, *self.alt_steam_ids]:
+                if not sid:
+                    continue
+                game_path = getattr(self, "_game_path", None)
+                if not prefix_is_in_wrong_library(prefix, sid, game_path):
+                    continue
+                found = _fp(sid, game_path)
+                if not found or found == prefix:
+                    continue
+                from Utils.app_log import app_log
+                app_log(f"[{self.name}] Proton prefix {prefix} is in a Steam "
+                        f"library that does not own app {sid}; switching to {found}")
+                self._prefix_path = found
+                self._save_global_prefix(found)
+                return
+        except Exception:
+            pass
 
     def _save_global_prefix(self, prefix: Path) -> None:
         """Write an auto-located prefix into the global paths.json.
@@ -1820,6 +1936,8 @@ class BaseGame(ABC):
                 "prefix_path":  str(self._prefix_path)  if self._prefix_path  else "",
                 "deploy_mode":  mode_str,
                 "staging_path": str(self._staging_path) if self._staging_path else "",
+                "save_path_override": (str(self._save_path_override)
+                                       if self._save_path_override else ""),
             }
             data.update(self._save_paths_extra())
             self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -1859,6 +1977,10 @@ class BaseGame(ABC):
         }
         data = self._read_global_paths()
         data["staging_path"] = str(self._staging_path) if self._staging_path else ""
+        # Saves live where the game puts them, not where a profile says — the
+        # override stays global rather than joining the per-profile pins.
+        data["save_path_override"] = (str(self._save_path_override)
+                                      if self._save_path_override else "")
         data.update(global_extras)
         self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -1906,6 +2028,28 @@ class BaseGame(ABC):
             if self._paths_file.is_file():
                 data = json.loads(self._paths_file.read_text(encoding="utf-8")) or {}
             data["lutris_slug"] = slug or ""
+            self._paths_file.parent.mkdir(parents=True, exist_ok=True)
+            self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def set_faugus_gameid(self, gameid: str | None) -> None:
+        """Persist a discovered Faugus gameid into paths.json.
+
+        Written when the Configure-Game scan resolves the game via Faugus.
+        Launch code still prefers live detection against games.json, so
+        this field is an informational fallback rather than the source of
+        truth.
+        """
+        try:
+            self.save_paths()
+        except Exception:
+            pass
+        try:
+            data: dict = {}
+            if self._paths_file.is_file():
+                data = json.loads(self._paths_file.read_text(encoding="utf-8")) or {}
+            data["faugus_gameid"] = gameid or ""
             self._paths_file.parent.mkdir(parents=True, exist_ok=True)
             self._paths_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except (OSError, json.JSONDecodeError):

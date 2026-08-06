@@ -1,7 +1,9 @@
 """Panel-scoped BSA / BA2 / UE pak content preview for the Mod Files tab.
 
 Reads the archive's table-of-contents (Utils.bsa_reader for BSA/BA2,
-Utils.ue_pak_reader for .pak/.utoc — TOC only, no decompression) and shows
+Utils.ue_pak_reader for Unreal .pak/.utoc, Utils.pak_reader for Baldur's
+Gate 3 LSPK .pak — the two .pak formats are told apart by magic, not by
+extension; TOC only, no file-data decompression) and shows
 the internal file structure as a read-only tree. Uses the same visual recipe as the Mod Files / Text Files
 trees (QTreeView, no native branch decoration, TkStyleHeader-less single
 column, custom delegate drawing the arrow.png/right.png indicator + indent) so
@@ -21,200 +23,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QModelIndex, QAbstractItemModel, QRect, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTreeView, QAbstractItemView, QSizePolicy,
-    QStyledItemDelegate,
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
-from gui_qt.icons import icon
+from gui_qt.path_tree import (
+    Node as _Node, PathTreeDelegate as _ArchiveDelegate,
+    PathTreeModel as _ArchiveModel, build_tree as _build_tree,
+    node_path as _node_path,
+)
 
 # Archive extensions that get a content-preview tab instead of an image preview.
 ARCHIVE_EXTS = {".bsa", ".ba2", ".pak", ".utoc"}
-
-ARROW_SZ = 20
-INDENT = 18
-FONT_PX = 13
-
-NodeRole = Qt.UserRole + 1
-
-
-class _Node:
-    __slots__ = ("name", "is_dir", "children", "parent", "code")
-
-    def __init__(self, name, *, is_dir, parent=None):
-        self.name = name
-        self.is_dir = is_dir
-        self.children: list["_Node"] = []
-        self.parent = parent
-        self.code = 0   # 0 none / 1 wins / -1 loses / 2 mixed (dirs only)
-
-    def row(self) -> int:
-        if self.parent is None:
-            return 0
-        return self.parent.children.index(self)
-
-
-def _build_tree(paths: list[str]) -> tuple[_Node, dict[str, _Node]]:
-    """Turn flat 'a/b/c.dds' paths into a folder/file _Node hierarchy.
-
-    Also returns {full_path: file_node} so conflict codes can be applied
-    to the right leaves later without re-walking.
-    """
-    root = _Node("", is_dir=True)
-    folders: dict[str, _Node] = {}
-    files: dict[str, _Node] = {}
-    for p in paths:
-        if not p:
-            continue
-        norm = p.replace("\\", "/")
-        parts = norm.split("/")
-        parent = root
-        path_so_far = ""
-        for seg in parts[:-1]:
-            path_so_far = f"{path_so_far}/{seg}" if path_so_far else seg
-            node = folders.get(path_so_far)
-            if node is None:
-                node = _Node(seg, is_dir=True, parent=parent)
-                parent.children.append(node)
-                folders[path_so_far] = node
-            parent = node
-        leaf = _Node(parts[-1], is_dir=False, parent=parent)
-        parent.children.append(leaf)
-        files[norm] = leaf
-    _sort(root)
-    return root, files
-
-
-def _sort(node: _Node):
-    # Folders first, then files, each alphabetical (case-insensitive).
-    node.children.sort(key=lambda n: (not n.is_dir, n.name.lower()))
-    for c in node.children:
-        if c.is_dir:
-            _sort(c)
-
-
-class _ArchiveModel(QAbstractItemModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._root = _Node("", is_dir=True)
-
-    def set_root(self, root: _Node):
-        self.beginResetModel()
-        self._root = root
-        self.endResetModel()
-
-    def node(self, index: QModelIndex) -> _Node | None:
-        if not index.isValid():
-            return self._root
-        return index.internalPointer()
-
-    def index(self, row, col, parent=QModelIndex()):
-        if not self.hasIndex(row, col, parent):
-            return QModelIndex()
-        pnode = self.node(parent)
-        if pnode is None or row >= len(pnode.children):
-            return QModelIndex()
-        return self.createIndex(row, col, pnode.children[row])
-
-    def parent(self, index):
-        if not index.isValid():
-            return QModelIndex()
-        p = index.internalPointer().parent
-        if p is None or p is self._root:
-            return QModelIndex()
-        return self.createIndex(p.row(), 0, p)
-
-    def rowCount(self, parent=QModelIndex()):
-        pnode = self.node(parent)
-        return len(pnode.children) if pnode else 0
-
-    def columnCount(self, parent=QModelIndex()):
-        return 1
-
-    def flags(self, index):
-        if not index.isValid():
-            return Qt.NoItemFlags
-        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
-
-    def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
-            return None
-        node: _Node = index.internalPointer()
-        if role == NodeRole:
-            return node
-        if role == Qt.DisplayRole:
-            return node.name
-        return None
-
-
-class _ArchiveDelegate(QStyledItemDelegate):
-    """Name-only delegate: arrow.png/right.png indicator + per-depth indent +
-    elided text — same look as the Mod Files / Text Files name column."""
-
-    def __init__(self, view, parent=None):
-        super().__init__(parent or view)
-        self._view = view
-        p = active_palette()
-        self.c_text = QColor(_c(p, "TEXT_MAIN"))
-        self.c_dim = QColor("#9a9a9a")
-        self.c_sel = QColor(_c(p, "BG_SELECT"))
-        self.c_arrow = _c(p, "DROPDOWN_ARROW")   # expand/collapse arrow tint
-        # Same tones as the Show Conflicts tab panes.
-        self.c_win = QColor("#98c379")
-        self.c_lose = QColor("#e06c75")
-        self.c_mixed = QColor("#e5c07b")
-
-    def paint(self, p, opt, index):
-        r = opt.rect
-        node = index.model().node(index)
-        if node is None:
-            return
-        if opt.state & opt.state.State_Selected:
-            p.fillRect(r, self.c_sel)
-
-        depth = self._depth(index)
-        x = r.left() + 4 + depth * INDENT
-        if node.is_dir and index.model().rowCount(index) > 0:
-            a = QRect(x, r.top() + (r.height() - ARROW_SZ) // 2, ARROW_SZ, ARROW_SZ)
-            expanded = self._view.isExpanded(index)
-            ico = icon("arrow.png" if expanded else "right.png", ARROW_SZ,
-                       color=self.c_arrow)
-            if not ico.isNull():
-                ico.paint(p, a)
-        x += ARROW_SZ + 2
-
-        code = node.code
-        if code == 1:
-            pen = self.c_win
-        elif code == -1:
-            pen = self.c_lose
-        elif code == 2:
-            pen = self.c_mixed
-        else:
-            pen = self.c_text if node.is_dir else self.c_dim
-        p.setPen(pen)
-        f = QFont(); f.setPixelSize(FONT_PX); p.setFont(f)
-        text_rect = QRect(x, r.top(), r.right() - x - 4, r.height())
-        elided = p.fontMetrics().elidedText(node.name, Qt.ElideRight,
-                                            text_rect.width())
-        p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
-
-    def _depth(self, index) -> int:
-        d = 0
-        idx = index.parent()
-        while idx.isValid():
-            d += 1
-            idx = idx.parent()
-        return d
-
-    def sizeHint(self, opt, index):
-        s = super().sizeHint(opt, index)
-        s.setHeight(max(s.height(), 22))
-        return s
 
 
 class BsaPreview(QWidget):
@@ -230,6 +52,7 @@ class BsaPreview(QWidget):
         self.setObjectName("BsaPreview")
         self._conflict_fn = conflict_fn
         self._gen = 0
+        self._path: "Path | None" = None
         self._paths: list[str] = []
         self._codes: dict[str, int] = {}
         self._file_nodes: dict[str, "_Node"] = {}
@@ -289,12 +112,28 @@ class BsaPreview(QWidget):
 
     def _on_clicked(self, index):
         node = self._model.node(index)
-        if node is not None and node.is_dir and self._model.rowCount(index) > 0:
+        if node is None:
+            return
+        if node.is_dir and self._model.rowCount(index) > 0:
             self._tree.setExpanded(index, not self._tree.isExpanded(index))
+            return
+        if not node.is_dir:
+            self._open_file_node(node)
+
+    def _open_file_node(self, node):
+        """Hand a previewable entry to the host, identified by its inner path."""
+        from gui_qt.nif_preview import PREVIEW_EXTS as NIF_EXTS
+        rel = _node_path(node)
+        ext = ("." + rel.rsplit(".", 1)[-1].lower()) if "." in rel else ""
+        if ext in NIF_EXTS:
+            cb = getattr(self, "on_open_nif", None)
+            if cb is not None and self._path is not None:
+                cb(self._path, rel)
 
     def set_archive(self, path: Path, display_name: str = ""):
         """Load (or swap) the previewed archive in place."""
         self._header.setText(display_name or path.name)
+        self._path = path
         self._gen += 1
         self._codes = {}
         self._only_conflicts.blockSignals(True)
@@ -305,7 +144,13 @@ class BsaPreview(QWidget):
             from Utils.ue_pak_reader import (
                 UE_ARCHIVE_EXTENSIONS, read_ue_archive_file_list,
             )
-            if Path(path).suffix.lower() in UE_ARCHIVE_EXTENSIONS:
+            from Utils.pak_reader import is_lspk_file, read_lspk_file_list
+            suffix = Path(path).suffix.lower()
+            if suffix == ".pak" and is_lspk_file(path):
+                # Baldur's Gate 3 paks are Larian LSPK, not Unreal - same
+                # extension, unrelated format.
+                paths = read_lspk_file_list(path)
+            elif suffix in UE_ARCHIVE_EXTENSIONS:
                 paths = read_ue_archive_file_list(path)
             else:
                 from Utils.bsa_reader import read_bsa_file_list

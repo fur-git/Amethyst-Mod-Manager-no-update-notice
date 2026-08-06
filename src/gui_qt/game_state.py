@@ -33,6 +33,9 @@ class ConflictData:
     # compound NONE→WINS→PARTIAL.
     loose_codes_base: dict[str, int] | None = None
     bsa_codes: dict[str, int] = field(default_factory=dict)
+    # BG3 mods whose .pak duplicates another mod's module UUID — its own icon,
+    # kept out of loose_codes so an identity clash doesn't light up two.
+    uuid_codes: dict[str, int] = field(default_factory=dict)
     overrides: dict[str, set] = field(default_factory=dict)
     overridden_by: dict[str, set] = field(default_factory=dict)
     bsa_overrides: dict[str, set] = field(default_factory=dict)
@@ -93,6 +96,7 @@ class GameState:
                         if sess_profile else None) or \
             self._select_profile(per_game)
         self._apply_active_profile()
+        self._materialize_if_group()
         self._save_last_active_profile()
 
     # -- current handler ----------------------------------------------------
@@ -113,6 +117,7 @@ class GameState:
         # game.get_last_active_profile()), falling back to the first profile.
         self._select_last_active_profile()
         self._apply_active_profile()
+        self._materialize_if_group()
         self._save_last_active_profile()
         save_last_session(self.game_name, self.profile)
 
@@ -121,10 +126,30 @@ class GameState:
             return
         self.profile = profile
         self._apply_active_profile()
+        self._materialize_if_group()
         # Remember this as the game's last active profile so switching away and
         # back returns here (Tk parity — top_bar._on_profile_change).
         self._save_last_active_profile()
         save_last_session(self.game_name, self.profile)
+
+    def _materialize_if_group(self) -> None:
+        """Reconcile the just-activated profile when it is a Profile Group.
+
+        Runs ONLY on real profile-identity changes (load / set_game /
+        set_profile) — never from reassert_active_profile, which fires on
+        every reload and must stay a cheap no-op. Ordering matters: callers
+        run sync_modlist_with_mods_folder after switching, and that sync
+        drops entries whose folder is missing — the link farm must be
+        reconciled first."""
+        g = self.game
+        pdir = self.profile_dir()
+        if g is None or pdir is None:
+            return
+        try:
+            from Utils.profile_groups import materialize_if_group
+            materialize_if_group(g, pdir)
+        except Exception as exc:
+            print(f"[gui_qt] profile-group reconcile failed: {exc}", flush=True)
 
     # -- resolved paths -----------------------------------------------------
     def modlist_path(self) -> Path | None:
@@ -204,6 +229,7 @@ class GameState:
                 loose_codes=display_codes_from_conflict_map(_conflict_map),
                 overrides={k: set(v) for k, v in (overrides or {}).items()},
                 overridden_by={k: set(v) for k, v in (overridden_by or {}).items()},
+                uuid_codes=dict(getattr(result, "uuid_codes", None) or {}),
             )
         with span("_build_bsa_conflicts"):
             (data.bsa_codes, data.bsa_overrides,
@@ -406,7 +432,8 @@ class GameState:
         bsa_index = out_dir / "bsa_index.bin"
         try:
             if not bsa_index.is_file():
-                rebuild_bsa_index(bsa_index, staging, exts, log_fn=log)
+                rebuild_bsa_index(bsa_index, staging, exts, log_fn=log,
+                                  follow_toplevel_links_under=g.get_profile_root() / "profiles")
             pdir = self.profile_dir()
             # UE pak mounting is not plugin-driven — winners follow pure mod
             # priority there, so skip the plugin load-order refinement.

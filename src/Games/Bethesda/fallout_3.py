@@ -20,6 +20,8 @@ from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
 
+# Games that need lavfilters for the radio music to play correctly
+_LAVFILTERS_GAME_IDS = frozenset({"Fallout3", "Fallout3GOTY", "FalloutNV"})
 
 class Fallout_3(BaseGame):
 
@@ -41,8 +43,15 @@ class Fallout_3(BaseGame):
     # Auto-install the VC++ x64 runtime + fxc2 d3dcompiler_47 on add/save for
     # every Bethesda title (inherited by all subclasses below). The modern
     # Creation Engine games genuinely need them; the older Gamebryo titles
-    # don't, but installing is harmless.
-    auto_install_deps = MODERN_DIRECTX_DEPS
+    # don't, but installing is harmless. LAV Filters is the exception — it is
+    # added only for the games in _LAVFILTERS_GAME_IDS, since it is a real
+    # install (a Windows installer under Wine), not a cheap DLL drop.
+    @property
+    def auto_install_deps(self) -> list[str]:
+        deps = list(MODERN_DIRECTX_DEPS)
+        if self.game_id in _LAVFILTERS_GAME_IDS:
+            deps.append("lavfilters")
+        return deps
 
     # paths.json extras that a non-default profile may override (per-profile).
     # heroic_app_name etc. are deliberately excluded so they stay global.
@@ -202,16 +211,12 @@ class Fallout_3(BaseGame):
 
     @property
     def conflict_ignore_filenames(self) -> set[str]:
-        return {"info.xml","*read*.txt","*.jpg","*.html","*.md"}
+        return {"info.xml","*read*.txt","*.jpg","*.html","*.md","*.url","*.zip"}
 
     @property
     def conflict_ignore_foldernames(self) -> set[str]:
         return {"src"}
     
-    @property
-    def excluded_loose_filenames(self) -> set[str]:
-        return {"*.txt"}
-
     @property
     def archive_extensions(self) -> frozenset[str]:
         # Older Bethesda games use BSA archives. Fallout 4 / Fallout 4 VR /

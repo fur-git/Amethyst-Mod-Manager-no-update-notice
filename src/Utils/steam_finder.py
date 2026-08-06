@@ -6,6 +6,7 @@ No UI, no game-specific knowledge.
 
 from __future__ import annotations
 
+import collections
 import os
 import re
 import shutil
@@ -79,6 +80,35 @@ def steam_client_installed() -> bool:
     return any((root / "steamapps").is_dir() for root in _STEAM_CANDIDATES)
 
 
+STEAMLESS_NO_UMU_MESSAGE = (
+    "no Steam client and no umu-run launcher were found. Proton needs one of "
+    "the two: without Steam's runtime a raw Proton call runs Wine bare, which "
+    "fails with missing-FreeType / \"no driver could be loaded\" errors. "
+    "umu-run ships with Heroic (Wine Manager), Lutris and Faugus, or install "
+    "the umu-launcher package."
+)
+
+
+def steamless_launch_error() -> str:
+    """Explanation for why a Proton launch can't work, or "" if it can.
+
+    Non-empty only on a Steam-less system with no umu-run: the combination
+    that has no viable launch path at all. Callers use it in place of their
+    generic "could not determine Steam root" message, which misdescribes the
+    problem on a Heroic-only box (GH#320 - the reporter got a wall of Wine
+    errors instead of a cause).
+    """
+    if steam_client_installed():
+        return ""
+    try:
+        from Utils.lutris_finder import find_umu_run
+        if find_umu_run() is not None:
+            return ""
+    except Exception:
+        pass
+    return STEAMLESS_NO_UMU_MESSAGE
+
+
 _steamless_no_umu_logged = False
 
 
@@ -86,7 +116,7 @@ def _maybe_log_steamless_no_umu() -> None:
     """Log once when a Steam-less system has no umu-run launcher either.
 
     The raw ``proton <verb>`` fallback that follows needs Steam's client and
-    runtime, so it will very likely fail — point the user at the fix instead
+    runtime, so it will very likely fail - point the user at the fix instead
     of leaving only an opaque wine error.
     """
     global _steamless_no_umu_logged
@@ -95,14 +125,171 @@ def _maybe_log_steamless_no_umu() -> None:
     _steamless_no_umu_logged = True
     try:
         from Utils.app_log import app_log
-        app_log(
-            "No Steam client and no umu-run launcher were found — attempting "
-            "a raw Proton launch, which will likely fail. umu-run ships with "
-            "Heroic and Lutris (installing either, or the umu-launcher "
-            "package, provides it)."
-        )
+        app_log(f"Proton: {STEAMLESS_NO_UMU_MESSAGE}")
     except Exception:
         pass
+
+
+def steam_launch_options(app_id: str) -> str:
+    """The Launch Options string Steam has saved for *app_id*, or "".
+
+    Steam keeps them per user in ``userdata/<id>/config/localconfig.vdf`` under
+    Software/Valve/Steam/apps/<appid>/LaunchOptions. A game launched outside
+    the Steam client gets none of it, so options the user relies on (a wrapper,
+    ``SteamDeck=0``) silently stop applying - this lets a direct launch reuse
+    them. Newest localconfig wins when several users have the app.
+    """
+    if not app_id:
+        return ""
+    best: tuple[float, str] = (-1.0, "")
+    for steam_root in _STEAM_CANDIDATES:
+        userdata = steam_root / "userdata"
+        if not userdata.is_dir():
+            continue
+        try:
+            user_dirs = [d for d in userdata.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        for user_dir in user_dirs:
+            cfg = user_dir / "config" / "localconfig.vdf"
+            try:
+                mtime = cfg.stat().st_mtime
+            except OSError:
+                continue
+            if mtime <= best[0]:
+                continue
+            opts = _parse_launch_options(cfg, app_id)
+            if opts:
+                best = (mtime, opts)
+    return best[1]
+
+
+def _parse_launch_options(localconfig: Path, app_id: str) -> str:
+    """Read one app's LaunchOptions out of a localconfig.vdf."""
+    # Tracked as a lowercase section path so the nesting is unambiguous:
+    # "apps" appears under other parents too, and Steam's own casing varies.
+    want = ["userlocalconfigstore", "software", "valve", "steam", "apps",
+            app_id.lower()]
+    path: list[str] = []
+    pending = ""
+    try:
+        with localconfig.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line == "{":
+                    path.append(pending)
+                    pending = ""
+                    continue
+                if line == "}":
+                    if path:
+                        path.pop()
+                    continue
+                m = re.match(r'"([^"]*)"\s*"(.*)"$', line)
+                if m:
+                    if (path == want
+                            and m.group(1).lower() == "launchoptions"):
+                        return m.group(2).replace('\\"', '"').replace("\\\\", "\\")
+                    continue
+                m = re.match(r'"([^"]*)"$', line)
+                if m:
+                    pending = m.group(1).lower()
+    except OSError:
+        return ""
+    return ""
+
+
+_RUNTIME_ENTRY_POINT = "_v2-entry-point"
+
+# Steam Linux Runtime app ID → install dir, used only when the runtime's
+# appmanifest is missing (hand-copied runtime): appmanifest_<appid>.acf is the
+# authoritative mapping and is tried first.
+_KNOWN_RUNTIME_DIRS = {
+    "1070560": "SteamLinuxRuntime",           # 1.0 (scout)
+    "1391110": "SteamLinuxRuntime_soldier",   # 2.0
+    "1628350": "SteamLinuxRuntime_sniper",    # 3.0
+    "4183110": "SteamLinuxRuntime_4",         # 4.0
+}
+
+
+def _require_tool_appid(proton_script: "Path") -> str:
+    """The runtime app ID a Proton tool declares in its toolmanifest.vdf, or ""."""
+    try:
+        text = (Path(proton_script).parent / "toolmanifest.vdf").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.search(r'"require_tool_appid"\s+"(\d+)"', text)
+    return m.group(1) if m else ""
+
+
+def find_steam_runtime_entry_point(proton_script: "Path") -> "Path | None":
+    """Locate the ``_v2-entry-point`` of the runtime *proton_script* requires.
+
+    None when the tool declares no runtime or it isn't installed - the caller
+    then keeps the bare Proton call.
+    """
+    appid = _require_tool_appid(proton_script)
+    if not appid:
+        return None
+    names: list[str] = []
+    for steamapps in all_steamapps_dirs():
+        acf = steamapps / f"appmanifest_{appid}.acf"
+        try:
+            m = re.search(r'"installdir"\s+"([^"]+)"',
+                          acf.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            m = None
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    known = _KNOWN_RUNTIME_DIRS.get(appid)
+    if known and known not in names:
+        names.append(known)
+    for steamapps in all_steamapps_dirs():
+        for name in names:
+            entry = steamapps / "common" / name / _RUNTIME_ENTRY_POINT
+            if os.access(entry, os.X_OK):
+                return entry
+    return None
+
+
+def _wrap_in_steam_runtime(cmd: list[str], proton_script: "Path",
+                           args: "tuple[str, ...]",
+                           env: "dict | None") -> list[str]:
+    """Prefix *cmd* with the Steam Linux Runtime entry point for game launches.
+
+    Steam never runs Proton bare: it wraps the call in
+    ``SteamLinuxRuntime_*/_v2-entry-point``, whose pressure-vessel container
+    supplies the library stack Proton was built against. A bare
+    ``python3 proton waitforexitandrun`` (launch mode "None", or Play with no
+    launcher route) runs against the host's libraries instead - the breakage
+    (missing audio, missing libs) that sent non-Steam prefixes to umu-run,
+    which builds this very container itself.
+
+    Only game launches on a Steam-managed prefix are wrapped: tool verbs keep
+    the bare call they have always used, and non-Steam prefixes never get here
+    (the caller routes those to umu). ``AMM_STEAM_RUNTIME=0`` disables it.
+    Mutates *env*, like the umu branch.
+    """
+    if os.environ.get("AMM_STEAM_RUNTIME") == "0":
+        return cmd
+    verb = str(args[0]) if args else ""
+    if verb != "waitforexitandrun":
+        return cmd
+    # Steam-managed prefixes always live at steamapps/compatdata/<appid>;
+    # anything else is a non-Steam prefix whose launch belongs to umu.
+    compat_data = (env or {}).get("STEAM_COMPAT_DATA_PATH")
+    if not compat_data or Path(compat_data).parent.name.lower() != "compatdata":
+        return cmd
+    entry = find_steam_runtime_entry_point(proton_script)
+    if entry is None:
+        return cmd
+    if env is not None:
+        # Steam passes both the Proton build and the runtime here; without it
+        # pressure-vessel need not bind a Proton that lives outside $HOME
+        # (a compatibilitytools.d on a second drive).
+        env.setdefault("STEAM_COMPAT_TOOL_PATHS",
+                       f"{proton_script.parent}:{entry.parent}")
+    return [str(entry), f"--verb={verb}", "--", *cmd]
 
 
 def _host_python() -> str:
@@ -114,7 +301,7 @@ def _host_python() -> str:
     sentinel, so Proton's startup Vulkan probe fails with
     ``OSError: /anylinux_blocked_lib_that_does_not_exist.so`` when it tries to
     ``CDLL('libvulkan.so.1')``. Scrubbing the env dict we pass to Popen isn't
-    enough — the bundled interpreter re-pollutes itself on startup — so the
+    enough - the bundled interpreter re-pollutes itself on startup - so the
     interpreter itself must be a real host one.
 
     Prefer ``/usr/bin/python3`` (present on every target host); otherwise take
@@ -126,7 +313,7 @@ def _host_python() -> str:
     appdir = os.environ.get("APPDIR")
     appimage = os.environ.get("APPIMAGE")
     if not appdir and not appimage:
-        return "python3"           # not an AppImage — PATH python3 is the host's
+        return "python3"           # not an AppImage - PATH python3 is the host's
 
     def _is_bundled(path: str) -> bool:
         rp = os.path.realpath(path)
@@ -168,7 +355,7 @@ def proton_run_command(
     hits an lsteamclient assertion or missing-library failures.
 
     When we are *ourselves* inside a Flatpak sandbox (the manager's own
-    flatpak), there is no ``flatpak`` CLI in the runtime — the ``flatpak run``
+    flatpak), there is no ``flatpak`` CLI in the runtime - the ``flatpak run``
     must be forwarded to the host via ``flatpak-spawn --host``. flatpak-spawn
     does not forward the environment, so pass the Popen env dict as *env*:
     every var the caller added on top of ``os.environ`` (STEAM_COMPAT_*,
@@ -176,14 +363,14 @@ def proton_run_command(
 
     *proton_script* may also be a plain ``wine``/``wine64`` binary (Lutris
     classic-wine prefixes): the caller's env must then carry WINEPREFIX. Wine
-    takes the payload directly — Proton's verbs (run / runinprefix /
-    waitforexitandrun) have no wine equivalent and are dropped — and there is
+    takes the payload directly - Proton's verbs (run / runinprefix /
+    waitforexitandrun) have no wine equivalent and are dropped - and there is
     no python interpreter in front of the command.
     """
     # Directory flatpak-spawn's portal chdirs the host process into. Proton's
     # runinprefix (and bare wine) start the exe from this cwd, and Windows apps
     # that write files relative to their working directory (e.g.
-    # WitcherScriptMerger's MergeInventory.xml) resolve them here — under Wine
+    # WitcherScriptMerger's MergeInventory.xml) resolve them here - under Wine
     # cwd "/" maps to "Z:\\", which is not writable, so a real host directory
     # must be passed when the caller has one. Defaults to "/" because the app's
     # own sandbox cwd does not exist on the host and the portal would fail to
@@ -209,22 +396,20 @@ def proton_run_command(
         # Steam-less system (Heroic/Lutris-only, GH#320): a raw
         # ``python3 proton <verb>`` needs a Steam client for its compat
         # plumbing and runtime, which doesn't exist here. Route the launch
-        # through umu-run — the launcher Heroic itself uses — which runs
+        # through umu-run - the launcher Heroic itself uses - which runs
         # Proton inside the Steam Linux Runtime container with no Steam
-        # client at all. umu has no verbs (it always does a full Proton
-        # session) and derives its plumbing from WINEPREFIX / PROTONPATH /
-        # GAMEID; the caller's STEAM_COMPAT_* vars are overridden by umu
-        # itself, so they can stay in *env*. Mutates *env* (callers pass the
-        # same dict to Popen, and umu_run_command re-exports the diff under
-        # flatpak-spawn).
+        # client at all. umu derives its plumbing from WINEPREFIX /
+        # PROTONPATH / GAMEID and rebuilds every STEAM_COMPAT_* var itself
+        # (umu_run.py sets STEAM_COMPAT_CLIENT_INSTALL_PATH=""), so whatever
+        # the caller put there is ignored and can stay in *env*. Mutates
+        # *env* (callers pass the same dict to Popen, and umu_run_command
+        # re-exports the diff under flatpak-spawn).
         try:
             from Utils.lutris_finder import find_umu_run, umu_run_command
             umu_bin = find_umu_run()
         except Exception:
             umu_bin = None
         if umu_bin is not None and env is not None:
-            payload = [a for a in map(str, args) if a not in
-                       ("run", "runinprefix", "waitforexitandrun")]
             if not env.get("WINEPREFIX") and env.get("STEAM_COMPAT_DATA_PATH"):
                 # Proton resolves the real prefix as $WINEPREFIX/pfx, same
                 # shape as $STEAM_COMPAT_DATA_PATH/pfx (umu self-links pfx →
@@ -233,13 +418,25 @@ def proton_run_command(
                 env["WINEPREFIX"] = env["STEAM_COMPAT_DATA_PATH"]
             env["PROTONPATH"] = str(script.parent)
             env.setdefault("GAMEID", "umu-default")
-            return umu_run_command(umu_bin, *payload, env=env,
+            # The Proton verb is passed straight through: umu treats a leading
+            # run / runinprefix / waitforexitandrun as PROTON_VERB (see
+            # umu_consts.PROTON_VERBS). Keeping it preserves the distinction
+            # the callers rely on - "runinprefix" must NOT boot the steam.exe
+            # shim, which would start explorer/tabtip/xalia around every tool.
+            return umu_run_command(umu_bin, *map(str, args), env=env,
                                    host_cwd=directory)
         _maybe_log_steamless_no_umu()
 
     base = [_host_python(), str(proton_script), *map(str, args)]
     if not (_proton_script_in_steam_flatpak(proton_script)
             and not _own_process_in_steam_flatpak()):
+        # Game launches go through Steam's own runtime container (see
+        # _wrap_in_steam_runtime). Done before the flatpak-spawn wrap so the
+        # entry point runs on the host and the env diff below still sees the
+        # STEAM_COMPAT_TOOL_PATHS it adds. The Steam-flatpak branch below is
+        # left bare: that Proton already runs inside Steam's own sandbox,
+        # where its runtime and libraries are the ones it expects.
+        base = _wrap_in_steam_runtime(base, proton_script, args, env)
         if _in_flatpak_sandbox() and shutil.which("flatpak-spawn"):
             fwd = [
                 f"--env={k}={v}"
@@ -250,7 +447,7 @@ def proton_run_command(
                     *fwd, *base]
         return base
     # Steam-flatpak Proton runs INSIDE the sandbox, so --command=python3 uses
-    # the sandbox's own interpreter (not our host resolver) — that's correct.
+    # the sandbox's own interpreter (not our host resolver) - that's correct.
     # --filesystem=host so the sandbox can reach the staging/game/tool paths
     # that live outside Steam's own data dir.
     cmd = [
@@ -321,7 +518,7 @@ def list_installed_proton() -> list[Path]:
             except OSError:
                 continue
     # Heroic-managed Proton builds. A Heroic copy whose directory name matches
-    # a Steam-provided tool is skipped — it's the same build, and the Steam
+    # a Steam-provided tool is skipped - it's the same build, and the Steam
     # copy plays nicer with the Steam runtime plumbing.
     try:
         from Utils.heroic_finder import list_heroic_proton_scripts
@@ -386,7 +583,7 @@ def find_steam_root_for_proton_script(proton_script: Path) -> Path | None:
       - <steam_root>/compatibilitytools.d/<Tool>/proton
 
     When the Proton tool lives in a *secondary* library (SD card, second
-    drive), that library is not a real Steam client install — Proton needs the
+    drive), that library is not a real Steam client install - Proton needs the
     runtime that lives under the main Steam root. In that case we fall back to
     the first real Steam client candidate so the runtime is still found.
     """
@@ -435,7 +632,12 @@ def find_steam_root_for_proton_script(proton_script: Path) -> Path | None:
     # can proceed: launches on such systems are routed through umu-run
     # (proton_run_command), which builds its own compat plumbing and
     # overrides STEAM_COMPAT_CLIENT_INSTALL_PATH itself.
-    if not steam_client_installed():
+    #
+    # Gated on umu actually being present: without it the reroute can't happen
+    # and the stand-in would only buy a doomed bare-Wine launch (GH#320's
+    # second round - a 200-line Wine error wall and meaningless exit codes).
+    # Returning None instead makes callers stop and report the real cause.
+    if not steam_client_installed() and not steamless_launch_error():
         return script.parent
 
     return None
@@ -445,7 +647,7 @@ def find_steam_root_for_proton_script(proton_script: Path) -> Path | None:
 # Public API
 # ---------------------------------------------------------------------------
 
-# find_steam_libraries() cache — the GUI calls it on every refresh, and a
+# find_steam_libraries() cache - the GUI calls it on every refresh, and a
 # full run re-reads the ini + every candidate VDF and resolves every library.
 # Validated against the (st_mtime_ns, st_size) of the source files actually
 # read, so any change to them re-parses; stat-only validation is ~free.
@@ -501,7 +703,7 @@ def find_steam_libraries() -> list[Path]:
         vdf_candidates.append(Path(custom))
 
     # Built-in fallbacks. Steam keeps copies under both steamapps/ and the
-    # root config/, and may spell the file singular or plural — try them all.
+    # root config/, and may spell the file singular or plural - try them all.
     for steam_root in _STEAM_CANDIDATES:
         for name in _VDF_FILENAMES:
             vdf_candidates.append(steam_root / "steamapps" / name)
@@ -545,7 +747,7 @@ _vdf_warned_readonly: set[str] = set()
 
 def _warn_vdf_library(raw: str, common: Path) -> None:
     """Log a one-time warning for a library that is listed in VDF but
-    unusable (drive unmounted, read-only, etc.). Best-effort — swallows
+    unusable (drive unmounted, read-only, etc.). Best-effort - swallows
     import errors so this module stays UI-free.
     """
     try:
@@ -558,7 +760,7 @@ def _warn_vdf_library(raw: str, common: Path) -> None:
             _vdf_warned_missing.add(raw)
             app_log(
                 f"Steam library listed in libraryfolders.vdf but not accessible: "
-                f"{raw} — drive may be unmounted or disconnected"
+                f"{raw} - drive may be unmounted or disconnected"
             )
         return
 
@@ -568,7 +770,7 @@ def _warn_vdf_library(raw: str, common: Path) -> None:
         if raw not in _vdf_warned_readonly:
             _vdf_warned_readonly.add(raw)
             app_log(
-                f"Steam library is read-only: {common} — mod deployment to games "
+                f"Steam library is read-only: {common} - mod deployment to games "
                 f"in this library will fail until the mount is remounted writable"
             )
 
@@ -640,56 +842,170 @@ def _all_proton_search_roots() -> list[Path]:
     return roots
 
 
-def find_prefix(steam_id: str) -> Path | None:
+def _compatdata_prefix(compatdata: Path) -> Path | None:
+    """Return the prefix dir for a compatdata/<id> folder, or None.
+
+    Classic layout keeps the prefix in ``pfx/``; the flat umu/Proton layout
+    puts ``drive_c`` straight into the compatdata folder.
     """
-    Locate the Steam compatibility prefix directory for a given App ID.
+    pfx = compatdata / "pfx"
+    if pfx.is_dir():
+        return pfx
+    if (compatdata / "drive_c").is_dir():
+        return compatdata
+    return None
 
-    Steam stores per-game Proton prefixes under:
-        <steam_root>/steamapps/compatdata/<steam_id>/pfx/
 
-    Searches every known Steam root candidate first, then falls back to
-    extra library folders parsed from libraryfolders.vdf (e.g. SD card or
-    secondary drive libraries), since compatdata lives alongside the game.
+def all_steamapps_dirs() -> list[Path]:
+    """Every ``steamapps/`` directory Steam may use, deduplicated by real path.
 
-    Args:
-        steam_id: The Steam App ID as a string, e.g. '377160' for Fallout 4.
+    The known client roots come first, then the extra libraries listed in
+    libraryfolders.vdf (SD card, second drive, NAS). ``~/.steam/steam`` is
+    usually a symlink to the standard root, hence the resolve()-based dedup.
     """
-    if not steam_id:
-        return None
-
-    def _check_compatdata(compatdata: Path) -> Path | None:
-        """Return the prefix dir for a compatdata/<id> folder, or None."""
-        pfx = compatdata / "pfx"
-        if pfx.is_dir():
-            return pfx
-        if (compatdata / "drive_c").is_dir():
-            return compatdata
-        return None
-
-    # Primary: check known Steam root candidates
-    for steam_root in _STEAM_CANDIDATES:
-        result = _check_compatdata(steam_root / "steamapps" / "compatdata" / steam_id)
-        if result:
-            return result
-
-    # Secondary: check extra library folders (SD card, secondary drives, etc.)
-    # parse_vdf_libraries returns steamapps/common paths; parent is steamapps/
+    dirs: list[Path] = []
     seen: set[Path] = set()
+
+    def _add(steamapps: Path) -> None:
+        try:
+            resolved = steamapps.resolve()
+        except Exception:
+            resolved = steamapps
+        if resolved not in seen:
+            seen.add(resolved)
+            dirs.append(steamapps)
+
+    for steam_root in _STEAM_CANDIDATES:
+        _add(steam_root / "steamapps")
+
     for steam_root in _STEAM_CANDIDATES:
         vdf_path = steam_root / "steamapps" / _VDF_FILENAME
         if not vdf_path.is_file():
             continue
         for common in parse_vdf_libraries(vdf_path):
-            steamapps = common.parent
-            resolved = steamapps.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            result = _check_compatdata(steamapps / "compatdata" / steam_id)
-            if result:
-                return result
+            # common is .../steamapps/common; its parent is the steamapps dir
+            _add(common.parent)
+
+    return dirs
+
+
+def _steamapps_dir_of(game_path: "Path | str | None") -> Path | None:
+    """Return the ``steamapps/`` dir a game install sits under, or None.
+
+    Steam games live at ``<library>/steamapps/common/<installdir>``, so the
+    library that owns the game is an ancestor lookup away. Non-Steam installs
+    (Heroic, GOG, a manual copy) have no such ancestor and yield None.
+    """
+    if not game_path:
+        return None
+    try:
+        path = Path(game_path)
+        for parent in path.parents:
+            if parent.name.lower() == "steamapps":
+                return parent
+    except Exception:
+        pass
+    return None
+
+
+def owning_steamapps_dir(steam_id: str, game_path: "Path | str | None" = None) -> Path | None:
+    """Return the ``steamapps/`` dir of the library that owns *steam_id*.
+
+    Steam creates compatdata in the same library the game is installed in, so
+    ownership - not search order - decides which prefix is the live one. A user
+    with two libraries can easily have a stale compatdata left behind in the
+    home library after moving the game to another drive; searching by location
+    would keep finding that dead prefix (GH: second-library prefix mismatch).
+
+    Ownership is established from the configured *game_path* when we have one,
+    otherwise from the ``appmanifest_<id>.acf`` that Steam writes into the
+    owning library. Returns None when neither signal is available.
+    """
+    if not steam_id:
+        return None
+
+    from_game = _steamapps_dir_of(game_path)
+    if from_game is not None and (from_game / f"appmanifest_{steam_id}.acf").is_file():
+        return from_game
+
+    for steamapps in all_steamapps_dirs():
+        if (steamapps / f"appmanifest_{steam_id}.acf").is_file():
+            return steamapps
+
+    # No manifest anywhere (game uninstalled from Steam's view, or a manual
+    # copy into a library folder) - trust the game path's library if we have one.
+    return from_game
+
+
+def find_prefix(steam_id: str, game_path: "Path | str | None" = None) -> Path | None:
+    """
+    Locate the Steam compatibility prefix directory for a given App ID.
+
+    Steam stores per-game Proton prefixes under:
+        <library>/steamapps/compatdata/<steam_id>/pfx/
+
+    The library that actually owns the app is checked first, so a stale
+    compatdata in a different library never shadows the live prefix. Falls back
+    to scanning every known Steam root and then every library listed in
+    libraryfolders.vdf, which still covers a game installed in one library but
+    never launched there.
+
+    Args:
+        steam_id: The Steam App ID as a string, e.g. '377160' for Fallout 4.
+        game_path: The game's install directory when known. Used to identify
+            the owning library without reading any appmanifest.
+    """
+    if not steam_id:
+        return None
+
+    # Primary: the library that owns this App ID.
+    owner = owning_steamapps_dir(steam_id, game_path)
+    if owner is not None:
+        result = _compatdata_prefix(owner / "compatdata" / steam_id)
+        if result:
+            return result
+
+    # Fallback: known Steam roots first, then the extra libraries from the VDF.
+    for steamapps in all_steamapps_dirs():
+        result = _compatdata_prefix(steamapps / "compatdata" / steam_id)
+        if result:
+            return result
 
     return None
+
+
+def prefix_is_in_wrong_library(prefix: "Path | str | None", steam_id: str,
+                               game_path: "Path | str | None" = None) -> bool:
+    """True when *prefix* is a Steam compatdata prefix in a library that does
+    not own *steam_id*, and the owning library has a usable prefix instead.
+
+    Deliberately narrow: it only fires for Steam-shaped compatdata paths whose
+    owning library is known and demonstrably different, so a hand-picked
+    Heroic/Lutris/Faugus prefix or a custom path is never second-guessed.
+    """
+    if not prefix or not steam_id:
+        return False
+    try:
+        path = Path(prefix)
+    except Exception:
+        return False
+
+    # Only Steam compatdata layouts: .../steamapps/compatdata/<id>[/pfx]
+    compatdata = path if path.name == steam_id else path.parent
+    if compatdata.name != steam_id or compatdata.parent.name.lower() != "compatdata":
+        return False
+    current = compatdata.parent.parent  # the steamapps dir holding it
+
+    owner = owning_steamapps_dir(steam_id, game_path)
+    if owner is None:
+        return False
+    try:
+        if owner.resolve() == current.resolve():
+            return False
+    except Exception:
+        return False
+
+    return _compatdata_prefix(owner / "compatdata" / steam_id) is not None
 
 
 def game_steam_id(game) -> str:
@@ -718,7 +1034,7 @@ def find_proton_for_game(steam_id: str) -> Path | None:
     version the game uses, then locates the 'proton' script in steamapps/common/.
 
     Steam rewrites config.vdf atomically, so the live file may temporarily lack
-    CompatToolMapping — we also check .bak and .tmp variants of the file.
+    CompatToolMapping - we also check .bak and .tmp variants of the file.
 
     Returns the path to the 'proton' script, or None if the game's assigned
     Proton cannot be found (never falls back to an arbitrary version).
@@ -783,7 +1099,7 @@ def find_proton_for_game(steam_id: str) -> Path | None:
         dir_name = _COMPAT_TOOL_NAMES.get(tool_name, tool_name)
 
         # Search steamapps/common/ and compatibilitytools.d/ (GE-Proton, etc.)
-        # across every Steam root AND secondary library — Proton tools live
+        # across every Steam root AND secondary library - Proton tools live
         # alongside games, so the mapped tool may sit on an SD card / second
         # drive even though config.vdf only exists in the main Steam root.
         search_dirs: list[Path] = []
@@ -924,8 +1240,8 @@ def find_game_in_libraries(libraries: list[Path], exe_name: str) -> Path | None:
     Search each library's steamapps/common/* subfolder for exe_name.
     Returns the game root directory (the <GameFolder>) or None if not found.
 
-    exe_name may be a bare filename (e.g. "SkyrimSE.exe") — searched one
-    level deep — or a relative path with subdirectories (e.g. "bin/bg3.exe")
+    exe_name may be a bare filename (e.g. "SkyrimSE.exe") - searched one
+    level deep - or a relative path with subdirectories (e.g. "bin/bg3.exe")
     which is checked as an exact relative path under each game folder.
 
     The search is case-insensitive on the exe name to handle Linux/Proton layouts.
@@ -975,28 +1291,76 @@ def scan_drives_for_exe(exe_names: list[str],
                         stop_event: "threading.Event | None" = None) -> Path | None:
     """Scan all mounted drives for any of *exe_names*, stopping at first match.
 
-    Walks every real (non-pseudo) mount point from /proc/mounts, fanning the
-    top-level subtree walks out across a thread pool so a big multi-drive scan
-    doesn't run serially. Matching is on the bare filename (case-sensitive, to
-    match the Tk behaviour); *exe_names* entries with sub-paths are matched on
-    their final component. Returns the directory holding the exe, or None.
+    Walks every real (non-pseudo) mount point from /proc/mounts, fanning
+    subtree walks out across a thread pool — user trees (/home, /run/media,
+    /media, /mnt) are split a level deeper and queued first, and each walk is
+    breadth-first, since game dirs sit shallow. Per-session fuse mirrors
+    (document portal, gvfs) are excluded so the scan never returns a
+    /run/user/…/doc alias for a real path. Matching is on the bare filename
+    (case-sensitive, to match the Tk behaviour); *exe_names* entries with
+    sub-paths are matched on their final component, and the declared sub-path
+    is then stripped from the result so the game root comes back (parity with
+    find_game_in_libraries). Returns the game root directory, or None.
 
     Pass *stop_event* to allow an external caller (e.g. a closing dialog) to
     abort the walk early.
     """
     import concurrent.futures
 
-    names = {Path(e.replace("\\", "/")).name for e in exe_names if e}
+    # Map bare filename → declared parent sub-paths (lowercased), so a match
+    # can be walked back up to the game root: a handler exe of
+    # "Binaries/Win64/game.exe" matching at …/Icarus/Binaries/Win64 must
+    # return …/Icarus, matching what find_game_in_libraries returns. The
+    # strip is case-insensitive (Linux copies of Windows games vary in
+    # casing); longest declared sub-path wins.
+    name_parents: dict[str, list[tuple[str, ...]]] = {}
+    for e in exe_names:
+        if not e:
+            continue
+        rel = Path(e.replace("\\", "/"))
+        parents = tuple(p.lower() for p in rel.parent.parts if p != ".")
+        name_parents.setdefault(rel.name, []).append(parents)
+    for subpaths in name_parents.values():
+        subpaths.sort(key=len, reverse=True)
+    names = set(name_parents)
     if not names:
         return None
 
+    def _match_root(dirpath, matched: str) -> Path:
+        """Strip the matched exe's declared sub-path off its directory."""
+        d = Path(dirpath)
+        lower = tuple(p.lower() for p in d.parts)
+        for parents in name_parents[matched]:
+            n = len(parents)
+            if n and len(lower) > n and lower[-n:] == parents:
+                return Path(*d.parts[:-n])
+        return d
+
+    # fuse.portal is the xdg document portal: it mirrors folders the user
+    # previously picked in a portal file dialog under /run/user/<uid>/doc/…,
+    # so scanning it "finds" the game at an alias path that other processes
+    # (Steam, Proton) can't open. gvfs/revokefs are similar per-user fuse
+    # mirrors; autofs entries would trigger mounts as a side effect.
     skip_types = {"sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "cgroup",
                   "cgroup2", "pstore", "bpf", "tracefs", "debugfs",
                   "securityfs", "fusectl", "hugetlbfs", "mqueue", "configfs",
-                  "efivarfs", "overlay", "squashfs"}
+                  "efivarfs", "overlay", "squashfs", "autofs", "binfmt_misc",
+                  "nsfs", "ramfs", "fuse.portal", "fuse.gvfsd-fuse",
+                  "fuse.revokefs-fuse", "fuse.rofiles-fuse"}
     skip_dirs = {"proc", "sys", "dev", "run", "snap"}
 
+    def _unescape(mp: str) -> str:
+        """Decode /proc/mounts octal escapes (\\040 = space) in a mountpoint."""
+        if "\\" not in mp:
+            return mp
+        try:
+            return (mp.encode("latin-1").decode("unicode_escape")
+                    .encode("latin-1").decode("utf-8", "replace"))
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return mp
+
     roots: list[Path] = []
+    all_mounts: set[str] = set()
     try:
         with open("/proc/mounts", "r", encoding="utf-8") as f:
             for line in f:
@@ -1004,8 +1368,15 @@ def scan_drives_for_exe(exe_names: list[str],
                 if len(parts) < 3:
                     continue
                 fstype = parts[2]
-                mountpoint = parts[1]
+                mountpoint = _unescape(parts[1])
+                all_mounts.add(mountpoint)
                 if fstype in skip_types:
+                    continue
+                # /run/user holds only per-session fuse mirrors (doc portal,
+                # gvfs); /tmp/* mounts are AppImage runtimes. Neither can be
+                # real game storage. /run/media (removable drives) is NOT
+                # under /run/user and still gets scanned.
+                if mountpoint.startswith(("/run/user/", "/tmp/")):
                     continue
                 p = Path(mountpoint)
                 if p == Path("/"):
@@ -1018,27 +1389,91 @@ def scan_drives_for_exe(exe_names: list[str],
     if stop_event is None:
         stop_event = threading.Event()
 
+    root_set = {str(r) for r in roots}
+
     def _scan_subtree(start: Path) -> Path | None:
-        for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
+        """Breadth-first walk: game dirs sit shallow, so BFS finds them long
+        before a depth-first walk finishes exhausting deep unrelated trees.
+        Other mountpoints are pruned — every wanted mount is walked from its
+        own /proc/mounts entry, so descending into one here would scan it
+        twice (and descending into a skipped one at all)."""
+        queue = collections.deque([str(start)])
+        while queue:
             if stop_event.is_set():
                 return None
-            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
-            if names & set(filenames):
-                return Path(dirpath)
+            dirpath = queue.popleft()
+            try:
+                with os.scandir(dirpath) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if (entry.name not in skip_dirs
+                                        and entry.path not in all_mounts):
+                                    queue.append(entry.path)
+                            elif entry.name in names:
+                                return _match_root(dirpath, entry.name)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
         return None
 
-    scan_roots: list[Path] = []
-    for root in roots:
+    def _expand(d: Path) -> "tuple[Path | None, list[Path]]":
+        """Match d's own files and list its child dirs; (hit, children)."""
+        subs: list[Path] = []
         try:
-            scan_roots.extend(
-                p for p in root.iterdir()
-                if p.is_dir() and p.name not in skip_dirs)
-        except (PermissionError, OSError):
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if is_dir:
+                        if (entry.name not in skip_dirs
+                                and entry.path not in all_mounts):
+                            subs.append(Path(entry.path))
+                    elif entry.name in names:
+                        return _match_root(d, entry.name), []
+        except OSError:
             pass
+        return None, subs
+
+    def _priority(p: Path) -> int:
+        # User-writable trees where games actually live go first; rootfs
+        # system trees (/usr, /var, …) are the long tail.
+        s = str(p) + "/"
+        if s.startswith(("/home/", "/run/media/", "/media/", "/mnt/")):
+            return 0
+        return 1
+
+    units: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        hit, children = _expand(root)
+        if hit is not None:
+            return hit
+        for child in children:
+            if str(child) in root_set:
+                continue  # walked from its own mount entry
+            # Fan the user trees out one level deeper so e.g. /home/deck
+            # isn't a single serial walk unit dominating wall time.
+            if _priority(child) == 0:
+                hit, subs = _expand(child)
+                if hit is not None:
+                    return hit
+                group = subs
+            else:
+                group = [child]
+            for unit in group:
+                s = str(unit)
+                if s not in seen:
+                    seen.add(s)
+                    units.append(unit)
+    units.sort(key=_priority)
 
     found: Path | None = None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_scan_subtree, sr): sr for sr in scan_roots}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(_scan_subtree, u): u for u in units}
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result is not None:

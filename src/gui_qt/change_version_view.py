@@ -125,8 +125,9 @@ class _LegendBar(QWidget):
 class ChangeVersionView(QWidget):
     """Scoped-tab body for picking a mod version to install."""
 
-    # (files | None, error_msg) from the fetch worker → UI thread.
-    _files_ready = Signal(object, object)
+    # (files | None, error_msg, fetch_gen) from the fetch worker → UI thread.
+    # fetch_gen guards against a stale fetch landing after a retarget.
+    _files_ready = Signal(object, object, int)
     # (archive | None, meta | None) from the download worker → UI thread.
     _download_done = Signal(object, object)
     # (file, is_premium) from the premium-check worker → UI thread.
@@ -152,10 +153,15 @@ class ChangeVersionView(QWidget):
         self._progress_fn = progress_fn or (lambda key, name, d, t: None)
         self._dl_key = None    # popup card key while a manual watch is armed
         self._installing = False
+        self._files = None          # cached (sorted) file list for _meta.mod_id
+        self._fetch_gen = 0         # invalidates in-flight fetches on retarget
+        self._install_prev = None   # mod name captured when an install started
+        self._install_status = False  # status line shows "Installing…"
         # (file_id, watcher, install_btn) while a non-premium install waits
         # for a browser download; the row's Install button shows Cancel.
         self._manual_watch = None
         self._pending_btn = None    # button of the install being prepped
+        self._install_btns: list = []   # per-row buttons, for live relabelling
         # The destroyed hook must not touch self (C++ side is gone by then) —
         # it captures these holders directly. _key_holder["k"] tracks the live
         # popup-card key so a mid-watch tab close still clears the card.
@@ -193,9 +199,9 @@ class ChangeVersionView(QWidget):
         # Toolbar: title + Ignore Update + Close.
         bar = QWidget(); bar.setObjectName("HeaderBar")
         hb = QHBoxLayout(bar); hb.setContentsMargins(12, 8, 8, 8); hb.setSpacing(8)
-        title = QLabel(self.tr("Change Version — {0}").format(self._mod_name))
-        title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
-        hb.addWidget(title)
+        self._title = QLabel(self.tr("Change Version — {0}").format(self._mod_name))
+        self._title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
+        hb.addWidget(self._title)
         hb.addStretch(1)
 
         self._ignore_cb = QCheckBox(self.tr("Ignore Update"))
@@ -240,17 +246,21 @@ class ChangeVersionView(QWidget):
         domain = getattr(self._game, "nexus_game_domain", "") or \
             getattr(self._meta, "game_domain", "") or ""
         mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
+        self._fetch_gen += 1
+        gen = self._fetch_gen
 
         def worker():
             try:
                 resp = self._api.get_mod_files(domain, mod_id)
-                safe_emit(self._files_ready, list(resp.files), None)
+                safe_emit(self._files_ready, list(resp.files), None, gen)
             except Exception as exc:
-                safe_emit(self._files_ready, None, str(exc))
+                safe_emit(self._files_ready, None, str(exc), gen)
 
         threading.Thread(target=worker, daemon=True, name="change-version-fetch").start()
 
-    def _on_files_ready(self, files, error):
+    def _on_files_ready(self, files, error, gen):
+        if gen != self._fetch_gen:
+            return    # retargeted to another mod while this fetch ran
         if error is not None:
             self._status.setText(self.tr("Could not load files: {0}").format(error))
             self._status.setVisible(True)
@@ -260,9 +270,38 @@ class ChangeVersionView(QWidget):
             self._status.setVisible(True)
             return
         self._status.setVisible(False)
-        self._populate(sorted(files, key=sort_key))
+        self._files = sorted(files, key=sort_key)
+        self._populate(self._files)
 
     # ---- table population + highlight ------------------------------------
+    @staticmethod
+    def _download_only() -> bool:
+        from Utils.ui_config import load_download_only
+        try:
+            return bool(load_download_only())
+        except Exception:
+            return False
+
+    def _install_label(self) -> str:
+        """Install, or Download while 'Download only' is on."""
+        return self.tr("Download") if self._download_only() else self.tr("Install")
+
+    def refresh_install_labels(self):
+        """Re-read 'Download only' and relabel the row buttons in place."""
+        # NOT a _populate(): that deletes the widget a pending manual watch still
+        # references. The watching row keeps its Cancel (_end_manual_watch restores it).
+        text = self._install_label()
+        watch_btn = self._manual_watch[2] if self._manual_watch else None
+        live = []
+        for b in list(self._install_btns):
+            try:
+                if b is not watch_btn:
+                    b.setText(text)
+                live.append(b)
+            except RuntimeError:
+                pass        # row already rebuilt; the C++ side is gone
+        self._install_btns = live
+
     def _populate(self, files):
         installed_id = int(getattr(self._meta, "file_id", 0) or 0)
         match_id, old_ids = resolve_latest_name_match(
@@ -272,6 +311,10 @@ class ChangeVersionView(QWidget):
         mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
 
         hl = _hl_colors()
+        self._install_btns = []      # the old row widgets are about to be replaced
+        if not self._install_status:
+            self._status.setVisible(False)   # drop a stale download-only notice
+        _btn_label = self._install_label()
         self._table.setRowCount(len(files))
         for row, f in enumerate(files):
             is_installed = installed_id > 0 and f.file_id == installed_id
@@ -310,15 +353,62 @@ class ChangeVersionView(QWidget):
             view_btn.setStyleSheet(button_qss("BTN_GREY", padding="4px 10px"))
             view_btn.clicked.connect(lambda _=False, u=view_url: self._open_url(u))
             cb.addWidget(view_btn)
-            inst_btn = QPushButton(self.tr("Install")); inst_btn.setCursor(Qt.PointingHandCursor)
+            inst_btn = QPushButton(_btn_label); inst_btn.setCursor(Qt.PointingHandCursor)
             # Explicit success colour so the row tint (set on the parent cell)
             # can't bleed into the button background.
             inst_btn.setStyleSheet(button_qss("BTN_SUCCESS", padding="4px 10px"))
             inst_btn.clicked.connect(
                 lambda _=False, ff=f, b=inst_btn: self._install_file(ff, b))
             cb.addWidget(inst_btn)
+            self._install_btns.append(inst_btn)
             cb.addStretch(1)
             self._table.setCellWidget(row, 4, cell)
+
+    # ---- retargeting (tab stays open) -------------------------------------
+    def current_mod_name(self) -> str:
+        """The mod this tab is currently showing."""
+        return self._mod_name
+
+    def busy(self) -> bool:
+        """True while an install kicked off here is still in flight (premium
+        check, download, browser-download watch, or the async install itself) —
+        retargeting then would yank the flow out from under the user."""
+        return bool(self._installing or self._manual_watch is not None
+                    or self._install_status)
+
+    def clear_install_status(self):
+        """Hide the 'Installing…' notice (the install finished or failed)."""
+        if self._install_status:
+            self._install_status = False
+            self._status.setVisible(False)
+
+    def retarget(self, mod_name: str, meta):
+        """Point the open tab at *mod_name*: title, Ignore-Update state and row
+        highlights follow. The file list is only re-fetched when the Nexus mod
+        id actually changed; a same-mod retarget (install finished, or the
+        previous version was removed and the folder name swapped) just repaints
+        the highlights from the cached list."""
+        old_mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
+        # The repopulate below deletes the row buttons a pending browser-watch
+        # flow still references — stop it first (same as an Install-click toggle).
+        if self._manual_watch is not None:
+            self.cancel_manual_watch()
+        self._pending_btn = None
+        self._mod_name = mod_name
+        self._meta = meta
+        self._title.setText(self.tr("Change Version — {0}").format(mod_name))
+        self._ignore_cb.blockSignals(True)
+        self._ignore_cb.setChecked(bool(getattr(meta, "ignore_update", False)))
+        self._ignore_cb.blockSignals(False)
+        self.clear_install_status()
+        if int(getattr(meta, "mod_id", 0) or 0) != old_mod_id or not self._files:
+            self._files = None
+            self._table.setRowCount(0)
+            self._status.setText(self.tr("Loading files…"))
+            self._status.setVisible(True)
+            self._start_fetch()
+        else:
+            self._populate(self._files)
 
     # ---- actions ----------------------------------------------------------
     def _open_url(self, url):
@@ -380,6 +470,9 @@ class ChangeVersionView(QWidget):
             return
         self._installing = True
         self._pending_btn = btn
+        # Captured NOW: a retarget (selection follow) mid-download must not
+        # change which mod the install replaces.
+        self._install_prev = self._mod_name
 
         # Premium gate ([dev] force_manual_install honoured — same switch as
         # the browser/collections): free accounts can't use the download API,
@@ -535,7 +628,7 @@ class ChangeVersionView(QWidget):
         _fid, watcher, btn = t
         watcher.stop()
         if btn is not None:
-            btn.setText(self.tr("Install"))
+            btn.setText(self._install_label())
             btn.setStyleSheet(button_qss("BTN_SUCCESS", padding="4px 10px"))
         self._status.setVisible(False)
 
@@ -555,18 +648,31 @@ class ChangeVersionView(QWidget):
         self._installing = False
         # Clears the popup card + (for the manual path) restores the row button.
         self._end_manual_watch()
+        prev, self._install_prev = self._install_prev, None
         if not archive:
             return
-        self._log(f"Nexus: downloaded → {archive}; installing…")
+        self._log(f"Nexus: downloaded → {archive}")
         # Pass the mod we're updating so the app can offer "Remove previous
         # version?" if the new file installs under a different folder name.
         metas = {archive: meta} if meta is not None else None
         try:
-            self._install_fn([archive], metas,
-                             previous_mod_name=self._mod_name)
+            queued = self._install_fn([archive], metas,
+                                      previous_mod_name=prev or self._mod_name)
         except TypeError:
             # install_fn without the previous_mod_name kwarg (defensive).
-            self._install_fn([archive], metas)
-        # Close the panel now — the install runs asynchronously and its own
-        # completion path refreshes the modlist (+ any "Remove previous?" prompt).
-        self._on_close()
+            queued = self._install_fn([archive], metas)
+        # The host returns False when 'Download only' diverted it. Trust that
+        # rather than re-reading the setting — a toggle between the two reads
+        # would leave _install_status set with no install to ever clear it, and
+        # busy() would block retargeting this tab for good.
+        if queued is False:
+            self._status.setText(self.tr(
+                "Downloaded — install it from the Downloads tab."))
+            self._status.setVisible(True)
+            return
+        # The tab stays open — the install runs asynchronously and the host
+        # retargets this view (refreshing the highlights) once it lands.
+        self._install_status = True
+        self._status.setText(self.tr(
+            "Installing — the list will refresh when it finishes."))
+        self._status.setVisible(True)

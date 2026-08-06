@@ -69,6 +69,7 @@ BsaConflictRole = Qt.UserRole + 5  # int: BSA/BA2 archive conflict code
 HighlightRole = Qt.UserRole + 6    # int: 0 none, 1 higher(green), -1 lower(red),
                                    #      2 anchor(orange, plugin-selected mod),
                                    #      3 requires(purple), -3 required-by(blue)
+UuidConflictRole = Qt.UserRole + 7  # int: BG3 pak module-UUID conflict code
 
 _MIME = "application/x-amethyst-modrows"
 
@@ -126,6 +127,7 @@ class ModListModel(QAbstractTableModel):
         self._size_bytes: dict[str, int] = {}
         self._conflicts = conflicts or {}
         self._bsa_conflicts: dict[str, int] = {}
+        self._uuid_conflicts: dict[str, int] = {}
         self._flags: dict[str, int] = {}
         # Per-mod user note text (for the Note flag's hover tooltip). Kept in sync
         # with the FLAG_NOTE bit; empty when no note.
@@ -173,6 +175,11 @@ class ModListModel(QAbstractTableModel):
         # Per-row memo for _separator_highlight (block walk is O(block size)
         # and data() asks per paint). Cleared on highlight/collapse/entry edits.
         self._sep_hl_cache: dict[int, int] = {}
+        # File counts for the pinned Overwrite / Root Folder boundary rows —
+        # they own a folder rather than a block of mods, so the "(N)" they show
+        # counts files on disk. Filled by an async walk (see the app's
+        # _refresh_boundary_counts); empty until it lands.
+        self._boundary_counts: dict[str, int] = {}
 
     # ---- loading ----------------------------------------------------------
     @classmethod
@@ -373,13 +380,15 @@ class ModListModel(QAbstractTableModel):
 
     def set_filemap_results(self, conflicts: dict[str, int],
                             bsa_conflicts: dict[str, int],
-                            prertx: set[str], root_rule: set[str]) -> None:
+                            prertx: set[str], root_rule: set[str],
+                            uuid_conflicts: "dict[str, int] | None" = None) -> None:
         """Apply everything a filemap rebuild produces for this model in ONE
         dataChanged pass. Equivalent to set_conflicts + set_prertx_mods +
         set_root_rule_mods, but those each emit a full-table dataChanged —
         three repaint/relayout storms per rebuild on a big modlist."""
         self._conflicts = conflicts or {}
         self._bsa_conflicts = bsa_conflicts or {}
+        self._uuid_conflicts = uuid_conflicts or {}
         self._prertx_mods = set(prertx or ())
         self._root_rule_mods = set(root_rule or ())
         if self._entries:
@@ -387,18 +396,23 @@ class ModListModel(QAbstractTableModel):
             self.dataChanged.emit(
                 self.index(0, COL_NAME),
                 self.index(len(self._entries) - 1, COL_CONFLICTS),
-                [ConflictRole, BsaConflictRole, FlagsRole, Qt.DisplayRole])
+                [ConflictRole, BsaConflictRole, UuidConflictRole, FlagsRole,
+                 Qt.DisplayRole])
         self._resort_if_key("conflicts", "flags")
 
     def set_conflicts(self, conflicts: dict[str, int],
-                      bsa_conflicts: dict[str, int] | None = None) -> None:
+                      bsa_conflicts: dict[str, int] | None = None,
+                      uuid_conflicts: "dict[str, int] | None" = None) -> None:
         self._conflicts = conflicts or {}
         if bsa_conflicts is not None:
             self._bsa_conflicts = bsa_conflicts or {}
+        if uuid_conflicts is not None:
+            self._uuid_conflicts = uuid_conflicts or {}
         if self._entries:
             self.dataChanged.emit(self.index(0, COL_NAME),
                                   self.index(len(self._entries) - 1, COL_CONFLICTS),
-                                  [ConflictRole, BsaConflictRole, Qt.DisplayRole])
+                                  [ConflictRole, BsaConflictRole,
+                                   UuidConflictRole, Qt.DisplayRole])
         self._resort_if_key("conflicts")
 
     def set_bsa_conflicts(self, bsa_conflicts: dict[str, int]) -> None:
@@ -587,6 +601,8 @@ class ModListModel(QAbstractTableModel):
             return 0 if e.is_separator else self._conflicts.get(e.name, 0)
         if role == BsaConflictRole:
             return 0 if e.is_separator else self._bsa_conflicts.get(e.name, 0)
+        if role == UuidConflictRole:
+            return 0 if e.is_separator else self._uuid_conflicts.get(e.name, 0)
         if role == HighlightRole:
             if e.is_separator:
                 return self._separator_highlight(index.row(), e)
@@ -762,6 +778,14 @@ class ModListModel(QAbstractTableModel):
         else:
             self._sep_colors.pop(sep_name, None)
 
+    def set_boundary_counts(self, counts: dict[str, int] | None) -> None:
+        """Set the on-disk file counts for the Overwrite / Root Folder rows."""
+        self._boundary_counts = dict(counts or {})
+
+    def boundary_file_count(self, sep_name: str) -> int | None:
+        """File count for a boundary separator's folder, or None if unknown."""
+        return self._boundary_counts.get(sep_name)
+
     def sep_deploy_info(self, sep_name: str) -> dict:
         """Deployment override ({"path","raw","mode","merge"}) for a separator,
         keyed by its internal `..._separator` name, or {} if none."""
@@ -899,14 +923,15 @@ class ModListModel(QAbstractTableModel):
         lo, hi = min(prios), max(prios)
         return str(lo) if lo == hi else f"{lo} - {hi}"
 
-    def sep_block_summary(self, block) -> tuple[int, set, set]:
-        """(flag-bit union, loose conflict codes, BSA conflict codes) for the
+    def sep_block_summary(self, block) -> tuple[int, set, set, set]:
+        """(flag bits, loose codes, BSA codes, UUID codes) for the
         mods at *block* display rows — the collapsed-separator icon summary.
         Walks the dicts directly: the delegate asks per paint, and two
         data()/QModelIndex round-trips per row add up on big blocks."""
         bits = 0
         codes: set = set()
         bsa: set = set()
+        uuid: set = set()
         for r in block:
             e = self._entries[r]
             if e.is_separator:
@@ -918,7 +943,10 @@ class ModListModel(QAbstractTableModel):
             bc = self._bsa_conflicts.get(e.name, 0)
             if bc:
                 bsa.add(bc)
-        return bits, codes, bsa
+            uc = self._uuid_conflicts.get(e.name, 0)
+            if uc:
+                uuid.add(uc)
+        return bits, codes, bsa, uuid
 
     # ---- persistence ------------------------------------------------------
     def save(self, edit_ctx=None) -> None:

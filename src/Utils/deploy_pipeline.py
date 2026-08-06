@@ -24,7 +24,7 @@ from Utils.deploy import (
 from Utils.deploy_shared import _FILEMAP_SNAPSHOT_NAME
 from Utils.filemap import build_filemap
 from Utils.profile_backup import create_backup
-from Utils.profile_state import read_excluded_mod_files
+from Utils.profile_state import read_root_mod_files
 from Utils.ui_config import load_normalize_folder_case
 from Utils.wine_dll_config import deploy_game_wine_dll_overrides
 
@@ -276,6 +276,15 @@ def _make_custom_routing_conflict_key_fn(game):
     return _ck
 
 
+class _FilemapResult(tuple):
+    """build_filemap's 4-tuple plus extras, read via getattr by callers wanting them.
+
+    A tuple subclass so every existing 4-way unpack keeps working. No __slots__ —
+    CPython rejects a non-empty one on a tuple subtype.
+    """
+    uuid_codes: "dict | None" = None
+
+
 def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                             rescan_index: bool = False):
     """Rebuild filemap.txt + filemap_root.txt for *profile* of *game*.
@@ -306,10 +315,25 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
 
         from Utils.perftrace import span
 
-        exc_raw = read_excluded_mod_files(modlist_path.parent, None)
-        exc = {k: set(v) for k, v in exc_raw.items()} if exc_raw else None
         with span("collect_root_flagged_mods"):
             rf_mods = collect_root_flagged_mods(modlist_path, staging, log_fn=log_fn)
+
+        # Per-file state is stored against RAW paths; the merge loop matches
+        # index keys, so translate at this boundary.
+        _pm_strips = load_per_mod_strip_prefixes(modlist_path.parent)
+        from Utils.mod_files import translate_exclusions_for_engine
+        exc = translate_exclusions_for_engine(
+            modlist_path.parent, staging, game.mod_folder_strip_prefixes,
+            _pm_strips, rf_mods) or None
+        rt_raw = read_root_mod_files(modlist_path.parent, None)
+        rt = None
+        if rt_raw:
+            from Utils.filemap import index_keys_for_mod
+            rt = {
+                m: index_keys_for_mod(v, m, game.mod_folder_strip_prefixes,
+                                      _pm_strips, rf_mods)
+                for m, v in rt_raw.items() if v
+            } or None
 
         if rescan_index:
             # Sweep stray Tk-era per-profile indexes. The old Tk install path
@@ -357,6 +381,7 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                     allowed_extensions=set(game.mod_install_extensions or ()) or None,
                     root_folder_mods=set(rf_mods or ()) or None,
                     log_fn=log_fn,
+                    follow_toplevel_links_under=game.get_profile_root() / "profiles",
                 )
             except Exception as idx_err:
                 # Make the consequence explicit: a failed index write is the
@@ -385,7 +410,25 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                 # different staged prefixes are flagged (e.g. FF12 gamedata/
                 # vs ff12data/gamedata/).
                 conflict_key_fn = _make_custom_routing_conflict_key_fn(game)
+            # Games whose conflict identity lives inside the file (BG3 pak
+            # UUIDs) WRAP the path-based keying above and delegate every file
+            # they don't claim back to it.
+            _maker = getattr(game, "make_filemap_conflict_key_fn", None)
+            if _maker is not None:
+                try:
+                    _content_ck = _maker(
+                        staging, filemap_out.parent / "modindex.bin",
+                        log_fn=log_fn, fallback=conflict_key_fn)
+                except Exception as _ck_err:
+                    log_fn(f"Conflict-key setup warning: {_ck_err}")
+                    _content_ck = None
+                if _content_ck is not None:
+                    conflict_key_fn = _content_ck
 
+        # Identity conflicts have their own icon, so ask for a conflict map
+        # that excludes them (see build_filemap's conflict_extras).
+        _ident_pfx = getattr(conflict_key_fn, "identity_key_prefix", None)
+        _extras: dict = {}
         with span("build_filemap"):
             result = build_filemap(
                 modlist_path, staging, filemap_out,
@@ -408,7 +451,27 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                 filemap_casing_pins=getattr(game, "filemap_casing_pins", None),
                 conflict_key_fn=conflict_key_fn,
                 root_folder_mods=rf_mods or None,
+                root_mod_files=rt,
+                follow_toplevel_links_under=game.get_profile_root() / "profiles",
+                identity_ck_prefix=_ident_pfx,
+                conflict_extras=_extras if _ident_pfx else None,
             )
+        # Persist the UUIDs the callback read (so the next build doesn't reopen
+        # every archive) and carry its per-mod codes out for the UUID icon.
+        _save_ck = getattr(conflict_key_fn, "save_cache", None)
+        if _save_ck is not None:
+            _save_ck()
+        _uuid_codes_fn = getattr(conflict_key_fn, "uuid_conflict_codes", None)
+        if _uuid_codes_fn is not None and result is not None:
+            try:
+                _path_map = _extras.get("path_conflict_map")
+                _count, _cmap, _ov, _obv = result
+                result = _FilemapResult(
+                    (_count, _path_map if _path_map is not None else _cmap,
+                     _ov, _obv))
+                result.uuid_codes = _uuid_codes_fn()
+            except Exception as _uc_err:
+                log_fn(f"UUID conflict summary warning: {_uc_err}")
         # Game-specific filemap rewrite (e.g. Witcher 3 routes staging paths
         # like TrueFires_v1.01/modTrueFires/… to mods/modTrueFires/… so the
         # Data tab and conflicts match the deployed game-root layout).
@@ -492,6 +555,18 @@ def run_deploy_pipeline(
             # last-deployed profile may target a different game folder/prefix).
             game.load_paths()
             game_root = game.get_game_path()
+
+        # Profile Group target: reconcile it against its members' current
+        # state BEFORE the incremental probe / filemap build so both see the
+        # post-reconcile modlist, links and index. Explicit-dir based — the
+        # active profile still points at last_deployed for the restore.
+        try:
+            from Utils.profile_groups import materialize_if_group
+            materialize_if_group(
+                game, game.get_profile_root() / "profiles" / profile,
+                log_fn=log_fn)
+        except Exception as _pg_err:
+            log_fn(f"Profile Group reconcile warning: {_pg_err}")
 
         # Incremental fast path: redeploying the profile that is already
         # deployed with the same link mode → skip the restore and let the
@@ -606,12 +681,19 @@ def run_deploy_pipeline(
             else:
                 game.deploy(log_fn=log_fn, profile=profile, mode=deploy_mode)
 
+        from Utils.mod_files import excluded_raw_by_mod
+        from Utils.deploy_shared import set_deploy_excluded_raw
+
         # Defer the handler's end-of-deploy game-root snapshot: the pipeline
         # writes it once after the root-folder files land (below), instead of
         # the handler walking the game root now and the pipeline walking it
         # again for the refresh.
         game.begin_deferred_runtime_snapshot()
         try:
+            # Source resolution must never pick a disabled variant when two
+            # staged files collapse onto one filemap key. Set inside the try so
+            # the finally always clears it — a leak would follow into restore.
+            set_deploy_excluded_raw(excluded_raw_by_mod(profile_dir) or None)
             if incr_plan is not None:
                 _incr.activate(incr_plan)
                 try:
@@ -637,6 +719,7 @@ def run_deploy_pipeline(
             else:
                 _run_game_deploy()
         finally:
+            set_deploy_excluded_raw(None)
             snapshot_requested = game.end_deferred_runtime_snapshot()
 
         pfx = game.get_prefix_path()
@@ -670,6 +753,7 @@ def run_deploy_pipeline(
                 filemap_root_path, game_root, staging,
                 mode=deploy_mode, strip_prefixes=strip,
                 per_mod_strip_prefixes=per_mod_strip or None,
+                excluded_raw=excluded_raw_by_mod(profile_dir) or None,
                 log_fn=log_fn,
             )
             if rf_count:

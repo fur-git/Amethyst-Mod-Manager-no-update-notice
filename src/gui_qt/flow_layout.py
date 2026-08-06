@@ -17,6 +17,16 @@ from PySide6.QtWidgets import (
     QLayout, QLayoutItem, QSizePolicy, QSpacerItem, QWidget,
 )
 
+from gui_qt.qt_callback_guard import guard_virtuals
+
+
+def enable_height_for_width(w: QWidget) -> None:
+    """Make a FlowLayout host report its height at its ACTUAL width — Qt
+    otherwise evaluates the hint at minimum width, i.e. fully wrapped."""
+    pol = w.sizePolicy()
+    pol.setHeightForWidth(True)
+    w.setSizePolicy(pol)
+
 
 class FlowLayout(QLayout):
     def __init__(self, parent: QWidget | None = None,
@@ -108,12 +118,19 @@ class FlowLayout(QLayout):
         effective = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
         y = effective.y()
 
+        # Clamp every item to the row width: an oversized label would otherwise
+        # be placed at its full sizeHint and clip instead of eliding.
+        avail_w = max(0, effective.width())
+
+        def item_w(it: QLayoutItem) -> int:
+            return min(it.sizeHint().width(), avail_w)
+
         # Pass 1: group items into rows at the available width.
         rows: list[list[QLayoutItem]] = []
         row: list[QLayoutItem] = []
         row_w = 0
         for item in self._items:
-            w = item.sizeHint().width()
+            w = item_w(item)
             needed = row_w + (self._spacing if row else 0) + w
             if row and effective.x() + needed > effective.right():
                 rows.append(row)
@@ -128,7 +145,7 @@ class FlowLayout(QLayout):
         # Spring items (add_stretch) share the row's leftover width between the
         # widgets on either side of them; a row with springs is never centred.
         for row in rows:
-            row_w = sum(it.sizeHint().width() for it in row) \
+            row_w = sum(item_w(it) for it in row) \
                 + self._spacing * (len(row) - 1)
             springs = sum(1 for it in row if self._is_spring(it))
             per_spring = (max(0, effective.width() - row_w) // springs
@@ -143,6 +160,7 @@ class FlowLayout(QLayout):
                     x += per_spring
                     continue
                 w = item.sizeHint()
+                iw = min(w.width(), avail_w)
                 # Match QBoxLayout's cross-axis behaviour: widgets whose
                 # vertical policy can grow fill the row height; fixed-height
                 # ones (buttons, line edits) are centred on the row instead of
@@ -151,10 +169,26 @@ class FlowLayout(QLayout):
                 if not test_only:
                     item.setGeometry(QRect(
                         QPoint(x, y + (line_height - h) // 2),
-                        QSize(w.width(), h)))
-                x += w.width() + self._spacing
+                        QSize(iw, h)))
+                x += iw + self._spacing
             y += line_height + self._spacing
         if rows:
             y -= self._spacing
 
         return y - rect.y() + m.bottom()
+
+
+# Qt drives these from C++ (layout passes, reparenting), where an escaping
+# exception poisons the interpreter instead of being raised - see
+# qt_callback_guard. A stale QLayoutItem whose widget is already gone is the
+# usual way _do_layout blows up.
+guard_virtuals(
+    FlowLayout,
+    heightForWidth=0,
+    setGeometry=None,
+    sizeHint=QSize,
+    minimumSize=QSize,
+    itemAt=None,
+    takeAt=None,
+    count=0,
+)
