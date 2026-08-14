@@ -16,10 +16,10 @@ the MO2 ``[General]`` section format::
 
 This module provides:
 
-- **NexusModMeta** — data class holding per-mod Nexus info
-- **read_meta** / **write_meta** — I/O helpers (non-destructive: preserves
+- **NexusModMeta** - data class holding per-mod Nexus info
+- **read_meta** / **write_meta** - I/O helpers (non-destructive: preserves
   existing ``meta.ini`` content when writing)
-- **scan_installed_mods** — walk a staging root and collect all mods that
+- **scan_installed_mods** - walk a staging root and collect all mods that
   have Nexus metadata (``modid`` > 0)
 """
 
@@ -32,9 +32,11 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from Utils.app_log import app_log
+from Utils.atomic_write import atomic_writer
+from Utils.meta_lock import locked_meta_write
 
 
 @dataclass
@@ -73,10 +75,13 @@ class NexusModMeta:
     from_collection: str = ""          # slug of the collection that installed this mod
     from_collection_bundled: bool = False  # True for mods extracted from collection bundled/ folder
     from_collection_patched: bool = False  # True for mods that received BSDIFF40 patches from a collection
+    collection_optional: bool = False  # manifest ``optional`` flag at collection-install time
+    collection_phase: int = 0          # manifest ``phase`` at collection-install time
     xedit_modified_plugins: str = ""   # semicolon-separated plugin names edited in xEdit (set on restore)
     fomod_pending_deps: str = ""       # ';'-separated '+'-joined AND-clauses of fileDependency plugins on FOMOD options the user did NOT select; flags a rerun when a clause becomes fully present in the load order
     fomod_active_deps: str = ""        # ';'-separated '+'-joined AND-clauses of fileDependency plugins on FOMOD options the user DID select; flags a rerun when a clause is no longer fully present (its mod was removed)
     fomod_active_deps_seen: str = ""   # subset of fomod_active_deps observed SATISFIED at least once; the "orphaned patch" flag only fires for these, so a clause that was never satisfied (a hint pattern recorded by an older installer) can't fire it
+    fomod_pending_baselined: bool = False  # True once the rerun-flag refresh has evaluated fomod_pending_deps against the first post-install load order and pruned the clauses that already held (deps the wizard showed and the user declined - an informed choice, not a change); cleared by a (re)install
 
     @property
     def nexus_page_url(self) -> str:
@@ -160,26 +165,31 @@ _KEY_MAP: dict[str, str] = {
     "fromCollection":    "from_collection",
     "fromCollectionBundled": "from_collection_bundled",
     "fromCollectionPatched": "from_collection_patched",
+    "collectionOptional": "collection_optional",
+    "collectionPhase":   "collection_phase",
     "xeditModifiedPlugins": "xedit_modified_plugins",
     "fomodPendingDeps":  "fomod_pending_deps",
     "fomodActiveDeps":   "fomod_active_deps",
     "fomodActiveDepsSeen": "fomod_active_deps_seen",
+    "fomodPendingBaselined": "fomod_pending_baselined",
 }
 
 # Attributes that are ints
-_INT_FIELDS = {"mod_id", "file_id", "category_id", "latest_file_id", "file_size"}
+_INT_FIELDS = {"mod_id", "file_id", "category_id", "latest_file_id", "file_size",
+               "collection_phase"}
 
 # Attributes that are bools
 _BOOL_FIELDS = {
     "endorsed", "has_update", "ignore_update", "is_fomod", "is_bain",
     "root_folder", "from_collection_bundled", "from_collection_patched",
+    "collection_optional", "fomod_pending_baselined",
 }
 
 
 # Parsed meta.ini cache, keyed by path with the file's mtime as validity.
 # Several hot paths parse the SAME metas back-to-back on every reload /
 # profile switch (the modlist meta worker, the filemap build's root-flag
-# collect, flag refreshes) — hundreds of configparser runs each. A write
+# collect, flag refreshes) - hundreds of configparser runs each. A write
 # bumps the mtime, so the entry self-invalidates. A COPY is returned/stored:
 # callers mutate the result before write_meta, which must never leak into
 # the cached instance (all fields are scalars, so a shallow copy is enough).
@@ -236,11 +246,12 @@ def read_meta(meta_ini_path: Path) -> NexusModMeta:
     return meta
 
 
+@locked_meta_write
 def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
     """
     Write (or update) Nexus metadata into a ``meta.ini`` file.
 
-    Existing content is preserved — only the keys we manage are touched.
+    Existing content is preserved - only the keys we manage are touched.
     """
     cp = configparser.ConfigParser()
     # Preserve existing content (e.g. FOMOD flags, notes, etc.)
@@ -256,12 +267,13 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
             continue
         if attr in _BOOL_FIELDS:
             # Never clobber an existing True flag with False for state set by
-            # the installer (FOMOD, collection bundle/patch markers) — those
+            # the installer (FOMOD, collection bundle/patch markers) - those
             # come from a one-shot install step and should survive callers
             # that construct fresh ``NexusModMeta`` objects without them.
             if attr in (
                 "is_fomod", "is_bain", "from_collection_bundled",
-                "from_collection_patched",
+                "from_collection_patched", "collection_optional",
+                "fomod_pending_baselined",
             ) and not value:
                 continue
             cp.set(_SECTION, ini_key, "true" if value else "false")
@@ -274,7 +286,7 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
                 continue
             # Same for the FOMOD pending-deps list: written by the FOMOD
             # installer only. A fresh NexusModMeta from an unrelated update
-            # (endorse toggle, update check) must not wipe it — the installer
+            # (endorse toggle, update check) must not wipe it - the installer
             # clears it explicitly (removing the ini key) when a rerun finds no
             # unselected deps, so it never needs to write an empty value here.
             if attr == "fomod_pending_deps" and not value:
@@ -289,6 +301,11 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
             # that build a fresh NexusModMeta must not zero it.
             if attr == "file_size" and not value:
                 continue
+            # Same for the collection phase: stamped by the collection install;
+            # absence means phase 0, so 0 is never written and a stamped phase
+            # survives fresh NexusModMeta writers.
+            if attr == "collection_phase" and not value:
+                continue
             # Same for the uploader: stamped by the install lookup / update
             # check; a fresh NexusModMeta without it must not blank the value.
             if attr == "uploaded_by" and not value:
@@ -296,7 +313,7 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
             cp.set(_SECTION, ini_key, str(value).replace("%", "%%"))
 
     meta_ini_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(meta_ini_path, "w", encoding="utf-8") as f:
+    with atomic_writer(meta_ini_path) as f:
         cp.write(f)
 
     app_log(f"Wrote meta.ini: {meta_ini_path}")
@@ -308,6 +325,13 @@ def set_meta_key(meta_ini_path: Path, ini_key: str, value: str) -> None:
     Cheaper and safer than a read/modify/write_meta round-trip for callers that
     only maintain a single bookkeeping key.
     """
+    set_meta_keys(meta_ini_path, {ini_key: value})
+
+
+@locked_meta_write
+def set_meta_keys(meta_ini_path: Path, values: dict) -> None:
+    """Set several keys in a meta.ini's [General] section in ONE write, leaving
+    the rest untouched. A value of ``None`` REMOVES that key."""
     if not meta_ini_path.is_file():
         return
     cp = configparser.ConfigParser(allow_no_value=True, strict=False)
@@ -317,11 +341,16 @@ def set_meta_key(meta_ini_path: Path, ini_key: str, value: str) -> None:
         return
     if not cp.has_section(_SECTION):
         cp.add_section(_SECTION)
-    cp.set(_SECTION, ini_key, str(value).replace("%", "%%"))
-    with open(meta_ini_path, "w", encoding="utf-8") as f:
+    for ini_key, value in values.items():
+        if value is None:
+            cp.remove_option(_SECTION, ini_key)
+        else:
+            cp.set(_SECTION, ini_key, str(value).replace("%", "%%"))
+    with atomic_writer(meta_ini_path) as f:
         cp.write(f)
 
 
+@locked_meta_write
 def ensure_installed_stamp(meta_ini_path: Path) -> bool:
     """
     If ``installed`` is missing from meta.ini, backfill it from the file's mtime
@@ -339,7 +368,7 @@ def ensure_installed_stamp(meta_ini_path: Path) -> bool:
     mtime = meta_ini_path.stat().st_mtime
     dt = datetime.fromtimestamp(mtime)
     cp.set(_SECTION, "installed", dt.strftime("%Y-%m-%dT%H:%M:%S"))
-    with open(meta_ini_path, "w", encoding="utf-8") as f:
+    with atomic_writer(meta_ini_path) as f:
         cp.write(f)
     return True
 
@@ -391,6 +420,18 @@ def build_meta_from_download(
     return meta
 
 
+def has_reinstall_carryover(installed: "NexusModMeta | None") -> bool:
+    """True when an installed meta carries anything merge_reinstall_metadata
+    would preserve. Reinstall callers must NOT hand _write_install_meta a
+    prebuilt meta otherwise: an identity-less prebuilt short-circuits its
+    filename/MD5 Nexus lookup, so a mod that was never identified at install
+    time would stay unidentified forever."""
+    return installed is not None and bool(
+        getattr(installed, "mod_id", 0)
+        or getattr(installed, "root_folder", False)
+        or getattr(installed, "from_collection", ""))
+
+
 def merge_reinstall_metadata(
     refreshed: "NexusModMeta | None",
     installed: "NexusModMeta | None",
@@ -400,7 +441,9 @@ def merge_reinstall_metadata(
     API/download metadata remains authoritative when available.  A local
     reinstall can reuse stable package identity from the installed metadata,
     while install-layout and collection ownership must survive either path.
-    Transient update-check and user-state fields are deliberately excluded.
+    Transient update-check state is deliberately excluded (re-derived by the
+    next check), as is from_collection_patched (a plain reinstall does NOT
+    reapply a collection's BSDIFF patches, so the badge would lie).
     """
     meta = copy.copy(refreshed) if refreshed is not None else NexusModMeta()
     if installed is None:
@@ -425,8 +468,19 @@ def merge_reinstall_metadata(
         if not getattr(meta, field_name):
             setattr(meta, field_name, getattr(installed, field_name))
 
+    # Layout + ownership come from the INSTALLED meta unconditionally - a
+    # fresh API/download meta can never know them (build_meta_from_download
+    # leaves them at defaults), and losing root_folder flattens a root
+    # package's Data/ tree on reinstall (the bug this merge exists to fix).
     meta.root_folder = installed.root_folder
     meta.from_collection = installed.from_collection
+    meta.from_collection_bundled = installed.from_collection_bundled
+    # A dismissed update nag survives reinstalling the SAME file - the update
+    # checker un-ignores by itself when a version STRICTLY NEWER than
+    # ignored_version appears (nexus_update_checker), so this can't hide a
+    # genuinely new update.
+    meta.ignore_update = installed.ignore_update
+    meta.ignored_version = installed.ignored_version
     return meta
 
 
@@ -482,7 +536,7 @@ _root_flag_cache: dict[str, tuple[float, bool]] = {}
 def collect_root_flagged_mods(modlist_path: Path, staging_root: Path,
                               log_fn=None) -> set[str]:
     """Return the set of mods in *modlist_path* whose meta.ini sets
-    rootFolder=true — DISABLED mods included. Malformed meta.ini files are
+    rootFolder=true - DISABLED mods included. Malformed meta.ini files are
     logged (if *log_fn* is provided) and skipped. Per-file results are
     mtime-cached.
 
@@ -491,9 +545,9 @@ def collect_root_flagged_mods(modlist_path: Path, staging_root: Path,
     keep their Data/ prefix unstripped) independent of its enabled state.
     Skipping disabled entries meant a root mod that was disabled during a
     Refresh had its index entry rebuilt STRIPPED; enabling it later (no
-    rescan on toggle) root-deployed the stripped paths — e.g. a freshly
+    rescan on toggle) root-deployed the stripped paths - e.g. a freshly
     wizard-installed SKSE put Scripts/ in the game root instead of Data/.
-    For build_filemap the extra names are harmless — it only tests membership
+    For build_filemap the extra names are harmless - it only tests membership
     for mods already in the enabled iteration."""
     from Utils.modlist import read_modlist
 
@@ -606,9 +660,9 @@ def resolve_nexus_meta_for_archive(
     """
     Try to identify a Nexus mod from an archive using:
 
-      1. **Filename parsing** — extract mod_id from the Nexus-style filename
+      1. **Filename parsing** - extract mod_id from the Nexus-style filename
          suffix, then query the API for full details.
-      2. **MD5 hash lookup** — hash the archive and query
+      2. **MD5 hash lookup** - hash the archive and query
          ``GET /games/{domain}/mods/md5_search/{hash}``.
 
     Returns a :class:`NexusModMeta` if identified, or ``None``.
@@ -630,8 +684,8 @@ def resolve_nexus_meta_for_archive(
         _log(f"Nexus: Detected mod ID {fn_info.mod_id} from filename.")
 
         if api is None:
-            # Offline — save what we can from the filename alone.
-            _log("Nexus: Not connected — saving mod ID and install date from filename.")
+            # Offline - save what we can from the filename alone.
+            _log("Nexus: Not connected - saving mod ID and install date from filename.")
             now = datetime.now(timezone.utc)
             date_version = now.strftime("d%Y.%-m.%-d.0")
             return NexusModMeta(
@@ -738,12 +792,47 @@ def resolve_nexus_meta_for_archive(
                 file_category=file_data.get("category_name", ""),
                 nexus_url=f"https://www.nexusmods.com/{game_domain}/mods/{mod_data.get('mod_id', 0)}",
             )
-            _log(f"Nexus: MD5 match — '{meta.nexus_name}' "
+            _log(f"Nexus: MD5 match - '{meta.nexus_name}' "
                  f"(mod {meta.mod_id}, file {meta.file_id}).")
             return meta
         else:
-            _log("Nexus: No MD5 match found — this file may not be from Nexus.")
+            _log("Nexus: No MD5 match found - this file may not be from Nexus.")
     except Exception as exc:
-        _log(f"Nexus: MD5 lookup failed — {exc}")
+        _log(f"Nexus: MD5 lookup failed - {exc}")
 
     return None
+
+
+def resolve_nexus_meta_for_archive_domains(
+    archive_path: Path,
+    game_domains: Iterable[str],
+    api: Optional[object] = None,
+    log_fn: Optional[callable] = None,
+) -> Optional[NexusModMeta]:
+    """Identify an archive across a game's primary and additional domains.
+
+    A result that identifies the exact Nexus file wins over a filename-only
+    mod-page match. If no domain can identify the file, the primary domain's
+    partial result preserves the legacy fallback behaviour.
+    """
+    domains: list[str] = []
+    seen: set[str] = set()
+    for raw in game_domains:
+        domain = normalise_game_domain(raw or "")
+        if domain and domain not in seen:
+            seen.add(domain)
+            domains.append(domain)
+    if not domains:
+        return None
+
+    partial: Optional[NexusModMeta] = None
+    for domain in domains:
+        meta = resolve_nexus_meta_for_archive(
+            archive_path, domain, api=api, log_fn=log_fn)
+        if meta is None:
+            continue
+        if meta.file_id > 0:
+            return meta
+        if partial is None:
+            partial = meta
+    return partial

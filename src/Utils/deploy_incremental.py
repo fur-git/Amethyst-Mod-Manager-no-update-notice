@@ -2,20 +2,20 @@
 deploy_incremental.py
 Incremental redeploy for standard-mode (Data/) games.
 
-When nothing structural changed since the last deploy — same profile, same
-link mode, deployment still on disk — the deploy pipeline activates an
+When nothing structural changed since the last deploy - same profile, same
+link mode, deployment still on disk - the deploy pipeline activates an
 "incremental plan" and the three standard primitives cooperate instead of
 tearing everything down and rebuilding it:
 
-  move_to_core    — keeps the deployed Data/ and its <Data>_Core backup
-  deploy_filemap  — diffs the new task set against the previous deploy
+  move_to_core    - keeps the deployed Data/ and its <Data>_Core backup
+  deploy_filemap  - diffs the new task set against the previous deploy
                     (apply_incremental below) and only unlinks/links deltas
-  deploy_core     — no-op; the diff refills vanilla gaps itself
+  deploy_core     - no-op; the diff refills vanilla gaps itself
 
 The handler's own post-deploy steps (plugins.txt symlink, archive
 invalidation, plugin mtime stamping, …) run unchanged.  Any anomaly raises
 IncrementalFallback, which run_deploy_pipeline catches to rerun the classic
-full restore + deploy — restore_data_core is built to recover an arbitrary
+full restore + deploy - restore_data_core is built to recover an arbitrary
 half-mutated Data/, so a partial incremental pass is always safe to abandon.
 
 Kill switch: AMM_DEPLOY_INCREMENTAL=0 forces the full path.
@@ -23,15 +23,14 @@ Verify mode:  AMM_DEPLOY_VERIFY=1 re-checks every deployed file after an
 incremental deploy and logs mismatches (never fails the deploy).
 
 State on disk (all in the profile root, beside filemap.txt):
-  deployed_filemap.txt — rel→mod of the last deploy's effective placed set,
+  deployed_filemap.txt - rel→mod of the last deploy's effective placed set,
                          written by every successful deploy_filemap run
-  deploy_stats.txt     — (size, mtime_ns) per placed regular file (existing)
-  last_deploy_mode     — key in deploy_state.json (see BaseGame)
+  deploy_stats.txt     - (size, mtime_ns) per placed regular file (existing)
+  last_deploy_mode     - key in deploy_state.json (see BaseGame)
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import errno
 import os
 import stat as _stat_m
@@ -45,8 +44,8 @@ from Utils.deploy_shared import (
     _OVERWRITE_NAME,
     _append_overwrite_log,
     _default_core,
-    _deploy_workers,
     _do_link_ex,
+    _iter_map_batched,
     _map_batched,
     _mkdir_leaves,
     _move_crash_safe,
@@ -56,7 +55,7 @@ from Utils.deploy_shared import (
 DEPLOYED_FILEMAP_NAME = "deployed_filemap.txt"
 
 # When more than this share of the (old ∪ new) deployment changed, a full
-# deploy is cheaper/safer than a diff — mirrors filemap.py's incremental cap.
+# deploy is cheaper/safer than a diff - mirrors filemap.py's incremental cap.
 _DELTA_FALLBACK_RATIO = 0.40
 
 
@@ -65,13 +64,13 @@ class IncrementalFallback(RuntimeError):
 
     Raised by the primitive hooks / apply_incremental and caught in exactly
     one place: run_deploy_pipeline, which then reruns the full restore +
-    deploy.  Safe even after partial mutation — restore_data_core recovers
+    deploy.  Safe even after partial mutation - restore_data_core recovers
     any intermediate Data/ state (fresh links are symlinks / nlink>1 files,
     rescued runtime files are already in overwrite/)."""
 
 
 def incremental_enabled() -> bool:
-    """Kill switch — set AMM_DEPLOY_INCREMENTAL=0 to force full deploys."""
+    """Kill switch - set AMM_DEPLOY_INCREMENTAL=0 to force full deploys."""
     return os.environ.get("AMM_DEPLOY_INCREMENTAL") != "0"
 
 
@@ -115,7 +114,7 @@ def active_for(deploy_dir) -> "IncrementalPlan | None":
     """Return the active plan when *deploy_dir* is its target, else None.
 
     A primitive invoked for a *different* directory while a plan is active
-    (e.g. a chained second deploy target) is a state we never planned for —
+    (e.g. a chained second deploy target) is a state we never planned for -
     fall back to the full path rather than guess."""
     if _ACTIVE is None:
         return None
@@ -165,7 +164,7 @@ def plan_incremental(game, profile: str, mode: LinkMode,
     """Return an IncrementalPlan when this deploy can run incrementally.
 
     Every miss is logged with its reason and returns None (full path).
-    Read-only — nothing on disk is touched here."""
+    Read-only - nothing on disk is touched here."""
     _log = _safe_log(log_fn)
     if not incremental_enabled():
         return None
@@ -173,7 +172,7 @@ def plan_incremental(game, profile: str, mode: LinkMode,
         return None
 
     def _skip(reason: str) -> None:
-        _log(f"Incremental deploy unavailable — {reason}; using the full path.")
+        _log(f"Incremental deploy unavailable - {reason}; using the full path.")
         return None
 
     try:
@@ -206,7 +205,7 @@ def plan_incremental(game, profile: str, mode: LinkMode,
             return _skip("leftover custom-deploy log present")
 
         # Per-separator overrides drive the wholesale-replace / dir-symlink /
-        # per-mod link-mode machinery in the full path — v1 of the diff does
+        # per-mod link-mode machinery in the full path - v1 of the diff does
         # not mirror them, so any configured override falls back.
         from Utils.deploy_shared import load_separator_deploy_paths
         profile_dir = game.get_profile_root() / "profiles" / profile
@@ -230,7 +229,7 @@ def plan_incremental(game, profile: str, mode: LinkMode,
             old_filemap=old_filemap,
             deploy_stats=_load_deploy_stats(stats_path),
         )
-    except Exception as exc:                    # noqa: BLE001 — never block a deploy
+    except Exception as exc:                    # noqa: BLE001 - never block a deploy
         return _skip(f"eligibility check failed ({exc})")
 
 
@@ -254,9 +253,9 @@ def apply_incremental(
 ) -> "tuple[int, set[str]]":
     """Diff *tasks* (the new deployment) against plan.old_filemap and apply.
 
-    tasks   — deploy_filemap's resolved task list:
+    tasks   - deploy_filemap's resolved task list:
               (src_str, dst_str, rel_lower, is_custom, use_symlink, override_mode)
-    rel_mod — rel_lower -> (rel_str, mod_name) for the new deployment.
+    rel_mod - rel_lower -> (rel_str, mod_name) for the new deployment.
 
     Returns (files_linked, placed_lower) exactly like the full deploy_filemap
     path, so the calling handler code is none the wiser.  Raises
@@ -303,7 +302,7 @@ def apply_incremental(
         try:
             dstat = os.lstat(dst)
         except OSError:
-            return rel_lower                # destination vanished — relink
+            return rel_lower                # destination vanished - relink
         if _stat_m.S_ISLNK(dstat.st_mode):
             # Symlink placement (requested, or hardlink fell back to it):
             # intact iff it still points at the staging source.
@@ -314,9 +313,9 @@ def apply_incremental(
         try:
             sst = os.lstat(src)
         except OSError:
-            return rel_lower                # source vanished — relink WARNs
+            return rel_lower                # source vanished - relink WARNs
         if dstat.st_ino == sst.st_ino and dstat.st_dev == sst.st_dev:
-            return None                     # hardlink intact — airtight check
+            return None                     # hardlink intact - airtight check
         # Copy placement (or a hardlink whose staging side was replaced,
         # breaking the link).  Unchanged only when BOTH sides still match the
         # recorded deploy-time stat: the destination check catches in-place
@@ -380,12 +379,12 @@ def apply_incremental(
     def _clear_dst(dst: str, rel_lower: str,
                    staging_dst: "str | None" = None) -> None:
         """Clear whatever sits at *dst* so a new link can land (or the path
-        can stay vacant).  Managed placements — symlinks, hardlinks, copies
-        still matching the deploy record or the vanilla backup — are
+        can stay vacant).  Managed placements - symlinks, hardlinks, copies
+        still matching the deploy record or the vanilla backup - are
         discarded (staging/core owns the data); anything else is a runtime
         or externally-edited file.  When *staging_dst* is given (same-mod
         "changed" rels), an edited file is moved back onto its staging
-        source — the restore path's xEdit semantics — so the relink deploys
+        source - the restore path's xEdit semantics - so the relink deploys
         the edited content; otherwise it is rescued to overwrite/."""
         try:
             st = os.lstat(dst)
@@ -449,7 +448,7 @@ def apply_incremental(
     # Relinked rels: clear whatever occupies the destination (stale vanilla
     # fill, old mod link, runtime file) before the new link lands.  For
     # same-mod "changed" rels an edited destination goes back onto its
-    # staging source (xEdit semantics — the relink then redeploys the edit);
+    # staging source (xEdit semantics - the relink then redeploys the edit);
     # added/moved rels rescue foreign content to overwrite/.
     changed_set = set(changed)
     for rel_lower in relink:
@@ -489,27 +488,30 @@ def apply_incremental(
         return rel_lower, actual, None, line
 
     if link_specs:
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=_deploy_workers()) as pool:
-            for rel_lower, actual, err, line in pool.map(_do_one, link_specs):
-                done += 1
-                if err is not None:
-                    dst_err, exc = err
-                    if getattr(exc, "errno", None) == errno.ENOSPC:
-                        pool.shutdown(wait=True, cancel_futures=True)
-                        _log(f"  ERROR: game drive is full — aborting deploy "
-                             f"(failed at {dst_err}). Free up space, then run "
-                             f"Restore and deploy again.")
-                        raise OSError(errno.ENOSPC,
-                                      f"Game drive full while deploying {dst_err}")
-                    _log(f"  WARN: could not transfer {dst_err}: {exc}")
-                    continue
-                placed_relinked.add(rel_lower)
-                linked += 1
-                if line is not None:
-                    stats_new[rel_lower] = line
-                if progress_fn is not None and (done % 200 == 0 or done == total_ops):
-                    progress_fn(done, total_ops)
+        def _link_fatal(result) -> bool:
+            err = result[2]
+            return (err is not None
+                    and getattr(err[1], "errno", None) == errno.ENOSPC)
+
+        for rel_lower, actual, err, line in _iter_map_batched(
+                _do_one, link_specs, stop_on=_link_fatal):
+            done += 1
+            if err is not None:
+                dst_err, exc = err
+                if getattr(exc, "errno", None) == errno.ENOSPC:
+                    _log(f"  ERROR: game drive is full - aborting deploy "
+                         f"(failed at {dst_err}). Free up space, then run "
+                         f"Restore and deploy again.")
+                    raise OSError(errno.ENOSPC,
+                                  f"Game drive full while deploying {dst_err}")
+                _log(f"  WARN: could not transfer {dst_err}: {exc}")
+                continue
+            placed_relinked.add(rel_lower)
+            linked += 1
+            if line is not None:
+                stats_new[rel_lower] = line
+            if progress_fn is not None and (done % 200 == 0 or done == total_ops):
+                progress_fn(done, total_ops)
 
     def _do_refill(item):
         cp, dst = item
@@ -517,21 +519,22 @@ def apply_incremental(
         return dst, actual, err
 
     if refill_tasks:
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=_deploy_workers()) as pool:
-            for dst, actual, err in pool.map(_do_refill, refill_tasks):
-                done += 1
-                if err is not None:
-                    if getattr(err, "errno", None) == errno.ENOSPC:
-                        pool.shutdown(wait=True, cancel_futures=True)
-                        raise OSError(errno.ENOSPC,
-                                      f"Game drive full while deploying {dst}")
-                    _log(f"  WARN: could not restore vanilla {dst}: {err}")
-                    continue
-                if actual is LinkMode.SYMLINK:
-                    vanilla_added.append(dst[plen:])
-                if progress_fn is not None and (done % 200 == 0 or done == total_ops):
-                    progress_fn(done, total_ops)
+        def _refill_fatal(result) -> bool:
+            return getattr(result[2], "errno", None) == errno.ENOSPC
+
+        for dst, actual, err in _iter_map_batched(
+                _do_refill, refill_tasks, stop_on=_refill_fatal):
+            done += 1
+            if err is not None:
+                if getattr(err, "errno", None) == errno.ENOSPC:
+                    raise OSError(errno.ENOSPC,
+                                  f"Game drive full while deploying {dst}")
+                _log(f"  WARN: could not restore vanilla {dst}: {err}")
+                continue
+            if actual is LinkMode.SYMLINK:
+                vanilla_added.append(dst[plen:])
+            if progress_fn is not None and (done % 200 == 0 or done == total_ops):
+                progress_fn(done, total_ops)
 
     # Prune directories emptied by the removals (deepest first; rmdir only
     # succeeds on empty dirs, so refilled/live paths are naturally kept).
@@ -565,7 +568,7 @@ def apply_incremental(
         else:
             ds = stats.get(rel_lower)
             if ds is not None:
-                # Kept file — previous record still accurate.  The loader
+                # Kept file - previous record still accurate.  The loader
                 # lowercases rels, so the new filemap's casing is fine here.
                 stats_lines.append(f"{rel_mod[rel_lower][0]}\t{ds[0]}\t{ds[1]}\n")
     _write_deploy_stats(state_dir / _DEPLOY_STATS_NAME, stats_lines,
@@ -628,7 +631,7 @@ def _record_overwrite_index(overwrite_dir: Path, rels: "list[str]", _log) -> Non
 def _verify(new_tasks: dict, final_placed: "set[str]", eff_mode_fn,
             core_index: "dict[str, tuple[str, str]]", deploy_dir_str: str,
             dir_listing_cache: dict, resolved_dir_cache: dict, _log) -> None:
-    """AMM_DEPLOY_VERIFY=1 — check every placed rel is correctly linked and
+    """AMM_DEPLOY_VERIFY=1 - check every placed rel is correctly linked and
     every uncovered vanilla file is present.  Logs a summary, never raises.
     A debugging aid: clarity over speed."""
     from Utils.deploy_standard import _MTIME_TOLERANCE_NS
@@ -654,7 +657,7 @@ def _verify(new_tasks: dict, final_placed: "set[str]", eff_mode_fn,
             return 1
         if st.st_ino == sst.st_ino and st.st_dev == sst.st_dev:
             return 0
-        # copy / fell back to copy — size + mtime parity
+        # copy / fell back to copy - size + mtime parity
         if st.st_size == sst.st_size \
                 and abs(st.st_mtime_ns - sst.st_mtime_ns) <= _MTIME_TOLERANCE_NS:
             return 0
@@ -677,7 +680,7 @@ def _verify(new_tasks: dict, final_placed: "set[str]", eff_mode_fn,
 
     if mismatches or missing_vanilla:
         _log(f"  VERIFY: {mismatches} mismatched deployed file(s), "
-             f"{missing_vanilla} missing vanilla file(s) — incremental deploy "
+             f"{missing_vanilla} missing vanilla file(s) - incremental deploy "
              f"diverged; run a full deploy (AMM_DEPLOY_INCREMENTAL=0) and report.")
     else:
         _log("  VERIFY: incremental deploy matches expectation.")

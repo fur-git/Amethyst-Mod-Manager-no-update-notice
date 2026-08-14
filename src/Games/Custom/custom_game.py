@@ -11,21 +11,23 @@ JSON format (~/.config/AmethystModManager/custom_games/<game_id>.json):
   "mod_data_path":     "Data",       // relative path (standard only; ignored for root/ue5)
   "steam_id":          "",           // optional Steam App ID
   "nexus_game_domain": "",           // optional Nexus domain slug
+  "additional_nexus_domains": [],     // optional extra Nexus domain slugs
+  "thunderstore_community": "",      // optional Thunderstore community slug
   "image_url":         ""            // optional banner image URL
   "editable":          true          // false = skip definition editor on reconfigure (for repo handlers)
 }
 
 Deploy types
 ------------
-standard — mods go into a single subdirectory (mod_data_path) inside the
+standard - mods go into a single subdirectory (mod_data_path) inside the
            game root, same pattern as Bethesda games and BepInEx.
            Uses the Core backup + filemap deploy approach.
 
-root     — mods are deployed directly to the game's root folder,
+root     - mods are deployed directly to the game's root folder,
            same pattern as The Witcher 3 and Cyberpunk 2077.
            Uses the root filemap deploy approach (backed-up log).
 
-ue5      — uses the UE5 multi-target manifest deploy; with no routing
+ue5      - uses the UE5 multi-target manifest deploy; with no routing
            rules everything lands in the game root via the deployed.txt
            manifest, same as Oblivion Remastered / Hogwarts Legacy.
 """
@@ -115,7 +117,7 @@ def _defn_to_custom_rules(defn: dict) -> list[CustomRule]:
     Each entry is a dict with keys ``dest``, and optionally ``extensions``,
     ``folders``, and/or ``filenames``.
 
-    ``folders`` keeps the casing the definition spelled — matching lowercases
+    ``folders`` keeps the casing the definition spelled - matching lowercases
     it everywhere, but the deploy uses it as the canonical casing for the
     folder it names, so mods shipping ``~Mods`` and ``~mods`` land in one
     folder (see ``canonicalize_declared_folders``).
@@ -190,7 +192,7 @@ def load_custom_game_definitions() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Built-in presets — ready-made starting templates offered in the define-custom-
+# Built-in presets - ready-made starting templates offered in the define-custom-
 # game editor's "Load Preset" dropdown (alongside the user's own definitions).
 # These are never written to disk on their own; selecting one just prefills the
 # form.  The user still supplies a unique name and executable path.
@@ -205,6 +207,8 @@ BUILTIN_GAME_TEMPLATES: list[dict] = [
         "mod_data_path": "BepInEx/plugins",
         "steam_id": "",
         "nexus_game_domain": "",
+        "additional_nexus_domains": [],
+        "thunderstore_community": "",
         "image_url": "",
         "mod_folder_strip_prefixes": ["BepInEx", "plugins"],
         "conflict_ignore_filenames": [],
@@ -241,6 +245,7 @@ BUILTIN_GAME_TEMPLATES: list[dict] = [
         "mod_data_path": "GAMEID",
         "steam_id": "",
         "nexus_game_domain": "",
+        "additional_nexus_domains": [],
         "image_url": "",
         "mod_folder_strip_prefixes": [
             "GAMEID", "Content", "Paks", "~mods", "Binaries", "Win64",
@@ -303,7 +308,7 @@ def delete_custom_game_definition(game_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Share codes — pack a custom game definition into a compact, copy-pasteable
+# Share codes - pack a custom game definition into a compact, copy-pasteable
 # string (same scheme as the profile share code: JSON → zlib → urlsafe base64
 # with a version prefix) so a definition can be shared and re-applied as a
 # preset in the define-custom-game editor.
@@ -365,7 +370,7 @@ def download_missing_custom_game_images(
     ----------
     on_done:
         Optional callback invoked with the *game_id* after each image is
-        successfully saved.  It is called from the worker thread — if you
+        successfully saved.  It is called from the worker thread - if you
         need to update the UI, use ``widget.after(0, ...)`` inside the
         callback.
     """
@@ -445,6 +450,15 @@ class StandardCustomGame(BaseGame):
     @property
     def nexus_game_domain(self) -> str:
         return self._defn.get("nexus_game_domain", "")
+
+    @property
+    def additional_nexus_domains(self) -> list[str]:
+        value = self._defn.get("additional_nexus_domains", [])
+        return list(value) if isinstance(value, (list, tuple, set)) else []
+
+    @property
+    def thunderstore_community(self) -> str:
+        return self._defn.get("thunderstore_community", "")
 
     @property
     def image_url(self) -> str:
@@ -561,7 +575,7 @@ class StandardCustomGame(BaseGame):
 
     def runtime_snapshot_exclude_dirs(self) -> set[str] | None:
         # Exclude the configured deploy subfolder. No subfolder = deploy target
-        # is the game root, so there is nothing to snapshot around — None.
+        # is the game root, so there is nothing to snapshot around - None.
         rel = self._defn.get("mod_data_path", "").strip("/\\")
         if not rel:
             return None
@@ -622,7 +636,7 @@ class StandardCustomGame(BaseGame):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
-        # Separator overrides — loaded from the real profile_dir and passed
+        # Separator overrides - loaded from the real profile_dir and passed
         # explicitly so shared-staging layouts get the right link modes.
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
@@ -726,7 +740,7 @@ class RootCustomGame(StandardCustomGame):
         return self._game_path
 
     def runtime_snapshot_exclude_dirs(self) -> set[str] | None:
-        # Mods deploy to the game root — no subfolder, so capture does not apply.
+        # Mods deploy to the game root - no subfolder, so capture does not apply.
         return None
 
     def deploy(self, log_fn=None, mode: LinkMode = LinkMode.HARDLINK,
@@ -745,7 +759,7 @@ class RootCustomGame(StandardCustomGame):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
-        # Separator overrides — loaded from the real profile_dir so custom-routed
+        # Separator overrides - loaded from the real profile_dir so custom-routed
         # files honour a separator's File Transfer Method (shared-staging safe).
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
@@ -812,13 +826,13 @@ class Ue5CustomGame(UE5Game):
     """Custom game that uses the UE5 manifest deploy ('ue5' mode).
 
     No routing rules are defined, so every file goes to the game root and is
-    tracked via ue5_deployed.txt — identical to how Oblivion Remastered works
+    tracked via ue5_deployed.txt - identical to how Oblivion Remastered works
     when all rules fall through to the default destination.
     """
 
     def __init__(self, defn: dict) -> None:
         self._defn = defn
-        # UE5Game.__init__ calls load_paths() — run after setting _defn
+        # UE5Game.__init__ calls load_paths() - run after setting _defn
         super().__init__()
 
     # ------------------------------------------------------------------
@@ -846,6 +860,15 @@ class Ue5CustomGame(UE5Game):
     @property
     def nexus_game_domain(self) -> str:
         return self._defn.get("nexus_game_domain", "")
+
+    @property
+    def additional_nexus_domains(self) -> list[str]:
+        value = self._defn.get("additional_nexus_domains", [])
+        return list(value) if isinstance(value, (list, tuple, set)) else []
+
+    @property
+    def thunderstore_community(self) -> str:
+        return self._defn.get("thunderstore_community", "")
 
     @property
     def image_url(self) -> str:
@@ -979,7 +1002,7 @@ class Ue5CustomGame(UE5Game):
         return {}
 
     # ------------------------------------------------------------------
-    # UE5 routing — the user's custom_routing_rules are converted to
+    # UE5 routing - the user's custom_routing_rules are converted to
     # UE5Rules and prepended by UE5Game.ue5_routing_rules; the built-in
     # defaults below act as fallbacks when no custom rule matched.
     # ------------------------------------------------------------------

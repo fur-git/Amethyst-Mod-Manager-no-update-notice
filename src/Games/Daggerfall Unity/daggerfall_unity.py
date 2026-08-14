@@ -5,7 +5,7 @@ Game handler for Daggerfall Unity.
 Mod structure:
   Everything a mod ships lands under
     <game_path>/DaggerfallUnity_Data/StreamingAssets/
-  Packaged mods are single .dfmod asset bundles in StreamingAssets/Mods/ —
+  Packaged mods are single .dfmod asset bundles in StreamingAssets/Mods/ -
   DFU scans that folder recursively, so per-mod subfolders are fine.  Loose
   replacement assets go in the sibling StreamingAssets folders instead
   (Textures/, Quests/, QuestPacks/, Sound/, Text/, …), which is why the whole
@@ -15,12 +15,13 @@ Mod structure:
   Root_Folder/ files deploy straight to the game install root (handled by GUI).
 
 Notes:
-  - DFU is a native Linux binary shipped as a standalone zip — there is no
+  - DFU is a native Linux binary shipped as a standalone zip - there is no
     Steam app id and no Proton prefix.  get_launch_command() runs the player
     directly; the binary is normally <game_path>/DaggerfallUnity.x86_64 but a
     user-set override is honoured (persisted as a paths.json extra).
-  - The load order lives outside the game folder, in DFU's own Mods.json —
-    see dfu_mods_json.py.
+  - The load order lives outside the game folder, in DFU's own Mods.json.
+    Amethyst synchronises it by default; users can instead leave it entirely
+    to DFU with the "Manage load order in DFU" option.
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ _LOOSE_FILE_HOMES = {"namegen.txt": "Text"}
 # because plainer spellings ("Windows Version", "Mac") turn up too.
 _PLATFORM_DIRS = ("standalonelinux64", "standalonewindows64",
                   "standalonewindows", "standaloneosx")
-# Whole words only, and never bare "win"/"mac" — this collection alone has a
+# Whole words only, and never bare "win"/"mac" - this collection alone has a
 # "Windmills of Daggerfall" that a substring match would call a Windows build.
 _PLATFORM_WORDS = ("linux", "windows", "osx", "macos")
 # Rank order: exact build-target folders first, then loose spellings, Linux
@@ -114,7 +115,7 @@ _CASING_PINS = {
 def _mods_json():
     """Load the sibling dfu_mods_json module (the folder name has a space)."""
     # Handlers are loaded by file path, and "Games.Daggerfall Unity.x" is not a
-    # valid dotted import — same trick BG3 uses for its mod.io helpers.
+    # valid dotted import - same trick BG3 uses for its mod.io helpers.
     mod_name = "dfu_mods_json_dfu"
     cached = sys.modules.get(mod_name)
     if cached is not None:
@@ -140,7 +141,7 @@ def _platform_rank(path: Path, dest_root: Path) -> int:
     """Rank a .dfmod by how well its platform folder suits the Linux player.
 
     Lower is better.  A bundle in no platform folder outranks every
-    platform-specific one — it is the author's single cross-platform build.
+    platform-specific one - it is the author's single cross-platform build.
     """
     folder = _platform_folder(path, dest_root)
     if not folder:
@@ -180,7 +181,7 @@ def normalise_dfu_mod(dest_root: Path, mod_name: str, log_fn) -> None:
         if (dest_root / "Mods") not in best.parents and _move_into(best, dest_root / "Mods"):
             moved += 1
         # Only ever delete a *duplicate* of a bundle we already took, and only
-        # when it sits in a platform folder — a lone bundle under a folder that
+        # when it sits in a platform folder - a lone bundle under a folder that
         # merely reads like a platform name must be left alone.
         for other in paths:
             if other == best or not other.is_file():
@@ -214,6 +215,10 @@ class DaggerfallUnity(BaseGame):
     # The launch binary is a configured path, so make it per-profile like the
     # game/staging paths (stored as a paths.json extra).
     profile_overridable_paths_extras = ("launch_binary_path",)
+    profile_overridable_settings = (
+        *BaseGame.profile_overridable_settings,
+        "manage_load_order_in_dfu",
+    )
 
     def __init__(self):
         self._game_path: Path | None = None
@@ -242,14 +247,14 @@ class DaggerfallUnity(BaseGame):
     @property
     def steam_id(self) -> str:
         # DFU is a standalone download from the Daggerfall Workshop GitHub
-        # releases — it has no Steam app id of its own.  (Steam 1812390 is the
+        # releases - it has no Steam app id of its own.  (Steam 1812390 is the
         # DOS original, useful only as a source of the ARENA2 game files.)
         return ""
 
     @property
     def auto_drive_scan(self) -> bool:
         # No storefront ships DFU, so the store-library scan can never find
-        # it — go straight to the all-drives scan.
+        # it - go straight to the all-drives scan.
         return True
 
     @property
@@ -297,7 +302,7 @@ class DaggerfallUnity(BaseGame):
 
     @property
     def excluded_loose_filenames(self) -> set[str]:
-        # Nothing DFU loads sits loose at a mod's top level — every asset lives
+        # Nothing DFU loads sits loose at a mod's top level - every asset lives
         # in a StreamingAssets subfolder, and normalise_dfu_mod has already
         # rehomed the files that belong somewhere.  What is left is changelogs,
         # posters, guides and per-platform bundle manifests.
@@ -339,7 +344,17 @@ class DaggerfallUnity(BaseGame):
         self._deploy_mode = mode
         self.save_paths()
 
-    # DFU is a native Linux binary — no Proton prefix, so never look one up.
+    @property
+    def manage_load_order_in_dfu(self) -> bool:
+        """Whether DFU, rather than Amethyst, owns the .dfmod load order."""
+        return self._load_settings().get("manage_load_order_in_dfu", False)
+
+    def set_manage_load_order_in_dfu(self, value: bool) -> None:
+        data = self._load_settings()
+        data["manage_load_order_in_dfu"] = bool(value)
+        self._save_settings(data)
+
+    # DFU is a native Linux binary - no Proton prefix, so never look one up.
     def _find_prefix_for_load(self) -> "Path | None":
         return None
 
@@ -416,7 +431,7 @@ class DaggerfallUnity(BaseGame):
     # -----------------------------------------------------------------------
 
     def _ordered_dfmods(self, profile: str) -> list[Path]:
-        """Deployed .dfmod paths in mod-list priority order (index 0 = highest)."""
+        """Deployed .dfmod paths in top-to-bottom mod-list order."""
         deploy_dir = self.get_mod_data_path()
         if deploy_dir is None:
             return []
@@ -444,6 +459,27 @@ class DaggerfallUnity(BaseGame):
                     ordered.append(hit)
         return ordered
 
+    def _sync_mods_json(self, profile: str, log_fn) -> None:
+        """Sync Amethyst's order, unless the user delegated it to DFU."""
+        if self.manage_load_order_in_dfu:
+            log_fn("Step 4: Leaving Mods.json for DFU to manage.")
+            return
+
+        log_fn("Step 4: Writing the load order to DFU's Mods.json ...")
+        mods_json = _mods_json()
+        # Parsed ModInfo lives beside the profile's modindex.bin, keyed by size
+        # and mtime, so repeat deploys skip decompressing every bundle again.
+        cache_path = (self.get_profile_root() / "profiles" / profile /
+                      mods_json.CACHE_NAME)
+        try:
+            mods_json.sync_mods_json(
+                self._game_path, self._ordered_dfmods(profile), log_fn=log_fn,
+                cache_path=cache_path)
+        except OSError as exc:
+            # The load order is a convenience - never fail a deploy over it.
+            log_fn(f"  Could not write Mods.json ({exc}); order mods in DFU's "
+                   "Mod Loader instead.")
+
     def deploy(self, log_fn=None, mode: LinkMode = LinkMode.HARDLINK,
                profile: str = "default", progress_fn=None) -> None:
         """Deploy staged mods into DaggerfallUnity_Data/StreamingAssets/.
@@ -452,7 +488,8 @@ class DaggerfallUnity(BaseGame):
           1. Move StreamingAssets/ → StreamingAssets_Core/  (vanilla backup)
           2. Transfer mod files listed in filemap.txt into StreamingAssets/
           3. Fill gaps with vanilla files from StreamingAssets_Core/
-          4. Write the mod-list order into DFU's Mods.json
+          4. Write the mod-list order into DFU's Mods.json, unless delegated
+             to DFU in configuration
         (Root Folder deployment is handled by the GUI after this returns.)
         """
         _log = log_fn or (lambda _: None)
@@ -467,7 +504,7 @@ class DaggerfallUnity(BaseGame):
 
         if not (self._game_path / _DATA_DIR).is_dir():
             raise RuntimeError(
-                f"'{_DATA_DIR}' not found in {self._game_path} — the game path "
+                f"'{_DATA_DIR}' not found in {self._game_path} - the game path "
                 "must be the folder containing DaggerfallUnity.x86_64."
             )
         if not filemap.is_file():
@@ -503,14 +540,7 @@ class DaggerfallUnity(BaseGame):
         linked_core = deploy_core(data_dir, placed, mode=mode, log_fn=_log)
         _log(f"  Transferred {linked_core} vanilla file(s).")
 
-        _log("Step 4: Writing the load order to DFU's Mods.json ...")
-        try:
-            _mods_json().sync_mods_json(
-                self._game_path, self._ordered_dfmods(profile), log_fn=_log)
-        except OSError as exc:
-            # The load order is a convenience — never fail a deploy over it.
-            _log(f"  Could not write Mods.json ({exc}); order mods in DFU's "
-                 "Mod Loader instead.")
+        self._sync_mods_json(profile, _log)
 
         _log(
             f"Deploy complete. "
@@ -552,7 +582,7 @@ class DaggerfallUnity(BaseGame):
             )
             _log(f"  Restored {restored} file(s). {core}/ removed.")
         else:
-            _log(f"Restore: no {core}/ found — nothing to restore.")
+            _log(f"Restore: no {core}/ found - nothing to restore.")
 
         moved = self.capture_runtime_files_to_root_folder(log_fn=_log)
         if moved:

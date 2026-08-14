@@ -9,12 +9,11 @@ and the Mod Files preview.
 
 from __future__ import annotations
 
-import threading
-
 from PySide6.QtCore import QObject, Signal
 
 from gui_qt.safe_emit import safe_emit
-from Utils.mesh_catalog import find_copies, read_entry, source_label
+from gui_qt.worker import LatestWorker
+from Utils.mesh_catalog import MeshEntry, find_copies, read_entry, source_label
 
 __all__ = ["TextureSourceController", "group_by_source", "make_override"]
 
@@ -36,12 +35,26 @@ def make_override(chosen: dict | None, staging, data_dir):
     and fall through to normal resolution."""
     if not chosen:
         return None
-    from Utils.asset_resolver import normalise
+    from Utils.asset_resolver import DirCache, normalise
+    dirs = DirCache()
+    representative = next(iter(chosen.values()), None)
 
     def override(rel: str):
-        entry = chosen.get(normalise(rel))
+        key = normalise(rel)
+        entry = chosen.get(key)
+        if entry is None and not key.startswith(("textures/", "materials/")):
+            return None
+        if entry is None and representative is not None:
+            # A chosen material file can reveal texture paths that were not in
+            # the original winning material.  Keep resolving those later paths
+            # from the same physical source instead of falling back and mixing
+            # providers again.
+            entry = MeshEntry(key, representative.kind,
+                              mod=representative.mod,
+                              archive=representative.archive)
         # Runs on the parse worker; read_entry is plain file/archive I/O.
-        return read_entry(entry, staging, data_dir) if entry is not None else None
+        return (read_entry(entry, staging, data_dir, dirs=dirs)
+                if entry is not None else None)
 
     return override
 
@@ -60,6 +73,7 @@ class TextureSourceController(QObject):
         self._scanned = None          # token whose sources are already listed
         self._reload = None           # reload(override) -> re-render this mesh
         self._by_source: dict = {}
+        self._source_jobs = LatestWorker("nif-texture-sources")
         self._staging = self._modlist = self._data = self._resolver = None
 
         self._sources_ready.connect(self._on_sources_ready)
@@ -73,6 +87,11 @@ class TextureSourceController(QObject):
         self._data = data_dir
         self._resolver = resolver
 
+    def cancel(self):
+        """Invalidate pending provider scans when the hosting preview closes."""
+        self._gen += 1
+        self._source_jobs.discard_pending()
+
     def arm(self, token, reload_fn):
         """Call just before loading a mesh: a NEW *token* clears the picker;
         *reload_fn(override)* re-issues the load and is how a pick applies."""
@@ -85,7 +104,7 @@ class TextureSourceController(QObject):
             self._preview.set_texture_sources([])
 
     def _on_textures_seen(self, paths):
-        """The mesh asked for these textures — list who else provides them."""
+        """The mesh asked for these textures - list who else provides them."""
         if not paths or self._token is None:
             return
         # A reload with an override reports the same paths again; don't rebuild
@@ -112,14 +131,14 @@ class TextureSourceController(QObject):
                 copies = {}
             safe_emit(self._sources_ready, gen, copies)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._source_jobs.submit(worker)
 
     def _on_sources_ready(self, gen: int, copies: dict):
         if gen != self._gen:
             return
         self._by_source, total = group_by_source(copies)
         if len(self._by_source) < 2:
-            # A single provider for everything — nothing to swap to.
+            # A single provider for everything - nothing to swap to.
             self._preview.set_texture_sources([])
             return
         items = [(self.tr("Textures: as the game loads"), None)]

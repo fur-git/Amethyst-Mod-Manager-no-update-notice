@@ -1,5 +1,5 @@
 """Real modlist metadata (versions / installed dates / flags from meta.ini, and
-conflicts from filemap overrides). Pure backend calls — no Qt, no gui.* — so
+conflicts from filemap overrides). Pure backend calls - no Qt, no gui.* - so
 they can run on a worker thread.
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from Utils.modlist import ModEntry
 
 
-# Flag bits for the Flags column — mirrors the full Tk set (FOMOD/BAIN are
+# Flag bits for the Flags column - mirrors the full Tk set (FOMOD/BAIN are
 # install methods, NOT flag icons).
 FLAG_UPDATE = 1 << 0       # has_update & not ignored
 FLAG_ENDORSED = 1 << 1
@@ -24,16 +24,17 @@ FLAG_COLLECTION_PATCHED = 1 << 6  # meta.from_collection_patched (diff-patched b
 FLAG_NOTE = 1 << 7         # a saved per-profile user note (read_mod_notes)
 FLAG_XEDIT = 1 << 8        # meta.xedit_modified_plugins non-empty (xEdit-edited plugins)
 FLAG_BUNDLE = 1 << 9       # RE/Fluffy bundle (a [Bundle] section in meta.ini)
-FLAG_MODIO_UPDATE = 1 << 10  # BG3 mod.io update (modioFileId != modioLatestFileId)
-FLAG_PRERTX = 1 << 11      # contains pre-RTX (natives/x64) files — filemap-derived
-FLAG_ROOT_RULE = 1 << 12   # owns files with a custom root-routing rule — filemap-derived
-FLAG_RERUN_FOMOD = 1 << 13  # a FOMOD option's fileDependency plugin is now in the load order — live overlay
+FLAG_MODIO_UPDATE = 1 << 10  # BG3 mod.io update (file id or embedded version)
+FLAG_PRERTX = 1 << 11      # contains pre-RTX (natives/x64) files - filemap-derived
+FLAG_ROOT_RULE = 1 << 12   # owns files with a custom root-routing rule - filemap-derived
+FLAG_RERUN_FOMOD = 1 << 13  # a FOMOD option's fileDependency plugin is now in the load order - live overlay
+FLAG_THUNDERSTORE_UPDATE = 1 << 14  # Thunderstore update ([thunderstore] hasUpdate)
 
 
 def _parse_missing_req_pairs(raw: str) -> list[tuple[int, str]]:
     """`(modId, name)` pairs from a meta.ini `missing_requirements` value:
     semicolon-separated `modId:name` entries. The name half may be blank
-    (locally-seeded requirements — e.g. the TTW installer — store `modId:`
+    (locally-seeded requirements - e.g. the TTW installer - store `modId:`
     with no name), so entries are keyed on the id, not the name."""
     pairs: list[tuple[int, str]] = []
     for part in (raw or "").split(";"):
@@ -46,6 +47,37 @@ def _parse_missing_req_pairs(raw: str) -> list[tuple[int, str]]:
         except ValueError:
             pass
     return pairs
+
+
+def _apply_req_substitutions(pairs: list[tuple[int, str]], domain: str,
+                             cache: dict) -> list[tuple[int, str]]:
+    """Rewrite requirement pairs through the filter file's substitution rules
+    (e.g. Nemesis 60033 → Pandora 133232), deduping the result.
+
+    meta.ini values stamped before a rule existed still name the old mod, so the
+    flag pass and the Missing Requirements panel remap on read; the next
+    requirements check rewrites the stored value for good. Rules come from the
+    local filter cache only (no network) and are memoised per domain."""
+    if domain not in cache:
+        try:
+            from Nexus.nexus_requirements import load_requirement_substitutions
+            cache[domain] = load_requirement_substitutions(domain)
+        except Exception:
+            cache[domain] = {}
+    subs = cache[domain]
+    if not subs:
+        return pairs
+    out: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for mid, name in pairs:
+        repl = subs.get(mid)
+        if repl is not None:
+            mid, name = repl[0], (repl[1] or name)
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append((mid, name))
+    return out
 
 
 def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
@@ -62,13 +94,14 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     fomod              -> set of mod names installed via FOMOD (meta.is_fomod)
     bain               -> set of mod names installed via BAIN (meta.is_bain)
     missing_reqs       -> set of mod names with un-ignored missing requirements
-    descriptions[name] -> Nexus summary text for the name-column hover tooltip
+    descriptions[name] -> Nexus summary, falling back to the Thunderstore
+                          description, for the name-column hover tooltip
     authors[name]      -> Nexus uploader username (Author column, "" if none)
 
-    *ignored_reqs* — requirement names the user has dismissed (per-profile); a
+    *ignored_reqs* - requirement names the user has dismissed (per-profile); a
     mod is only flagged if it still has missing requirements outside this set.
-    *profile_dir* — the active profile dir; when given, per-mod user notes are
-    read (Note flag). *is_bg3* — enable the BG3-only mod.io update flag.
+    *profile_dir* - the active profile dir; when given, per-mod user notes are
+    read (Note flag). *is_bg3* - enable the BG3-only mod.io update flag.
     """
     versions: dict[str, str] = {}
     installed: dict[str, str] = {}
@@ -86,6 +119,8 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     # requirements (e.g. the TTW installer) still surface.
     installed_ids: set[int] = set()
     raw_missing_pairs: dict[str, list[tuple[int, str]]] = {}
+    # domain → substitution rules, filled on first use (see _apply_req_substitutions)
+    subs_cache: dict[str, dict[int, tuple[int, str]]] = {}
 
     try:
         from Nexus.nexus_meta import read_meta
@@ -93,7 +128,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
         return (versions, installed, flags, categories, updates, fomod, bain,
                 missing_reqs, descriptions, authors)
 
-    # Per-profile user notes (Note flag) — one read for the whole list.
+    # Per-profile user notes (Note flag) - one read for the whole list.
     notes: dict[str, str] = {}
     if profile_dir is not None:
         try:
@@ -157,12 +192,17 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
         if getattr(meta, "mod_id", 0):
             installed_ids.add(int(meta.mod_id))
         if getattr(meta, "missing_requirements", "") and e.name not in ignored_reqs:
-            pairs = _parse_missing_req_pairs(meta.missing_requirements)
+            dom = (getattr(meta, "game_domain", "") or "").strip().lower()
+            pairs = _apply_req_substitutions(
+                _parse_missing_req_pairs(meta.missing_requirements),
+                dom, subs_cache)
             # Per-requirement ignores (meta.ini ignoredRequirements): those ids
             # never raise the ⚠ flag, but stay in missing_requirements so the
             # Missing Requirements panel still lists them (un-ignorable there).
-            ign_ids = {mid for mid, _ in _parse_missing_req_pairs(
-                getattr(meta, "ignored_requirements", "") or "")}
+            ign_ids = {mid for mid, _ in _apply_req_substitutions(
+                _parse_missing_req_pairs(
+                    getattr(meta, "ignored_requirements", "") or ""),
+                dom, subs_cache)}
             if ign_ids:
                 pairs = [pr for pr in pairs if pr[0] not in ign_ids]
             if pairs:
@@ -182,19 +222,55 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
                 bits |= FLAG_BUNDLE
         except Exception:
             pass
-        # BG3 mod.io update (installed file id differs from the latest).
+        # BG3 mod.io update (file-id or embedded-version comparison).
         if is_bg3:
             try:
                 import configparser as _cp_modio
                 cp = _cp_modio.ConfigParser(interpolation=None)
                 cp.read(str(meta_path), encoding="utf-8")
-                _fid = int(cp.get("General", "modioFileId", fallback="0") or "0")
-                _lfid = int(cp.get("General", "modioLatestFileId", fallback="0") or "0")
-                if _lfid and _fid and _lfid != _fid:
+
+                def _modio_value(key, legacy_key, fallback):
+                    if cp.has_option("modio", key):
+                        return cp.get("modio", key, fallback=fallback)
+                    return cp.get(
+                        "General", legacy_key, fallback=fallback)
+
+                _fid = int(_modio_value(
+                    "fileId", "modioFileId", "0") or "0")
+                _lfid = int(_modio_value(
+                    "latestFileId", "modioLatestFileId", "0") or "0")
+                _has_update = _modio_value(
+                    "hasUpdate", "modioHasUpdate", "false"
+                ).strip().lower() in ("true", "1", "yes")
+                if _has_update or (_lfid and _fid and _lfid != _fid):
                     bits |= FLAG_MODIO_UPDATE
                     updates.add(e.name)
             except Exception:
                 pass
+        # Thunderstore update (its own meta.ini section, so no game gate -
+        # any BepInEx-style game can carry Thunderstore mods).
+        try:
+            from Thunderstore.thunderstore_meta import read_meta as _ts_read
+            _ts = _ts_read(meta_path)
+            # Version follows the same precedence as the description: Nexus
+            # owns the existing column value when present; Thunderstore fills
+            # it for Thunderstore-only installs.
+            if e.name not in versions:
+                _ts_version = (getattr(_ts, "version", "") or "").strip()
+                if _ts_version:
+                    versions[e.name] = _ts_version
+            # A mod can carry both stores' metadata. Keep the Nexus summary as
+            # the preferred tooltip, but use Thunderstore's package description
+            # when Nexus has none (including Thunderstore-only installs).
+            if e.name not in descriptions:
+                _ts_desc = (getattr(_ts, "description", "") or "").strip()
+                if _ts_desc:
+                    descriptions[e.name] = _ts_desc
+            if _ts.package_id and _ts.has_update and not _ts.ignore_update:
+                bits |= FLAG_THUNDERSTORE_UPDATE
+                updates.add(e.name)
+        except Exception:
+            pass
         # Per-profile user note.
         if notes.get(e.name):
             bits |= FLAG_NOTE
@@ -213,7 +289,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
             missing_reqs, descriptions, authors)
 
 
-# ---- mod folder sizes (Size column) — ported from gui/modlist_panel.py --------
+# ---- mod folder sizes (Size column) - ported from gui/modlist_panel.py --------
 def _dir_size_bytes(path: Path) -> int:
     """Recursively sum file sizes under path (bytes). Safe to run in a thread."""
     total = 0

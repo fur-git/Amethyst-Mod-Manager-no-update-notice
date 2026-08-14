@@ -1,7 +1,7 @@
 """Right-click context menu for the modlist.
 
 Mirrors the Tk menu (gui/modlist_panel.py `_populate_context_menu`) for all three
-target types — normal mods, separators, and the Overwrite folder. Each item is
+target types - normal mods, separators, and the Overwrite folder. Each item is
 SHOWN only when its Tk condition holds and HIDDEN otherwise (Tk omits items; it
 never disables them). Any remaining greyed items are the handful still awaiting a
 Qt backend, and even those appear only when their Tk show-condition passes.
@@ -22,7 +22,7 @@ from gui_qt.modlist_model import COL_NAME
 from gui_qt.text_input_overlay import TextInputOverlay
 
 # Display-only shortcut hints shown right-aligned in the context menu. These MUST
-# match the real window-level QShortcut bindings in gui_qt/shortcuts.py — they are
+# match the real window-level QShortcut bindings in gui_qt/shortcuts.py - they are
 # not registered as accelerators here, only rendered as menu text.
 _SC_RENAME = "F2"
 _SC_REMOVE = "Del"
@@ -52,14 +52,14 @@ def show_context_menu(view, global_pos, index):
 
 
 def build_context_menu(view, index):
-    """Construct (but don't exec) the context QMenu for *index* — split out so
+    """Construct (but don't exec) the context QMenu for *index* - split out so
     headless tests can inspect the actions. Returns None if there's no menu."""
     model = view.model()
     if not index.isValid():
         return None
     row = index.row()
     entry = model.entry(row)
-    # Fresh meta.ini memo per build — the gate helpers re-read the same metas
+    # Fresh meta.ini memo per build - the gate helpers re-read the same metas
     # many times per selected mod (see _read_mod_meta).
     view._menu_meta_cache = {}
 
@@ -108,14 +108,14 @@ def build_context_menu(view, index):
         return act(label, lambda: None, enabled=False)
 
     def submenu(label, items, enabled=True, scroll_cap=0):
-        """Add a nested QMenu. *items* is a list of (text, slot) pairs — one
+        """Add a nested QMenu. *items* is a list of (text, slot) pairs - one
         action each. Used for Copy/Move to profile (the profile list nests as a
         submenu instead of opening a picker window).
 
         *scroll_cap* > 0 caps the visible height at that many rows: past the cap
         the submenu holds a single QWidgetAction wrapping a scrollable list
         instead of plain actions (used by Move to separator). QMenu's own
-        scroller can't do this — it only engages when the popup exceeds the
+        scroller can't do this - it only engages when the popup exceeds the
         SCREEN height, and a max-height-constrained QMenu just clips and
         mis-positions."""
         # `label` is already translated by the caller.
@@ -141,10 +141,10 @@ def build_context_menu(view, index):
 
     if entry.is_separator and entry.name in _boundary_names():
         # The synthetic Overwrite / Root Folder rows share a small menu:
-        #   Open folder — both (they resolve to a real on-disk folder)
-        #   Log         — both (files swept in on restore; Root Folder gets its
+        #   Open folder - both (they resolve to a real on-disk folder)
+        #   Log         - both (files swept in on restore; Root Folder gets its
         #                 own .mm_overwrite_log.txt written by _move_runtime_files)
-        #   Show Conflicts — Overwrite only (Root Folder has no conflict data)
+        #   Show Conflicts - Overwrite only (Root Folder has no conflict data)
         from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
         if multi_mods or multi_seps:
             return None
@@ -155,7 +155,7 @@ def build_context_menu(view, index):
             enabled=has_game)
         if entry.name == OVERWRITE_NAME and _has_conflict(model, row):
             act(_mt("Show Conflicts"), lambda: _show_conflicts(view, entry.name))
-        # Create an empty mod below — lives on the Overwrite row in normal mode
+        # Create an empty mod below - lives on the Overwrite row in normal mode
         # and the Root Folder row in reverse-priority mode, so it stays usable
         # even when the modlist has no mods to right-click.
         reverse = model.reverse_mode_active
@@ -206,7 +206,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         n = len(sel_mods)
         _names = [model.entry(r).name for r in sel_mods]
         _staging_ok = getattr(view, "staging_dir", None) is not None
-        # Group: files — Root Folder toggles gate on the non-empty subset each
+        # Group: files - Root Folder toggles gate on the non-empty subset each
         # applies to (Tk root_folder_enable_multi / _disable_multi).
         if _staging_ok:
             _rf_disable = [nm for nm in _names if _is_root_folder(view, nm)]
@@ -218,7 +218,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
                 act(_mtf("Enable Root Folder install ({0})", len(_rf_enable)),
                     lambda ns=_rf_enable: _toggle_root_folder(view, ns, True))
         divider()
-        # Group: Nexus — each item shows only when it has valid targets (Tk).
+        # Group: Nexus - each item shows only when it has valid targets (Tk).
         _endorse_multi = [nm for nm in _names
                           if _has_nexus_id(view, nm) and not _is_endorsed(view, nm)]
         _abstain_multi = [nm for nm in _names
@@ -228,7 +228,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         _nexus_multi = [nm for nm in _names if _has_nexus_page(view, nm)]
         _reqs_multi = [nm for nm in _names if _has_missing_reqs(view, nm)]
         _qu = [nm for nm in _names if _has_update_flag(view, nm)]
-        # Reinstall: archive on disk OR redownloadable from Nexus (mod/file id).
+        # Reinstall: archive on disk OR redownloadable from Nexus/Thunderstore.
         _reinstall_multi = [nm for nm in _names
                             if _installation_archive(view, nm) is not None
                             or _can_redownload(view, nm)]
@@ -306,16 +306,17 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
     _staging_ok = getattr(view, "staging_dir", None) is not None
     # Group 1: manage
     act(_mt("Open folder"), lambda: _open_folder(view, model, row))
-    # Bundle options… — shown only when the mod carries a RE/Fluffy bundle spec.
+    # Bundle options… - shown only when the mod carries a RE/Fluffy bundle spec.
     if _has_bundle_spec(view, name):
         act(_mt("Bundle options…"), lambda: _open_bundle(view, name))
     if _staging_ok:
         act(_mt("Create empty mod below"), lambda: _create_empty_mod(view, model, row))
-    # Reinstall Mod — from the recorded archive when it's still on disk (Tk:
+    # Reinstall Mod - from the recorded archive when it's still on disk (Tk:
     # ctx_meta present + _find_installation_archive), reinstalling into the same
     # folder (silent Replace-All). When the archive is gone but the mod carries
-    # a Nexus mod/file id, offer 'Reinstall (Redownload)' instead — the handler
-    # redownloads from Nexus (premium) or opens the files page (non-premium).
+    # a Nexus mod/file id or Thunderstore package identity, offer 'Reinstall
+    # (Redownload)' instead. Nexus keeps its premium/manual-browser behaviour;
+    # Thunderstore downloads are public and direct.
     if _installation_archive(view, name) is not None:
         act(_mt("Reinstall Mod"), lambda: _reinstall(view, [name]))
     elif _can_redownload(view, name):
@@ -329,7 +330,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         act(_mt("Disable Root Folder install") if _is_rf else _mt("Enable Root Folder install"),
             lambda: _toggle_root_folder(view, [name], not _is_rf))
     divider()
-    # Group 3: Nexus / online & updates — each item shows only when applicable.
+    # Group 3: Nexus / online & updates - each item shows only when applicable.
     # The endorse/version/check/track/open-on-Nexus items nest under a
     # "Nexus Actions" submenu; the rest stay inline.
     _endorsed = _is_endorsed(view, name)
@@ -352,6 +353,18 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
             (_mt("Open on Nexus"), lambda: _open_on_nexus(view, name)))
     if _nexus_items:
         submenu(_mt("Nexus Actions"), _nexus_items)
+    # Thunderstore mods get their own submenu, mirroring "Nexus Actions".
+    # A mod can legitimately carry both sections (same mod mirrored on both
+    # stores), so this is independent of the Nexus block above.
+    if _is_thunderstore_mod(view, name):
+        submenu(_mt("Thunderstore Actions"), [
+            (_mt("Change Version"),
+             lambda: _thunderstore_change_version(view, name)),
+            (_mt("Check Updates"),
+             lambda: _thunderstore_check_updates(view, [name])),
+            (_mt("Open on Thunderstore"),
+             lambda: _open_on_thunderstore(view, name)),
+        ])
     if _modio_url(view, name):
         act(_mt("Open on mod.io"), lambda: _open_on_modio(view, name))
     if _has_update_flag(view, name):
@@ -392,22 +405,37 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
 
 
 def _fill_scroll_submenu(root_menu, sub, items, scroll_cap):
-    """Fill *sub* with a single QWidgetAction wrapping a QListWidget showing
-    *items* — visible height capped at *scroll_cap* rows, real scrollbar past
-    that. Clicking a row closes the whole menu and runs its slot."""
-    from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QListWidget, QWidgetAction
-    lst = QListWidget(sub)
+    """Fill *sub* with a single QWidgetAction wrapping a search box over a
+    QListWidget showing *items* - visible height capped at *scroll_cap* rows,
+    real scrollbar past that, and typing in the box filters the rows. Enter
+    picks the highlighted (else first visible) row; clicking a row or pressing
+    Enter closes the whole menu and runs its slot."""
+    from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+    from PySide6.QtWidgets import (QLineEdit, QListWidget, QVBoxLayout,
+                                   QWidget, QWidgetAction)
+    box = QWidget(sub)
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(4, 4, 4, 4)
+    lay.setSpacing(4)
+    edit = QLineEdit(box)
+    edit.setPlaceholderText(_mt("Search…"))
+    edit.setClearButtonEnabled(True)
+    lst = QListWidget(box)
     lst.setFrameShape(QListWidget.Shape.NoFrame)
     lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     lst.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     lst.setMouseTracking(True)
+    # Focus stays in the search box; arrows are forwarded so the list never
+    # needs it (and hover/selection styling still applies without focus).
+    lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     # Menu-like hover highlight (QListWidget only tints on selection by default).
     lst.setStyleSheet(
         "QListWidget { background: transparent; outline: none; }"
         "QListWidget::item { padding: 3px 16px; }"
         "QListWidget::item:hover, QListWidget::item:selected {"
         " background: palette(highlight); color: palette(highlighted-text); }")
+    lay.addWidget(edit)
+    lay.addWidget(lst)
     slots = []
     for text, slot in items:
         # Item texts are DATA (separator names), not translated.
@@ -418,16 +446,65 @@ def _fill_scroll_submenu(root_menu, sub, items, scroll_cap):
     sbar_w = lst.verticalScrollBar().sizeHint().width()
     lst.setMinimumWidth(lst.sizeHintForColumn(0) + sbar_w + 8)
 
-    def _picked(item):
-        row = lst.row(item)
+    def _pick(row):
         sub.close()
         root_menu.close()
         if 0 <= row < len(slots):
             slots[row]()
 
-    lst.itemClicked.connect(_picked)
+    lst.itemClicked.connect(lambda item: _pick(lst.row(item)))
+
+    def _visible_rows():
+        return [i for i in range(lst.count()) if not lst.item(i).isHidden()]
+
+    def _apply_filter(text):
+        needle = text.casefold()
+        for i in range(lst.count()):
+            lst.item(i).setHidden(needle not in lst.item(i).text().casefold())
+        vis = _visible_rows()
+        # Keep a current row so Enter always has a target while typing.
+        lst.setCurrentRow(vis[0] if vis else -1)
+
+    edit.textChanged.connect(_apply_filter)
+
+    def _pick_current():
+        row = lst.currentRow()
+        if row < 0 or lst.item(row).isHidden():
+            vis = _visible_rows()
+            row = vis[0] if vis else -1
+        if row >= 0:
+            _pick(row)
+
+    edit.returnPressed.connect(_pick_current)
+
+    def _step(delta):
+        vis = _visible_rows()
+        if not vis:
+            return
+        cur = lst.currentRow()
+        pos = vis.index(cur) if cur in vis else (-1 if delta > 0 else 0)
+        lst.setCurrentRow(vis[max(0, min(len(vis) - 1, pos + delta))])
+        lst.scrollToItem(lst.currentItem())
+
+    class _ArrowFwd(QObject):
+        # Up/Down typed in the search box move the list highlight.
+        def eventFilter(self, obj, ev):
+            if ev.type() == QEvent.Type.KeyPress:
+                if ev.key() == Qt.Key.Key_Up:
+                    _step(-1)
+                    return True
+                if ev.key() == Qt.Key.Key_Down:
+                    _step(1)
+                    return True
+            return False
+
+    edit.installEventFilter(_ArrowFwd(edit))
+    # QMenu doesn't focus embedded widgets on its own - grab it post-show so
+    # typing filters immediately (singleShot: the menu isn't visible yet inside
+    # aboutToShow, and setFocus on a hidden widget is dropped).
+    sub.aboutToShow.connect(lambda: QTimer.singleShot(0, edit.setFocus))
     wa = QWidgetAction(sub)
-    wa.setDefaultWidget(lst)
+    wa.setDefaultWidget(box)
     sub.addAction(wa)
 
 
@@ -509,7 +586,7 @@ def _has_missing_reqs(view, name: str) -> bool:
 
     Fallback: a mod whose every missing requirement is individually ignored
     (meta.ini ignoredRequirements) has no ⚠ flag, but the panel must stay
-    reachable so the ignores can be unticked — keep the menu item when the meta
+    reachable so the ignores can be unticked - keep the menu item when the meta
     carries per-requirement ignores."""
     try:
         model = view.model()
@@ -611,7 +688,7 @@ def _open_nif_viewer(view, name):
 
 
 def _mod_nexus_url(view, name: str) -> str:
-    """The mod's Nexus page URL from its meta.ini ("" if none / no staging)."""
+    """The mod's Nexus page, with the game's primary as a legacy fallback."""
     staging = getattr(view, "staging_dir", None)
     if staging is None:
         return ""
@@ -619,8 +696,16 @@ def _mod_nexus_url(view, name: str) -> str:
     if not meta_path.is_file():
         return ""
     try:
-        from Nexus.nexus_meta import read_meta
-        return read_meta(meta_path).nexus_page_url or ""
+        from Nexus.nexus_meta import normalise_game_domain, read_meta
+        meta = read_meta(meta_path)
+        domain = normalise_game_domain(meta.game_domain)
+        if not domain:
+            game = getattr(view, "game", None)
+            domain = normalise_game_domain(
+                getattr(game, "nexus_game_domain", "") or "")
+        if domain and int(getattr(meta, "mod_id", 0) or 0) > 0:
+            return f"https://www.nexusmods.com/{domain}/mods/{meta.mod_id}"
+        return meta.nexus_page_url or ""
     except Exception:
         return ""
 
@@ -653,7 +738,10 @@ def _modio_url(view, name: str) -> str:
         import configparser
         cp = configparser.ConfigParser(interpolation=None)
         cp.read(str(meta_path), encoding="utf-8")
-        return (cp.get("General", "modioProfileUrl", fallback="") or "").strip()
+        if cp.has_option("modio", "profileUrl"):
+            return (cp.get("modio", "profileUrl", fallback="") or "").strip()
+        return (cp.get(
+            "General", "modioProfileUrl", fallback="") or "").strip()
     except Exception:
         return ""
 
@@ -669,6 +757,93 @@ def _open_on_modio(view, name: str):
         pass
 
 
+# ---- Thunderstore ----------------------------------------------------------
+def _thunderstore_meta(view, name: str):
+    """The mod's parsed [thunderstore] metadata, or None when it isn't one."""
+    staging = getattr(view, "staging_dir", None)
+    if staging is None:
+        return None
+    meta_path = staging / name / "meta.ini"
+    if not meta_path.is_file():
+        return None
+    try:
+        from Thunderstore.thunderstore_meta import read_meta
+        meta = read_meta(meta_path)
+    except Exception:
+        return None
+    return meta if meta.package_id else None
+
+
+def _is_thunderstore_mod(view, name: str) -> bool:
+    return _thunderstore_meta(view, name) is not None
+
+
+def _thunderstore_url(view, name: str) -> str:
+    """The mod's Thunderstore page URL ("" if it isn't a Thunderstore mod).
+
+    Only the community-scoped ``/c/{community}/p/{ns}/{name}/`` form actually
+    resolves - the bare ``/package/{ns}/{name}/`` URL the API reports as
+    ``package_url`` 404s in a browser (verified 2026-08-11). So a mod whose
+    community was never recorded returns "" here, and the caller resolves it
+    from the API instead of opening a dead link.
+    """
+    meta = _thunderstore_meta(view, name)
+    if meta is None:
+        return ""
+    community = (meta.community or "").strip()
+    if not community:
+        return ""
+    return (f"https://thunderstore.io/c/{community}/p/"
+            f"{meta.namespace}/{meta.name}/")
+
+
+def _open_on_thunderstore(view, name: str):
+    """Open the mod's Thunderstore page, resolving its community if needed."""
+    url = _thunderstore_url(view, name)
+    if not url:
+        # No community stored (installed before it was recorded, or the stamp
+        # failed): look it up now and remember it, so the next click is instant.
+        meta = _thunderstore_meta(view, name)
+        if meta is None:
+            return
+        try:
+            from Thunderstore.ror2mm_handler import Ror2mmLink
+            from Thunderstore.thunderstore_download import resolve_communities
+            from Thunderstore.thunderstore_meta import write_meta
+            slugs = resolve_communities(Ror2mmLink(
+                namespace=meta.namespace, name=meta.name,
+                version=meta.version or "0.0.0"))
+            if not slugs:
+                return
+            meta.community = slugs[0]
+            staging = getattr(view, "staging_dir", None)
+            if staging is not None:
+                write_meta(staging / name / "meta.ini", meta)
+            url = (f"https://thunderstore.io/c/{meta.community}/p/"
+                   f"{meta.namespace}/{meta.name}/")
+        except Exception:
+            return
+    try:
+        from Utils.xdg import open_url
+        open_url(url)
+    except Exception:
+        pass
+
+
+def _thunderstore_change_version(view, name: str):
+    """Open the Thunderstore version picker (host installs the callback)."""
+    cb = getattr(view, "on_thunderstore_change_version", None)
+    if cb is not None and name:
+        cb(name)
+
+
+def _thunderstore_check_updates(view, names):
+    """Run a Thunderstore-only update check over *names*."""
+    cb = getattr(view, "on_thunderstore_check_updates", None)
+    if cb is not None and names:
+        cb(set(names))
+
+
 # ---- Move to separator -----------------------------------------------------
 def _separator_choices(model):
     """(display, internal_name) for every non-boundary separator, in list order."""
@@ -682,7 +857,7 @@ def _separator_choices(model):
 
 
 def _separator_submenu_items(view, model, mod_rows):
-    """(display, slot) pairs for the Move-to-separator submenu — one entry per
+    """(display, slot) pairs for the Move-to-separator submenu - one entry per
     non-boundary separator, sorted A→Z by display name (the natural list order
     isn't useful in a menu). Separator display names are DATA, not translated."""
     choices = sorted(_separator_choices(model), key=lambda c: c[0].casefold())
@@ -704,9 +879,13 @@ def _move_to_separator(view, model, mod_rows, sep_name):
     if not rows:
         return
     moved_names = {model.entry(r).name for r in rows}
-    moved = [model.entry(r) for r in rows]           # preserve selection order
+    # Take the block in NATURAL order, not display order - the display may be
+    # an inverted/sorted permutation (reverse-priority mode reverses it), and
+    # splicing a display-ordered block into the natural list flips the mods'
+    # relative priorities (GH#380).
+    moved = [e for e in model.natural_entries() if e.name in moved_names]
     old_order = [e.name for e in model.natural_entries() if not e.is_separator]
-    # Body = the NATURAL order minus the moved mods — the display may be a
+    # Body = the NATURAL order minus the moved mods - the display may be a
     # sorted/inverted permutation and must never be persisted as the new order.
     body = [e for e in model.natural_entries()
             if e.name not in _PINNED_NAMES and e.name not in moved_names]
@@ -716,7 +895,7 @@ def _move_to_separator(view, model, mod_rows, sep_name):
         return
     body[sep_idx + 1:sep_idx + 1] = moved
     model.set_entries(body)
-    # Pure reorder — hand the app a "move" ctx so a repositioning that crossed
+    # Pure reorder - hand the app a "move" ctx so a repositioning that crossed
     # no conflicting mod skips the conflict rebuild (see app._on_modlist_saved).
     new_order = [e.name for e in model.natural_entries() if not e.is_separator]
     ctx = model._move_ctx(old_order, new_order, [e.name for e in moved])
@@ -730,7 +909,7 @@ def _move_to_separator(view, model, mod_rows, sep_name):
 def _other_profiles(view):
     """Profile names for this game, excluding the current one and Profile
     Groups ([] if none). Groups are excluded as TARGETS: 'copy into a group'
-    is ill-defined (which member would own it?) — copy into a member and the
+    is ill-defined (which member would own it?) - copy into a member and the
     group reconciles it in."""
     game = getattr(view, "game", None)
     pdir = getattr(view, "profile_dir", None)
@@ -752,6 +931,12 @@ def _profile_submenu_items(view, names, mod_rows, others, move: bool):
     Each entry copies/moves *names* to that profile (Tk lists the profiles as a
     submenu rather than opening a picker window)."""
     model = view.model()
+    # The copy worker registers the block in the target modlist assuming
+    # highest-priority-first (app._run_copy_to_profile prepends it as one
+    # unit) - reorder the display-ordered selection into NATURAL order so a
+    # reverse-priority (or column-sorted) view doesn't flip the block.
+    nat = {e.name: i for i, e in enumerate(model.natural_entries())}
+    names = sorted(names, key=lambda n: nat.get(n, len(nat)))
     enabled_map = {}
     for r in mod_rows:
         e = model.entry(r)
@@ -766,7 +951,7 @@ def _profile_submenu_items(view, names, mod_rows, others, move: bool):
 
 def _copy_to_profile(view, names, enabled_map, target_profile, move):
     """Delegate the copy/move to the window (needs game, worker thread, collision
-    overlay, and — for move — remove_mods + reload)."""
+    overlay, and - for move - remove_mods + reload)."""
     cb = getattr(view, "on_copy_to_profile", None)
     if cb is not None and names and target_profile:
         cb(list(names), dict(enabled_map), target_profile, move)
@@ -813,10 +998,21 @@ def _installation_archive(view, name: str):
     item. Searches the user's Downloads dir + the game's configured caches +
     any extra download locations, matching the Tk lookup."""
     meta = _read_mod_meta(view, name)
-    filename = getattr(meta, "installation_file", "") if meta is not None else ""
-    if not filename:
+    filenames = []
+    nexus_filename = (
+        getattr(meta, "installation_file", "") if meta is not None else "")
+    if nexus_filename:
+        filenames.append(nexus_filename)
+    ts_meta = _thunderstore_meta(view, name)
+    if ts_meta is not None and ts_meta.namespace and ts_meta.name \
+            and ts_meta.version:
+        ts_full_name = (ts_meta.full_name or
+                        f"{ts_meta.namespace}-{ts_meta.name}-{ts_meta.version}")
+        ts_filename = f"{ts_full_name}.zip"
+        if ts_filename not in filenames:
+            filenames.append(ts_filename)
+    if not filenames:
         return None
-    import os
     from pathlib import Path
     game = getattr(view, "game", None)
     game_name = getattr(game, "name", "") or ""
@@ -824,40 +1020,44 @@ def _installation_archive(view, name: str):
     try:
         from Utils.config_paths import list_all_cache_dirs
         from Utils.download_locations import (
-            is_default_downloads_disabled, load_extra_download_locations)
+            get_default_downloads_dir, is_default_downloads_disabled,
+            load_extra_download_locations)
         if not is_default_downloads_disabled():
-            xdg = os.environ.get("XDG_DOWNLOAD_DIR")
-            search_dirs.append(Path(xdg) if xdg else Path.home() / "Downloads")
+            search_dirs.append(get_default_downloads_dir())
         search_dirs.extend(list_all_cache_dirs(game_name))
         search_dirs.extend(Path(p) for p in load_extra_download_locations())
     except Exception:
         return None
     for d in search_dirs:
-        cand = Path(d) / filename
-        if cand.is_file():
-            return cand
+        for filename in filenames:
+            cand = Path(d) / filename
+            if cand.is_file():
+                return cand
     return None
 
 
 def _can_redownload(view, name: str) -> bool:
-    """True if the mod carries a Nexus mod id + file id (and a resolvable game
-    domain) in its meta.ini, so its install archive can be redownloaded from
-    Nexus even when the on-disk archive is gone. Gates the 'Reinstall
-    (Redownload)' menu item (the handler premium-gates / falls back to the
-    browser)."""
+    """Whether a missing install archive can be fetched from a recorded store.
+
+    Nexus requires mod/file ids plus a game domain. Thunderstore packages are
+    public and need only their namespace, name and exact installed version.
+    """
     meta = _read_mod_meta(view, name)
-    if meta is None:
-        return False
-    if int(getattr(meta, "mod_id", 0) or 0) <= 0:
-        return False
-    if int(getattr(meta, "file_id", 0) or 0) <= 0:
-        return False
-    from Nexus.nexus_meta import normalise_game_domain
-    domain = normalise_game_domain(getattr(meta, "game_domain", "") or "")
-    if not domain:
-        game = getattr(view, "game", None)
-        domain = getattr(game, "nexus_game_domain", "") or ""
-    return bool(domain)
+    if meta is not None:
+        mod_id = int(getattr(meta, "mod_id", 0) or 0)
+        file_id = int(getattr(meta, "file_id", 0) or 0)
+        if mod_id > 0 and file_id > 0:
+            from Nexus.nexus_meta import normalise_game_domain
+            domain = normalise_game_domain(
+                getattr(meta, "game_domain", "") or "")
+            if not domain:
+                game = getattr(view, "game", None)
+                domain = getattr(game, "nexus_game_domain", "") or ""
+            if domain:
+                return True
+    ts_meta = _thunderstore_meta(view, name)
+    return bool(ts_meta is not None and ts_meta.namespace and ts_meta.name
+                and ts_meta.version)
 
 
 # ---- Root Folder install toggle -------------------------------------------
@@ -905,7 +1105,7 @@ def _has_nexus_id(view, name) -> bool:
 
 
 def _endorse(view, names, endorse: bool):
-    """Endorse/abstain the mods — delegated to the window (needs the shared
+    """Endorse/abstain the mods - delegated to the window (needs the shared
     Nexus API + a worker thread; see app._on_modlist_endorse)."""
     cb = getattr(view, "on_endorse", None)
     if cb is not None and names:
@@ -913,7 +1113,7 @@ def _endorse(view, names, endorse: bool):
 
 
 def _track(view, names):
-    """Start tracking the mods on Nexus — delegated to the window (needs the
+    """Start tracking the mods on Nexus - delegated to the window (needs the
     shared Nexus API + a worker thread; see app._on_modlist_track)."""
     cb = getattr(view, "on_track", None)
     if cb is not None and names:
@@ -1057,7 +1257,7 @@ def _sort_selected_alphabetically(view, model, mod_rows):
             continue
         body.append(next(it) if id(e) in sel_ids else e)
     model.set_entries(body)
-    # Pure (non-contiguous) reorder — _move_ctx handles per-mod crossings, so
+    # Pure (non-contiguous) reorder - _move_ctx handles per-mod crossings, so
     # a sort that flipped no conflicting pair skips the conflict rebuild.
     new_order = [e.name for e in model.natural_entries() if not e.is_separator]
     ctx = model._move_ctx(old_order, new_order, [e.name for e in sel])
@@ -1076,7 +1276,7 @@ def _create_empty_mod(view, model, row):
 
 def _create_empty_mod_at_boundary(view, model, top):
     """As _create_empty_mod, but insert at the top (below Overwrite) or bottom
-    (below Root Folder) of the body — used from the boundary rows so it works
+    (below Root Folder) of the body - used from the boundary rows so it works
     even when the modlist is empty."""
     _create_empty_mod_prompt(view, model,
                              lambda name: model.insert_mod_at_body_edge(top, name))
@@ -1123,7 +1323,7 @@ def _create_empty_mod_prompt(view, model, insert):
 
 
 def _show_overwrite_log(view, boundary_name=None):
-    """Show the read-only restore-log overlay — files swept into the deploy
+    """Show the read-only restore-log overlay - files swept into the deploy
     target on restore, parsed from OVERWRITE_LOG_NAME. Overwrite reads
     game.get_effective_overwrite_path(); Root Folder reads
     game.get_effective_root_folder_path() (standard-deployed games sweep
@@ -1161,7 +1361,7 @@ def _rename(view, model, row):
         if new is None or not new.strip() or new.strip() == e.display_name:
             return
         if e.is_separator:
-            # No folder on disk — a pure modlist.txt edit is the whole rename.
+            # No folder on disk - a pure modlist.txt edit is the whole rename.
             # Migrate the separator's colour + deploy override to the new name
             # so they follow it (Tk parity), then persist via the window
             # callback.
@@ -1179,8 +1379,25 @@ def _rename(view, model, row):
         if callable(cb):
             cb(e.name, new.strip())
 
+    # Separators have no folder (and so no meta.ini) - only mods get the
+    # suggested-name dropdown.
+    suggestions = [] if e.is_separator else _name_suggestions(view, e.name)
     TextInputOverlay.show_over(view, _mt("Rename"), _mt("New name:"), _named,
-                               initial=e.display_name, ok_label=_mt("Rename"))
+                               initial=e.display_name, ok_label=_mt("Rename"),
+                               suggestions=suggestions)
+
+
+def _name_suggestions(view, name):
+    """Rename candidates for a staged mod (Nexus name, sibling version, …)."""
+    staging = getattr(view, "staging_dir", None)
+    if staging is None:
+        return []
+    try:
+        from Utils.mod_name_utils import suggest_names_for_staged_mod
+        return suggest_names_for_staged_mod(staging, name)
+    except Exception as exc:
+        print(f"[gui_qt] name suggestions failed for {name!r}: {exc}", flush=True)
+        return []
 
 
 def _set_priority(view, model, row):
@@ -1282,8 +1499,8 @@ def _run_remove(view, game, profile_dir, names, owners) -> list:
 def _remove(view, model, row):
     """Fully remove a mod: undeploy its files, delete its staging folder, drop
     its index/BSA/plugins entries, then remove the modlist row. (Not just the
-    list line — that left the files on disk so the mod still read as installed.)
-    On a Profile Group the mod is removed from the OWNING MEMBER profile too —
+    list line - that left the files on disk so the mod still read as installed.)
+    On a Profile Group the mod is removed from the OWNING MEMBER profile too -
     the confirm names it."""
     e = model.entry(row)
     if e is None or e.is_separator:
@@ -1293,7 +1510,7 @@ def _remove(view, model, row):
     # from the member profile itself.
     locked = _locked_group_mods(view, [e.name])
     if locked:
-        _notify(view, _mt("'{0}' belongs to the locked profile '{1}' — switch "
+        _notify(view, _mt("'{0}' belongs to the locked profile '{1}' - switch "
                           "to that profile to remove it, or unlock it.")
                 .format(e.display_name, locked[e.name]))
         return
@@ -1316,7 +1533,7 @@ def _remove(view, model, row):
         owner = owners.get(e.name)
         where = (f"the member profile '{owner}' and this group" if owner
                  else "this group")
-        msg = (f"Remove '{e.display_name}'?\n\nThis is a profile group — the "
+        msg = (f"Remove '{e.display_name}'?\n\nThis is a profile group - the "
                f"mod is removed from {where}, deleting its folder. This "
                f"cannot be undone.")
     else:
@@ -1418,12 +1635,12 @@ def _remove_mods_multi(view, model, mod_rows):
             and not e.is_separator and not e.locked]
     if not rows:
         return
-    # Drop mods owned by a LOCKED member profile — they stay removable from
+    # Drop mods owned by a LOCKED member profile - they stay removable from
     # that profile itself, just not through the group.
     locked = _locked_group_mods(view, [model.entry(r).name for r in rows])
     if locked:
         rows = [r for r in rows if model.entry(r).name not in locked]
-        _notify(view, _mt("{0} mod(s) skipped — they belong to locked "
+        _notify(view, _mt("{0} mod(s) skipped - they belong to locked "
                           "profile(s): {1}.")
                 .format(len(locked), ", ".join(sorted(set(locked.values())))))
         if not rows:
@@ -1448,7 +1665,7 @@ def _remove_mods_multi(view, model, mod_rows):
 
     if owners is not None:
         members = sorted({m for m in owners.values() if m})
-        msg = (f"Remove {len(names)} mod(s)?\n\nThis is a profile group — "
+        msg = (f"Remove {len(names)} mod(s)?\n\nThis is a profile group - "
                f"the mods are removed from their member profile(s) "
                f"({', '.join(members) if members else 'none found'}) and "
                "this group, deleting their folders. This cannot be undone.")
@@ -1460,7 +1677,7 @@ def _remove_mods_multi(view, model, mod_rows):
 
 # lupdate extraction anchors: every _mt/_mtf label above is translated at
 # runtime via QCoreApplication.translate("ModListMenu", …), which lupdate
-# cannot see through — so each literal is registered here explicitly.
+# cannot see through - so each literal is registered here explicitly.
 _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Abstain from Endorsement"),
     QT_TRANSLATE_NOOP("ModListMenu", "Abstain selected ({0})"),
@@ -1491,9 +1708,9 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Endorse Mod"),
     QT_TRANSLATE_NOOP("ModListMenu", "Endorse selected ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "'{0}' belongs to the locked profile "
-                      "'{1}' — switch to that profile to remove it, or "
+                      "'{1}' - switch to that profile to remove it, or "
                       "unlock it."),
-    QT_TRANSLATE_NOOP("ModListMenu", "{0} mod(s) skipped — they belong to "
+    QT_TRANSLATE_NOOP("ModListMenu", "{0} mod(s) skipped - they belong to "
                       "locked profile(s): {1}."),
     QT_TRANSLATE_NOOP("ModListMenu", "Lock Separator"),
     QT_TRANSLATE_NOOP("ModListMenu", "Lock Separators"),
@@ -1513,6 +1730,8 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Open on Nexus"),
     QT_TRANSLATE_NOOP("ModListMenu", "Open on Nexus ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Open on mod.io"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Open on Thunderstore"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Thunderstore Actions"),
     QT_TRANSLATE_NOOP("ModListMenu", "Quick Update"),
     QT_TRANSLATE_NOOP("ModListMenu", "Quick Update ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Reinstall ({0})"),
@@ -1526,6 +1745,7 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Rename"),
     QT_TRANSLATE_NOOP("ModListMenu", "Rename mod"),
     QT_TRANSLATE_NOOP("ModListMenu", "Rename separator"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Search…"),
     QT_TRANSLATE_NOOP("ModListMenu", "Separator name:"),
     QT_TRANSLATE_NOOP("ModListMenu", "Separator settings…"),
     QT_TRANSLATE_NOOP("ModListMenu", "Set priority"),

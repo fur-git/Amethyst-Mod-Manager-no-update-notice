@@ -36,7 +36,7 @@ def strip_appimage_env(env: dict) -> dict:
     and its blocked LD_LIBRARY_PATH sentinel instead of the host's, breaking
     Proton's Vulkan GPU probe on startup.
 
-    The var list and strip logic live in :mod:`Utils.appimage_env` — the
+    The var list and strip logic live in :mod:`Utils.appimage_env` - the
     single source of truth shared with ``xdg.host_env``.
     """
     if not in_appimage():
@@ -68,6 +68,22 @@ def dotnet_dep_key(version: str) -> str:
     return f"dotnet{version}_windowsdesktop"
 
 
+def winetricks_verb_dep_key(verb: str) -> str:
+    """Marker key for a generic winetricks verb (e.g. 'fontsmooth=rgb' → 'wt_fontsmooth_rgb')."""
+    return "wt_" + re.sub(r"\W+", "_", verb).strip("_")
+
+
+# Marker key → the Utils.prefix_health component token that can confirm it by
+# reading the prefix. Deliberately mapped HERE rather than in prefix_health, so
+# the import stays one-way (protontricks → prefix_health, never the reverse)
+# and is_dep_installed can never recurse into itself.
+_DETECTABLE_DEPS: dict[str, str] = {
+    VCREDIST_DEP_KEY: "vcredist",
+    D3D_DEP_KEY: "d3dcompiler_47",
+    winetricks_verb_dep_key("lavfilters"): "lavfilters",
+}
+
+
 def _deps_file(prefix_path: Path) -> Path:
     return prefix_path.parent / _DEPS_FILE
 
@@ -81,7 +97,31 @@ def read_installed_deps(prefix_path: Path) -> list[str]:
 
 
 def is_dep_installed(prefix_path: Path, key: str) -> bool:
-    return key in read_installed_deps(prefix_path)
+    """True when *key* is recorded in amethyst_deps.json OR really in the prefix.
+
+    The marker only exists for prefixes Amethyst itself provisioned, and only
+    since the marker was introduced. Prefixes built by hand with winetricks /
+    protontricks, or by another manager, would otherwise be re-installed on
+    every add-game and save. For the components we can positively identify on
+    disk, fall back to reading the prefix (see Utils.prefix_health).
+
+    Read-only by design: a predicate must not write into the user's prefix.
+    Self-healing the marker here would create amethyst_deps.json outside
+    Heroic/Lutris/Faugus prefixes (``_deps_file`` is the prefix's *sibling*),
+    destroy the file's "did Amethyst install this?" meaning, and race the
+    background dependency worker through an unlocked read-modify-write.
+    """
+    if key in read_installed_deps(prefix_path):
+        return True
+    token = _DETECTABLE_DEPS.get(key)
+    if token is None:
+        return False
+    try:
+        from Utils.prefix_health import detect_component
+        # `is True` keeps "cannot tell" (None) behaving as before: install it.
+        return detect_component(token, Path(prefix_path)) is True
+    except Exception:
+        return False        # detection must never break an installer path
 
 
 def mark_dep_installed(prefix_path: Path, key: str) -> None:
@@ -299,12 +339,12 @@ def _install_via_winetricks(
 ) -> bool:
     """Install *component* directly via the bundled winetricks using WINEPREFIX."""
     if not _bundled_winetricks().is_file():
-        log_fn("winetricks not found — downloading it now …")
+        log_fn("winetricks not found - downloading it now …")
         if not install_winetricks(log_fn=log_fn):
             return False
 
     if not cabextract_installed():
-        log_fn("cabextract not found — downloading a portable copy now …")
+        log_fn("cabextract not found - downloading a portable copy now …")
         if not install_cabextract(log_fn=log_fn):
             return False
 
@@ -351,7 +391,7 @@ def _install_via_protontricks(
     cmd = _get_protontricks_cmd(steam_id)
     if cmd is None:
         return False
-    # -q = unattended (forwarded to winetricks inside the prefix) — no
+    # -q = unattended (forwarded to winetricks inside the prefix) - no
     # regsvr32 popups, silent verb installers.
     cmd = cmd + ["-q", component]
     log_fn(f"Installing {component} via protontricks (this may take a minute) …")
@@ -370,11 +410,6 @@ def _install_via_protontricks(
         return False
 
 
-def winetricks_verb_dep_key(verb: str) -> str:
-    """Marker key for a generic winetricks verb (e.g. 'fontsmooth=rgb' → 'wt_fontsmooth_rgb')."""
-    return "wt_" + re.sub(r"\W+", "_", verb).strip("_")
-
-
 def install_winetricks_verb(
     game,
     verb: str,
@@ -384,11 +419,11 @@ def install_winetricks_verb(
 ) -> bool:
     """Install a generic winetricks *verb* into *game*'s Proton prefix.
 
-    Uses the bundled winetricks with WINEPREFIX first (self-contained — no
+    Uses the bundled winetricks with WINEPREFIX first (self-contained - no
     protontricks needed on the system), falling back to system protontricks
     against the game's Steam ID when winetricks fails or no prefix path is
     configured. Success is recorded in the prefix's amethyst_deps.json so
-    repeat calls skip instantly. *timeout* is per attempt — pass a large
+    repeat calls skip instantly. *timeout* is per attempt - pass a large
     value for slow verbs like dotnet48.
     """
     _log = _safe_log(log_fn)
@@ -399,7 +434,7 @@ def install_winetricks_verb(
 
     key = winetricks_verb_dep_key(verb)
     if prefix is not None and is_dep_installed(Path(prefix), key):
-        _log(f"{verb} already installed in this prefix — skipping.")
+        _log(f"{verb} already installed in this prefix - skipping.")
         return True
 
     def _mark():
@@ -421,7 +456,7 @@ def install_winetricks_verb(
         return False
 
     if prefix is None:
-        _log(f"{verb}: no prefix path or working protontricks available — cannot install.")
+        _log(f"{verb}: no prefix path or working protontricks available - cannot install.")
     return False
 
 
@@ -445,7 +480,7 @@ def _download_verified(url: str, sha256: str, log_fn: Callable[[str], None]) -> 
 def _install_d3dcompiler_47_fxc2(prefix_path: Path, log_fn: Callable[[str], None]) -> bool:
     """Drop the Mozilla fxc2 (Win 8.1 SDK) d3dcompiler_47 DLLs into the prefix.
 
-    64-bit → system32, 32-bit → syswow64 — the standard Wine wow64 layout.
+    64-bit → system32, 32-bit → syswow64 - the standard Wine wow64 layout.
     This is the build that supports SM5.x extended typed UAV loads, which the
     winetricks verb's older DLL does not (causes shader error X3676).
     """
@@ -505,7 +540,7 @@ def install_d3dcompiler_47(
         if _install_d3dcompiler_47_fxc2(prefix, _log):
             _mark()
             return True
-        _log("fxc2 install failed — falling back to protontricks/winetricks "
+        _log("fxc2 install failed - falling back to protontricks/winetricks "
              "(note: that DLL may not support Community Shaders / ENB).")
 
     if steam_id and _get_protontricks_cmd(steam_id) is not None:
@@ -520,13 +555,13 @@ def install_d3dcompiler_47(
             return True
         return False
 
-    _log("d3dcompiler_47: no prefix path or working protontricks available — cannot install.")
+    _log("d3dcompiler_47: no prefix path or working protontricks available - cannot install.")
     return False
 
 
 # --- shared silent-installer runner ----------------------------------------
 # Silent in-prefix installers run under ``proton runinprefix``, which never
-# returns if wine wedges — the app then sits on a dead progress bar forever
+# returns if wine wedges - the app then sits on a dead progress bar forever
 # (GH#333). Cap them: on a healthy prefix these finish in seconds, so two
 # minutes is already generous.
 PREFIX_INSTALLER_TIMEOUT_S = 120
@@ -534,7 +569,7 @@ _HEARTBEAT_S = 20
 
 
 def _kill_installer(proc: "subprocess.Popen") -> None:
-    """Kill a wedged installer's whole process group — Proton spawns children."""
+    """Kill a wedged installer's whole process group - Proton spawns children."""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except OSError:
@@ -562,7 +597,7 @@ def run_prefix_installer(
     """Run a silent in-prefix installer under a hard timeout.
 
     Returns ``(exit_code, captured_output)``, or ``(None, output)`` when
-    *timeout* elapsed — in that case the process group is killed and the
+    *timeout* elapsed - in that case the process group is killed and the
     prefix's wineserver shut down, so a wedged run can't block the next
     attempt. Wine's chatter is captured rather than leaking into the app's
     stdout; callers log the tail when the exit code says something went wrong.
@@ -572,7 +607,7 @@ def run_prefix_installer(
     _log = _safe_log(log_fn)
     # NamedTemporaryFile, NOT TemporaryFile: the latter is an anonymous
     # O_TMPFILE fd on Linux, and 32-bit wine startup segfaults (exit 245, NULL
-    # read in host libc) when its stdout is a nameless fd — verified against
+    # read in host libc) when its stdout is a nameless fd - verified against
     # GE-Proton10-33. Any *named* file works.
     out = tempfile.NamedTemporaryFile(
         mode="w+", encoding="utf-8", errors="replace", prefix="amm-installer-")
@@ -597,7 +632,7 @@ def run_prefix_installer(
                 next_beat = now + _HEARTBEAT_S
                 _log(f"{label}: still working ({int(now - started)}s elapsed) …")
         if rc is None:
-            _log(f"{label}: no response after {timeout}s — aborting and shutting "
+            _log(f"{label}: no response after {timeout}s - aborting and shutting "
                  "down the prefix's wine processes.")
             _kill_installer(proc)
             if proton_script is not None and compat_data is not None:
@@ -633,7 +668,7 @@ def _numeric_prefix_version(ver: str) -> "tuple[int, int] | None":
     """``(major, minor)`` of a stock Proton prefix version ('9.0-203' → (9, 0)).
 
     None for GE-Proton-style versions ('GE-Proton10-33'), which Proton's own
-    ``upgrade_pfx`` cannot order either — those skip the mismatch check.
+    ``upgrade_pfx`` cannot order either - those skip the mismatch check.
     """
     head, sep, _build = ver.partition("-")
     if not sep or "." not in head:
@@ -651,7 +686,7 @@ def prefix_downgrade_warning(
     """Explain why a silent install would hang here, or None when it's safe.
 
     ``proton runinprefix`` is dispatched with ``init_session(False)``, and that
-    flag is the only thing gating ``setup_prefix()`` — the sole caller of
+    flag is the only thing gating ``setup_prefix()`` - the sole caller of
     ``upgrade_pfx()``. So when a prefix built by a NEWER Proton is driven by an
     OLDER one, the "Removing newer prefix" downgrade Proton normally performs
     on a version change never runs for our silent installers, and the old wine
@@ -673,7 +708,7 @@ def prefix_downgrade_warning(
     new = _numeric_prefix_version(new_ver)
     if old is None or new is None or new >= old:
         return None
-    # Report the major only — Proton's minor is an internal prefix-schema
+    # Report the major only - Proton's minor is an internal prefix-schema
     # number ("10.1000"), meaningless to users; the raw strings disambiguate.
     return (
         f"this prefix was built by Proton {old[0]} ({old_ver}) but the game is "
@@ -774,7 +809,7 @@ def install_vcredist(
     """Install the VC++ Redistributable silently into the prefix via Proton.
 
     Downloads (and caches) Microsoft's official ``vc_redist.x64.exe`` and runs
-    it with ``/install /quiet /norestart`` through ``proton runinprefix`` — the
+    it with ``/install /quiet /norestart`` through ``proton runinprefix`` - the
     exact mechanism the Proton Tools menu uses (runinprefix skips the steam.exe
     shim, so the silent install doesn't show the game as "Running" in Steam).
     Records success in the prefix's amethyst_deps.json so other callers can
@@ -784,14 +819,14 @@ def install_vcredist(
     from Utils.config_paths import get_vcredist_cache_path
 
     # Flatpak without the Compat.i386 extension: wine would die with the
-    # cryptic "/lib/ld-linux.so.2: could not open" — fail with the fix instead.
+    # cryptic "/lib/ld-linux.so.2: could not open" - fail with the fix instead.
     from Utils.flatpak_i386 import preflight_i386_error
     i386_err = preflight_i386_error(proton_script)
     if i386_err:
         _log(f"VC++ Redistributable: {i386_err}")
         return False
 
-    # Older Proton driving a newer prefix hangs under runinprefix — refuse with
+    # Older Proton driving a newer prefix hangs under runinprefix - refuse with
     # the fix instead of sitting on a dead progress bar (GH#333).
     compat_data = env.get("STEAM_COMPAT_DATA_PATH")
     stale_prefix = prefix_downgrade_warning(proton_script, compat_data)
@@ -808,7 +843,7 @@ def install_vcredist(
             _log("Download complete.")
         else:
             _log("Using cached VC++ Redistributable installer.")
-        _log("Installing VC++ Redistributable in game prefix (silent) — please wait …")
+        _log("Installing VC++ Redistributable in game prefix (silent) - please wait …")
         from Utils.steam_finder import proton_run_command
         rc, output = run_prefix_installer(
             proton_run_command(proton_script, "runinprefix",

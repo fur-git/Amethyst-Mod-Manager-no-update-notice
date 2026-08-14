@@ -3,8 +3,8 @@ mesh_catalog.py
 Enumerate every copy of an asset kind (default .nif) across a profile + vanilla.
 
 Unlike Utils.asset_resolver, which answers "which copy applies", this lists ALL
-copies — loose files from every enabled mod, loose files in the game data folder,
-and members of BSA/BA2 archives on both sides — and flags the one the game would
+copies - loose files from every enabled mod, loose files in the game data folder,
+and members of BSA/BA2 archives on both sides - and flags the one the game would
 load, using the resolver's own winner tables so the two never disagree.
 """
 
@@ -118,7 +118,7 @@ def build_catalog(resolver, staging: Path | None, modlist_path: Path | None,
         return []
 
     # Loose files the game sees but no mod owns. A DEPLOYED profile puts every
-    # winning mod file in the data folder too, so those keys are dropped here —
+    # winning mod file in the data folder too, so those keys are dropped here -
     # otherwise each one sprouts a phantom "Data" duplicate of itself.
     if data_dir is not None:
         deployed = set(_winner_map(resolver, "loose_winners"))
@@ -144,7 +144,7 @@ def build_catalog(resolver, staging: Path | None, modlist_path: Path | None,
 def find_copies(rel_keys, resolver, staging: Path | None,
                 modlist_path: Path | None, data_dir: Path | None,
                 *, keep_prefix=("textures/", "materials/")) -> dict:
-    """Every copy of each of *rel_keys*, winner first — build_catalog for a
+    """Every copy of each of *rel_keys*, winner first - build_catalog for a
     handful of known paths, cheap enough to run per preview."""
     keys = [normalise(k) for k in rel_keys if k]
     keys = [k for k in dict.fromkeys(keys) if k]          # de-dupe, keep order
@@ -211,7 +211,7 @@ def mod_has_assets(staging: Path | None, mod: str, *,
                    prefix: str = DEFAULT_PREFIX,
                    exts: tuple[str, ...] = DEFAULT_EXTS) -> bool:
     """True if *mod* ships at least one matching asset, loose or in its own
-    BSA/BA2 — the right-click gate for "is there anything to view here".
+    BSA/BA2 - the right-click gate for "is there anything to view here".
 
     Reads the cached modindex/bsa_index (no disk walk) when they exist, so it
     is cheap enough to run while a context menu is being built.
@@ -254,7 +254,7 @@ def _data_archive_copies(data_dir: Path, wanted: set, keep_prefix) -> list:
         return []
     out: list[MeshEntry] = []
     for archive in find_archives([data_dir]):
-        # The TOC cache is keyed by keep_prefix — pass the resolver's to reuse
+        # The TOC cache is keyed by keep_prefix - pass the resolver's to reuse
         # the indexes it already built.
         for key in wanted.intersection(index_archive(archive, keep_prefix)):
             out.append(MeshEntry(key, DATA_ARCHIVE, archive=archive))
@@ -275,7 +275,7 @@ def _enabled_mods(modlist_path: Path | None) -> list[str]:
 
 def _mod_loose(staging: Path, mods: list[str], prefix: str,
                exts: tuple[str, ...]) -> list[MeshEntry]:
-    """Loose copies from every enabled mod — modindex.bin (NOT filemap.txt,
+    """Loose copies from every enabled mod - modindex.bin (NOT filemap.txt,
     which holds only winners), or a disk walk if the index is absent."""
     out: list[MeshEntry] = []
     index = None
@@ -329,14 +329,14 @@ def _data_archives(data_dir: Path, prefix: str,
                    exts: tuple[str, ...]) -> list[MeshEntry]:
     """Archived copies in the game data folder, in the order the game mounts."""
     try:
-        from Utils.archive_lookup import find_archives
-        from Utils.bsa_reader import read_bsa_file_list
+        from Utils.archive_lookup import find_archives, index_archive
     except Exception:                                    # noqa: BLE001
         return []
     out: list[MeshEntry] = []
     for archive in find_archives([data_dir]):
-        # Name-only TOC read: never decompresses, and a broken archive is [].
-        for key in read_bsa_file_list(archive):
+        # Reuse archive_lookup's path+mtime+size cache.  The old name-only
+        # reader reparsed every vanilla TOC each time the viewer opened.
+        for key in index_archive(archive):
             if key.startswith(prefix) and _ext_ok(key, exts):
                 out.append(MeshEntry(key, DATA_ARCHIVE, archive=archive))
     return out
@@ -386,7 +386,7 @@ def _pick_winner(key: str, group: list[MeshEntry], loose_w: dict[str, str],
             return e
     if not loose_w:
         # No filemap AT ALL: fall back to modlist priority (group is sorted).
-        # Gated on the whole map being empty, not this key missing from it —
+        # Gated on the whole map being empty, not this key missing from it -
         # a filemap that omits a path means the engine skips the loose copy
         # too, and guessing there would disagree with AssetResolver.read().
         for e in group:
@@ -412,7 +412,7 @@ def _pick_winner(key: str, group: list[MeshEntry], loose_w: dict[str, str],
 
 def read_entry(entry: MeshEntry, staging: Path | None, data_dir: Path | None,
                dirs=None) -> bytes | None:
-    """Bytes of THIS copy — not the winner, which is all resolver.read() gives."""
+    """Bytes of THIS copy - not the winner, which is all resolver.read() gives."""
     if dirs is None:
         from Utils.asset_resolver import DirCache
         dirs = DirCache()
@@ -436,16 +436,20 @@ def read_entry(entry: MeshEntry, staging: Path | None, data_dir: Path | None,
 
 def read_archive_member(archive: Path, inner_path: str) -> bytes | None:
     """One member's bytes from a BSA/BA2, without unpacking the archive."""
-    key = inner_path.replace("\\", "/").lower()
     archive = Path(archive)
     try:
-        if archive.suffix.lower() == ".ba2":
-            from Utils.ba2_extract import index_ba2, read_ba2_entry
-            rec = index_ba2(archive).get(key)
-            return read_ba2_entry(archive, rec) if rec else None
-        from Utils.bsa_extract import index_bsa, read_bsa_entry
-        info, entries = index_bsa(archive)
-        found = entries.get(key)
-        return read_bsa_entry(archive, info, found) if found else None
+        from Utils.archive_lookup import index_archive, normalise
+        # Direct access avoids rebuilding ArchiveLookup's merged map for every
+        # texture while retaining its process-wide cached archive index.
+        got = index_archive(archive).get(normalise(inner_path))
+        if got is None:
+            return None
+        kind, record = got
+        if kind == "ba2":
+            from Utils.ba2_extract import read_ba2_entry
+            return read_ba2_entry(archive, record)
+        from Utils.bsa_extract import read_bsa_entry
+        info, entry = record
+        return read_bsa_entry(archive, info, entry)
     except Exception:                                    # noqa: BLE001
         return None

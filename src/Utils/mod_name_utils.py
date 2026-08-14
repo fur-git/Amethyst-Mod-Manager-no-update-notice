@@ -9,7 +9,7 @@ import unicodedata
 
 # Characters Windows/Wine forbid in a path component.  Mods are deployed and
 # read through Wine tools (xEdit, PGPatcher, BodySlide, …) and into Wine
-# prefixes, so a folder name Wine can't address breaks those tools — and a
+# prefixes, so a folder name Wine can't address breaks those tools - and a
 # trailing dot or space is silently stripped by Windows path normalisation,
 # which makes the folder vanish from the tool's point of view.
 _WINDOWS_RESERVED_CHARS = r'<>:"/\\|?*'
@@ -42,12 +42,12 @@ def sanitize_mod_folder_name(name: str) -> str:
     - Strips characters Windows/Wine forbid in a path component.
     - Removes control characters.
     - Trims trailing dots and spaces (incl. the no-break space, which
-      str.strip() treats as whitespace) — Windows path normalisation drops
+      str.strip() treats as whitespace) - Windows path normalisation drops
       these, so "Foo." / "Foo " / "Foo " become unreachable to Wine tools.
     - Falls back to "Mod" if nothing usable remains.
 
     Visible non-ASCII characters (accented letters, Cyrillic, CJK, …) are
-    preserved — only ambiguous/invisible bytes are normalised away. This only
+    preserved - only ambiguous/invisible bytes are normalised away. This only
     affects the on-disk folder name; the user's chosen display name is
     unaffected elsewhere.
     """
@@ -60,7 +60,7 @@ def sanitize_mod_folder_name(name: str) -> str:
     s = "".join(ch for ch in s if ord(ch) >= 32)
     # Windows strips trailing dots and spaces from each path component.
     s = s.rstrip(". ")
-    # Reserved DOS device names (CON, PRN, NUL, COM1…) — extremely rare for a
+    # Reserved DOS device names (CON, PRN, NUL, COM1…) - extremely rare for a
     # mod name, but a folder so named is unusable under Wine.
     if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])", s):
         s = s + "_"
@@ -116,7 +116,7 @@ _NEW_NEXUS_SPACED_TS_RE = re.compile(
 
 # mod.io download names append a truncated-UUID tail: an underscore, the first
 # two hex groups of the mod's UUID (``<8hex>-<4hex>``), then one or more short
-# trailing groups (1-4 chars each) ending in a random token — e.g.
+# trailing groups (1-4 chars each) ending in a random token - e.g.
 # ``bettercontainers_cb42bc3a-f1d2-afwl``, ``wingsunlocked_3d7eabb4-81bf-d9-bwww``,
 # ``weightlessgold_81117bd5-de2f-a-du9y`` (note the 1-char ``a`` group).  The
 # ``_<8hex>-<4hex>`` anchor is distinct from any Nexus tail, so matching is
@@ -128,7 +128,7 @@ _MODIO_TAIL_RE = re.compile(r"_[0-9a-f]{8}-[0-9a-f]{4}(?:-[0-9a-z]{1,4})+$")
 # Default (built-in) install-name rules, exposed as editable regex rows.
 #
 # These mirror the known download-name formats above as plain search/replace
-# regex so a user can SEE and tweak what runs — the editor seeds them into the
+# regex so a user can SEE and tweak what runs - the editor seeds them into the
 # config on first use and offers a per-row / global "restore default". They run
 # through the same _apply_custom_patterns path as user rules (as Step 0 of
 # _suggest_mod_names). The heuristic Python parsers below (_strip_nexus_new_format
@@ -180,7 +180,7 @@ def default_install_name_rules() -> list[dict]:
 # ids of the built-in defaults whose FORMAT is ALSO handled by a heuristic
 # Python parser below (_strip_nexus_new_format / the mod.io tail strip). The
 # editor's rules are authoritative: when the user disables (or deletes) the rule
-# for one of these, the matching Python parser step is skipped too — otherwise
+# for one of these, the matching Python parser step is skipped too - otherwise
 # the internal parser would silently shadow the disabled rule and disabling
 # would appear to do nothing. Formats WITHOUT a duplicate parser (e.g. the
 # underscore ``<name>_<ver>_<slug>`` form, legacy dash tails) always run.
@@ -194,7 +194,7 @@ def _disabled_gated_ids() -> set[str]:
     """Return the set of gated default-rule ids that the user has disabled or
     removed. A gated Python parser step is skipped for any id in this set so the
     editor's rules stay authoritative. On any error, returns an empty set (parse
-    everything — the safe default)."""
+    everything - the safe default)."""
     try:
         from Utils.ui_config import load_install_name_patterns
         rules = load_install_name_patterns()
@@ -214,7 +214,7 @@ def _apply_custom_patterns(stem: str) -> str | None:
     """Apply the user's custom install-name search/replace rules to *stem*.
 
     Rules come from Settings ▸ (install name patterns) via
-    ``ui_config.load_install_name_patterns`` and are applied in order — each
+    ``ui_config.load_install_name_patterns`` and are applied in order - each
     enabled rule runs ``re.sub(search, replace, stem)``. Nexus keeps changing
     its download-name format, so this lets a user adapt without a code change.
 
@@ -365,7 +365,7 @@ def _suggest_mod_names(filename_stem: str) -> list[str]:
     for the install/rename dialog, **best (default) first**.
 
     Nexus Mods download names follow ``ModName-nexusid-version-timestamp``.
-    The only suffix we strip for the *default* name is that Nexus tail — the
+    The only suffix we strip for the *default* name is that Nexus tail - the
     title itself (including any parentheses, version, or descriptive tags the
     uploader chose) is preserved.  This mirrors Mod Organizer 2, whose
     name-guess regex treats ``( ) . -`` and spaces as legitimate mod-name
@@ -373,12 +373,12 @@ def _suggest_mod_names(filename_stem: str) -> list[str]:
 
     The aggressively-cleaned name (parens/version/edition tags removed) is still
     offered as a *lower-priority* candidate so the rename dialog can suggest it,
-    but it is no longer the default — too many real titles carry meaningful
+    but it is no longer the default - too many real titles carry meaningful
     parentheses (Stardew framework tags "(CP)"/"(AT)", disambiguators like
     "(Black)" vs "(Silver)", etc.) that the old default silently destroyed.
     """
     # Step 0: user-defined custom rules (Settings) win over every built-in
-    # parser — this is the escape hatch for a new Nexus download-name format we
+    # parser - this is the escape hatch for a new Nexus download-name format we
     # haven't shipped a built-in for yet. When a rule matches, the transformed
     # name is the default candidate; the built-in suggestions are still appended
     # below as fallbacks in the rename dialog.
@@ -389,7 +389,7 @@ def _suggest_mod_names(filename_stem: str) -> list[str]:
 
     # Which built-in default rules has the user turned off? The matching
     # (duplicated) parser steps below are skipped so the editor's rules stay
-    # authoritative — disabling a default rule visibly changes the result.
+    # authoritative - disabling a default rule visibly changes the result.
     disabled = _disabled_gated_ids()
 
     # Step 1: strip duplicate-download suffix added by browsers/OS (e.g. " (1)", " (2)")
@@ -449,7 +449,7 @@ def _suggest_mod_names(filename_stem: str) -> list[str]:
             nexus_clean = re.sub(r"(-\d+)+$", "", stem).strip()
 
     # Aggressively-cleaned variant: strip parens/brackets/version/edition tags.
-    # Offered as a fallback candidate only — NOT the default (see docstring).
+    # Offered as a fallback candidate only - NOT the default (see docstring).
     title_clean = _strip_title_metadata(nexus_clean)
 
     # Build de-duplicated list, default (least-destructive) first.
@@ -460,3 +460,187 @@ def _suggest_mod_names(filename_stem: str) -> list[str]:
             seen.add(candidate)
             result.append(candidate)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Rename / install name suggestions (GH#368)
+# ---------------------------------------------------------------------------
+#
+# Every place the user can name or rename a mod offers the same short menu of
+# candidates, mirroring MO2's install dialog:
+#   1. the name on Nexus (per-file label first, then the mod page title),
+#   2. the folder name an older/other version of the SAME Nexus mod already
+#      uses (so a second part or an update lands on the existing name),
+#   3. the prettified archive filename (Amethyst's install default),
+#   4. the untouched archive filename.
+# Source labels are English keys - the UI translates them.
+
+SRC_NEXUS_FILE = "Nexus file name"
+SRC_NEXUS_MOD = "Nexus mod name"
+SRC_INSTALLED = "Previously installed"
+SRC_CLEANED = "Cleaned filename"
+SRC_ALTERNATIVE = "Alternative"
+SRC_ORIGINAL = "Original filename"
+SRC_THUNDERSTORE = "Thunderstore mod name"
+SRC_THUNDERSTORE_TEAM = "Thunderstore team and name"
+
+
+# Only KNOWN archive extensions are stripped - a blind "drop the last dotted
+# segment" pass eats real version tails ("Mod v1.2.3" → "Mod v1.2").
+_ARCHIVE_EXTS = {
+    "zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst", "lzma", "tgz", "omod",
+}
+
+
+def _archive_stem(installation_file: str) -> str:
+    """Strip the (possibly multi-part) archive extension off a download name."""
+    stem = installation_file.strip()
+    # Trailing split-archive part number, e.g. "Foo.7z.001".
+    base, dot, ext = stem.rpartition(".")
+    if dot and ext.isdigit() and len(ext) <= 3:
+        stem = base
+    for _ in range(2):                      # ".tar.gz" needs two passes
+        base, dot, ext = stem.rpartition(".")
+        if not dot or ext.lower() not in _ARCHIVE_EXTS:
+            break
+        stem = base
+    # RAR's split form puts the part number BEFORE the extension ("Foo.part1.rar").
+    return re.sub(r"\.part\d+$", "", stem, flags=re.I)
+
+
+def name_suggestions(meta=None, *, installation_file: str = "",
+                     previous_name: str = "",
+                     exclude: str = "") -> list[tuple[str, str]]:
+    """Return ``[(name, source_label), …]`` naming candidates, best first."""
+    file_name = installation_file or getattr(meta, "installation_file", "") or ""
+    stem = _archive_stem(file_name)
+    cleaned = _suggest_mod_names(stem) if stem else []
+
+    ordered: list[tuple[str, str]] = []
+    if previous_name:
+        # An existing folder for this same mod outranks everything else: it is
+        # what a multi-part download or an update has to land on to merge.
+        ordered.append((previous_name, SRC_INSTALLED))
+    ordered.append((getattr(meta, "nexus_file_name", "") or "", SRC_NEXUS_FILE))
+    ordered.append((getattr(meta, "nexus_name", "") or "", SRC_NEXUS_MOD))
+    # _suggest_mod_names always ends with the untouched stem; it is offered
+    # below under its own label, so it must not also show up as a "cleaned" one.
+    for i, cand in enumerate([c for c in cleaned if c != stem]):
+        ordered.append((cand, SRC_CLEANED if i == 0 else SRC_ALTERNATIVE))
+    ordered.append((stem, SRC_ORIGINAL))
+
+    out: list[tuple[str, str]] = []
+    seen = {exclude.strip().lower()} if exclude else set()
+    for raw, label in ordered:
+        if not raw.strip():
+            continue
+        name = sanitize_mod_folder_name(raw.strip())
+        if not name:
+            continue
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append((name, label))
+    return out
+
+
+def sibling_version_name(staging_root, mod_name: str, meta) -> str:
+    """Folder name of another staged mod sharing this mod's Nexus id ("" if none)."""
+    mod_id = int(getattr(meta, "mod_id", 0) or 0)
+    if mod_id <= 0 or staging_root is None:
+        return ""
+    from Nexus.nexus_meta import read_meta   # lazy: Utils must not need Nexus
+    domain = (getattr(meta, "game_domain", "") or "").lower()
+    try:
+        folders = sorted(p for p in staging_root.iterdir() if p.is_dir())
+    except OSError:
+        return ""
+    # Raw substring probe before the (much costlier) configparser parse - this
+    # runs on the UI thread when the user hits F2, and a big staging folder is
+    # thousands of meta.ini files.
+    id_re = re.compile(rf"^\s*modid\s*=\s*{mod_id}\s*$", re.MULTILINE | re.I)
+    for folder in folders:
+        if folder.name == mod_name:
+            continue
+        meta_path = folder / "meta.ini"
+        try:
+            if not id_re.search(meta_path.read_text(encoding="utf-8",
+                                                    errors="replace")):
+                continue
+            other = read_meta(meta_path)
+        except Exception:      # missing / unreadable / malformed meta.ini
+            continue
+        if int(getattr(other, "mod_id", 0) or 0) != mod_id:
+            continue
+        if domain and (other.game_domain or "").lower() != domain:
+            continue
+        return folder.name
+    return ""
+
+
+def thunderstore_name_candidates(ts_meta) -> list[tuple[str, str]]:
+    """``[(name, source_label), …]`` naming candidates from Thunderstore metadata.
+
+    Thunderstore's ``name`` IS the display name - the API exposes no prettier
+    title, and underscores are how the site spells spaces
+    (``Base_Deconstruct_Fix``). So the package name comes first, a
+    de-underscored variant second (nicer in the modlist), then the
+    team-qualified form for disambiguating same-named packages.
+    """
+    if ts_meta is None or not getattr(ts_meta, "package_id", ""):
+        return []
+    name = (getattr(ts_meta, "name", "") or "").strip()
+    namespace = (getattr(ts_meta, "namespace", "") or "").strip()
+    out: list[tuple[str, str]] = []
+    if name:
+        out.append((name, SRC_THUNDERSTORE))
+        spaced = name.replace("_", " ").strip()
+        if spaced and spaced != name:
+            out.append((spaced, SRC_THUNDERSTORE))
+    if namespace and name:
+        out.append((f"{namespace}-{name}", SRC_THUNDERSTORE_TEAM))
+    return out
+
+
+def suggest_names_for_staged_mod(staging_root, mod_name: str
+                                 ) -> list[tuple[str, str]]:
+    """Rename candidates for an installed mod, read from its meta.ini."""
+    if staging_root is None or not mod_name:
+        return []
+    meta_path = staging_root / mod_name / "meta.ini"
+    if not meta_path.is_file():
+        return []
+    # Thunderstore candidates come first when the mod has a [thunderstore]
+    # section: for those mods the package name is the authoritative one, and
+    # the Nexus-derived suggestions are just archive-stem guesses.
+    ts_out: list[tuple[str, str]] = []
+    try:
+        from Thunderstore.thunderstore_meta import read_meta as ts_read
+        ts_out = thunderstore_name_candidates(ts_read(meta_path))
+    except Exception:
+        ts_out = []
+    try:
+        from Nexus.nexus_meta import read_meta
+        meta = read_meta(meta_path)
+    except Exception:
+        meta = None
+    nexus_out = []
+    if meta is not None:
+        nexus_out = name_suggestions(
+            meta,
+            previous_name=sibling_version_name(staging_root, mod_name, meta),
+            exclude=mod_name,
+        )
+    # Merge, de-duplicating on the sanitised name and dropping the current
+    # folder name (same rules name_suggestions applies internally).
+    out: list[tuple[str, str]] = []
+    seen = {mod_name.strip().lower()}
+    for raw, label in list(ts_out) + list(nexus_out):
+        if not raw or not raw.strip():
+            continue
+        clean = sanitize_mod_folder_name(raw.strip())
+        if not clean or clean.lower() in seen:
+            continue
+        seen.add(clean.lower())
+        out.append((clean, label))
+    return out

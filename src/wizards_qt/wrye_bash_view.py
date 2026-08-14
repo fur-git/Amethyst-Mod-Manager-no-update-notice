@@ -1,4 +1,4 @@
-"""Wrye Bash wizard — Qt port of wizards/wrye_bash.py (registered by every
+"""Wrye Bash wizard - Qt port of wizards/wrye_bash.py (registered by every
 Bethesda game).
 
 Auto-downloads the latest Standalone Executable release from GitHub,
@@ -39,7 +39,7 @@ class WryeBashView(WizardViewBase):
     def __init__(self, game: "BaseGame", log_fn=None, on_close=None, ctx=None,
                  **_extra):
         super().__init__(game, log_fn, on_close, ctx,
-                         title=self.tr("Run Wrye Bash — {0}").format(game.name))
+                         title=self.tr("Run Wrye Bash - {0}").format(game.name))
         self._exe = tool_exe_path(game, _EXE_NAME, _APP_DIR)
         self._proton_name = ""
         self._prefix_mode = ""
@@ -112,12 +112,13 @@ class WryeBashView(WizardViewBase):
             )
             from Utils.xedit_tools import prepare_xedit_prefix
             _wlog = lambda m: self._log(f"Wrye Bash Wizard: {m}")
+            proton_script = compat_data = None
             try:
                 result = resolve_tool_prefix(
                     exe, game, proton_name, prefix_mode, log_fn=_wlog)
                 if result is None:
                     safe_emit(self._run_status_sig,
-                              self.tr("Could not find Proton '{0}' — "
+                              self.tr("Could not find Proton '{0}' - "
                               "check that it is installed in Steam.").format(
                                   proton_name), RED)
                     return
@@ -153,8 +154,6 @@ class WryeBashView(WizardViewBase):
                 safe_emit(self._run_started_sig)
                 run_tool_logged(proton_script, exe, env, log_fn=_wlog,
                                 extra_args=game_arg, label="Wrye Bash")
-                shutdown_prefix_wineserver(proton_script, compat_data,
-                                           log_fn=_wlog)
                 _wlog("Wrye Bash closed.")
                 safe_emit(self._run_status_sig,
                           self.tr("Wrye Bash finished."), GREEN)
@@ -163,6 +162,12 @@ class WryeBashView(WizardViewBase):
                 safe_emit(self._run_status_sig,
                           self.tr("Launch error: {0}").format(exc), RED)
                 self._log(f"Wrye Bash Wizard: launch error: {exc}")
+            finally:
+                # In finally: a tool that crashed is exactly when Proton
+                # sidecars are most likely to be left holding the prefix.
+                if proton_script is not None and compat_data is not None:
+                    shutdown_prefix_wineserver(proton_script, compat_data,
+                                               log_fn=_wlog)
 
         threading.Thread(target=worker, daemon=True, name="wryebash-run").start()
 

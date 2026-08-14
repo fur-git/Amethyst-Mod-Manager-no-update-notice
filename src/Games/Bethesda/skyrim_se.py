@@ -11,19 +11,19 @@ from pathlib import Path
 
 from Games.Bethesda.fallout_3 import Fallout_3
 from Games.base_game import WizardTool, MODERN_DIRECTX_DEPS
-from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, restore_data_core, move_to_core
+from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, restore_data_core, move_to_core, remove_case_alias_links, remove_probe_stub_dirs
 from Utils.modlist import read_modlist
 
 
 class SkyrimSE(Fallout_3):
 
-    # SSE auto-loads plugin-matched BSAs — it is NOT a FO3/FNV-style engine that
+    # SSE auto-loads plugin-matched BSAs - it is NOT a FO3/FNV-style engine that
     # only reads archives listed in the INI. Override the Fallout_3 default.
     _archive_list_needs_mod_bsas = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
     # Vanilla incl. Skyrim.ccc content (and _ResourcePack.esl, which is listed
-    # inside Skyrim.ccc since 1.6.1130) stays OUT of plugins.txt — the engine
+    # inside Skyrim.ccc since 1.6.1130) stays OUT of plugins.txt - the engine
     # force-loads it before reading the file and strips any such entries on
     # launch. MO2/Vortex/LOOT exclude it identically.
     supports_esl_flag = True
@@ -56,12 +56,16 @@ class SkyrimSE(Fallout_3):
         return "489830"
 
     @property
+    def direct_launch_exes(self) -> list[str]:
+        return ["SkyrimSE.exe"]
+
+    @property
     def nexus_game_domain(self) -> str:
         return "skyrimspecialedition"
 
     @property
     def mod_required_top_level_folders(self) -> set[str]:
-        # Skyrim SE subset — excludes Fallout-specific folders (f4se, nvse,
+        # Skyrim SE subset - excludes Fallout-specific folders (f4se, nvse,
         # fose, config) that Fallout_3 includes.
         return {
             "skse",
@@ -95,6 +99,7 @@ class SkyrimSE(Fallout_3):
             "trees",
             "asi",
             "tools",
+            "enbseries",
         }
 
     @property
@@ -115,7 +120,7 @@ class SkyrimSE(Fallout_3):
         # xaudio2_7 access-violates on the audio thread under Proton (crash in
         # XAudio2_7.dll touching BSXAudio2GameSound), so prefer native but fall
         # back to Wine's builtin (wired to winepulse). d3dcompiler_47 stays
-        # native — we install the Mozilla fxc2 build that supports SM5.x typed
+        # native - we install the Mozilla fxc2 build that supports SM5.x typed
         # UAV loads (Community Shaders / ENB; see install_d3dcompiler_47).
         overrides = {
             "winmm": "native,builtin",
@@ -150,8 +155,22 @@ class SkyrimSE(Fallout_3):
     @property
     def filemap_casing_pins(self) -> dict[str, str]:
         return {
+            # These are mostly to fix issues with infinity UI related mods that expect exact casing otherwise they crash
             "hudmoviebaseinstance":    "HUDMovieBaseInstance",
             "compassshoutmeterholder": "CompassShoutMeterHolder",
+            "infinityui": "InfinityUI",
+            "hudmenu": "HUDMenu",
+            "skse": "SKSE",
+            "!assets": "!assets",
+            "compass.swf": "Compass.swf",
+            "questitemlist.swf": "QuestItemList.swf",
+            "minimap.swf": "Minimap.swf",
+            "minimapart.swf": "MinimapArt.swf",
+            "worldmap": "WorldMap",
+            "localmapmenu": "LocalMapMenu",
+            "icondisplayextension.swf": "IconDisplayExtension.swf",
+            "icondisplayextensionart.swf": "IconDisplayExtensionArt.swf",
+            "data" : "Data",
         }
 
     @property
@@ -167,21 +186,8 @@ class SkyrimSE(Fallout_3):
             CustomRule(dest="", filenames=[
                 "d3d11.dll",
                 "d3dcompiler_46e.dll",
-                "enbadaptation.fx",
-                "enbbloom.fx",
-                "enbdepthoffield.fx",
-                "enbeffect.fx",
-                "enbeffectpostpass.fx",
-                "enbeffectprepass.fx",
-                "enblens.fx",
                 "enblocal.ini",
-                "enbpalette.bmp",
-                "enbraindrops.dds",
                 "enbseries.ini",
-                "enbsunsprite.bmp",
-                "enbsunsprite.fx",
-                "enbunderwater.fx",
-                "enbunderwaternoise.bmp",
             ], flatten=True),
             CustomRule(dest="", folders=["enbseries"], flatten=True),
             self._saves_routing_rule([".ess"]),
@@ -269,7 +275,7 @@ class SkyrimSE(Fallout_3):
                 description="Deploy mods and run Outfit Studio from the Data folder.",
                 dialog_class_path="wizards.bodyslide.OutfitStudioWizard",
             ))
-        # Native Linux builds — always listed: the wizard downloads the
+        # Native Linux builds - always listed: the wizard downloads the
         # AppImage itself, so there is no staged exe to gate on.
         pandora_tools.append(WizardTool(
             id="run_bodyslide_linux_skyrimse",
@@ -411,7 +417,7 @@ class SkyrimSE(Fallout_3):
             ),
             WizardTool(
                 id="run_skygen_skyrimse",
-                label="SkyGen — Patch Generator",
+                label="SkyGen - Patch Generator",
                 description=(
                     "Scan your load order for Base Object Swapper / SkyPatcher patch coverage "
                     "and generate new BOS or SP INI patches."
@@ -444,7 +450,7 @@ class SkyrimSE(Fallout_3):
     # SSE engine doesn't need the dummy-BSA trick: bUseLooseFiles defaults true
     # and the engine prefers loose files over archived assets without timestamp
     # gymnastics. MO2's game_skyrimSE plugin omits a BSAInvalidation feature
-    # entirely — we match that. Only the bInvalidateOlderFiles INI key is set.
+    # entirely - we match that. Only the bInvalidateOlderFiles INI key is set.
     _invalidation_bsa_name = None
     _invalidation_bsa_version = None
 
@@ -453,7 +459,7 @@ class SkyrimSE(Fallout_3):
         return "skse64_loader.exe"
 
     # swap_launcher / _restore_launcher are inherited from Fallout_3: it
-    # derives the launcher name from exe_name (SkyrimSELauncher.exe — GOG uses
+    # derives the launcher name from exe_name (SkyrimSELauncher.exe - GOG uses
     # the same name, unlike GOG Fallout 3) and the SE loader from
     # _script_extender_exe above, so the base logic is already correct here.
 
@@ -491,7 +497,7 @@ class SkyrimSE(Fallout_3):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
-        # Separator overrides — loaded from the real profile_dir (modlist.txt /
+        # Separator overrides - loaded from the real profile_dir (modlist.txt /
         # profile_state.json live there, not necessarily next to the filemap) and
         # passed explicitly so shared-staging layouts get the right link modes.
         _sep_deploy = load_separator_deploy_paths(profile_dir)
@@ -566,6 +572,12 @@ class SkyrimSE(Fallout_3):
         data_dir      = self._game_path / "Data"
         staging       = self.get_effective_mod_staging_path()
         overwrite_dir = self.get_effective_overwrite_path()
+
+        _log("Restore: removing case-alias symlinks ...")
+        remove_case_alias_links(self._game_path, self.case_alias_dirs,
+                                log_fn=_log)
+        remove_probe_stub_dirs(self._game_path, self.probe_stub_dirs,
+                               log_fn=_log)
 
         _log("Restore: removing plugins.txt symlink ...")
         self._remove_plugins_txt_symlink(_log)

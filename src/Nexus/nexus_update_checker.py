@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from Nexus.nexus_api import NexusAPI, NexusAPIError, NexusModUpdateInfo
-from Nexus.nexus_meta import NexusModMeta, scan_installed_mods, write_meta
+from Nexus.nexus_meta import (
+    NexusModMeta, normalise_game_domain, scan_installed_mods, write_meta)
 from Nexus.nexus_requirements import MissingRequirementInfo, check_requirements_from_gql
 
 ProgressCallback = Callable[[str], None]
@@ -86,7 +87,7 @@ def _alpha_key(segment: str) -> tuple[int, str]:
 
     A longer run is always greater, so once an author wraps past ``z`` the
     sequence keeps ascending: ``z < aa < ab < ba < zz < aaa``.  Equal-length
-    runs fall back to lexical order.  (Plain lexical order would be wrong here —
+    runs fall back to lexical order.  (Plain lexical order would be wrong here -
     ``"aa" < "z"`` would make a wrap to ``.aa`` look like a downgrade.)
     """
     return (len(segment), segment)
@@ -172,13 +173,13 @@ def _version_is_newer(latest: str, installed: str) -> bool:
 
     Both strings are parsed via ``_parse_version``.  If either is unparseable,
     falls back to a case-insensitive string inequality (only flags "newer" when
-    the normalised strings differ — conservative).
+    the normalised strings differ - conservative).
     """
     lp = _parse_version(latest)
     ip = _parse_version(installed)
     if lp is not None and ip is not None:
         return lp > ip
-    # Fallback: can't parse — only say "newer" if clearly different
+    # Fallback: can't parse - only say "newer" if clearly different
     ln = (latest or "").strip().lower().lstrip("v").strip()
     iv = (installed or "").strip().lower().lstrip("v").strip()
     if not ln or not iv:
@@ -209,13 +210,56 @@ def check_for_updates(
     enabled_only: Optional[set] = None,
     max_workers: int = 10,
 ) -> tuple[list["UpdateInfo"], list["MissingRequirementInfo"]]:
+    """Check installed mods in domain-qualified batches.
+
+    Nexus mod ids are scoped to a game. Grouping before invoking the existing
+    single-domain pipeline prevents equal numeric ids in compatible domains
+    from sharing update, file, endorsement, or requirement data.
+    """
+    _log = progress_cb or (lambda m: None)
+    installed = scan_installed_mods(staging_root)
+    selected = [m for m in installed
+                if enabled_only is None or m.mod_name in enabled_only]
+    fallback = normalise_game_domain(game_domain)
+    by_domain: dict[str, set[str]] = {}
+    for meta in selected:
+        domain = normalise_game_domain(meta.game_domain) or fallback
+        if domain:
+            by_domain.setdefault(domain, set()).add(meta.mod_name)
+    if not by_domain:
+        _log("No Nexus-sourced mods with a game domain found.")
+        return [], []
+
+    updates: list[UpdateInfo] = []
+    missing: list[MissingRequirementInfo] = []
+    for domain, names in by_domain.items():
+        if len(by_domain) > 1:
+            _log(f"Checking Nexus domain '{domain}'...")
+        domain_updates, domain_missing = _check_for_updates_one_domain(
+            api, staging_root, game_domain=domain, progress_cb=progress_cb,
+            save_results=save_results, enabled_only=names,
+            max_workers=max_workers)
+        updates.extend(domain_updates)
+        missing.extend(domain_missing)
+    return updates, missing
+
+
+def _check_for_updates_one_domain(
+    api: NexusAPI,
+    staging_root: Path,
+    game_domain: str = "",
+    progress_cb: Optional[ProgressCallback] = None,
+    save_results: bool = True,
+    enabled_only: Optional[set] = None,
+    max_workers: int = 10,
+) -> tuple[list["UpdateInfo"], list["MissingRequirementInfo"]]:
     """
     Check all Nexus-sourced mods under *staging_root* for updates and missing
     requirements in a single pass.
 
     A single set of batched GraphQL requests fetches both ``updatedAt``
     (for update detection) and ``modRequirements`` (for dependency checking)
-    simultaneously so both checks cost the same as running either one alone —
+    simultaneously so both checks cost the same as running either one alone -
     and neither consumes the REST hourly rate limit.
 
     **Update detection:**
@@ -261,8 +305,15 @@ def check_for_updates(
         _log("No Nexus-sourced mods found.")
         return [], []
 
-    # Keep a reference to ALL installed mods before applying the enabled_only
-    # filter — requirements checking needs the full set to build installed_mod_ids.
+    # Keep only this Nexus game. A blank legacy meta belongs to the supplied
+    # primary fallback; an explicit per-mod domain is authoritative.
+    wanted_domain = normalise_game_domain(game_domain)
+    installed = [m for m in installed
+                 if (normalise_game_domain(m.game_domain) or wanted_domain)
+                 == wanted_domain]
+
+    # Keep a reference to ALL same-domain mods before applying enabled_only
+    # filter - requirements checking needs the full set to build installed_mod_ids.
     all_installed = installed
 
     if enabled_only is not None:
@@ -281,7 +332,7 @@ def check_for_updates(
     skipped = len(installed) - len(checkable)
 
     _log(f"Checking {len(checkable)} Nexus mod(s) for updates"
-         f"{f' ({skipped} skipped — no version, file id, or install date)' if skipped else ''}...")
+         f"{f' ({skipped} skipped - no version, file id, or install date)' if skipped else ''}...")
 
     if not checkable:
         _log("No checkable mods found (need a modid plus a version, file id, or install date).")
@@ -291,7 +342,7 @@ def check_for_updates(
     if not game_domain:
         game_domain = checkable[0].game_domain.strip().lower()
     if not game_domain:
-        _log("No game domain available — cannot check updates.")
+        _log("No game domain available - cannot check updates.")
         return [], []
 
     # Deduplicate by mod_id
@@ -302,7 +353,7 @@ def check_for_updates(
     updates: list[UpdateInfo] = []
 
     # -----------------------------------------------------------------------
-    # 2. Batch GraphQL call — fetch updatedAt + viewerUpdateAvailable for
+    # 2. Batch GraphQL call - fetch updatedAt + viewerUpdateAvailable for
     #    all mods in a handful of requests instead of one REST call per mod.
     #    This does not consume the REST hourly rate limit.
     # -----------------------------------------------------------------------
@@ -311,7 +362,7 @@ def check_for_updates(
     gql_info: dict[int, NexusModUpdateInfo] = api.graphql_mod_update_info_batch(gql_ids)
 
     # Backfill meta.description / meta.uploaded_by from the GraphQL data
-    # whenever they differ (or were empty). Free — same batch call already
+    # whenever they differ (or were empty). Free - same batch call already
     # fetched the data.
     if save_results:
         desc_updated = 0
@@ -334,7 +385,7 @@ def check_for_updates(
 
     # -------------------------------------------------------------------
     # Fetch per-mod file lists via GraphQL (rate-limit-free) for any mod
-    # that has a file_id — needed to (a) discover the installed file's
+    # that has a file_id - needed to (a) discover the installed file's
     # category when meta.ini doesn't record it, and (b) compare against
     # files in the same category as the installed file so non-MAIN
     # installs don't false-positive off a newer MAIN upload.
@@ -370,7 +421,7 @@ def check_for_updates(
         if category_backfilled:
             _log(f"  File category backfilled for {category_backfilled} mod(s).")
 
-    # Sync endorsement state via a single REST call — get_endorsements()
+    # Sync endorsement state via a single REST call - get_endorsements()
     # returns every endorsement the user has across all games in one request,
     # so the cost is exactly 1 rate-limit call regardless of mod count.
     # GraphQL's legacyMod type does not expose viewer endorsement status.
@@ -380,7 +431,8 @@ def check_for_updates(
             endorsed_ids: set[int] = {
                 int(e.get("mod_id", 0))
                 for e in all_endorsements
-                if e.get("domain_name", "") == game_domain
+                if normalise_game_domain(e.get("domain_name", ""))
+                == normalise_game_domain(game_domain)
                 and (e.get("status", "") or "").lower() == "endorsed"
                 and int(e.get("mod_id", 0)) > 0
             }
@@ -431,7 +483,7 @@ def check_for_updates(
                 continue
 
             # --- Path A: Nexus-native flag = True (trusted).
-            # Only True is reliable — False can mean "author didn't bump the
+            # Only True is reliable - False can mean "author didn't bump the
             # page version" even when a new file exists.
             if info is not None and info.viewer_update_available is True:
                 has_update = True
@@ -469,7 +521,7 @@ def check_for_updates(
                     gql_version_backfilled = True
 
             else:
-                # No usable comparison data — skip
+                # No usable comparison data - skip
                 continue
 
             _apply_update_result(
@@ -487,19 +539,19 @@ def check_for_updates(
             )
 
     if not gql_info:
-        _log("  GraphQL returned no results — falling back to REST for all mods.")
+        _log("  GraphQL returned no results - falling back to REST for all mods.")
     else:
         _log(f"  {len(rest_fallback)} mod(s) will be compared at file level.")
 
     # -----------------------------------------------------------------------
-    # 4. File-level check — use batch files when available, REST only when
+    # 4. File-level check - use batch files when available, REST only when
     #    GraphQL didn't return the mod (avoids N REST calls for batched mods).
     # -----------------------------------------------------------------------
     if rest_fallback:
         _lock = threading.Lock()
 
         def _check_with_files(mod_id: int, metas: list[NexusModMeta], files: list) -> None:
-            """Process mod(s) using file list — from GraphQL batch or REST."""
+            """Process mod(s) using file list - from GraphQL batch or REST."""
             gql_mod_info = gql_info.get(mod_id)
             cat_id = gql_mod_info.category_id if gql_mod_info else 0
             if not files:
@@ -518,7 +570,7 @@ def check_for_updates(
                 )
 
                 # Backfill meta.version from the installed file record.
-                # The file record on Nexus is authoritative — meta.ini's
+                # The file record on Nexus is authoritative - meta.ini's
                 # version field is often stale because it was parsed from
                 # the archive filename at install time (which lags behind
                 # the actual upload version, e.g. archive "...-1-0-33-..."
@@ -532,7 +584,7 @@ def check_for_updates(
                         meta.version = _vf
                         version_backfilled = True
 
-                # Pick comparison target — only consider files in the
+                # Pick comparison target - only consider files in the
                 # same category (MAIN, OPTIONAL, etc.) so that e.g. a
                 # newer OPTIONAL file doesn't flag a MAIN install.
                 #
@@ -541,7 +593,7 @@ def check_for_updates(
                 # superseded it. We don't know which category the user
                 # originally installed from (MAIN vs OPTIONAL), so
                 # compare against the newest non-superseded file of any
-                # current category — any of those could be the intended
+                # current category - any of those could be the intended
                 # replacement.
                 installed_cat = (
                     installed_file.category_name
@@ -564,14 +616,14 @@ def check_for_updates(
                     )
 
                 # When we can identify the installed file, further restrict
-                # comparison to files sharing its display name — same Nexus
+                # comparison to files sharing its display name - same Nexus
                 # "slot"/variant. Otherwise a mod page like Engine Fixes,
                 # which ships both "Engine Fixes - Main File" and
                 # "Engine Fixes - SKSE64 Preloader" under MAIN, would flag
                 # the Preloader as updated whenever the Main File bumps,
                 # even though the Preloader itself hasn't changed.
                 # Only apply this narrowing if the installed file's name
-                # actually matches at least one file in the current list —
+                # actually matches at least one file in the current list -
                 # otherwise the file may have been renamed and we should
                 # fall back to the broader category set.
                 if cat_matches and installed_file and installed_file.name:
@@ -593,10 +645,10 @@ def check_for_updates(
 
                 install_date = _parse_install_date(meta)
                 if meta.version:
-                    # Version compare — authoritative per user spec.
+                    # Version compare - authoritative per user spec.
                     has_update = _version_is_newer(latest_ver, meta.version)
                 elif install_date is not None:
-                    # No version even after REST lookup — date-compare fallback.
+                    # No version even after REST lookup - date-compare fallback.
                     latest_upload = datetime.fromtimestamp(
                         latest.uploaded_timestamp, tz=timezone.utc
                     )
@@ -649,7 +701,7 @@ def check_for_updates(
     _log(f"Update check complete: {len(updates)} update(s) available.")
 
     # -----------------------------------------------------------------------
-    # 5. Requirements check — mod-level from the same gql_info batch data;
+    # 5. Requirements check - mod-level from the same gql_info batch data;
     #    file-level (v3) via the api client in one extra batched call.
     # -----------------------------------------------------------------------
     _log("Checking mod requirements...")
@@ -688,12 +740,12 @@ def _apply_update_result(
     # newer version has appeared since they set the ignore flag.
     if has_update and meta.ignore_update:
         if meta.ignored_version and _version_is_newer(latest_version, meta.ignored_version):
-            # A real new version has landed beyond the one they chose to ignore —
+            # A real new version has landed beyond the one they chose to ignore -
             # lift the ignore flag so the update badge re-appears.
             meta.ignore_update = False
             meta.ignored_version = ""
         else:
-            # Still at (or before) the ignored version — suppress the update.
+            # Still at (or before) the ignored version - suppress the update.
             has_update = False
 
     if has_update:

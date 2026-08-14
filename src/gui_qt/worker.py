@@ -1,4 +1,4 @@
-"""run_in_worker — start a daemon thread that computes a result and hands it
+"""run_in_worker - start a daemon thread that computes a result and hands it
 back to the UI thread via a Signal.
 
 The standard pattern in gui_qt is: nested ``worker()`` → ``threading.Thread``
@@ -21,12 +21,59 @@ from gui_qt.safe_emit import safe_emit
 NO_EMIT = object()
 
 
+class LatestWorker:
+    """Run at most one expensive job at a time and retain only the newest.
+
+    Preview-style UIs can produce work much faster than it can be completed
+    (scrubbing through meshes, changing filters, switching texture sources).
+    Generation counters stop stale results reaching the UI, but starting one
+    thread per request still lets all of the stale I/O and decoding run.  This
+    small daemon runner serialises the active job and replaces any queued job
+    with the newest submission.
+    """
+
+    def __init__(self, name: str = "latest-worker"):
+        self.name = name
+        self._lock = threading.Lock()
+        self._pending = None
+        self._running = False
+
+    def submit(self, fn) -> None:
+        """Schedule ``fn()``; replace a not-yet-started older function."""
+        with self._lock:
+            self._pending = fn
+            if self._running:
+                return
+            self._running = True
+        threading.Thread(target=self._drain, daemon=True,
+                         name=self.name).start()
+
+    def discard_pending(self) -> None:
+        """Drop the queued job.  A currently-running function is cooperative."""
+        with self._lock:
+            self._pending = None
+
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                fn = self._pending
+                self._pending = None
+                if fn is None:
+                    self._running = False
+                    return
+            try:
+                fn()
+            except Exception as exc:                     # noqa: BLE001
+                from Utils.app_log import app_log
+                app_log(f"[worker:{self.name}] {exc}")
+
+
 def run_in_worker(fn, done_sig=None, *, name: str | None = None,
                   error_result=None, unpack: bool = False) -> threading.Thread:
     """Run ``fn()`` on a daemon thread, then ``safe_emit(done_sig, result)``.
 
     *done_sig* may be None for fire-and-forget work (errors still get
-    logged). If *fn* raises, *error_result* is emitted instead — pass
+    logged). If *fn* raises, *error_result* is emitted instead - pass
     ``NO_EMIT`` to skip the emit on failure. With ``unpack=True`` a tuple
     result is splatted across a multi-argument Signal.
     """

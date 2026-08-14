@@ -1,4 +1,4 @@
-"""profile_export.py — neutral (GUI-free) helpers for the "Export profile" feature.
+"""profile_export.py - neutral (GUI-free) helpers for the "Export profile" feature.
 
 Packages the current profile into a shareable, zipped ``.amethyst`` manifest:
 ``manifest.json`` + bundled ``mods/`` + ``overwrite/`` + ``profile/`` state files.
@@ -19,9 +19,11 @@ A *row* is a plain dict describing one mod's export configuration::
         "version":       str,   # from meta.ini
         "category_id":   int,
         "category_name": str,
-        "ver_label":     str,   # "fileid — version" or "—"
+        "game_domain":   str,   # per-mod Nexus domain from meta.ini
+        "ver_label":     str,   # "fileid - version" or "-"
         "ver_options":   list,  # [{"label", "name", "size_bytes"}]
-        "optional":      bool,  # user-set
+        "optional":      bool,  # user-set; defaults from meta.ini collectionOptional
+        "phase":         int,   # install phase; defaults from meta.ini collectionPhase
         "has_fomod":     bool,  # has a FOMOD or BAIN sidecar
         "has_bain":      bool,
         "fomod_export":  bool,  # include installer choices in the export
@@ -29,8 +31,24 @@ A *row* is a plain dict describing one mod's export configuration::
         "size_bytes":    int,   # original archive size from meta.ini (0 if unknown)
         "root_folder":   bool,  # deploys to game root (meta.ini rootFolder)
         "enabled":       bool,  # modlist enabled state of the source entry
-        "source":        str,   # "nexus" | "direct" | "bundle" | "ignore"
+        "source":        str,   # "nexus" | "thunderstore" | "direct" | "browse"
+                                # | "manual" | "bundle" | "ignore";
+                                # see apply_source_defaults
         "direct_url":    str,
+        "save_edits":    bool,  # ship local file edits as binary patches
+                                # (build_patch_jobs); not set by load_rows
+
+        # Thunderstore pin, from the mod's [thunderstore] meta.ini section. Set
+        # only for mods installed from Thunderstore; a package is identified by
+        # (namespace, name, version) - there is no file-id equivalent.
+        "ts_namespace":  str,
+        "ts_name":       str,   # PACKAGE name, not the staging folder name
+        "ts_version":    str,
+        "ts_full_name":  str,   # "{namespace}-{name}-{version}"
+        "ts_community":  str,
+        "ts_size_bytes": int,
+        "ts_ver_options":    list,  # [{"label", "name", "size_bytes"}]
+        "ts_versions_fetched": bool,
     }
 """
 
@@ -38,11 +56,13 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import zlib
 import zipfile
 import shutil
 from pathlib import Path
 
+from Nexus.nexus_meta import normalise_game_domain
 from Utils.config_paths import get_fomod_selections_path, get_bain_selections_path
 
 
@@ -50,17 +70,41 @@ from Utils.config_paths import get_fomod_selections_path, get_bain_selections_pa
 # Row building (port of workshop_dialog._load_mods)
 # ---------------------------------------------------------------------------
 
+# Version labels read "<file id> - <version>". Both an em dash and a plain
+# hyphen have been written at different times (and are sitting in users' saved
+# workshop settings), so PARSING must accept either while new labels use one.
+VER_LABEL_SEP = " - "
+_VER_LABEL_RE = re.compile(r"^\s*(\d+)\s+[-—]\s+(.*)$")
+
+
+def split_ver_label(label: str) -> "tuple[int, str]":
+    """``"12345 - 1.2"`` → ``(12345, "1.2")``; ``(0, "")`` when it isn't one."""
+    m = _VER_LABEL_RE.match(label or "")
+    if not m:
+        return 0, ""
+    try:
+        return int(m.group(1)), m.group(2).strip()
+    except ValueError:
+        return 0, ""
+
+
 def load_rows(entries, game) -> list[dict]:
     """Build the per-mod export rows from a list of modlist ``ModEntry`` objects.
 
-    *entries* — enabled, non-separator modlist entries (high-priority first, like
-                the Tk workshop). *game* — the configured Game object; used for the
+    *entries* - non-separator modlist entries, LOWEST priority first (callers
+                pass ``reversed(read_modlist(...))``, since modlist.txt stores
+                index 0 = highest priority). The resulting row order is the
+                manifest's mods-array order, where the last entry wins
+                conflicts - matching what our installer's topo sort and Vortex
+                both expect. *game* - the configured Game object; used for the
                 staging path and active profile dir.
     """
     from Nexus.nexus_meta import read_meta
 
     staging_root = game.get_effective_mod_staging_path() if game else None
     profile_dir = getattr(game, "_active_profile_dir", None) if game else None
+
+    from Thunderstore.thunderstore_meta import read_meta as ts_read_meta
 
     rows: list[dict] = []
     for entry in entries:
@@ -69,8 +113,13 @@ def load_rows(entries, game) -> list[dict]:
         version = ""
         category_id = 0
         category_name = ""
+        game_domain = ""
         size_bytes = 0
         root_folder = False
+        col_optional = False
+        col_phase = 0
+        ts_ns = ts_pkg = ts_version = ts_full = ts_community = ""
+        ts_size = 0
         if staging_root:
             meta_path = Path(staging_root) / name / "meta.ini"
             if meta_path.is_file():
@@ -81,17 +130,33 @@ def load_rows(entries, game) -> list[dict]:
                     version = meta.version or ""
                     category_id = meta.category_id or 0
                     category_name = meta.category_name or ""
+                    game_domain = normalise_game_domain(meta.game_domain or "")
                     size_bytes = meta.file_size or 0
                     root_folder = bool(meta.root_folder)
+                    col_optional = bool(meta.collection_optional)
+                    col_phase = meta.collection_phase or 0
+                except Exception:
+                    pass
+                # The same meta.ini can carry BOTH sections (a mod mirrored on
+                # Nexus and Thunderstore), so this is a second read, not an else.
+                try:
+                    tsm = ts_read_meta(meta_path)
+                    if tsm.package_id:
+                        ts_ns = tsm.namespace
+                        ts_pkg = tsm.name
+                        ts_version = tsm.version or ""
+                        ts_full = tsm.full_name or ""
+                        ts_community = tsm.community or ""
+                        ts_size = tsm.file_size or 0
                 except Exception:
                     pass
 
         if file_id and version:
-            ver_label = f"{file_id} — {version}"
+            ver_label = f"{file_id} - {version}"
         elif file_id:
             ver_label = str(file_id)
         else:
-            ver_label = "—"
+            ver_label = "-"
 
         has_fomod = bool(
             profile_dir
@@ -112,9 +177,11 @@ def load_rows(entries, game) -> list[dict]:
             "version":          version,
             "category_id":      category_id,
             "category_name":    category_name,
+            "game_domain":      game_domain,
             "ver_label":        ver_label,
             "ver_options":      [{"label": ver_label, "name": "", "size_bytes": 0}],
-            "optional":         False,
+            "optional":         col_optional,
+            "phase":            col_phase,
             "has_fomod":        has_installer,
             "has_bain":         has_bain,
             "fomod_export":     has_installer,
@@ -122,8 +189,21 @@ def load_rows(entries, game) -> list[dict]:
             "size_bytes":       size_bytes,
             "root_folder":      root_folder,
             "enabled":          bool(getattr(entry, "enabled", True)),
-            "source":           "nexus",
+            # A Thunderstore pin IS the download source, so detect it here
+            # rather than in apply_source_defaults: that helper is shared with
+            # the Nexus-collection publisher, which must never offer this
+            # source (see CreateCollectionView._seed_rows).
+            "source":           "thunderstore" if (ts_ns and ts_pkg) else "nexus",
             "direct_url":       "",
+            "source_instructions": "",
+            "ts_namespace":     ts_ns,
+            "ts_name":          ts_pkg,
+            "ts_version":       ts_version,
+            "ts_full_name":     ts_full,
+            "ts_community":     ts_community,
+            "ts_size_bytes":    ts_size,
+            "ts_ver_options":   [],
+            "ts_versions_fetched": False,
         })
 
     return rows
@@ -135,15 +215,11 @@ def load_rows(entries, game) -> list[dict]:
 
 def _row_file_id(row: dict) -> int:
     """The effective file id for a row: the explicit ``file_id``, else parsed from
-    the ``ver_label`` ("fileid — version")."""
+    the ``ver_label`` ("fileid - version")."""
     fid = row.get("file_id") or 0
     if not fid:
         lbl = row.get("ver_label", "")
-        if lbl and " — " in lbl:
-            try:
-                fid = int(lbl.split(" — ")[0])
-            except ValueError:
-                fid = 0
+        fid = split_ver_label(lbl)[0]
     return fid
 
 
@@ -162,7 +238,17 @@ def write_settings(out_path, rows) -> Path:
                 "source":     r.get("source", "nexus"),
                 "direct_url": r.get("direct_url", ""),
                 "file_id":    _row_file_id(r),
-                "ver_label":  r.get("ver_label", "—"),
+                "ver_label":  r.get("ver_label", "-"),
+                "game_domain": r.get("game_domain", ""),
+                "phase":      int(r.get("phase") or 0),
+                "update_policy": r.get("update_policy", "exact"),
+                "instructions": r.get("source_instructions", ""),
+                "save_edits": bool(r.get("save_edits", False)),
+                # Thunderstore pin: the version may be a user override from the
+                # version picker, so it has to survive a save/load round trip.
+                "ts_version":  r.get("ts_version", ""),
+                "ts_full_name": r.get("ts_full_name", ""),
+                "ts_size_bytes": int(r.get("ts_size_bytes") or 0),
             }
             for r in rows
         ],
@@ -184,26 +270,171 @@ def read_settings(in_path, rows) -> None:
         if not m:
             continue
         row["optional"] = bool(m.get("optional", False))
-        row["source"] = m.get("source", "nexus")
+        # Keep the row's current source when the saved entry has none: a file
+        # written before sources existed must not reset a deduced one. For the
+        # same reason a saved "nexus" never overrides a detected Thunderstore
+        # pin - every settings file written before Thunderstore support existed
+        # recorded "nexus" for these mods, and honouring it would silently undo
+        # the detection on every load.
+        saved_source = m.get("source") or ""
+        if saved_source == "nexus" and row.get("source") == "thunderstore":
+            saved_source = ""
+        row["source"] = saved_source or row.get("source", "nexus")
         row["direct_url"] = m.get("direct_url", "")
+        row["source_instructions"] = m.get("instructions", "")
+        # Installed meta.ini is authoritative. A saved domain only repairs a
+        # row whose current metadata does not identify its Nexus game.
+        if not row.get("game_domain") and m.get("game_domain"):
+            row["game_domain"] = normalise_game_domain(
+                str(m["game_domain"]))
+        try:
+            row["phase"] = int(m.get("phase") or 0)
+        except (TypeError, ValueError):
+            row["phase"] = 0
+        if m.get("update_policy") in ("exact", "prefer", "latest"):
+            row["update_policy"] = m["update_policy"]
+        row["save_edits"] = bool(m.get("save_edits", False))
+        # A saved Thunderstore version is a deliberate user pin from the version
+        # picker (unlike file_id, where the installed file wins), so it takes
+        # precedence over the installed meta.ini - but only on a row that really
+        # is a Thunderstore mod, so a stale entry can't invent a pin.
+        if row.get("ts_namespace") and row.get("ts_name") and m.get("ts_version"):
+            row["ts_version"] = str(m["ts_version"])
+            row["ts_full_name"] = (
+                m.get("ts_full_name")
+                or f"{row['ts_namespace']}-{row['ts_name']}-{row['ts_version']}")
+            if m.get("ts_size_bytes"):
+                try:
+                    row["ts_size_bytes"] = int(m["ts_size_bytes"])
+                except (TypeError, ValueError):
+                    pass
         # Only apply file_id / ver_label from the JSON when the mod has no file_id
-        # already set from meta.ini — the installed file takes precedence.
+        # already set from meta.ini - the installed file takes precedence.
         if not row.get("file_id"):
             if m.get("file_id"):
                 row["file_id"] = m["file_id"]
             if m.get("ver_label"):
                 row["ver_label"] = m["ver_label"]
                 # Back-fill file_id from ver_label if still missing.
-                if not row.get("file_id") and " — " in row["ver_label"]:
-                    try:
-                        row["file_id"] = int(row["ver_label"].split(" — ")[0])
-                    except ValueError:
-                        pass
+                if not row.get("file_id"):
+                    parsed = split_ver_label(row["ver_label"])[0]
+                    if parsed:
+                        row["file_id"] = parsed
+
+
+# ---------------------------------------------------------------------------
+# Binary patches - local file edits shipped as diffs over the pristine download
+# ---------------------------------------------------------------------------
+
+def build_patch_jobs(rows, manifest: dict, game, *, scratch_out=None
+                     ) -> "tuple[list, list]":
+    """Diff each ``save_edits`` row's staged files against its cached archive.
+
+    Attaches the resulting ``{rel_path: source_crc32}`` map to the matching
+    manifest mod entry (``patches`` - the same shape Nexus collections use, so
+    the collection-install pipeline can apply them) and returns
+    ``(jobs, warnings)``: *jobs* are ``(src_path, arcname)`` pairs for
+    :func:`write_amethyst`'s ``patch_jobs``, arcnames under ``patches/``.
+
+    Bundle rows are skipped - their files ship verbatim, edits included.
+    *scratch_out*, when given, receives the temp dir holding the ``.diff``
+    files; the caller must delete it after packing (the files have to outlive
+    this call but must not outlive the export).
+    """
+    import tempfile
+    from Utils.collection_export import (
+        _cached_archive, _read_row_meta, _safe_archive_component,
+        _scan_mod_patches)
+    from Utils.config_paths import get_download_cache_dir
+
+    jobs: list = []
+    warnings: list = []
+    wanted = [r for r in rows
+              if r.get("save_edits")
+              and r.get("source", "nexus") not in ("bundle", "ignore")]
+    if not wanted:
+        return jobs, warnings
+
+    staging_root = game.get_effective_mod_staging_path() if game else None
+    game_name = getattr(game, "name", "") or ""
+    entries = {m.get("name"): m for m in manifest.get("mods") or []}
+
+    patch_root = None
+    for row in wanted:
+        name = row["name"]
+        mod_entry = entries.get(name)
+        if mod_entry is None:
+            continue
+        mod_dir = Path(staging_root) / name if staging_root else None
+        if not (mod_dir and mod_dir.is_dir()):
+            continue
+        meta = _read_row_meta(staging_root, name)
+        archive = _cached_archive(meta, game_name)
+        if archive is None:
+            warnings.append(
+                f"'{name}': file edits skipped - the original archive is "
+                "not in the download cache.")
+            continue
+        if patch_root is None:
+            patch_root = Path(tempfile.mkdtemp(
+                prefix="amethyst_profexport_",
+                dir=str(get_download_cache_dir())))
+            if scratch_out is not None:
+                scratch_out.append(patch_root)
+        # The folder is named after the mod, which comes from Nexus metadata -
+        # strip anything that could climb out of patches/ on extraction.
+        patch_dir_name = _safe_archive_component(name)
+        mod_patch_dir = patch_root / patch_dir_name
+        found = _scan_mod_patches(mod_dir, archive, mod_patch_dir,
+                                  name, warnings)
+        if found:
+            mod_entry["patches"] = found
+            for diff in sorted(mod_patch_dir.rglob("*.diff")):
+                rel = diff.relative_to(mod_patch_dir).as_posix()
+                jobs.append((diff, f"patches/{patch_dir_name}/{rel}"))
+    return jobs, warnings
 
 
 # ---------------------------------------------------------------------------
 # Manifest build + zip (port of _write_manifest)
 # ---------------------------------------------------------------------------
+
+def apply_source_defaults(rows, *, ignore_disabled: bool = False) -> int:
+    """Replace the un-chosen ``"nexus"`` default with a source that can work.
+
+    Only rows still sitting on ``"nexus"`` are touched, so an explicit choice -
+    a manifest seed, saved settings, or a source the user picked by hand -
+    always wins. Applied AFTER those, so a stale autosave that recorded
+    ``"nexus"`` for a row that can never export as Nexus gets corrected too.
+
+    * No modId AND no fileId → ``"bundle"``. There is no mod page to point at,
+      so Nexus is not a possible answer: the row would either block the upload
+      (``nexus_missing_file_ids``) or export as ``modId 0`` with its files left
+      behind. Bundling ships the files instead, and is exactly the case
+      ``_bundle_blocked_reason`` permits. Vortex deduces the same way
+      (transformCollection.ts ``deduceSource``: no nexus repo → ``bundle``).
+      A row with a modId but no fileId is deliberately left alone - it IS on
+      Nexus, and the version picker is how the user fills the fileId in.
+    * ``ignore_disabled`` → disabled rows become ``"ignore"``. Only for Nexus
+      collections, which have no disabled state and drop those rows anyway; the
+      ``.amethyst`` profile export carries ``enabled: false`` through to the
+      importer, so defaulting there would LOSE mods it can represent.
+
+    Returns how many rows changed.
+    """
+    changed = 0
+    for row in rows:
+        if row.get("source", "nexus") != "nexus":
+            continue
+        if ignore_disabled and row.get("enabled") is False:
+            row["source"] = "ignore"
+        elif not row.get("mod_id") and not row.get("file_id"):
+            row["source"] = "bundle"
+        else:
+            continue
+        changed += 1
+    return changed
+
 
 def nexus_missing_file_ids(rows) -> list[str]:
     """Names of Nexus-source mods that lack a File ID (can't be exported until set)."""
@@ -211,6 +442,126 @@ def nexus_missing_file_ids(rows) -> list[str]:
         row["name"] for row in rows
         if row.get("source", "nexus") == "nexus" and not row.get("file_id")
     ]
+
+
+def redistributable_bundle_names(rows) -> list[str]:
+    """Names of bundled mods that are also downloadable from Nexus.
+
+    Bundling packs the mod's files into the ``.amethyst`` itself, so for a mod
+    with a Nexus page the export stops being a list of what to download and
+    becomes a copy of someone else's work. That is fine for a personal backup -
+    the export has no upload path - but not for one handed to other people, so
+    the Qt view confirms before writing. Publishing is blocked outright; see
+    CreateCollectionView._bundle_blocked_reason and collection_export's
+    bundle -> nexus downgrade.
+    """
+    return [
+        row["name"] for row in rows
+        if row.get("source") == "bundle" and row.get("mod_id")
+        and row.get("file_id")
+    ]
+
+
+def _thunderstore_source(row: dict) -> dict:
+    """The manifest ``source`` object for a Thunderstore row.
+
+    Namespace, name and version are all carried explicitly rather than left to
+    be re-derived from ``fullName``: namespaces and package names contain
+    hyphens, so only ``parse_full_name``'s right-split is safe, and a manifest
+    that lost ``fullName`` must still install. ``fileSize`` is the only
+    integrity check Thunderstore offers (no hashes exist) and becomes the
+    importer's ``expected_size``.
+
+    Falls back to ``{"bundle": True}`` when the pin is incomplete - shipping the
+    files beats writing an entry no importer can resolve.
+    """
+    ns = (row.get("ts_namespace") or "").strip()
+    pkg = (row.get("ts_name") or "").strip()
+    version = (row.get("ts_version") or "").strip()
+    if not (ns and pkg and version):
+        return {"bundle": True}
+    source: dict = {
+        "type":      "thunderstore",
+        "namespace": ns,
+        "name":      pkg,
+        "version":   version,
+        "fullName":  (row.get("ts_full_name") or "").strip()
+                     or f"{ns}-{pkg}-{version}",
+        "logicalFilename": row["name"],
+    }
+    if row.get("ts_community"):
+        source["community"] = row["ts_community"]
+    if row.get("ts_size_bytes"):
+        source["fileSize"] = int(row["ts_size_bytes"])
+    return source
+
+
+def is_thunderstore_source(src: dict) -> bool:
+    """Whether a manifest ``source`` object points at a Thunderstore package."""
+    return ((src or {}).get("type") or "").strip().lower() == "thunderstore"
+
+
+def manifest_needs_nexus(manifest: dict) -> bool:
+    """Whether importing *manifest* requires a logged-in Nexus account.
+
+    Thunderstore downloads are public and bundled/off-site mods need no API at
+    all, so a profile made entirely of those imports with no login. That is not
+    an optimisation: the Thunderstore-only games (Risk of Rain 2, Inscryption)
+    have an empty ``nexus_game_domain`` by design, so requiring Nexus would
+    block the import outright.
+    """
+    for mod in manifest.get("mods") or []:
+        src = mod.get("source") or {}
+        stype = (src.get("type") or "").strip().lower()
+        if src.get("bundle") is True or stype in (
+                "bundle", "thunderstore", "browse", "direct", "manual"):
+            continue
+        return True
+    return False
+
+
+def thunderstore_entries(manifest: dict) -> list[dict]:
+    """The manifest's Thunderstore mods, in mods-array order.
+
+    Each entry carries everything the importer needs so it never has to re-walk
+    the manifest: ``array_index`` (the position in ``manifest["mods"]``, which
+    fixes the mod's priority relative to the Nexus mods), the package pin, and
+    the per-mod flags the install pass has to reapply.
+
+    Entries whose pin is incomplete are dropped - they cannot be downloaded, and
+    the exporter writes them as bundles instead.
+    """
+    out: list[dict] = []
+    for idx, mod in enumerate(manifest.get("mods") or []):
+        src = mod.get("source") or {}
+        if not is_thunderstore_source(src):
+            continue
+        ns = (src.get("namespace") or "").strip()
+        pkg = (src.get("name") or "").strip()
+        version = (src.get("version") or "").strip()
+        if not (ns and pkg and version):
+            continue
+        try:
+            file_size = int(src.get("fileSize") or 0)
+        except (TypeError, ValueError):
+            file_size = 0
+        out.append({
+            "array_index": idx,
+            "name":        mod.get("name") or "",
+            "namespace":   ns,
+            "package":     pkg,
+            "version":     version,
+            "full_name":   (src.get("fullName") or "").strip()
+                           or f"{ns}-{pkg}-{version}",
+            "community":   (src.get("community") or "").strip(),
+            "file_size":   file_size,
+            "logical":     (src.get("logicalFilename") or "").strip(),
+            "optional":    bool(mod.get("optional", False)),
+            "enabled":     mod.get("enabled", True) is not False,
+            "root_folder": ((mod.get("details") or {}).get("type") or "")
+                           .strip() == "dinput",
+        })
+    return out
 
 
 def build_manifest(rows, game_domain: str, app_version: str, *,
@@ -222,14 +573,12 @@ def build_manifest(rows, game_domain: str, app_version: str, *,
     for row in rows:
         if row.get("source") == "ignore":
             continue
-        # Parse fileid from ver_label ("fileid — version") when present.
+        # Parse fileid from ver_label ("fileid - version") when present.
         ver_label = row["ver_label"]
         file_id = row["file_id"]
-        if ver_label and " — " in ver_label:
-            try:
-                file_id = int(ver_label.split(" — ")[0])
-            except ValueError:
-                pass
+        parsed_fid = split_ver_label(ver_label)[0]
+        if parsed_fid:
+            file_id = parsed_fid
 
         row_source = row.get("source", "nexus")
         if row_source == "direct":
@@ -237,6 +586,14 @@ def build_manifest(rows, game_domain: str, app_version: str, *,
                 "type": "direct",
                 "url":  row.get("direct_url", ""),
             }
+        elif row_source in ("browse", "manual"):
+            source = {"type": row_source}
+            if row.get("direct_url"):
+                source["url"] = row["direct_url"]
+            if row.get("source_instructions"):
+                source["instructions"] = row["source_instructions"]
+        elif row_source == "thunderstore":
+            source = _thunderstore_source(row)
         elif row_source == "bundle":
             source = {"bundle": True}
         else:
@@ -253,19 +610,27 @@ def build_manifest(rows, game_domain: str, app_version: str, *,
             "source":   source,
             "optional": row["optional"],
         }
+        mod_domain = (normalise_game_domain(row.get("game_domain") or "")
+                      or normalise_game_domain(game_domain))
+        if mod_domain:
+            mod_entry["domainName"] = mod_domain
         # Carry a disabled modlist state (enabled entries stay implicit). The
         # importer stages the mod normally, then marks it disabled.
         if row.get("enabled") is False:
             mod_entry["enabled"] = False
-        # Root-deploy mods use the Nexus-collections "dinput" install type —
+        # Root-deploy mods use the Nexus-collections "dinput" install type -
         # the importer already maps details.type == "dinput" to meta rootFolder.
         if row.get("root_folder"):
             mod_entry["details"] = {"type": "dinput"}
 
         # Include version and category from meta.ini if available.
         row_version = row.get("version") or ""
-        if not row_version and ver_label and " — " in ver_label:
-            row_version = ver_label.split(" — ", 1)[1]
+        if not row_version:
+            row_version = split_ver_label(ver_label)[1]
+        if not row_version and row_source == "thunderstore":
+            # A Thunderstore-only mod has no [General] version - the pin is the
+            # version, and it may be a user override from the version picker.
+            row_version = row.get("ts_version") or ""
         if row_version:
             mod_entry["version"] = row_version
         cat_id = row.get("category_id") or 0
@@ -280,7 +645,7 @@ def build_manifest(rows, game_domain: str, app_version: str, *,
         if row["has_fomod"] and row.get("fomod_export", True) and game_name:
             # Prefer the profile-local copy so exports stay profile-specific even
             # if the global installer settings differ. A mod is either BAIN or
-            # FOMOD — pick the right sidecar + type.
+            # FOMOD - pick the right sidecar + type.
             if row.get("has_bain"):
                 sub_dir, choices_type, path_fn = (
                     "bain", "bain_selections", get_bain_selections_path)
@@ -319,13 +684,17 @@ def build_manifest(rows, game_domain: str, app_version: str, *,
 
 def write_amethyst(out_path, manifest: dict, *, staging_root=None,
                    overwrite_root=None, profile_dir=None,
-                   bundle_names=None, progress_cb=None) -> Path:
+                   bundle_names=None, patch_jobs=None,
+                   progress_cb=None) -> Path:
     """Write the ``.amethyst`` zip: ``manifest.json`` + bundled ``mods/`` +
     ``overwrite/`` + ``profile/`` state files. Returns the final path (suffix
     forced to .amethyst when not already .zip/.amethyst).
 
+    *patch_jobs* - ``(src_path, arcname)`` pairs from :func:`build_patch_jobs`
+    (binary-patch ``.diff`` files under ``patches/``).
+
     *progress_cb* (optional) is called as ``progress_cb(done_bytes, total_bytes,
-    arcname)`` — once with ``done_bytes=0`` before writing starts (total known),
+    arcname)`` - once with ``done_bytes=0`` before writing starts (total known),
     then after each member is written. Members are collected up-front so the
     byte total is exact; the callback runs on the caller's thread."""
     out_path = Path(out_path)
@@ -341,6 +710,9 @@ def write_amethyst(out_path, manifest: dict, *, staging_root=None,
     jobs: list[tuple] = [
         (None, "manifest.json", json.dumps(manifest, indent=2).encode("utf-8")),
     ]
+
+    for src, arcname in (patch_jobs or []):
+        jobs.append((Path(src), str(arcname), None))
 
     if staging_root:
         for name in bundle_names:
@@ -465,7 +837,7 @@ def read_manifest(src_path) -> dict:
 def install_local_bundle(src_path, profile_dir, mods_dir, overwrite_dir=None, *,
                          log_fn=None) -> list[str]:
     """Extract a locally-exported ``.amethyst`` bundle into a freshly-installed
-    profile — faithful to the Tk import (CollectionsDialog bundle-zip extraction):
+    profile - faithful to the Tk import (CollectionsDialog bundle-zip extraction):
 
       * ``mods/<name>/…``      → ``<mods_dir>/<name>/…`` **verbatim** (folder names
         preserved exactly, including spaces, keeping the archive's own meta.ini) so
@@ -495,7 +867,7 @@ def install_local_bundle(src_path, profile_dir, mods_dir, overwrite_dir=None, *,
     with _zip.ZipFile(src_path, "r") as zf:
         names = zf.namelist()
 
-        # (1) Bundled mods + overwrite — extract verbatim (no rename, keep meta.ini).
+        # (1) Bundled mods + overwrite - extract verbatim (no rename, keep meta.ini).
         for n in names:
             if n.endswith("/"):
                 continue
@@ -532,10 +904,21 @@ def install_local_bundle(src_path, profile_dir, mods_dir, overwrite_dir=None, *,
             wrote_profile = True
         if wrote_profile:
             log(f"Import: restored profile state files into {profile_dir}")
+            # Snapshot the pristine authored order files NOW - the reconcile
+            # below drops modlist rows for off-site mods that aren't installed
+            # yet, and Reset Load Order needs the full original to put them
+            # back in place once the user installs them.
+            try:
+                from Utils.collection_export import write_amethyst_stash
+                if write_amethyst_stash(profile_dir, log_fn=log):
+                    log("Import: saved Amethyst/ order snapshot "
+                        "(Reset Load Order restores from it).")
+            except Exception as exc:
+                log(f"Import: order snapshot failed: {exc}")
 
     # (3) Reconcile the modlist against what's actually on disk: the bundled
     # modlist.txt lists mods that were NOT exported (disabled leftovers from the
-    # source profile) — drop those phantom entries now so they don't linger until
+    # source profile) - drop those phantom entries now so they don't linger until
     # a manual Refresh. Mirrors the Refresh path's folder-sync.
     try:
         from Utils.modlist import sync_modlist_with_mods_folder
@@ -548,14 +931,15 @@ def install_local_bundle(src_path, profile_dir, mods_dir, overwrite_dir=None, *,
 
 
 # ---------------------------------------------------------------------------
-# Share code — a compressed, copy-pasteable text form of the manifest
+# Share code - a compressed, copy-pasteable text form of the manifest
 # ---------------------------------------------------------------------------
 #
 # The "Export code" feature turns the same Amethyst manifest into a short text
 # string the user can paste into a chat / forum to share a modlist. It carries
-# only what a recipient can rebuild from Nexus — mods with BOTH a modId and a
-# fileId — plus embedded FOMOD/BAIN installer choices. No mod files are bundled
-# (that's what the .amethyst zip is for), so a code stays small.
+# only what a recipient can re-download - Nexus mods with BOTH a modId and a
+# fileId, and Thunderstore mods with a complete (namespace, name, version) pin -
+# plus embedded FOMOD/BAIN installer choices. No mod files are bundled (that's
+# what the .amethyst zip is for), so a code stays small.
 #
 # Load order is carried by the ORDER of the manifest's ``mods`` array (top of
 # modlist first): the collection-install pipeline that consumes an imported
@@ -568,14 +952,15 @@ CODE_PREFIX = "AMMCODE1:"   # version tag; bump the digit on a format change.
 
 def build_code_manifest(entries, game, app_version: str, *,
                         profile_name=None) -> dict:
-    """Build a share-code manifest from *entries* — modlist entries (separators
+    """Build a share-code manifest from *entries* - modlist entries (separators
     included) in ``read_modlist`` order (index 0 = HIGHEST priority = top of
-    modlist). Includes only mods with both a modId and a fileId; embeds
+    modlist). Includes mods the recipient can re-download: Nexus mods with a
+    modId + fileId, and Thunderstore mods with a complete package pin. Embeds
     FOMOD/BAIN choices, per-mod enabled state and root-deploy flags.
 
     The collection-install pipeline that consumes an imported manifest treats the
     ``mods`` array as LOW-priority first (``mods[-1]`` becomes the top of the
-    modlist — see ``collection_reset._topo_sort_collection``). *entries* is highest-
+    modlist - see ``collection_reset._topo_sort_collection``). *entries* is highest-
     priority first, so we reverse when writing the array to keep the imported load
     order identical to the source. No separate ``loadOrder`` block is emitted (that
     would switch the importer onto its FBLO code path); the mods-array order alone
@@ -583,18 +968,25 @@ def build_code_manifest(entries, game, app_version: str, *,
 
     Beyond the mods array, the manifest carries:
 
-    * ``modlistSeparators`` — the source modlist's separators, TOP-first, each
+    * ``modlistSeparators`` - the source modlist's separators, TOP-first, each
       with its member mod names (the exported mods between it and the next
       separator, modlist order) plus optional ``color``/``locked``. The importer
       re-inserts each one above its first surviving member.
-    * ``info.exported`` / ``info.gameName`` / ``info.totalSize`` — display
+    * ``info.exported`` / ``info.gameName`` / ``info.totalSize`` - display
       metadata for the import preview (ISO timestamp, game display name, sum of
       the known archive sizes)."""
     mod_entries = [e for e in entries if not getattr(e, "is_separator", False)]
     rows = load_rows(mod_entries, game)
-    # Keep only Nexus-resolvable mods: need modId + a fileId (from meta or label).
-    keep = [r for r in rows if r.get("mod_id") and _row_file_id(r)]
-    game_domain = (getattr(game, "nexus_game_domain", "") or "") if game else ""
+    # Keep only mods the recipient can actually download: a Nexus mod needs a
+    # modId + fileId (from meta or label), a Thunderstore mod needs its full
+    # (namespace, name, version) pin. A code ships no files, so anything else
+    # would import as a name with nothing behind it.
+    keep = [r for r in rows
+            if (r.get("mod_id") and _row_file_id(r))
+            or (r.get("source") == "thunderstore" and r.get("ts_namespace")
+                and r.get("ts_name") and r.get("ts_version"))]
+    game_domain = (normalise_game_domain(
+        getattr(game, "nexus_game_domain", "") or "") if game else "")
     game_name = game.name if game else None
     profile_dir = getattr(game, "_active_profile_dir", None) if game else None
     # Reverse so the emitted mods array is low-priority first (importer puts
@@ -629,7 +1021,7 @@ def _separator_blocks(entries, kept_names: set, profile_dir) -> list[dict]:
     """Build the ``modlistSeparators`` manifest block: one dict per separator in
     modlist order (top-first) with the names of its exported member mods (the
     kept mods between it and the next separator). Separators whose group has no
-    exported member are dropped — the importer would have nothing to anchor them
+    exported member are dropped - the importer would have nothing to anchor them
     to. Colors / locks come from the profile's separator state."""
     colors = {}
     locks = {}
@@ -647,9 +1039,13 @@ def _separator_blocks(entries, kept_names: set, profile_dir) -> list[dict]:
         name = getattr(entry, "name", None) or str(entry)
         if getattr(entry, "is_separator", False):
             current = {"name": name, "mods": []}
-            if colors.get(name):
-                current["color"] = colors[name]
-            if locks.get(name):
+            # Separator state is keyed by DISPLAY name (no _separator suffix)
+            # in profile_state - the full name is only a fallback.
+            disp = getattr(entry, "display_name", name)
+            color = colors.get(disp) or colors.get(name)
+            if color:
+                current["color"] = color
+            if locks.get(disp) or locks.get(name):
                 current["locked"] = True
             blocks.append(current)
         elif current is not None and name in kept_names:

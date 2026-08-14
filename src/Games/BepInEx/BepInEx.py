@@ -57,15 +57,36 @@ class Subnautica(BaseGame):
     def set_heroic_app_name(self, app_name: str | None) -> None:
         self._saved_heroic_app_name = app_name or None
         self.save_paths()
+    
+    @property
+    def conflict_ignore_filenames(self) -> set[str]:
+        return {
+            "*.md",
+            "icon.png",
+            "manifest.json",
+            "LocalizationExample.zip",
+            "*read*.txt",
+            "changelog*.txt",
+            "steam_appid.txt",
+            }
 
     @property
     def nexus_game_domain(self) -> str:
         return "subnautica"
 
     @property
-    def mod_folder_strip_prefixes(self) -> set[str]:
-        return {"plugins", "bepinex", "BepInExPack_Valheim"}
+    def thunderstore_community(self) -> str:
+        return "subnautica"
     
+    @property
+    def extra_mod_folder_strip_prefixes(self) -> set[str]:
+        """Per-game wrapper folders to strip on top of the shared BepInEx set."""
+        return set()
+
+    @property
+    def mod_folder_strip_prefixes(self) -> set[str]:
+        return {"plugins", "bepinex", "BepInExPack"} | self.extra_mod_folder_strip_prefixes
+
     @property
     def mods_dir(self) -> str:
         return "BepInEx/plugins"
@@ -89,7 +110,7 @@ class Subnautica(BaseGame):
     @property
     def frameworks(self) -> "dict[str, tuple[str, ...]]":
         # Windows builds proxy-load via winhttp.dll; native Linux builds ship
-        # run_bepinex.sh instead — either one means BepInEx is present.
+        # run_bepinex.sh instead - either one means BepInEx is present.
         return {"BepInEx": ("winhttp.dll", "run_bepinex.sh")}
 
     @property
@@ -114,7 +135,11 @@ class Subnautica(BaseGame):
                 "core",
                 "patchers",
                 "plugins",
+                "monomod",
             ], flatten=True, loose_only=True),
+            CustomRule(dest="BepInEx/monomod", extensions=[
+                ".mm.dll"
+            ], loose_only=True),
             CustomRule(dest="BepInEx/plugins", folders=[
                 "Tobey"
             ], flatten=True, loose_only=True),
@@ -208,7 +233,7 @@ class Subnautica(BaseGame):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
-        # Separator overrides — loaded from the real profile_dir and passed
+        # Separator overrides - loaded from the real profile_dir and passed
         # explicitly so shared-staging layouts get the right link modes.
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
@@ -305,7 +330,7 @@ class Subnautica(BaseGame):
             try:
                 _dir.rmdir()
             except OSError:
-                break  # not empty (or gone) — stop climbing
+                break  # not empty (or gone) - stop climbing
             _log(f"  Removed empty folder {_dir.relative_to(self._game_path)}/.")
             _dir = _dir.parent
 
@@ -333,6 +358,10 @@ class Subnautica_Below_Zero(Subnautica):
     def nexus_game_domain(self) -> str:
         return "subnauticabelowzero"
 
+    @property
+    def thunderstore_community(self) -> str:
+        return "subnautica-below-zero"
+
 class TCG_Card_Shop_Simulator(Subnautica):
 
     @property
@@ -354,6 +383,10 @@ class TCG_Card_Shop_Simulator(Subnautica):
     @property
     def nexus_game_domain(self) -> str:
         return "tcgcardshopsimulator"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "tcg-card-shop-simulator"
 
     @property
     def default_deploy_mode(self) -> str:
@@ -380,6 +413,10 @@ class Lethal_Company(Subnautica):
     @property
     def nexus_game_domain(self) -> str:
         return "lethalcompany"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "lethal-company"
 
     @property
     def default_deploy_mode(self) -> str:
@@ -411,14 +448,12 @@ class Valheim(Subnautica):
         return "valheim"
 
     @property
-    def conflict_ignore_filenames(self) -> set[str]:
-        return {
-            "*.md",
-            "icon.png",
-            "manifest.json",
-            "LocalizationExample.zip",
-            "*read*.txt"
-            }
+    def thunderstore_community(self) -> str:
+        return "valheim"
+
+    @property
+    def extra_mod_folder_strip_prefixes(self) -> set[str]:
+        return {"BepInExPack_Valheim"}
 
     @property
     def default_deploy_mode(self) -> str:
@@ -475,6 +510,10 @@ class HNSS(Subnautica):
     @property
     def nexus_game_domain(self) -> str:
         return "hollowknightsilksong"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "hollow-knight-silksong"
     
     @property
     def exe_name_alts(self) -> list[str]:
@@ -483,3 +522,143 @@ class HNSS(Subnautica):
     @property
     def default_deploy_mode(self) -> str:
         return "symlink"
+
+class Peak(Subnautica):
+    @property
+    def name(self) -> str:
+        return "Peak"
+
+    @property
+    def game_id(self) -> str:
+        return "peak"
+
+    @property
+    def exe_name(self) -> str:
+        return "PEAK.exe"
+
+    @property
+    def steam_id(self) -> str:
+        return "3527290"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        return "peak"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "peak"
+
+    @property
+    def extra_mod_folder_strip_prefixes(self) -> set[str]:
+        return {"BepInExPack_Peak"}
+
+class ROR2(Subnautica):
+    @property
+    def name(self) -> str:
+        return "Risk of Rain 2"
+
+    @property
+    def game_id(self) -> str:
+        return "riskofrain2"
+
+    @property
+    def exe_name(self) -> str:
+        return "Risk of Rain 2.exe"
+
+    @property
+    def steam_id(self) -> str:
+        return "632360"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        # Thunderstore-only game. MUST be overridden to "" - without it the
+        # class inherits Subnautica's domain and the Nexus browser would list
+        # Subnautica mods for Risk of Rain 2.
+        return ""
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "riskofrain2"
+
+class Inscryption(Subnautica):
+    @property
+    def name(self) -> str:
+        return "Inscryption"
+
+    @property
+    def game_id(self) -> str:
+        return "inscryption"
+
+    @property
+    def exe_name(self) -> str:
+        return "Inscryption.exe"
+
+    @property
+    def exe_name_alts(self) -> list[str]:
+        return ["Inscryption.x86_64"]
+
+    @property
+    def steam_id(self) -> str:
+        return "1092790"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        return ""
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "inscryption"
+
+    @property
+    def extra_mod_folder_strip_prefixes(self) -> set[str]:
+        return {"BepInExPack_Inscryption"}
+
+class repo(Subnautica):
+    @property
+    def name(self) -> str:
+        return "R.E.P.O"
+
+    @property
+    def game_id(self) -> str:
+        return "repo"
+
+    @property
+    def exe_name(self) -> str:
+        return "REPO.exe"
+
+    @property
+    def steam_id(self) -> str:
+        return "3241660"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        return "repo"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "repo"
+
+class DysonSphereProgram(Subnautica):
+    @property
+    def name(self) -> str:
+        return "Dyson Sphere Program"
+
+    @property
+    def game_id(self) -> str:
+        return "dysonsphereprogram"
+
+    @property
+    def exe_name(self) -> str:
+        return "DSPGAME.exe"
+
+    @property
+    def steam_id(self) -> str:
+        return "1366540"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        return "dysonsphereprogram"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return "dyson-sphere-program"

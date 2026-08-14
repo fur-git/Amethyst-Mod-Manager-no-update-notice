@@ -2,7 +2,7 @@
 resident_evil_village.py
 Game handler for Resident Evil Village (RE8).
 
-Base class for RE Engine games that use PAK archive invalidation — the other
+Base class for RE Engine games that use PAK archive invalidation - the other
 handlers in RE_Engine_Invalidation/ subclass this one.
 
 Mod structure:
@@ -58,6 +58,7 @@ from Utils.re_pak_patcher import (
     restore_pak_file,
     update_root_manifest,
 )
+from Utils.steam_finder import parse_acf_beta_key
 from Utils.tex_convert import convert_tex_v10_to_v34, tex_needs_conversion
 
 _PROFILES_DIR = get_profiles_dir()
@@ -65,12 +66,56 @@ _PROFILES_DIR = get_profiles_dir()
 
 class ResidentEvilVillage(BaseGame):
 
+    # Remaps that only apply to the current (post-RT-update) game build.
+    # RE2/RE3/RE7 set these; on the dx11_non-rt Steam beta branch the legacy
+    # engine reads natives/x64 and .tex.10 directly, so both are skipped (GH#365).
+    _rt_path_remap: dict[str, str] = {}
+    _rt_ext_remap: dict[str, str] = {}
+    _NON_RT_BETA_KEY = "dx11_non-rt"
+
     def __init__(self):
         self._game_path: Path | None = None
         self._prefix_path: Path | None = None
         self._deploy_mode: LinkMode = LinkMode.HARDLINK
         self._staging_path: Path | None = None
+        self._beta_branch_cache: tuple[tuple, str | None] | None = None
         self.load_paths()
+
+    # -----------------------------------------------------------------------
+    # Steam beta branch detection
+    # -----------------------------------------------------------------------
+
+    def _steam_beta_branch(self) -> str | None:
+        """Installed Steam beta branch from the appmanifest, None for default."""
+        if self._game_path is None:
+            return None
+        acf = self._game_path.parent.parent / f"appmanifest_{self.steam_id}.acf"
+        try:
+            st = acf.stat()
+        except OSError:
+            return None
+        cache_key = (str(acf), st.st_mtime_ns, st.st_size)
+        if self._beta_branch_cache and self._beta_branch_cache[0] == cache_key:
+            return self._beta_branch_cache[1]
+        branch = parse_acf_beta_key(acf)
+        self._beta_branch_cache = (cache_key, branch)
+        return branch
+
+    def _is_non_rt_branch(self) -> bool:
+        """True when the legacy pre-RT-update build is installed."""
+        return self._steam_beta_branch() == self._NON_RT_BETA_KEY
+
+    @property
+    def mod_deploy_path_remap(self) -> dict[str, str]:
+        if self._rt_path_remap and self._is_non_rt_branch():
+            return {}
+        return dict(self._rt_path_remap)
+
+    @property
+    def pak_hash_extension_remap(self) -> dict[str, str]:
+        if self._rt_ext_remap and self._is_non_rt_branch():
+            return {}
+        return dict(self._rt_ext_remap)
 
     # -----------------------------------------------------------------------
     # Identity
@@ -246,6 +291,10 @@ class ResidentEvilVillage(BaseGame):
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
 
+        if (self._rt_path_remap or self._rt_ext_remap) and self._is_non_rt_branch():
+            _log(f"  Steam beta branch '{self._NON_RT_BETA_KEY}' detected - "
+                 "legacy build: keeping natives/x64 paths and .tex.10 textures.")
+
         _log("Step 1: Deploying mod files to game root, backing up overwritten vanilla files ...")
 
         # Set up TEX conversion for RTX-updated games (RE2/RE3/RE7).
@@ -321,7 +370,7 @@ class ResidentEvilVillage(BaseGame):
             hashes: set[tuple[int, int]] = {hash_filepath(_remap_path(p)) for p in placed_lower}
             pak_files = find_pak_files(self._game_path)
             if not pak_files:
-                _log("  [WARN] No re_chunk_000.pak found — PAK patching skipped.")
+                _log("  [WARN] No re_chunk_000.pak found - PAK patching skipped.")
             else:
                 total_patched = 0
                 for pak in pak_files:
@@ -340,7 +389,7 @@ class ResidentEvilVillage(BaseGame):
                         "  or if the RE Engine path format needs adjustment."
                     )
                 else:
-                    _log(f"  PAK patching complete — {total_patched} total entr{'y' if total_patched == 1 else 'ies'} invalidated.")
+                    _log(f"  PAK patching complete - {total_patched} total entr{'y' if total_patched == 1 else 'ies'} invalidated.")
 
         _log(f"Deploy complete. {linked_mod} mod file(s) deployed.")
 
@@ -357,7 +406,7 @@ class ResidentEvilVillage(BaseGame):
 
         # Restore PAK entries from every profile's pak_patches/ backups.
         # Deploy writes backups under whichever profile was active, so restore
-        # must scan all profiles — looking only in default/ would permanently
+        # must scan all profiles - looking only in default/ would permanently
         # strand zeroed entries patched under a non-default profile.
         _log("Restore: restoring PAK entries from backups ...")
         restored_entries = 0
@@ -389,7 +438,7 @@ class ResidentEvilVillage(BaseGame):
             _log("  No PAK backups found (nothing to restore).")
 
         # NB the game-root manifest (.mm_pak_restore.json) is intentionally
-        # kept — it is an append-only ledger of every entry the manager has
+        # kept - it is an append-only ledger of every entry the manager has
         # ever invalidated, so the "Repair PAK files" wizard can always re-heal
         # the PAKs even if a future deploy/restore leaves them stranded.
 

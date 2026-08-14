@@ -1,14 +1,14 @@
-"""Missing Requirements panel — a vertical list of cards (one per missing
+"""Missing Requirements panel - a vertical list of cards (one per missing
 requirement) showing the required mod's name + its notes, with a View link.
 Opens as a plugins-panel-scoped tab (covers the whole plugins panel), like the
 Change Version overlay.
 
 The notes/description aren't in meta.ini (which only stores `modId:name` pairs),
 so they're fetched from `api.get_mod_requirements(domain, mod_id)` on a daemon
-thread (a Signal marshals the result back — never a QThread). For multiple mods
-the requirements are aggregated and deduped by mod_id.
+thread (a Signal marshals the result back - never a QThread). For multiple mods
+the requirements are aggregated and deduped by Nexus domain plus mod_id.
 
-No keyword categorisation (the Tk Required/Optional/Other split was unreliable —
+No keyword categorisation (the Tk Required/Optional/Other split was unreliable -
 dropped per the user).
 """
 
@@ -149,15 +149,15 @@ class MissingReqsView(QWidget):
         self._save_ignored_fn = save_ignored_fn or (lambda s: None)
         self._on_close = on_close or (lambda: None)
         self._log = log_fn or (lambda _m: None)
-        # install_fn(mod_id, domain, name) — runs the full premium→files→download
+        # install_fn(mod_id, domain, name) - runs the full premium→files→download
         # →install flow (provided by the window). None = install disabled.
         self._install_fn = install_fn
-        # ignore_req_fn(req_id, req_name, ignored, owner_names) — persists a
+        # ignore_req_fn(req_id, req_name, ignored, owner_names) - persists a
         # per-requirement ignore into the owning mods' meta.ini (provided by
         # the window). None = no per-requirement Ignore checkboxes.
         self._ignore_req_fn = ignore_req_fn
-        # mod_id → card widget, so cards can be pruned once installed.
-        self._cards: dict[int, _ReqCard] = {}
+        # (domain, mod_id) → card widget, so cross-domain ids cannot collide.
+        self._cards: dict[tuple[str, int], _ReqCard] = {}
 
         self.setObjectName("MissingReqsView")
         self._reqs_ready.connect(self._on_reqs_ready)
@@ -174,10 +174,10 @@ class MissingReqsView(QWidget):
         # Toolbar: title + Ignore requirements + Close.
         bar = QWidget(); bar.setObjectName("HeaderBar")
         hb = QHBoxLayout(bar); hb.setContentsMargins(12, 8, 8, 8); hb.setSpacing(8)
-        full = self.tr("Missing requirements — {0}").format(self._title_text())
+        full = self.tr("Missing requirements - {0}").format(self._title_text())
         title = _ElidedLabel(full, max_width=360)
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
-        # A long mod name must not be allowed to force the whole panel wide — the
+        # A long mod name must not be allowed to force the whole panel wide - the
         # label caps its own width and elides the overflow (full name in tooltip).
         title.setToolTip(full)
         hb.addWidget(title)
@@ -235,7 +235,7 @@ class MissingReqsView(QWidget):
         try:
             self._save_ignored_fn(self._ignored_set)
         except Exception as exc:
-            self._log(f"Nexus: could not save ignored requirements — {exc}")
+            self._log(f"Nexus: could not save ignored requirements - {exc}")
 
     # ---- fetch ------------------------------------------------------------
     def _start_fetch(self):
@@ -243,7 +243,7 @@ class MissingReqsView(QWidget):
 
         def worker():
             out = []
-            seen: set[int] = set()
+            seen: set[tuple[str, int]] = set()
             errors: list[str] = []
             try:
                 for m in mods:
@@ -259,18 +259,24 @@ class MissingReqsView(QWidget):
                             errors.append(f"{m.get('mod_name','?')}: {e}")
                             reqs = []
                         for r in reqs:
-                            if r.mod_id in want and r.mod_id not in seen:
-                                seen.add(r.mod_id)
+                            key = (domain.strip().lower(), int(r.mod_id or 0))
+                            if r.mod_id in want and key not in seen:
+                                # GraphQL exposes a numeric game id here; the
+                                # owning mod's slug is the domain these same-game
+                                # requirements must use for links and installs.
+                                r.game_domain = domain
+                                seen.add(key)
                                 out.append(r)
-                    # Any required ids the graph didn't cover — including every id
+                    # Any required ids the graph didn't cover - including every id
                     # when the owning mod is local (mod_id<=0, e.g. TTW's seeded
-                    # requirements) — are resolved one mod at a time.
+                    # requirements) - are resolved one mod at a time.
                     for rid in want:
-                        if rid in seen:
+                        key = (domain.strip().lower(), int(rid or 0))
+                        if key in seen:
                             continue
                         req = self._resolve_single(domain, rid, errors)
                         if req is not None:
-                            seen.add(rid)
+                            seen.add(key)
                             out.append(req)
             except Exception as e:
                 safe_emit(self._reqs_ready, None, str(e))
@@ -284,7 +290,7 @@ class MissingReqsView(QWidget):
         """Build a NexusModRequirement for a single required *mod_id* by fetching
         the mod directly. Used for locally-seeded requirements (e.g. the TTW
         installer) where there's no owning-mod requirement graph to read notes
-        from — so the mod's summary stands in for the requirement notes."""
+        from - so the mod's summary stands in for the requirement notes."""
         from Nexus.nexus_api import NexusModRequirement
         try:
             info = self._api.get_mod(domain, mod_id)
@@ -307,7 +313,7 @@ class MissingReqsView(QWidget):
             return
         self._status.setVisible(False)
         p = active_palette()
-        # Insert cards before the trailing stretch, keeping a mod_id → card map
+        # Insert cards before the trailing stretch, keeping qualified identities
         # so cards can be pruned once their requirement is installed.
         insert_at = self._cards_layout.count() - 1
         for r in reqs:
@@ -315,12 +321,14 @@ class MissingReqsView(QWidget):
             url = self._req_url(r, is_external)
             card = _ReqCard(
                 p, r, url, is_external, self._open_url, self._install_req,
-                ignored=self._req_ignored(int(r.mod_id or 0)),
+                ignored=self._req_ignored(r),
                 on_ignore=(self._toggle_req_ignored
                            if self._ignore_req_fn is not None else None))
             self._cards_layout.insertWidget(insert_at, card)
             insert_at += 1
-            self._cards[int(r.mod_id)] = card
+            key = ((getattr(r, "game_domain", "") or self._domain()).strip().lower(),
+                   int(r.mod_id))
+            self._cards[key] = card
 
     def refresh_install_labels(self):
         """Re-read 'Download only' and relabel the per-card buttons."""
@@ -333,11 +341,11 @@ class MissingReqsView(QWidget):
     def prune_installed(self, installed_ids):
         """Remove the cards for any requirement whose mod_id is now installed
         (called after the modlist flags refresh, so this works no matter how the
-        requirement got installed — panel Install button, manual, NXM, …).
+        requirement got installed - panel Install button, manual, NXM, …).
         Shows the empty-state text once every card is gone."""
-        installed = {int(i) for i in installed_ids or ()}
-        for mid in [m for m in self._cards if m in installed]:
-            card = self._cards.pop(mid)
+        installed = set(installed_ids or ())
+        for key in [k for k in self._cards if k in installed]:
+            card = self._cards.pop(key)
             self._cards_layout.removeWidget(card)
             card.deleteLater()
         if not self._cards:
@@ -345,22 +353,21 @@ class MissingReqsView(QWidget):
             self._status.setVisible(True)
 
     def _domain(self) -> str:
-        return getattr(self._game, "nexus_game_domain", "") or (
-            self._mods[0].get("domain", "") if self._mods else "")
+        return (self._mods[0].get("domain", "") if self._mods else "") or \
+            getattr(self._game, "nexus_game_domain", "") or ""
 
     def _req_url(self, req, is_external: bool) -> str:
         """The link the View button opens. The GraphQL `url` is usually empty for
         Nexus-hosted requirements (only externals carry it), so fall back to the
         mod page built from the domain + mod_id (mirrors the Tk panel).
 
-        NB `req.game_domain` is the GraphQL `gameId` — a NUMERIC id (e.g. 1704),
-        not a domain slug — so it can't go in the URL. Use the view's real domain
-        slug (the game's `nexus_game_domain`); only same-game reqs are supported."""
+        Fetched requirements are stamped with their owning mod's domain slug,
+        so equal numeric mod IDs in different Nexus games remain distinct."""
         if req.url:
             return req.url
         if is_external:
             return ""   # external w/ no url → nothing to open
-        domain = self._domain()
+        domain = getattr(req, "game_domain", "") or self._domain()
         if domain and req.mod_id:
             return f"https://www.nexusmods.com/{domain}/mods/{req.mod_id}"
         return ""
@@ -378,22 +385,28 @@ class MissingReqsView(QWidget):
     def _install_req(self, req):
         """Hand the required mod off to the window's Nexus-install flow
         (premium → file pick → download → install). Use the view's real domain
-        slug — `req.game_domain` is a numeric gameId, not a slug."""
+        slug stamped on the requirement by the fetch worker."""
         if self._install_fn is None:
             return
-        self._install_fn(req.mod_id, self._domain(),
+        domain = getattr(req, "game_domain", "") or self._domain()
+        self._install_fn(req.mod_id, domain,
                          req.mod_name or f"Mod {req.mod_id}")
 
     # ---- per-requirement ignore --------------------------------------------
-    def _req_owners(self, req_id: int) -> list:
+    def _req_owners(self, req_id: int, domain: str = "") -> list:
         """The panel mods whose missing list contains *req_id* (a deduped card
         can belong to several owning mods)."""
+        wanted = (domain or "").strip().lower()
         return [m for m in self._mods
-                if req_id in (m.get("missing_ids") or set())]
+                if req_id in (m.get("missing_ids") or set())
+                and (not wanted
+                     or (m.get("domain", "") or "").strip().lower() == wanted)]
 
-    def _req_ignored(self, req_id: int) -> bool:
-        """Checked state for a card: ignored in EVERY owning mod that lists it."""
-        owners = self._req_owners(req_id)
+    def _req_ignored(self, req) -> bool:
+        """Checked state for a card: ignored in every same-domain owner."""
+        req_id = int(getattr(req, "mod_id", 0) or 0)
+        owners = self._req_owners(
+            req_id, getattr(req, "game_domain", "") or self._domain())
         return bool(owners) and all(
             req_id in (m.get("ignored_ids") or set()) for m in owners)
 
@@ -404,7 +417,8 @@ class MissingReqsView(QWidget):
         rid = int(getattr(req, "mod_id", 0) or 0)
         if rid <= 0 or self._ignore_req_fn is None:
             return
-        owners = self._req_owners(rid)
+        owners = self._req_owners(
+            rid, getattr(req, "game_domain", "") or self._domain())
         names = [m.get("mod_name", "") for m in owners if m.get("mod_name")]
         if not names:
             return
@@ -414,4 +428,4 @@ class MissingReqsView(QWidget):
         try:
             self._ignore_req_fn(rid, req.mod_name or "", bool(state), names)
         except Exception as exc:
-            self._log(f"Nexus: could not save the ignored requirement — {exc}")
+            self._log(f"Nexus: could not save the ignored requirement - {exc}")

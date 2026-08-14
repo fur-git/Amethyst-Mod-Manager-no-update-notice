@@ -217,9 +217,15 @@ def _get_compositor_scale() -> float:
         if m and int(m.group(1)) > 1:
             return float(int(m.group(1)))
 
-    # Environment variables set by some DEs / launch wrappers
+    # Environment variables set by some DEs / launch wrappers. QT_SCALE_FACTOR
+    # only counts when someone ELSE set it: after a settings re-exec the env
+    # holds OUR OWN value (marker _AMM_OWNS_SCALE, see gui_qt/app.py run()),
+    # and reading it back as a "compositor" signal would make a once-applied
+    # auto scale sticky forever.
+    ours = os.environ.get("_AMM_OWNS_SCALE") == "1"
+    env_vars = ("GDK_SCALE",) if ours else ("GDK_SCALE", "QT_SCALE_FACTOR")
     env_scale = 1.0
-    for var in ("GDK_SCALE", "QT_SCALE_FACTOR"):
+    for var in env_vars:
         try:
             v = os.environ.get(var, "").strip()
             if v:
@@ -240,6 +246,31 @@ def _get_compositor_scale() -> float:
     if env_scale > 1.0:
         return env_scale
 
+    return 1.0
+
+
+def _get_xft_dpi_scale() -> float:
+    """Return the DE-advertised Xft.dpi as a scale factor (Xft.dpi / 96).
+
+    Qt's xcb backend consumes Xft.dpi itself (devicePixelRatio = Xft.dpi/96),
+    so a raised value means Qt already scales the UI and any QT_SCALE_FACTOR
+    we add would multiply on top of it.  Probed via xrdb, retried through
+    flatpak-spawn --host because the Flatpak runtime doesn't ship xrdb.
+    Returns 1.0 when unset/unreadable.
+    """
+    out = _run_capture(["xrdb", "-query"], timeout=2)
+    if not out:
+        out = _run_capture(
+            ["flatpak-spawn", "--host", "--directory=/", "xrdb", "-query"],
+            timeout=2)
+    m = _re.search(r"^Xft\.dpi:\s*([\d.]+)", out, _re.MULTILINE)
+    if m:
+        try:
+            dpi = float(m.group(1))
+            if dpi > 0:
+                return dpi / 96.0
+        except ValueError:
+            pass
     return 1.0
 
 
@@ -337,13 +368,21 @@ def get_screen_info() -> tuple[int, int, float]:
     if w <= 0 or h <= 0:
         return w, h, _DEFAULT_SCALE
 
-    # Wayland guard: Tk is X11-only, so on Wayland we run under XWayland and
-    # most compositors (GNOME always, KDE in "Scaled by the system" mode)
-    # already upscale the window. Scaling again on top would double-scale.
-    # The reliable tell is Xft.dpi: when the session expects X11 apps to
-    # scale *themselves*, the DE raises Xft.dpi (e.g. 192 at 200%); when the
-    # compositor scales them, Xft.dpi stays at ~96. So only trust a reported
-    # compositor scale if Xft.dpi confirms we are expected to apply it.
+    # Xft.dpi guard: Qt's xcb backend reads Xft.dpi on its own and scales the
+    # whole UI by Xft.dpi/96 (that is where devicePixelRatio comes from on
+    # X11/XWayland). When the DE advertises a raised Xft.dpi - KDE/GNOME on
+    # X11 with scaling, GNOME 47+ XWayland native scaling (GH#337: Xft.dpi=192
+    # at 200%) - the display scale is ALREADY handled, and a QT_SCALE_FACTOR
+    # we set would multiply on top of it, not replace it. So auto must stay
+    # at 1.0. (The opposite of the Tk era: Tk ignores Xft.dpi, which is why
+    # this module used to apply the scale itself.)
+    if _get_xft_dpi_scale() > 1.05:
+        return w, h, 1.0
+
+    # Wayland guard: we force xcb, so on Wayland we run under XWayland and
+    # compositors without a raised Xft.dpi (GNOME pre-47, KDE in "Scaled by
+    # the system" mode) upscale the window themselves. Either way the scale
+    # is applied outside the app - scaling again would double-scale.
     on_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
     compositor = max(_get_portal_scale(), _get_compositor_scale())
     if on_wayland and compositor > 1.0 and de_scale <= 1.05:
@@ -388,10 +427,12 @@ def get_screen_info() -> tuple[int, int, float]:
 def detect_hidpi_scale() -> float:
     """Detect suggested UI scale (compositor-reported, else screen height).
 
-    Prefers the DE/compositor's own scale (portal, kscreen-doctor, gsettings,
-    env vars), skipped when the Wayland compositor already upscales XWayland.
-    Resolution fallback: heights ≤1600 → 1.0; above scales by h/1080, capped
-    at _AUTO_MAX_SCALE (1.5x); manual selection can still go higher.
+    Returns 1.0 whenever the scale is already applied outside the app: a
+    raised Xft.dpi (Qt xcb self-scales by it) or a Wayland session (the
+    compositor upscales XWayland). Otherwise prefers the DE/compositor's own
+    scale (portal, kscreen-doctor, gsettings, env vars). Resolution fallback:
+    heights ≤1600 → 1.0; above scales by h/1080, capped at _AUTO_MAX_SCALE
+    (1.5x); manual selection can still go higher.
     """
     _, _, scale = get_screen_info()
     return scale
@@ -631,6 +672,44 @@ def save_fs_warning_ack(game_name: str, fingerprint: str) -> None:
     # Escape % for ConfigParser interpolation (mount paths may contain it);
     # parser.get() on read resolves %% back to %.
     parser[_FS_WARNINGS_SECTION][game_name] = fingerprint.replace("%", "%%")
+    _write_ini(parser, path)
+
+
+# ---------------------------------------------------------------------------
+# Fallout 3 Anniversary-Edition downgrade prompt: records the exe version the
+# user chose to "Deploy anyway" on (see Utils.fo3_version_check). Stored so the
+# prompt shows once per game, re-arming if a game update changes the exe again.
+# ---------------------------------------------------------------------------
+_FO3_DOWNGRADE_SECTION = "fo3_downgrade_ack"
+
+
+def get_fo3_downgrade_ack(game_name: str) -> str:
+    """Return the exe version the user acknowledged the FO3 downgrade prompt
+    for ("" if they never dismissed it for *game_name*)."""
+    if not game_name:
+        return ""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return ""
+    try:
+        parser = _read_ini(path)
+        return parser.get(_FO3_DOWNGRADE_SECTION, game_name, fallback="").strip()
+    except Exception:
+        return ""
+
+
+def save_fo3_downgrade_ack(game_name: str, version: str) -> None:
+    """Persist the acknowledged Fallout 3 exe version for *game_name*."""
+    if not game_name or not version:
+        return
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _FO3_DOWNGRADE_SECTION not in parser:
+        parser[_FO3_DOWNGRADE_SECTION] = {}
+    parser[_FO3_DOWNGRADE_SECTION][game_name] = version.replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -1397,6 +1476,56 @@ def save_hide_bsa_conflicts(value: bool) -> None:
     _write_ini(parser, path)
 
 
+def load_hide_kofi_button() -> bool:
+    """Return the hide_kofi_button setting (default False)."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    try:
+        parser = _read_ini(path)
+        return parser.getboolean(_FILEMAP_SECTION, "hide_kofi_button", fallback=False)
+    except Exception:
+        return False
+
+
+def save_hide_kofi_button(value: bool) -> None:
+    """Persist the hide_kofi_button setting to amethyst.ini."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _FILEMAP_SECTION not in parser:
+        parser[_FILEMAP_SECTION] = {}
+    parser[_FILEMAP_SECTION]["hide_kofi_button"] = "true" if value else "false"
+    _write_ini(parser, path)
+
+
+def load_hide_endorse_button() -> bool:
+    """Return the hide_endorse_button setting (default False)."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    try:
+        parser = _read_ini(path)
+        return parser.getboolean(_FILEMAP_SECTION, "hide_endorse_button", fallback=False)
+    except Exception:
+        return False
+
+
+def save_hide_endorse_button(value: bool) -> None:
+    """Persist the hide_endorse_button setting to amethyst.ini."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _FILEMAP_SECTION not in parser:
+        parser[_FILEMAP_SECTION] = {}
+    parser[_FILEMAP_SECTION]["hide_endorse_button"] = "true" if value else "false"
+    _write_ini(parser, path)
+
+
 def load_rename_mod_after_install() -> bool:
     """Return the rename_mod_after_install setting (default False).
 
@@ -1464,6 +1593,39 @@ def save_nexus_show_adult(value: bool) -> None:
     if _NEXUS_SECTION not in parser:
         parser[_NEXUS_SECTION] = {}
     parser[_NEXUS_SECTION]["show_adult"] = "true" if value else "false"
+    _write_ini(parser, path)
+
+
+_THUNDERSTORE_SECTION = "thunderstore"
+
+
+def load_thunderstore_flag(key: str) -> bool:
+    """Return a persisted Thunderstore browser toggle (default False).
+
+    *key* is "show_nsfw" or "show_deprecated". Kept in its own [thunderstore]
+    section rather than reusing the Nexus show_adult key - different site,
+    different user intent.
+    """
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    try:
+        parser = _read_ini(path)
+        return parser.getboolean(_THUNDERSTORE_SECTION, key, fallback=False)
+    except Exception:
+        return False
+
+
+def save_thunderstore_flag(key: str, value: bool) -> None:
+    """Persist a Thunderstore browser toggle to amethyst.ini."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _THUNDERSTORE_SECTION not in parser:
+        parser[_THUNDERSTORE_SECTION] = {}
+    parser[_THUNDERSTORE_SECTION][key] = "true" if value else "false"
     _write_ini(parser, path)
 
 

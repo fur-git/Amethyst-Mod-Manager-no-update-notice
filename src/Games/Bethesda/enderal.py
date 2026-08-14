@@ -12,7 +12,7 @@ from Games.Bethesda.fallout_3 import Fallout_3
 class Enderal(Fallout_3):
 
     _archive_list_needs_mod_bsas = False
-    # Skyrim LE engine — plugins.txt-ordered, not file mtimes.
+    # Skyrim LE engine - plugins.txt-ordered, not file mtimes.
     _plugin_load_order_by_mtime = False
     vanilla_plugins = ["Skyrim.esm", "Update.esm", "Enderal - Forgotten Stories.esm"]
     vanilla_dlc_plugins = [
@@ -41,6 +41,10 @@ class Enderal(Fallout_3):
     @property
     def nexus_game_domain(self) -> str:
         return "enderal"
+
+    @property
+    def additional_nexus_domains(self) -> list[str]:
+        return ["skyrim"]
 
     @property
     def loot_game_type(self) -> str:
@@ -75,7 +79,7 @@ class Enderal(Fallout_3):
 
     def swap_launcher(self, log_fn) -> None:
         # Enderal Launcher.exe already bootstraps SKSE; swapping breaks it.
-        log_fn("  Enderal Launcher invokes SKSE internally — skipping launcher swap.")
+        log_fn("  Enderal Launcher invokes SKSE internally - skipping launcher swap.")
 
     def _restore_launcher(self, log_fn) -> None:
         # Migration path: undo any prior swap left over from earlier versions.

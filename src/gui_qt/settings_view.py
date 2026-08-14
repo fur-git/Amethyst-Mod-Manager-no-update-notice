@@ -42,6 +42,10 @@ class SettingsView(QWidget):
     # (edit, save_fn, path) result to the GUI thread before touching a widget.
     _folder_picked = Signal(object)
 
+    # Shared width for the Language / Theme combos so the buttons that follow
+    # them ("Sync language files" / "Edit / Create Theme…") align on one edge.
+    COMBO_W = 180
+
     def __init__(self, window):
         super().__init__()
         self._window = window          # main window - for _notify, threads
@@ -310,6 +314,9 @@ class SettingsView(QWidget):
         g.addWidget(QLabel(self.tr("Language")), row, 0)
         self._lang_combo = QComboBox()
         no_wheel(self._lang_combo)
+        # Fixed width shared with the Theme combo so both trailing buttons
+        # ("Sync language files" / "Edit / Create Theme…") start at the same x.
+        self._lang_combo.setFixedWidth(self.COMBO_W)
         self._lang_sync_btn = QPushButton(self.tr("Sync language files"))
         self._lang_sync_btn.setCursor(Qt.PointingHandCursor)
         self._lang_sync_btn.clicked.connect(self._on_sync_languages)
@@ -345,6 +352,27 @@ class SettingsView(QWidget):
             help=self.tr("Show a mod's Nexus description as a tooltip when you "
                  "hover over its name in the mod list."))
 
+        self._checkbox(
+            g, self.tr("Hide Ko-Fi button"),
+            uc.load_hide_kofi_button, uc.save_hide_kofi_button,
+            help=self.tr("Hide the Ko-Fi donation button in the status bar."),
+            on_changed=lambda _v: self._apply_support_buttons())
+
+        self._checkbox(
+            g, self.tr("Hide Endorse button"),
+            uc.load_hide_endorse_button, uc.save_hide_endorse_button,
+            help=self.tr("Hide the Endorse AMM button in the status bar."),
+            on_changed=lambda _v: self._apply_support_buttons())
+
+    def _apply_support_buttons(self):
+        """Ask the window to re-apply Ko-Fi / Endorse button visibility live."""
+        win = self._window
+        if win is not None and hasattr(win, "_apply_support_button_visibility"):
+            try:
+                win._apply_support_button_visibility()
+            except Exception:
+                pass
+
     def _build_theme(self, g):
         """Theme picker (formerly its own Appearance section). Takes effect on
         restart, like Language / UI Scale - selecting a new theme persists it and
@@ -366,6 +394,7 @@ class SettingsView(QWidget):
 
         combo = QComboBox()
         no_wheel(combo)
+        combo.setFixedWidth(self.COMBO_W)
         values = [tid for tid in themes]
         for tid, disp in themes.items():
             combo.addItem(disp, tid)
@@ -459,11 +488,13 @@ class SettingsView(QWidget):
             self._safe_save(uc.save_ui_scale, "auto")
             self._prompt_scale_restart()
         else:
-            # Disabling auto just re-enables the slider. The slider already shows
-            # the currently-applied scale, so nothing changes until the user
-            # actually moves it (which commits + prompts then). Persist the
-            # explicit value so a manual scale is recorded, but don't prompt.
-            self._safe_save(uc.save_ui_scale, self._scale_slider.value() / 100.0)
+            # Disabling auto just re-enables the slider; nothing is persisted
+            # until the user actually moves it (which commits + prompts then).
+            # Writing the slider's current value here would freeze the
+            # auto-detected scale as a manual choice - GH#337: a wrong auto
+            # value got cemented that way and later detection fixes never
+            # reached the user's ini.
+            pass
 
     def _on_scale_value_changed(self, pct: int):
         """Live label update on every tick. Commit immediately only when the
@@ -882,7 +913,8 @@ class SettingsView(QWidget):
         """Relabel Install/Download on any tab open alongside Settings."""
         # _checkbox persists before calling here, so the views re-read the new value.
         w = self._window
-        for attr in ("_nexus_view", "_change_version_view", "_missing_reqs_view"):
+        for attr in ("_nexus_view", "_thunderstore_view", "_change_version_view",
+                     "_missing_reqs_view"):
             view = getattr(w, attr, None)
             if view is None:
                 continue

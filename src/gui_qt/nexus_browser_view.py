@@ -1,4 +1,4 @@
-"""Nexus Mods browser — a full detachable tab.
+"""Nexus Mods browser - a full detachable tab.
 
 Qt port of the Tk overlay (gui/nexus_browser_overlay.py + browse/trending/
 tracked/endorsed_mods_panel.py + mod_card.py). Layout:
@@ -14,18 +14,19 @@ tracked/endorsed_mods_panel.py + mod_card.py). Layout:
 
 All Nexus data + install logic comes from the toolkit-neutral Nexus/ layer; this
 file is pure Qt UI + threading. Fetches run on worker threads and marshal results
-back via signals. The active GAME determines the domain (game.nexus_game_domain).
+back via signals. The active game supplies the primary and compatible Nexus
+domains; the selector chooses which one this browser session uses.
 """
 
 from __future__ import annotations
 
 import threading
 
-from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QDate
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QDate, QStringListModel
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QScrollArea, QFrame, QCheckBox, QToolButton, QMenu,
-    QSplitter,
+    QSplitter, QCompleter, QComboBox,
 )
 
 from gui_qt.theme_qt import active_palette, _c
@@ -53,6 +54,34 @@ TIME_RANGES = [
     ("Year", 365),
 ]
 SECTIONS = ["Browse", "Tracked", "Endorsed", "Trending"]
+# Common mod-translation languages on Nexus. Not exhaustive - the API doesn't
+# expose a list to query, so this is a curated set matching what shows up in
+# practice (mirrors the site's own Language Support filter roughly).
+LANGUAGES = [
+    "English", "French", "German", "Spanish", "Italian", "Polish",
+    "Portuguese", "Russian", "Chinese", "Japanese", "Korean", "Turkish",
+    "Dutch", "Czech", "Hungarian", "Swedish", "Ukrainian", "Arabic",
+    "Vietnamese", "Thai", "Indonesian",
+]
+# File Size / Downloads / Endorsements min/max dropdown presets - lifted
+# straight from the site's own filter menus (values confirmed live), not
+# invented breakpoints, so a user picking "50MB" here gets the same result
+# they'd get there.
+FILE_SIZE_PRESETS = [
+    ("1KB", 1), ("100KB", 100), ("500KB", 500), ("1MB", 1024),
+    ("50MB", 51_200), ("100MB", 102_400), ("500MB", 512_000),
+    ("1GB", 1_048_576), ("5GB", 5_242_880), ("10GB", 10_485_760),
+]
+DOWNLOADS_PRESETS = [
+    ("50", 50), ("100", 100), ("1,000", 1_000), ("5,000", 5_000),
+    ("10,000", 10_000), ("50,000", 50_000), ("100,000", 100_000),
+    ("500,000", 500_000), ("1,000,000", 1_000_000), ("5,000,000", 5_000_000),
+]
+ENDORSEMENTS_PRESETS = [
+    ("10", 10), ("50", 50), ("100", 100), ("1,000", 1_000), ("5,000", 5_000),
+    ("10,000", 10_000), ("50,000", 50_000), ("100,000", 100_000),
+    ("300,000", 300_000),
+]
 # Default "shown per page"; overridden by the footer dropdown (persisted).
 PAGE_SIZE_BROWSE = 30
 # User-selectable "shown per page" counts (footer dropdown).
@@ -64,11 +93,12 @@ class NexusBrowserView(QWidget):
     *game*. Optional: *install_fn(list[str])* (defaults to a no-op), *log_fn*."""
 
     _results_ready = Signal(object, str, object)   # (entries, status, token)
-    _cats_ready = Signal(object)                    # (list[NexusCategory])
+    _cats_ready = Signal(object, str)               # (list[NexusCategory], domain)
+    _tags_ready = Signal(object, str)               # (list[NexusTag], domain)
     _premium_checked = Signal(object, object)       # (entry, is_premium|None)
     _files_ready = Signal(object, object)           # (entry, list[NexusModFile])
     _manual_files_ready = Signal(object, object)    # (entry, list[NexusModFile]|None)
-    _manual_watch_ended = Signal(int)               # (mod_id) — found or timed out
+    _manual_watch_ended = Signal(int)               # (mod_id) - found or timed out
     _download_done = Signal(object, object, object)      # (archive_path|None, meta|None, dl_key)
     _download_progress = Signal(object, object, "qlonglong", "qlonglong")  # (dl_key, name, downloaded, total bytes; 64-bit: >2GB)
 
@@ -76,7 +106,10 @@ class NexusBrowserView(QWidget):
                  progress_fn=None, parent=None):
         super().__init__(parent)
         self._api = api
-        self._domain = domain or ""
+        domains = tuple(getattr(game, "nexus_game_domains", ()) or ())
+        self._domains = domains or tuple(
+            d for d in ((domain or "").strip().lower(),) if d)
+        self._domain = self._domains[0] if self._domains else ""
         self._game = game
         self._install_fn = install_fn or (lambda paths, metas=None: None)
         self._log = log_fn or (lambda m: None)
@@ -101,7 +134,10 @@ class NexusBrowserView(QWidget):
         # name. Non-zero id here → the Author-mode worker uses the id path.
         self._uploader_id = 0
         self._selected_categories: list[str] = []
-        self._show_adult = self._load_show_adult()
+        # None = no adult filter (site's "neither box checked"), True = only
+        # adult, False = hidden. Persisted default mirrors the old toolbar
+        # toggle: hidden unless the user previously chose to see everything.
+        self._adult: bool | None = False if not self._load_show_adult() else None
         self._page_size_choice = self._load_page_size()
         self._entries = []
         self._cards: list[NexusModCard] = []
@@ -109,10 +145,36 @@ class NexusBrowserView(QWidget):
         self._fetch_token = 0           # guards against stale async results
         self._cats_loaded = False
 
+        # advanced search state (see Nexus.nexus_api.NexusSearchFilters)
+        self._tags_loaded = False
+        self._game_tags: list = []          # list[NexusTag] for the active domain
+        self._tag_includes: list[str] = []
+        self._tag_excludes: list[str] = []
+        self._languages: list[str] = []
+        self._hide_translations = False
+        self._min_size_kb: int | None = None
+        self._max_size_kb: int | None = None
+        self._min_downloads: int | None = None
+        self._max_downloads: int | None = None
+        self._min_endorsements: int | None = None
+        self._max_endorsements: int | None = None
+        self._supports_vortex: bool | None = None
+        self._has_updated = False
+        self._title_contains = ""
+        self._description_contains = ""
+        self._author_contains = ""
+        self._uploader_contains = ""
+        # Coalesces a burst of advanced-filter edits into one refetch.
+        self._advanced_timer = QTimer(self)
+        self._advanced_timer.setSingleShot(True)
+        self._advanced_timer.setInterval(600)
+        self._advanced_timer.timeout.connect(self._apply_advanced_filters)
+
         self._thumbs = ThumbnailLoader(self)
         self._thumbs.loaded.connect(self._on_thumb)
         self._results_ready.connect(self._on_results)
         self._cats_ready.connect(self._on_cats)
+        self._tags_ready.connect(self._on_tags_ready)
         self._premium_checked.connect(self._on_premium_checked)
         self._files_ready.connect(self._on_files_ready)
         self._manual_files_ready.connect(self._on_manual_files_ready)
@@ -145,6 +207,7 @@ class NexusBrowserView(QWidget):
         self._update_section_buttons()
         self._update_browse_controls_visibility()
         self._load_categories()
+        self._load_tags()
         self._reload()
 
     # -- construction -------------------------------------------------------
@@ -161,6 +224,21 @@ class NexusBrowserView(QWidget):
         #FilterBody {{ background: {c('BG_PANEL')}; }}
         #FilterEmpty {{ color: {c('TEXT_DIM')}; font-style: italic; }}
         QScrollArea {{ background: {c('BG_PANEL')}; border: none; }}
+        #CollapsibleSection {{
+            border: 1px solid {c('BORDER')};
+            border-radius: 6px;
+            background: {c('BG_PANEL')};
+        }}
+        QToolButton#SectionToggle {{
+            background: transparent; border: none;
+            font-weight: bold; color: {c('TEXT_MAIN')};
+            padding: 2px 0;
+        }}
+        QToolButton#SectionToggle:hover,
+        QToolButton#SectionToggle:pressed,
+        QToolButton#SectionToggle:checked {{
+            background: transparent; color: {c('TEXT_MAIN')};
+        }}
         """
 
     @staticmethod
@@ -179,11 +257,177 @@ class NexusBrowserView(QWidget):
         except Exception:
             return PAGE_SIZE_BROWSE
 
+    def _add_filter_section(self, host_layout: QVBoxLayout, title: str,
+                            *, expanded: bool = False):
+        """Add an openable/closable section, returning its body layout."""
+        from gui_qt.collapsible_section import CollapsibleSection
+        sec = CollapsibleSection(title)
+        if expanded:
+            sec.expand()
+        body_layout = QVBoxLayout(sec.body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(4)
+        host_layout.addWidget(sec)
+        return body_layout
+
+    @staticmethod
+    def _range_combo(presets: list[tuple[str, int]], no_label: str) -> "QComboBox":
+        """A min/max dropdown: a "no limit" entry plus the site's presets."""
+        # "No min"/"No max" carries data=None; each preset carries the raw
+        # filter value the site itself sends.
+        cb = QComboBox()
+        cb.addItem(no_label, None)
+        for label, value in presets:
+            cb.addItem(label, value)
+        return cb
+
+    def _build_advanced_search_section(self, host_layout: QVBoxLayout) -> None:
+        """Build the rest of the site's filter panel below Category."""
+        # Tags, Search Parameters, Language Support, Content Options, File
+        # Size, Downloads, Endorsements - each its own openable/closable
+        # section like the site's. Built once (unlike Category, this doesn't
+        # get rebuilt per game); _reload() reads the live widget state each
+        # fetch.
+
+        def _tag_edit(placeholder: str) -> QLineEdit:
+            e = QLineEdit()
+            e.setPlaceholderText(placeholder)
+            completer = QCompleter([], self)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchContains)
+            e.setCompleter(completer)
+            return e
+
+        # -- Tags -------------------------------------------------------
+        lay = self._add_filter_section(host_layout, self.tr("Tags"))
+        lay.addWidget(QLabel(self.tr("Includes")))
+        self._tag_include_edit = _tag_edit(self.tr("Type a tag, press Enter…"))
+        self._tag_include_edit.returnPressed.connect(
+            lambda: self._add_tag(self._tag_include_edit, include=True))
+        lay.addWidget(self._tag_include_edit)
+        self._tag_include_row = QWidget()
+        self._tag_include_flow = FlowLayout(self._tag_include_row, spacing=4)
+        lay.addWidget(self._tag_include_row)
+
+        lay.addWidget(QLabel(self.tr("Excludes")))
+        self._tag_exclude_edit = _tag_edit(self.tr("Type a tag, press Enter…"))
+        self._tag_exclude_edit.returnPressed.connect(
+            lambda: self._add_tag(self._tag_exclude_edit, include=False))
+        lay.addWidget(self._tag_exclude_edit)
+        self._tag_exclude_row = QWidget()
+        self._tag_exclude_flow = FlowLayout(self._tag_exclude_row, spacing=4)
+        lay.addWidget(self._tag_exclude_row)
+
+        # -- Search Parameters -------------------------------------------
+        # title_contains overlaps with the browse bar's search (ANDs with it
+        # rather than replacing it - see NexusSearchFilters). Debounced via
+        # _on_advanced_changed rather than sitting behind a separate Apply
+        # button like the site's panel does.
+        lay = self._add_filter_section(host_layout, self.tr("Search Parameters"))
+        self._title_contains_edit = QLineEdit()
+        self._title_contains_edit.setPlaceholderText(self.tr("Title contains"))
+        lay.addWidget(self._title_contains_edit)
+        self._description_contains_edit = QLineEdit()
+        self._description_contains_edit.setPlaceholderText(self.tr("Description contains"))
+        lay.addWidget(self._description_contains_edit)
+        self._author_contains_edit = QLineEdit()
+        self._author_contains_edit.setPlaceholderText(self.tr("Author contains"))
+        lay.addWidget(self._author_contains_edit)
+        self._uploader_contains_edit = QLineEdit()
+        self._uploader_contains_edit.setPlaceholderText(self.tr("Uploader contains"))
+        lay.addWidget(self._uploader_contains_edit)
+        for edit in (self._title_contains_edit, self._description_contains_edit,
+                     self._author_contains_edit, self._uploader_contains_edit):
+            edit.textChanged.connect(self._on_advanced_changed)
+
+        # -- Language Support ---------------------------------------------
+        # Multi-select (OR'd - "any of these languages"), same TriStateCheckBox
+        # the category list uses, matching the site's checkbox list rather
+        # than a single-choice dropdown.
+        from gui_qt.tri_state_checkbox import TriStateCheckBox
+        lay = self._add_filter_section(host_layout, self.tr("Language Support"))
+        self._hide_translations_cb = TriStateCheckBox(
+            self.tr("Hide translations"), two_state=True)
+        self._hide_translations_cb.stateChanged.connect(
+            lambda _s: self._on_advanced_changed())
+        lay.addWidget(self._hide_translations_cb)
+        self._lang_checks: list[TriStateCheckBox] = []
+        for lang in LANGUAGES:
+            cb = TriStateCheckBox(lang, two_state=True)
+            cb._lang_name = lang
+            cb.stateChanged.connect(lambda _s: self._on_advanced_changed())
+            lay.addWidget(cb)
+            self._lang_checks.append(cb)
+
+        # -- Content Options ------------------------------------------------
+        # Hide/Show-only adult are mutually exclusive (site behaves the same
+        # way, even though it renders them as independent checkboxes).
+        lay = self._add_filter_section(host_layout, self.tr("Content Options"))
+        self._hide_adult_cb = TriStateCheckBox(self.tr("Hide adult content"), two_state=True)
+        self._hide_adult_cb.stateChanged.connect(lambda _s: self._on_hide_adult_toggled())
+        lay.addWidget(self._hide_adult_cb)
+        self._show_only_adult_cb = TriStateCheckBox(
+            self.tr("Show only adult content"), two_state=True)
+        self._show_only_adult_cb.stateChanged.connect(
+            lambda _s: self._on_show_only_adult_toggled())
+        lay.addWidget(self._show_only_adult_cb)
+        self._supports_vortex_cb = TriStateCheckBox(self.tr("Supported by Vortex"), two_state=True)
+        self._supports_vortex_cb.stateChanged.connect(
+            lambda _s: self._on_advanced_changed())
+        lay.addWidget(self._supports_vortex_cb)
+        self._only_updated_cb = TriStateCheckBox(self.tr("Show only updated mods"), two_state=True)
+        self._only_updated_cb.stateChanged.connect(
+            lambda _s: self._on_advanced_changed())
+        lay.addWidget(self._only_updated_cb)
+        self._hide_adult_cb.set_state(1 if self._adult is False else 0)
+
+        # -- File Size / Downloads / Endorsements --------------------------
+        # Dropdown presets, not free-text - lifted straight from the site's
+        # own min/max menus (verified against the live filter UI).
+        lay = self._add_filter_section(host_layout, self.tr("File Size"))
+        size_row = QHBoxLayout()
+        self._min_size_combo = self._range_combo(FILE_SIZE_PRESETS, self.tr("No min"))
+        self._max_size_combo = self._range_combo(FILE_SIZE_PRESETS, self.tr("No max"))
+        size_row.addWidget(self._min_size_combo)
+        size_row.addWidget(QLabel(self.tr("to")))
+        size_row.addWidget(self._max_size_combo)
+        lay.addLayout(size_row)
+
+        lay = self._add_filter_section(host_layout, self.tr("Downloads"))
+        dl_row = QHBoxLayout()
+        self._min_downloads_combo = self._range_combo(DOWNLOADS_PRESETS, self.tr("No min"))
+        self._max_downloads_combo = self._range_combo(DOWNLOADS_PRESETS, self.tr("No max"))
+        dl_row.addWidget(self._min_downloads_combo)
+        dl_row.addWidget(QLabel(self.tr("to")))
+        dl_row.addWidget(self._max_downloads_combo)
+        lay.addLayout(dl_row)
+
+        lay = self._add_filter_section(host_layout, self.tr("Endorsements"))
+        end_row = QHBoxLayout()
+        self._min_endorsements_combo = self._range_combo(ENDORSEMENTS_PRESETS, self.tr("No min"))
+        self._max_endorsements_combo = self._range_combo(ENDORSEMENTS_PRESETS, self.tr("No max"))
+        end_row.addWidget(self._min_endorsements_combo)
+        end_row.addWidget(QLabel(self.tr("to")))
+        end_row.addWidget(self._max_endorsements_combo)
+        lay.addLayout(end_row)
+
+        for combo in (self._min_size_combo, self._max_size_combo,
+                     self._min_downloads_combo, self._max_downloads_combo,
+                     self._min_endorsements_combo, self._max_endorsements_combo):
+            combo.currentIndexChanged.connect(lambda _i: self._on_advanced_changed())
+
+        clear_btn = QToolButton()
+        clear_btn.setText(self.tr("Clear advanced filters"))
+        clear_btn.setObjectName("ActionButton")
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.clicked.connect(self._clear_advanced_filters)
+        host_layout.addWidget(clear_btn)
+
     @staticmethod
     def _enable_hfw(w: QWidget) -> None:
         """Report the bar's height via heightForWidth (the wrapped FlowLayout
         height at the actual width), not the sizeHint Qt evaluates at minimum
-        width (every control on its own row) — same as app._enable_height_for_width."""
+        width (every control on its own row) - same as app._enable_height_for_width."""
         pol = w.sizePolicy()
         pol.setHeightForWidth(True)
         w.setSizePolicy(pol)
@@ -207,13 +451,22 @@ class NexusBrowserView(QWidget):
         tb.setContentsMargins(10, 6, 10, 6)
 
         self._cat_toggle = QToolButton()
-        self._cat_toggle.setText(self.tr("☰ Categories"))
+        self._cat_toggle.setText(self.tr("☰ Filters"))
         self._cat_toggle.setObjectName("ActionButton")
         self._cat_toggle.setCheckable(True)
         self._cat_toggle.setChecked(True)
         self._cat_toggle.setCursor(Qt.PointingHandCursor)
         self._cat_toggle.toggled.connect(self._toggle_categories)
         tb.addWidget(self._cat_toggle)
+
+        self._domain_sel = SelectorButton(
+            items=list(self._domains), current=self._domain,
+            prefix=self.tr("Domain: "), min_width=190,
+            on_select=self._on_domain_changed)
+        self._domain_sel.setToolTip(self.tr(
+            "Choose which compatible Nexus game to browse."))
+        self._domain_sel.setVisible(len(self._domains) > 1)
+        tb.addWidget(self._domain_sel)
 
         self._section_btns: dict[str, QToolButton] = {}
         for name in SECTIONS:
@@ -237,11 +490,6 @@ class NexusBrowserView(QWidget):
             prefix="Time: ", min_width=130, on_select=self._on_time_changed,
             actions=[(self.tr("Custom…"), self._pick_custom_time)])
         tb.addWidget(self._time_sel)
-
-        self._adult_cb = QCheckBox(self.tr("Show adult"))
-        self._adult_cb.setChecked(self._show_adult)
-        self._adult_cb.toggled.connect(self._on_adult_toggled)
-        tb.addWidget(self._adult_cb)
 
         refresh = QToolButton()
         refresh.setText(self.tr("Refresh"))
@@ -274,7 +522,7 @@ class NexusBrowserView(QWidget):
         cat_header.setObjectName("FilterHeader")
         chl = QHBoxLayout(cat_header)
         chl.setContentsMargins(10, 6, 8, 6)
-        cat_hdr = QLabel(self.tr("Categories"))
+        cat_hdr = QLabel(self.tr("Filters"))
         cat_hdr.setObjectName("FilterTitle")
         chl.addWidget(cat_hdr)
         chl.addStretch(1)
@@ -286,18 +534,38 @@ class NexusBrowserView(QWidget):
         self._cat_scroll = QScrollArea()
         self._cat_scroll.setWidgetResizable(True)
         self._cat_scroll.setFrameShape(QFrame.NoFrame)
+        # _cat_host holds every section, each an openable/closable
+        # CollapsibleSection like the site's own filter panel. Category is
+        # rebuilt per game (_on_cats, via _cat_layout inside its section body);
+        # the rest are built once here and never rebuilt.
         self._cat_host = QWidget()
         self._cat_host.setObjectName("FilterBody")
-        self._cat_layout = QVBoxLayout(self._cat_host)
-        self._cat_layout.setContentsMargins(10, 8, 10, 12)
+        host_layout = QVBoxLayout(self._cat_host)
+        host_layout.setContentsMargins(10, 8, 10, 12)
+        host_layout.setSpacing(6)
+        host_layout.setAlignment(Qt.AlignTop)
+
+        from gui_qt.collapsible_section import CollapsibleSection
+        cat_section = CollapsibleSection(self.tr("Category"))
+        cat_section.expand()             # open by default, matching current behaviour
+        cat_body_layout = QVBoxLayout(cat_section.body)
+        cat_body_layout.setContentsMargins(0, 0, 0, 0)
+        cat_list_host = QWidget()
+        self._cat_layout = QVBoxLayout(cat_list_host)
+        self._cat_layout.setContentsMargins(0, 0, 0, 0)
         self._cat_layout.setSpacing(3)
         self._cat_layout.setAlignment(Qt.AlignTop)
-        self._cat_scroll.setWidget(self._cat_host)
-        cv.addWidget(self._cat_scroll, 1)
+        cat_body_layout.addWidget(cat_list_host)
         self._cat_checks: list[QCheckBox] = []
         self._cat_status = QLabel(self.tr("Loading…"))
         self._cat_status.setObjectName("FilterEmpty")
         self._cat_layout.addWidget(self._cat_status)
+        host_layout.addWidget(cat_section)
+
+        self._build_advanced_search_section(host_layout)
+
+        self._cat_scroll.setWidget(self._cat_host)
+        cv.addWidget(self._cat_scroll, 1)
         self._cat_panel.setStyleSheet(self._filter_qss(p))
         self._body_split.addWidget(self._cat_panel)
 
@@ -448,11 +716,15 @@ class NexusBrowserView(QWidget):
         if self._cats_loaded or not self._domain:
             return
 
-        run_in_worker(lambda: self._api.get_game_categories(self._domain),
-                      self._cats_ready, name="nexus-categories",
-                      error_result=[])
+        domain = self._domain
+        run_in_worker(
+            lambda: (self._api.get_game_categories(domain), domain),
+            self._cats_ready, name="nexus-categories", unpack=True,
+            error_result=([], domain))
 
-    def _on_cats(self, cats):
+    def _on_cats(self, cats, domain: str):
+        if domain != self._domain:
+            return                       # stale result from the previous domain
         self._cats_loaded = True
         # clear existing (checks + any indent-wrapper rows + the status label)
         while self._cat_layout.count():
@@ -480,7 +752,7 @@ class NexusBrowserView(QWidget):
 
     def _add_cat_check(self, name: str, indent: int):
         # Use the SAME widget as the modlist filter panel (TriStateCheckBox) so
-        # the rows look identical — two_state so it's plain on/off (no exclude).
+        # the rows look identical - two_state so it's plain on/off (no exclude).
         from gui_qt.tri_state_checkbox import TriStateCheckBox
         cb = TriStateCheckBox(name, two_state=True)
         cb.setToolTip(name)              # long names that clip still readable
@@ -503,6 +775,173 @@ class NexusBrowserView(QWidget):
         self._page = 0
         self._reload()
 
+    # -- advanced search: tags / language / size / downloads / endorsements -
+    def _load_tags(self):
+        if self._tags_loaded or not self._domain:
+            return
+        domain = self._domain
+        run_in_worker(
+            lambda: (self._api.get_game_tags(domain), domain),
+            self._tags_ready, name="nexus-tags", unpack=True,
+            error_result=([], domain))
+
+    def _on_tags_ready(self, tags, domain: str):
+        if domain != self._domain:
+            return                       # stale result from the previous domain
+        self._tags_loaded = True
+        self._game_tags = list(tags or [])
+        names = sorted({t.name for t in self._game_tags}, key=str.lower)
+        for edit in (self._tag_include_edit, self._tag_exclude_edit):
+            completer = edit.completer()
+            if completer is not None:
+                completer.setModel(QStringListModel(names, completer))
+
+    def _add_tag(self, edit: QLineEdit, include: bool):
+        typed = edit.text().strip()
+        edit.clear()
+        if not typed:
+            return
+        # Match the fetched tag list case-insensitively so the stored name is
+        # exactly what the API expects; fall back to the typed text verbatim
+        # if the tag list hasn't loaded yet or has no match.
+        name = next((t.name for t in self._game_tags
+                    if t.name.lower() == typed.lower()), typed)
+        target = self._tag_includes if include else self._tag_excludes
+        other = self._tag_excludes if include else self._tag_includes
+        if name in other:
+            other.remove(name)           # a tag can't be both included and excluded
+        if name not in target:
+            target.append(name)
+        self._rebuild_tag_chips()
+        self._page = 0
+        self._reload()
+
+    def _remove_tag(self, name: str, include: bool):
+        target = self._tag_includes if include else self._tag_excludes
+        if name in target:
+            target.remove(name)
+        self._rebuild_tag_chips()
+        self._page = 0
+        self._reload()
+
+    def _rebuild_tag_chips(self):
+        for flow, names, include in (
+            (self._tag_include_flow, self._tag_includes, True),
+            (self._tag_exclude_flow, self._tag_excludes, False),
+        ):
+            while flow.count():
+                it = flow.takeAt(0)
+                w = it.widget()
+                if w is not None:
+                    w.deleteLater()
+            for name in names:
+                chip = QToolButton()
+                chip.setText(f"{name}  ✕")
+                chip.setObjectName("ActionButton")
+                chip.setCursor(Qt.PointingHandCursor)
+                chip.setToolTip(self.tr("Remove"))
+                chip.clicked.connect(
+                    lambda _=False, n=name, inc=include: self._remove_tag(n, inc))
+                flow.addWidget(chip)
+
+    def _on_advanced_changed(self, _ignored=None):
+        """Queue an advanced-filter refetch (debounced)."""
+        # Every advanced control funnels through here so a burst of edits -
+        # typing, ticking five languages, picking a min then a max - collapses
+        # into a single reload instead of one round trip per keystroke/click.
+        # Doubles as the fix for the read-your-own-writes race: the widget
+        # state is scraped once, in _apply_advanced_filters, after the pause.
+        self._advanced_timer.start()
+
+    def _apply_advanced_filters(self):
+        """Scrape every advanced widget into filter state and refetch."""
+        self._languages = [cb._lang_name for cb in self._lang_checks if cb.state()]
+        self._hide_translations = bool(self._hide_translations_cb.state())
+        self._supports_vortex = True if self._supports_vortex_cb.state() else None
+        self._has_updated = bool(self._only_updated_cb.state())
+        self._min_size_kb = self._min_size_combo.currentData()
+        self._max_size_kb = self._max_size_combo.currentData()
+        self._min_downloads = self._min_downloads_combo.currentData()
+        self._max_downloads = self._max_downloads_combo.currentData()
+        self._min_endorsements = self._min_endorsements_combo.currentData()
+        self._max_endorsements = self._max_endorsements_combo.currentData()
+        self._title_contains = self._title_contains_edit.text().strip()
+        self._description_contains = self._description_contains_edit.text().strip()
+        self._author_contains = self._author_contains_edit.text().strip()
+        self._uploader_contains = self._uploader_contains_edit.text().strip()
+        self._page = 0
+        self._reload()
+
+    def _reset_advanced_filter_state(self, *, keep_adult: bool = True):
+        """Clear the advanced filters without reloading."""
+        # Used by the "Clear" button (which reloads after) and by domain
+        # retargeting (which reloads once, later, after everything else
+        # resets). keep_adult: the adult choice is a user preference, not a
+        # game-scoped filter - a game switch must NOT silently un-hide adult
+        # content, so only the explicit "Clear" button passes keep_adult=False.
+        self._advanced_timer.stop()      # drop any refetch queued pre-reset
+        self._tag_includes.clear()
+        self._tag_excludes.clear()
+        self._rebuild_tag_chips()
+        self._languages = []
+        for cb in self._lang_checks:
+            cb.set_state(0)              # emit=False: no reload storm here
+        self._hide_translations = False
+        self._hide_translations_cb.set_state(0)
+        if not keep_adult:
+            self._adult = None
+            self._hide_adult_cb.set_state(0)
+            self._show_only_adult_cb.set_state(0)
+            self._save_adult_pref()
+        self._supports_vortex = None
+        self._supports_vortex_cb.set_state(0)
+        self._has_updated = False
+        self._only_updated_cb.set_state(0)
+        for combo in (self._min_size_combo, self._max_size_combo,
+                     self._min_downloads_combo, self._max_downloads_combo,
+                     self._min_endorsements_combo, self._max_endorsements_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._min_size_kb = self._max_size_kb = None
+        self._min_downloads = self._max_downloads = None
+        self._min_endorsements = self._max_endorsements = None
+        for edit in (self._title_contains_edit, self._description_contains_edit,
+                     self._author_contains_edit, self._uploader_contains_edit):
+            edit.blockSignals(True)
+            edit.clear()
+            edit.blockSignals(False)
+        self._title_contains = self._description_contains = ""
+        self._author_contains = self._uploader_contains = ""
+
+    def _clear_advanced_filters(self):
+        self._reset_advanced_filter_state(keep_adult=False)
+        self._page = 0
+        self._reload()
+
+    def _current_search_filters(self):
+        """Build a NexusSearchFilters from the live advanced-search widgets."""
+        from Nexus.nexus_api import NexusSearchFilters
+        return NexusSearchFilters(
+            tag_includes=tuple(self._tag_includes),
+            tag_excludes=tuple(self._tag_excludes),
+            languages=tuple(self._languages),
+            hide_translations=self._hide_translations,
+            min_file_size_kb=self._min_size_kb,
+            max_file_size_kb=self._max_size_kb,
+            min_downloads=self._min_downloads,
+            max_downloads=self._max_downloads,
+            min_endorsements=self._min_endorsements,
+            max_endorsements=self._max_endorsements,
+            adult=self._adult,
+            supports_vortex=self._supports_vortex,
+            has_updated=self._has_updated,
+            title_contains=self._title_contains or None,
+            description_contains=self._description_contains or None,
+            author_contains=self._author_contains or None,
+            uploader_contains=self._uploader_contains or None,
+        )
+
     # -- toolbar handlers ---------------------------------------------------
     def _on_sort_changed(self, label: str):
         self._sort_key = dict(SORT_KEYS).get(label, "downloads")
@@ -510,7 +949,7 @@ class NexusBrowserView(QWidget):
         self._reload()
 
     def _on_time_changed(self, label: str):
-        # A preset was chosen — drop any lingering custom range so it doesn't
+        # A preset was chosen - drop any lingering custom range so it doesn't
         # stay pinned in the dropdown next to the presets.
         if self._custom_time_label and label != self._custom_time_label:
             self._custom_time_label = None
@@ -553,14 +992,39 @@ class NexusBrowserView(QWidget):
         self._page = 0
         self._reload()
 
-    def _on_adult_toggled(self, on: bool):
-        self._show_adult = bool(on)
+    def _save_adult_pref(self):
+        """Persist the current adult choice."""
+        # Single writer for both adult checkboxes - persisting from only one of
+        # them let the stored preference drift out of sync with the UI. The
+        # stored flag is the legacy "show adult" boolean: only an explicit
+        # "Hide adult content" counts as hidden.
         try:
             from Utils.ui_config import save_nexus_show_adult
-            save_nexus_show_adult(self._show_adult)
+            save_nexus_show_adult(self._adult is not False)
         except Exception:
             pass
-        self._rebuild_cards()       # filter is applied at card-build time
+
+    def _on_hide_adult_toggled(self):
+        """Apply the "Hide adult content" checkbox."""
+        # Hide/Show-only adult are mutually exclusive (the site behaves the
+        # same even though it renders them as two independent checkboxes).
+        on = bool(self._hide_adult_cb.state())
+        if on:
+            self._show_only_adult_cb.set_state(0)   # emit=False: no double reload
+        self._adult = False if on else None
+        self._save_adult_pref()
+        self._page = 0
+        self._reload()
+
+    def _on_show_only_adult_toggled(self):
+        """Apply the "Show only adult content" checkbox."""
+        on = bool(self._show_only_adult_cb.state())
+        if on:
+            self._hide_adult_cb.set_state(0)
+        self._adult = True if on else None
+        self._save_adult_pref()
+        self._page = 0
+        self._reload()
 
     # -- search -------------------------------------------------------------
     def _on_search_mode_changed(self, label: str):
@@ -569,7 +1033,7 @@ class NexusBrowserView(QWidget):
         if mode == self._search_mode:
             return
         self._search_mode = mode
-        # Switching mode is a fresh, name-based query — drop any pinned uploader
+        # Switching mode is a fresh, name-based query - drop any pinned uploader
         # id from a prior right-click "Mods by this author".
         self._uploader_id = 0
         self._search.setPlaceholderText(
@@ -586,7 +1050,7 @@ class NexusBrowserView(QWidget):
 
     def _clear_search(self):
         """Empty the search field, switch back to Name mode (if the dropdown was
-        on Author), and — if a search was active — return to the default
+        on Author), and - if a search was active - return to the default
         (unfiltered) listing for the current section."""
         self._search.blockSignals(True)
         self._search.clear()
@@ -623,7 +1087,7 @@ class NexusBrowserView(QWidget):
             return
         if q == self._query:
             return
-        # A manually edited query is name-based — drop any pinned uploader id.
+        # A manually edited query is name-based - drop any pinned uploader id.
         self._uploader_id = 0
         self._query = q
         self._page = 0
@@ -675,15 +1139,27 @@ class NexusBrowserView(QWidget):
             self._reload()
 
     # -- fetch --------------------------------------------------------------
-    def set_game(self, game, domain):
-        """Retarget this browser at a different game (game switched while the tab
-        is open). Resets navigation + filters (categories differ per game) and
-        re-fetches categories + the Browse grid for the new domain."""
+    def _on_domain_changed(self, domain: str):
+        if (domain or "").strip().lower() == self._domain:
+            return
+        self._retarget_domain(domain)
+
+    def _retarget_domain(self, domain: str):
+        """Reset domain-scoped state and fetch the selected Nexus game."""
         # Pending browser-download watches would install into the NEW game's
-        # modlist — stop them (and their progress cards) instead.
+        # modlist - stop them (and their progress cards) instead.
         self._cancel_manual_watches()
-        self._game = game
-        self._domain = domain or ""
+        # Thumbnail completion signals only carry a numeric mod id. Replace the
+        # loader so an in-flight image for the previous domain cannot land on a
+        # same-id card in the newly selected domain.
+        try:
+            self._thumbs.loaded.disconnect(self._on_thumb)
+        except (RuntimeError, TypeError):
+            pass
+        self._thumbs.deleteLater()
+        self._thumbs = ThumbnailLoader(self)
+        self._thumbs.loaded.connect(self._on_thumb)
+        self._domain = (domain or "").strip().lower()
         # Reset navigation + search + filter state to the new game's defaults.
         self._section = "Browse"
         self._page = 0
@@ -704,6 +1180,7 @@ class NexusBrowserView(QWidget):
             self._search.blockSignals(False)
         except Exception:
             pass
+        self._reset_search_mode()
         # Force categories to reload for the new game.
         self._cats_loaded = False
         while self._cat_layout.count():
@@ -712,10 +1189,27 @@ class NexusBrowserView(QWidget):
             if w is not None:
                 w.deleteLater()
         self._cat_checks.clear()
+        # Advanced search filters (tags especially) are game-specific - reset
+        # them and force the tag list to reload for the new game.
+        self._tags_loaded = False
+        self._game_tags = []
+        self._reset_advanced_filter_state()
         self._update_section_buttons()
         self._update_browse_controls_visibility()
         self._load_categories()
+        self._load_tags()
         self._reload()
+
+    def set_game(self, game, domain):
+        """Retarget the browser after the application changes games."""
+        self._game = game
+        domains = tuple(getattr(game, "nexus_game_domains", ()) or ())
+        self._domains = domains or tuple(
+            d for d in (((domain or "").strip().lower()),) if d)
+        primary = self._domains[0] if self._domains else ""
+        self._domain_sel.set_items(list(self._domains), current=primary)
+        self._domain_sel.setVisible(len(self._domains) > 1)
+        self._retarget_domain(primary)
 
     def _reload(self):
         if not self._domain:
@@ -734,6 +1228,10 @@ class NexusBrowserView(QWidget):
         uploader_id = self._uploader_id
         cats = list(self._selected_categories) or None
         domain = self._domain
+        # Advanced filters only apply to the paged listing/search calls below
+        # (Tracked/Endorsed fetch by id list, not a ModsFilter search - same
+        # scoping the existing category filter already has).
+        filters = self._current_search_filters()
 
         def worker():
             entries = []
@@ -746,12 +1244,13 @@ class NexusBrowserView(QWidget):
                             entries = self._api.search_mods_by_uploader_id(
                                 domain, uploader_id, count=size,
                                 offset=page * size, category_names=cats,
-                                sort_key=sort_key)
+                                sort_key=sort_key, filters=filters)
                         else:
                             # Typed author search: match uploader by name.
                             entries = self._api.search_mods_by_author(
                                 domain, query, count=size, offset=page * size,
-                                category_names=cats, sort_key=sort_key)
+                                category_names=cats, sort_key=sort_key,
+                                filters=filters)
                         status = f"Mods by '{query}': page {page + 1} ({len(entries)} result(s))"
                     elif query.isdigit():
                         entries = self._api.search_mod_by_id(domain, int(query))
@@ -759,18 +1258,19 @@ class NexusBrowserView(QWidget):
                     else:
                         entries = self._api.search_mods(
                             domain, query, count=size, offset=page * size,
-                            category_names=cats, sort_key=sort_key)
+                            category_names=cats, sort_key=sort_key,
+                            filters=filters)
                         status = f"Search '{query}': page {page + 1} ({len(entries)} result(s))"
                 elif section == "Browse":
                     entries = self._api.get_top_mods(
                         domain, count=size, offset=page * size,
                         category_names=cats, created_since_days=time_days,
-                        sort_key=sort_key)
+                        sort_key=sort_key, filters=filters)
                     status = f"Browse: page {page + 1}"
                 elif section == "Trending":
                     entries = self._api.get_trending_mods_graphql(
                         domain, count=size, offset=page * size,
-                        category_names=cats)
+                        category_names=cats, filters=filters)
                     status = f"Trending (7 days): page {page + 1}"
                 elif section == "Tracked":
                     entries = self._fetch_user_mods(domain, self._api.get_tracked_mods)
@@ -809,6 +1309,15 @@ class NexusBrowserView(QWidget):
         if token != self._fetch_token:
             return                       # stale
         self._entries = list(entries or [])
+        # Some REST/GraphQL shapes omit the slug. Stamp the domain captured by
+        # this accepted result so later file fetches and metadata never fall
+        # back to a different selector value.
+        for entry in self._entries:
+            if not (getattr(entry, "domain_name", "") or "").strip():
+                try:
+                    entry.domain_name = self._domain
+                except Exception:
+                    pass
         self._status.setText(status)
         self._page_edit.setText(str(self._page + 1))
         self._set_loading(False)
@@ -818,6 +1327,7 @@ class NexusBrowserView(QWidget):
 
     def _set_loading(self, on: bool):
         for w in (self._prev_btn, self._next_btn, self._sort_sel, self._time_sel,
+                  self._domain_sel,
                   self._page_edit, self._perpage_sel):
             w.setEnabled(not on)
         if on:
@@ -833,10 +1343,17 @@ class NexusBrowserView(QWidget):
 
     # -- cards / grid -------------------------------------------------------
     def _visible_entries(self):
-        if self._show_adult:
+        """Client-side adult filter for Tracked/Endorsed."""
+        # Browse/Trending/search already filter server-side via
+        # NexusSearchFilters.adult - re-filtering them here would be a no-op at
+        # best and, if a node ever came back without adultContent populated,
+        # would silently empty the page. Tracked/Endorsed fetch by id list, so
+        # they get no ModsFilter and still need this pass.
+        if self._adult is None or self._section not in ("Tracked", "Endorsed"):
             return self._entries
+        want_adult = self._adult
         return [e for e in self._entries
-                if not getattr(e, "contains_adult_content", False)]
+                if bool(getattr(e, "contains_adult_content", False)) == want_adult]
 
     def _installed_ids(self) -> set:
         """Nexus mod IDs already installed in the active profile's staging for
@@ -851,10 +1368,12 @@ class NexusBrowserView(QWidget):
             if not staging or not Path(staging).is_dir():
                 return set()
             domain = (self._domain or "").lower()
+            primary = (getattr(game, "nexus_game_domain", "") or "").lower()
             return {
                 m.mod_id for m in scan_installed_mods(Path(staging))
                 if m.mod_id > 0
-                and (not domain or (m.game_domain or "").lower() == domain)
+                and (not domain
+                     or ((m.game_domain or "").lower() or primary) == domain)
             }
         except Exception:
             return set()
@@ -879,7 +1398,7 @@ class NexusBrowserView(QWidget):
 
     def refresh_installed(self):
         """Recompute installed IDs and flip card buttons. Call on profile change
-        and after an install completes — the browser tab persists across both."""
+        and after an install completes - the browser tab persists across both."""
         installed = self._installed_ids()
         for card in self._cards:
             card.set_installed(card.entry.mod_id in installed)
@@ -956,7 +1475,7 @@ class NexusBrowserView(QWidget):
             self.tr("Cancel download detection")
             if entry.mod_id in self._manual_watchers else _act,
             lambda: self._on_install(entry))
-        # Browse by the uploader's stable account id (reliable — survives a
+        # Browse by the uploader's stable account id (reliable - survives a
         # rename and can't be spoofed via the free-text `author` field). Fall
         # back to the display name / author only for a label when no id is
         # available (e.g. a REST-sourced entry without uploader.memberId).
@@ -987,7 +1506,7 @@ class NexusBrowserView(QWidget):
         uploader_id = int(uploader_id or 0)
         if not author and not uploader_id:
             return
-        # Switch to Browse first — _set_section clears the query and resets the
+        # Switch to Browse first - _set_section clears the query and resets the
         # mode (incl. the pinned uploader id), so do it before we set up below.
         if self._section != "Browse":
             self._set_section("Browse")
@@ -1030,7 +1549,7 @@ class NexusBrowserView(QWidget):
     # -- install (premium check → file pick → download → install queue) ----
     def _on_install(self, entry):
         if entry.mod_id in self._manual_watchers:
-            # Waiting for this mod's browser download — the click cancels the
+            # Waiting for this mod's browser download - the click cancels the
             # watch (e.g. it can't recognise the file). Click again to retry.
             self.cancel_manual_watch(entry.mod_id)
             self._log(f"Nexus: cancelled download detection for "
@@ -1051,7 +1570,7 @@ class NexusBrowserView(QWidget):
                 # browser-download flow (same switch the collections use).
                 from Utils.ui_config import load_force_manual_install
                 if load_force_manual_install():
-                    self._log("Nexus: [dev] force_manual_install — using the "
+                    self._log("Nexus: [dev] force_manual_install - using the "
                               "manual browser-download flow.")
                     premium = False
             return (entry, premium)
@@ -1084,17 +1603,17 @@ class NexusBrowserView(QWidget):
         """UI thread (non-premium install): pick the file (same chooser as the
         premium path), open ITS download page directly, and watch the download
         folders so the browser download auto-installs when it arrives.
-        'Download with Mod Manager' still works too — that comes back as an
+        'Download with Mod Manager' still works too - that comes back as an
         nxm:// link, which cancels this watch (see app._handle_nxm)."""
         from gui_qt.nexus_file_chooser import NexusFileChooser, installable_files
         picks = installable_files(files or [])
         if not picks:
             # No file list (API error) or nothing installable: fall back to
-            # the plain files page — no watch possible without expected files.
+            # the plain files page - no watch possible without expected files.
             from Utils.xdg import open_url
             self._installing = False
             open_url(f"{self._mod_url(entry)}?tab=files", log_fn=self._log)
-            self._log("Nexus: premium required for direct download — opened "
+            self._log("Nexus: premium required for direct download - opened "
                       "the files page (couldn't fetch the file list, so the "
                       "download won't auto-install; use 'Download with Mod "
                       "Manager' or the Downloads tab).")
@@ -1130,9 +1649,9 @@ class NexusBrowserView(QWidget):
         self._progress_fn(dl_key, name, 0, 0)
         watchers = self._manual_watchers
 
-        # All three callbacks run on the WATCHER thread — marshal via Signals.
+        # All three callbacks run on the WATCHER thread - marshal via Signals.
         def _claim() -> bool:
-            # Only the watch that still owns the slot may emit completion —
+            # Only the watch that still owns the slot may emit completion -
             # a watch cancelled or replaced by a re-click must stay silent
             # (double install / clobbering the new watch's progress card).
             t = watchers.pop(mod_id, None)
@@ -1156,7 +1675,7 @@ class NexusBrowserView(QWidget):
             if not _claim():
                 return
             self._log(f"Nexus: stopped waiting for a browser download of "
-                      f"{name} (nothing arrived — install it from the "
+                      f"{name} (nothing arrived - install it from the "
                       f"Downloads tab once downloaded).")
             safe_emit(self._download_done, None, None, dl_key)
             safe_emit(self._manual_watch_ended, mod_id)
@@ -1165,16 +1684,19 @@ class NexusBrowserView(QWidget):
             api=self._api, game_domain=domain, mod_id=mod_id, files=[file],
             open_url_fn=lambda u: open_url(u, log_fn=self._log),
             log_fn=self._log, log_label=file.file_name,
-            mod_info=entry,          # card entry IS the NexusModInfo — no fetch
+            mod_info=entry,          # card entry IS the NexusModInfo - no fetch
             on_archive=on_archive, on_progress=on_progress,
             on_timeout=on_timeout)
         watchers[mod_id] = (watcher, dl_key)
         self._set_card_watching(mod_id, True)
 
-    def cancel_manual_watch(self, mod_id: int):
+    def cancel_manual_watch(self, mod_id: int, game_domain: str = ""):
         """Stop a pending browser-download watch (no-op if none). Called on
         re-click, and by the app when an nxm:// download for the same mod
-        arrives — the nxm flow installs it, so the watch must not."""
+        arrives - the nxm flow installs it, so the watch must not."""
+        if (game_domain and
+                str(game_domain).strip().lower() != self._domain):
+            return
         t = self._manual_watchers.pop(int(mod_id or 0), None)
         if t is not None:
             watcher, dl_key = t
@@ -1233,7 +1755,7 @@ class NexusBrowserView(QWidget):
                 from Nexus.nexus_download import NexusDownloader
                 from Utils.config_paths import get_download_cache_dir_for_game
                 # Download into the per-game CACHE folder (the Downloads tab
-                # scans this), matching the Tk Nexus browser — NOT ~/Downloads.
+                # scans this), matching the Tk Nexus browser - NOT ~/Downloads.
                 dest = get_download_cache_dir_for_game(
                     getattr(self._game, "name", "") or "")
                 size = (file.size_in_bytes or 0) or (file.size_kb * 1024)
@@ -1246,7 +1768,7 @@ class NexusBrowserView(QWidget):
                 if result.success and result.file_path is not None:
                     archive = str(result.file_path)
                     # Build the meta from the KNOWN mod_id/file_id (the archive
-                    # name can mis-parse), like the Tk browser — so the installed
+                    # name can mis-parse), like the Tk browser - so the installed
                     # meta.ini records the right id and Reinstall detection works.
                     try:
                         from Nexus.nexus_meta import build_meta_from_download
@@ -1265,7 +1787,7 @@ class NexusBrowserView(QWidget):
 
         threading.Thread(target=worker, daemon=True).start()
         # The download is underway on its own thread with its own progress
-        # card — release the guard so the user can queue up the next mod
+        # card - release the guard so the user can queue up the next mod
         # while this one downloads/installs (installs serialise in the app's
         # pending-install queue).
         self._installing = False

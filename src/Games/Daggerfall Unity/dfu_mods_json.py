@@ -3,19 +3,19 @@ dfu_mods_json.py
 Load-order sync for Daggerfall Unity's Mods.json.
 
 DFU discovers .dfmod files by scanning StreamingAssets/Mods recursively and
-assigns each one a LoadPriority from the scan order — which is filesystem
+assigns each one a LoadPriority from the scan order - which is filesystem
 order, not anything the user chose.  It then overlays whatever is stored in
 <PersistentDataPath>/Mods/GameData/Mods.json, reading back only Title,
-Enabled and LoadPriority per entry and matching on Title.  Higher LoadPriority
-wins an asset conflict, so Amethyst's top-of-list mod must get the *highest*
-priority.
+Enabled and LoadPriority per entry and matching on Title.  DFU displays and
+validates this order from the lowest LoadPriority to the highest, so
+Amethyst's top-to-bottom order is written with increasing priorities.
 
 Matching is by ModTitle, which lives inside the .dfmod asset bundle.  It is
 read from the sibling <name>.dfmod.json manifest when the author shipped one
-(the Mod Builder emits it alongside the bundle); failing that a best-effort
-byte scan of the bundle is attempted.  Entries we cannot title are still
-written but DFU will simply not match them, so a miss costs ordering, never
-correctness.
+or otherwise included it in the archive; otherwise the embedded manifest
+TextAsset is read from the bundle's decompressed UnityFS blocks.
+Entries we cannot title are still written but DFU will simply not match them,
+so a miss costs ordering, never correctness.
 
 Set AMM_DFU_MODS_JSON=0 to skip this step entirely and manage the load order
 from DFU's own Mod Loader UI.
@@ -23,22 +23,45 @@ from DFU's own Mod Loader UI.
 
 from __future__ import annotations
 
+import heapq
+import io
 import json
+import lzma
 import os
 import re
 import shutil
+import struct
 from pathlib import Path
+from typing import NamedTuple
+
+import msgpack
+
+from Utils.atomic_write import atomic_writer
+
+CACHE_NAME = "dfu_modinfo.bin"
+_CACHE_VERSION = 1
 
 # Written next to Mods.json before the first sync so restore() can put the
 # user's own file back.  A zero-byte backup means "there was no file here".
 BACKUP_SUFFIX = ".amm-backup"
 
-# Cap the best-effort bundle scan — DREAM and friends ship multi-hundred-MB
-# .dfmod files and the manifest, when it is findable at all, sits near the top.
-_SCAN_LIMIT = 32 * 1024 * 1024
-_SCAN_CHUNK = 1 * 1024 * 1024
+# Cap raw inspection of legacy UnityRaw/UnityWeb bundles.  Modern UnityFS
+# bundles are decompressed a block at a time until the manifest is found;
+# limiting that scan used to miss valid manifests stored after the first
+# 32 MiB and caused DFU to ignore the resulting filename-as-title entry.
+_LEGACY_SCAN_LIMIT = 32 * 1024 * 1024
+_SCAN_CONTEXT = 64 * 1024
 
 _TITLE_RE = re.compile(rb'"ModTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_MANIFEST_KEY_RE = re.compile(
+    rb'"(?:ModVersion|ModAuthor|DFUnity_Version|ModDescription|GUID)"\s*:')
+# Dependencies sits in the same ModInfo object as ModTitle, but ModInfo.Files
+# lists every asset in the bundle and is written BETWEEN them - tens of
+# thousands of paths in a large mod.  So the array cannot be found by a bounded
+# regex from ModTitle (it is routinely ~85 KB further on) and must not be
+# matched with `\[[^\]]*\]`, which stops at the end of Files.  Decode the whole
+# ModInfo object instead; _MANIFEST_SCAN_LIMIT bounds the work.
+_MANIFEST_SCAN_LIMIT = 4 * 1024 * 1024
 
 
 def _noop(_msg: str) -> None:
@@ -68,7 +91,259 @@ def mods_json_path(game_path: Path) -> Path:
 # Titles
 # ---------------------------------------------------------------------------
 
-def _title_from_manifest(dfmod: Path) -> str | None:
+def _clean_title(value) -> str | None:
+    """Return a usable DFU title, rejecting binary false positives."""
+    if not isinstance(value, str):
+        return None
+    title = value.strip()
+    if not title or len(title) > 1024:
+        return None
+    # A title containing NUL or another JSON control character came from
+    # matching Unity's type metadata, not from the manifest TextAsset.
+    if any(ord(char) < 0x20 or ord(char) == 0x7f for char in title):
+        return None
+    return title
+
+
+class ModDependency(NamedTuple):
+    """One entry of a bundle's ModInfo.Dependencies array."""
+    name: str
+    is_peer: bool
+    is_optional: bool
+
+
+class ModInfo(NamedTuple):
+    """The parts of a .dfmod manifest that affect load order."""
+    title: str
+    dependencies: tuple[ModDependency, ...] = ()
+
+
+def _deps_from_list(raw) -> tuple[ModDependency, ...]:
+    """Normalise a decoded ModInfo.Dependencies array."""
+    deps: list[ModDependency] = []
+    for item in raw if isinstance(raw, list) else ():
+        if not isinstance(item, dict):
+            continue
+        # DFU matches dependencies against Mod.Title case-insensitively; the
+        # declared Name is frequently cased differently from the target's own
+        # ModTitle, so callers must fold case before comparing.
+        name = item.get("Name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        deps.append(ModDependency(name.strip(),
+                                  bool(item.get("IsPeer")),
+                                  bool(item.get("IsOptional"))))
+    return tuple(deps)
+
+
+def _parse_dependencies(data: bytes, brace: int) -> tuple[ModDependency, ...]:
+    """Read Dependencies from the ModInfo object opening at *brace*.
+
+    Decodes the object with raw_decode rather than pattern-matching the array,
+    because ModInfo.Files sits between ModTitle and Dependencies and contains
+    unbalanced-looking bracket runs of its own.
+    """
+    window = data[brace:brace + _MANIFEST_SCAN_LIMIT]
+    try:
+        text = window.decode("utf-8", errors="replace")
+        manifest, _ = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return ()
+    if not isinstance(manifest, dict):
+        return ()
+    return _deps_from_list(manifest.get("Dependencies"))
+
+
+def _title_from_manifest_bytes(data: bytes) -> str | None:
+    """Find and validate a ModInfo JSON object in decompressed bundle data."""
+    info = _info_from_manifest_bytes(data)
+    return None if info is None else info.title
+
+
+def _manifest_object_start(data: bytes, title_start: int) -> int | None:
+    """Offset of the '{' opening the ModInfo object containing *title_start*.
+
+    ModTitle is usually ModInfo's first property, but authors who list quest or
+    file arrays before it push it well into the object, so the brace is not
+    necessarily adjacent.  Walk back over balanced braces to find the real one
+    rather than requiring it within a fixed window.
+    """
+    depth = 0
+    for i in range(title_start - 1, max(-1, title_start - _MANIFEST_SCAN_LIMIT), -1):
+        byte = data[i]
+        if byte == 0x7d:                       # '}' - a nested object closed
+            depth += 1
+        elif byte == 0x7b:                     # '{'
+            if depth == 0:
+                return i
+            depth -= 1
+    return None
+
+
+def _info_from_manifest_bytes(data: bytes) -> ModInfo | None:
+    """Find and validate a ModInfo JSON object in decompressed bundle data."""
+    for match in _TITLE_RE.finditer(data):
+        # Let the JSON decoder handle escaped quotes, backslashes and Unicode;
+        # unicode_escape would corrupt already-decoded non-ASCII UTF-8.
+        try:
+            value = json.loads((b'"' + match.group(1) + b'"').decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        title = _clean_title(value)
+        if title is None:
+            continue
+
+        # ModTitle can occur in source code and Unity type trees too.  A real
+        # DFU ModInfo object has additional quoted manifest properties nearby;
+        # requiring an enclosing JSON object as well rejects the bare field
+        # names of a type tree, which have no brace structure around them.
+        context = data[match.end():match.end() + _SCAN_CONTEXT]
+        if not _MANIFEST_KEY_RE.search(context):
+            continue
+        obj_start = _manifest_object_start(data, match.start())
+        if obj_start is None:
+            continue
+        return ModInfo(title, _parse_dependencies(data, obj_start))
+    return None
+
+
+def _read_cstring(stream, limit: int = 1024) -> bytes:
+    value = bytearray()
+    while len(value) < limit:
+        char = stream.read(1)
+        if not char:
+            raise ValueError("truncated C string")
+        if char == b"\0":
+            return bytes(value)
+        value.extend(char)
+    raise ValueError("overlong C string")
+
+
+def _read_exact(stream, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) != size:
+        raise ValueError("truncated UnityFS bundle")
+    return data
+
+
+def _decompress_unity_block(data: bytes, size: int, flags: int) -> bytes:
+    """Decompress a UnityFS metadata or payload block."""
+    compression = flags & 0x3f
+    if compression == 0:
+        if len(data) != size:
+            raise ValueError("invalid uncompressed UnityFS block")
+        return data
+    if compression == 1:
+        if len(data) < 5:
+            raise ValueError("truncated Unity LZMA block")
+        props, dictionary_size = struct.unpack("<BI", data[:5])
+        lc = props % 9
+        remainder = props // 9
+        pb, lp = divmod(remainder, 5)
+        result = lzma.decompress(
+            data[5:],
+            format=lzma.FORMAT_RAW,
+            filters=[{"id": lzma.FILTER_LZMA1, "dict_size": dictionary_size,
+                      "lc": lc, "lp": lp, "pb": pb}],
+        )
+    elif compression in (2, 3):
+        # lz4 is already a packaged dependency (used by BG3 and BSA support).
+        import lz4.block
+        try:
+            result = lz4.block.decompress(data, uncompressed_size=size)
+        except Exception as exc:
+            raise ValueError("invalid Unity LZ4 block") from exc
+    else:
+        raise ValueError(f"unsupported UnityFS compression type {compression}")
+    if len(result) != size:
+        raise ValueError("UnityFS block decompressed to the wrong size")
+    return result
+
+
+def _unity_version_needs_alignment(version: int, engine: bytes) -> bool:
+    if version >= 7:
+        return True
+    # Unity 2019.4.15+ also aligned some format-6 bundles.  DFU currently uses
+    # 2019.4.41, but accepting this variant costs very little.
+    match = re.match(rb"2019\.4\.(\d+)", engine)
+    return bool(match and int(match.group(1)) >= 15)
+
+
+def _info_from_unityfs(dfmod: Path) -> ModInfo | None:
+    """Read ModInfo from the decompressed blocks of a modern UnityFS bundle."""
+    with dfmod.open("rb") as stream:
+        if _read_cstring(stream) != b"UnityFS":
+            return None
+        version = struct.unpack(">I", _read_exact(stream, 4))[0]
+        _read_cstring(stream)                 # minimum Unity version
+        engine = _read_cstring(stream)
+        _bundle_size, compressed_size, uncompressed_size, flags = struct.unpack(
+            ">QIII", _read_exact(stream, 20))
+        file_size = dfmod.stat().st_size
+        if compressed_size > file_size or uncompressed_size > 64 * 1024 * 1024:
+            raise ValueError("invalid UnityFS metadata size")
+
+        if _unity_version_needs_alignment(version, engine):
+            stream.seek((stream.tell() + 15) & ~15)
+        blocks_start = stream.tell()
+
+        if flags & 0x80:                      # BlocksInfoAtTheEnd
+            stream.seek(-compressed_size, os.SEEK_END)
+            compressed_info = _read_exact(stream, compressed_size)
+            stream.seek(blocks_start)
+        else:
+            compressed_info = _read_exact(stream, compressed_size)
+
+        info = _decompress_unity_block(compressed_info, uncompressed_size, flags)
+        reader = io.BytesIO(info)
+        _read_exact(reader, 16)                # uncompressed data hash
+        block_count = struct.unpack(">I", _read_exact(reader, 4))[0]
+        if block_count > 1_000_000:
+            raise ValueError("invalid UnityFS block count")
+
+        blocks: list[tuple[int, int, int]] = []
+        for _ in range(block_count):
+            unpacked, packed, block_flags = struct.unpack(
+                ">IIH", _read_exact(reader, 10))
+            if packed > file_size or unpacked > 128 * 1024 * 1024:
+                raise ValueError("invalid UnityFS block size")
+            blocks.append((unpacked, packed, block_flags))
+
+        # Newer Unity versions can request padding between block metadata and
+        # payload.  DFU's 2019 bundles do not set this flag, but support it for
+        # forwards compatibility.
+        if flags & 0x200:
+            stream.seek((stream.tell() + 15) & ~15)
+
+        def next_block(index: int) -> bytes:
+            unpacked, packed, block_flags = blocks[index]
+            return _decompress_unity_block(
+                _read_exact(stream, packed), unpacked, block_flags)
+
+        tail = b""
+        for i in range(len(blocks)):
+            buffer = tail + next_block(i)
+            info = _info_from_manifest_bytes(buffer)
+            if info is not None:
+                # ModInfo.Files sits between ModTitle and Dependencies, so the
+                # object routinely spans many blocks and this first parse sees
+                # it truncated.  Keep decompressing until Dependencies decodes
+                # or the manifest budget runs out; the title is already known,
+                # so a bundle that never completes still returns usable info.
+                j = i + 1
+                while (not info.dependencies and j < len(blocks)
+                       and len(buffer) < _MANIFEST_SCAN_LIMIT):
+                    buffer += next_block(j)
+                    j += 1
+                    parsed = _info_from_manifest_bytes(buffer)
+                    if parsed is not None:
+                        info = parsed
+                return info
+            tail = buffer[-_SCAN_CONTEXT:]
+    return None
+
+
+def _info_from_manifest(dfmod: Path) -> ModInfo | None:
     manifest = dfmod.with_name(dfmod.name + ".json")   # foo.dfmod -> foo.dfmod.json
     if not manifest.is_file():
         return None
@@ -76,41 +351,240 @@ def _title_from_manifest(dfmod: Path) -> str | None:
         data = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
         return None
-    title = data.get("ModTitle") if isinstance(data, dict) else None
-    return title.strip() if isinstance(title, str) and title.strip() else None
-
-
-def _title_from_bundle(dfmod: Path) -> str | None:
-    """Scan the bundle head for an embedded manifest; None when compressed."""
-    try:
-        read = 0
-        tail = b""
-        with dfmod.open("rb") as fh:
-            while read < _SCAN_LIMIT:
-                chunk = fh.read(_SCAN_CHUNK)
-                if not chunk:
-                    break
-                read += len(chunk)
-                m = _TITLE_RE.search(tail + chunk)
-                if m:
-                    title = m.group(1).decode("utf-8", "replace")
-                    title = title.encode().decode("unicode_escape", "replace")
-                    return title.strip() or None
-                # Overlap so a match straddling the chunk boundary is not lost.
-                tail = chunk[-512:]
-    except OSError:
+    if not isinstance(data, dict):
         return None
-    return None
+    title = _clean_title(data.get("ModTitle"))
+    if title is None:
+        return None
+    raw = data.get("Dependencies")
+    deps: list[ModDependency] = []
+    for item in raw if isinstance(raw, list) else ():
+        if isinstance(item, dict) and isinstance(item.get("Name"), str) \
+                and item["Name"].strip():
+            deps.append(ModDependency(item["Name"].strip(),
+                                      bool(item.get("IsPeer")),
+                                      bool(item.get("IsOptional"))))
+    return ModInfo(title, tuple(deps))
+
+
+def _info_from_bundle(dfmod: Path) -> ModInfo | None:
+    """Extract ModInfo without interpreting compressed bytes as strings."""
+    try:
+        with dfmod.open("rb") as stream:
+            signature = stream.read(8)
+        if signature == b"UnityFS\0":
+            try:
+                info = _info_from_unityfs(dfmod)
+            except (ImportError, lzma.LZMAError, struct.error, ValueError):
+                # A truncated or malformed archive still often carries a
+                # readable manifest, so fall through to the raw scan below
+                # rather than losing the title over a header we cannot walk.
+                info = None
+            if info is not None:
+                return info
+
+        # Very old UnityRaw/UnityWeb bundles are uncommon in current DFU.  A
+        # validated raw scan is safe for their uncompressed variants and, on
+        # failure, returning None is preferable to writing corrupt JSON.
+        with dfmod.open("rb") as stream:
+            return _info_from_manifest_bytes(stream.read(_LEGACY_SCAN_LIMIT))
+    except (ImportError, lzma.LZMAError, OSError, struct.error, ValueError):
+        return None
+
+
+class ModInfoCache:
+    """(size, mtime_ns) -> ModInfo cache for .dfmod bundles, as msgpack.
+
+    Finding Dependencies means decompressing past ModInfo.Files, which is the
+    bulk of a bundle, so a cold read of a large mod list costs seconds.  The
+    bundles themselves never change in place, making mtime a sound key.
+    """
+
+    def __init__(self, cache_path: Path | None = None):
+        self._path = cache_path
+        # abs path -> [size, mtime_ns, title, [[name, is_peer, is_optional]...]]
+        # title "" = a bundle whose ModInfo could not be read.
+        self._data: dict[str, list] = {}
+        self._seen: set[str] = set()
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        if self._path is None or not self._path.is_file():
+            return
+        try:
+            with self._path.open("rb") as handle:
+                payload = msgpack.unpack(handle, raw=False, strict_map_key=False)
+        except Exception:
+            return
+        if not isinstance(payload, dict) or payload.get("v") != _CACHE_VERSION:
+            return
+        mods = payload.get("mods")
+        if isinstance(mods, dict):
+            self._data = {k: list(v) for k, v in mods.items()
+                          if isinstance(v, (list, tuple)) and len(v) == 4}
+
+    def lookup(self, dfmod: Path) -> ModInfo | None:
+        key = str(dfmod)
+        try:
+            st = dfmod.stat()
+        except OSError:
+            # Not marked seen: a bundle that has gone away should be pruned on
+            # save rather than kept alive by the lookup that failed to read it.
+            return None
+        self._seen.add(key)
+
+        hit = self._data.get(key)
+        if hit is not None and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
+            if not hit[2]:
+                return None
+            deps = tuple(ModDependency(d[0], bool(d[1]), bool(d[2]))
+                         for d in hit[3] if isinstance(d, (list, tuple))
+                         and len(d) == 3)
+            return ModInfo(hit[2], deps)
+
+        info = _read_mod_info_uncached(dfmod)
+        # Cache the miss too: an unreadable bundle is otherwise fully
+        # decompressed again on every deploy.
+        self._data[key] = [
+            st.st_size, st.st_mtime_ns,
+            info.title if info is not None else "",
+            [[d.name, d.is_peer, d.is_optional] for d in info.dependencies]
+            if info is not None else [],
+        ]
+        self._dirty = True
+        return info
+
+    def save(self) -> None:
+        """Persist the cache, dropping entries for bundles that are gone."""
+        if self._path is None:
+            return
+        # Prune before the dirty check: a run that was entirely cache hits
+        # still needs to forget mods the user has since uninstalled, or the
+        # file grows for the lifetime of the profile.
+        for key in [k for k in self._data if k not in self._seen]:
+            if not os.path.exists(key):
+                del self._data[key]
+                self._dirty = True
+        if not self._dirty:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with atomic_writer(self._path, "wb", encoding=None,
+                               suffix=f".{os.getpid()}.tmp") as handle:
+                msgpack.pack({"v": _CACHE_VERSION, "mods": self._data}, handle,
+                             use_bin_type=True)
+            self._dirty = False
+        except Exception:
+            pass
+
+
+def _read_mod_info_uncached(dfmod: Path) -> ModInfo | None:
+    return _info_from_manifest(dfmod) or _info_from_bundle(dfmod)
+
+
+def read_mod_info(dfmod: Path, cache: ModInfoCache | None = None) -> ModInfo | None:
+    """Return the mod's ModInfo, or None when it cannot be determined."""
+    if cache is not None:
+        return cache.lookup(dfmod)
+    return _read_mod_info_uncached(dfmod)
 
 
 def read_mod_title(dfmod: Path) -> str | None:
     """Return the mod's ModTitle, or None when it cannot be determined."""
-    return _title_from_manifest(dfmod) or _title_from_bundle(dfmod)
+    info = read_mod_info(dfmod)
+    return None if info is None else info.title
 
 
 # ---------------------------------------------------------------------------
 # Sync / restore
 # ---------------------------------------------------------------------------
+
+def sort_by_dependencies(
+    titles: list[tuple[str, str]],
+    deps_by_file: dict[str, tuple[ModDependency, ...]],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Order *titles* so every dependency precedes its dependent.
+
+    DFU's CheckModDependencies errors when a mod's LoadPriority is lower than
+    that of a non-peer dependency, i.e. a dependency must load first.  Amethyst
+    otherwise knows nothing about these declarations, so the user's list order
+    alone routinely trips the Mod Loader's "must be positioned above" prompt.
+
+    Both *titles* and *deps_by_file* are keyed on the .dfmod file name without
+    its extension, because that - not ModTitle - is what a declared dependency
+    names.  GetModFromName matches Mod.FileName with StringComparison.Ordinal,
+    so the match is exact: "beautiful cities" is the bundle beautiful
+    cities.dfmod, whose ModTitle is the quite different "Beautiful Cities of
+    Daggerfall".  A dependency whose spelling does not match any installed file
+    is one DFU reports as missing rather than misordered, so leaving it out of
+    the graph is correct - no placement would satisfy it.
+
+    This is a stable topological sort: a mod moves only when a constraint
+    demands it, so the user's ordering survives everywhere it is already legal.
+    DFU's own AutoSortMods discards list order entirely, which is why we do not
+    simply mirror it.  Returns the new order plus any titles dropped from a
+    dependency cycle's constraints.
+    """
+    order = {filename: i for i, (filename, _) in enumerate(titles)}
+    # Peer dependencies impose no ordering; optional ones still do when the
+    # target is actually installed, which is exactly how DFU validates them.
+    edges: dict[int, set[int]] = {i: set() for i in range(len(titles))}
+    for i, (filename, _) in enumerate(titles):
+        for dep in deps_by_file.get(filename, ()):
+            if dep.is_peer:
+                continue
+            j = order.get(dep.name)
+            if j is not None and j != i:
+                edges[i].add(j)          # i must come after j
+
+    # Kahn's algorithm over the original indices.  Always taking the smallest
+    # ready index is what makes the result stable and deterministic.
+    remaining = {i: set(js) for i, js in edges.items()}
+    dependents: dict[int, list[int]] = {i: [] for i in range(len(titles))}
+    for i, js in edges.items():
+        for j in js:
+            dependents[j].append(i)
+
+    ready = [i for i, js in remaining.items() if not js]
+    heapq.heapify(ready)
+    result: list[int] = []
+    while ready:
+        i = heapq.heappop(ready)
+        result.append(i)
+        for k in dependents[i]:
+            remaining[k].discard(i)
+            if not remaining[k]:
+                heapq.heappush(ready, k)
+
+    # A cycle (mods declaring each other) leaves entries unemitted.  Append
+    # them in list order rather than dropping them: an unsatisfiable constraint
+    # is the author's problem, and losing the mod entirely would be worse.
+    cycled = [i for i in range(len(titles)) if i not in set(result)]
+    result.extend(cycled)
+    return [titles[i] for i in result], [titles[i][1] for i in cycled]
+
+
+def count_sort_issues(
+    titles: list[tuple[str, str]],
+    deps_by_file: dict[str, tuple[ModDependency, ...]],
+) -> int:
+    """How many constraints DFU's CheckModDependencies would flag in *titles*.
+
+    *titles* is in load order (index 0 loads first), matching what
+    sort_by_dependencies consumes and produces.
+    """
+    at = {filename: i for i, (filename, _) in enumerate(titles)}
+    issues = 0
+    for i, (filename, _) in enumerate(titles):
+        for dep in deps_by_file.get(filename, ()):
+            if dep.is_peer:
+                continue
+            j = at.get(dep.name)
+            if j is not None and i < j:
+                issues += 1
+    return issues
+
 
 def _load_existing(path: Path) -> list[dict]:
     try:
@@ -132,37 +606,96 @@ def _ensure_backup(path: Path, log_fn) -> None:
         backup.write_bytes(b"")
 
 
-def sync_mods_json(game_path: Path, ordered: list[Path], log_fn=None) -> int:
+def sync_mods_json(game_path: Path, ordered: list[Path], log_fn=None,
+                   cache_path: Path | None = None) -> int:
     """Write Amethyst's load order into Mods.json; returns entries written.
 
-    *ordered* is the deployed .dfmod paths in Amethyst priority order —
-    index 0 is the top of the mod list and must end up with the highest
-    DFU LoadPriority.
+    *ordered* is the deployed .dfmod paths in Amethyst list order (top first).
+    *cache_path* stores parsed ModInfo between deploys; without it every
+    bundle is decompressed again on each sync.
+
+    Both tools resolve a conflict in favour of one end of their order, but they
+    spell that end differently, so the list is REVERSED on the way out:
+
+      Amethyst - the top of the mod list wins; its Priority column counts down,
+                 so the top row holds the highest number.
+      DFU      - the highest LoadPriority wins.  TryGetAsset walks
+                 EnumerateEnabledModsReverse() and takes the first hit, and
+                 both FormulaHelper and PlayerActivate keep the provider with
+                 the greater LoadPriority.
+
+    So the top of the Amethyst list must come out with the HIGHEST
+    LoadPriority, i.e. loaded last.  Beware the word "above": DFU's
+    CheckModDependencies flags `mod.LoadPriority < target.LoadPriority`, so a
+    dependency "positioned above in the load order" needs the LOWER number -
+    it loads earlier and is overridden.  That is load order, not precedence,
+    and it is the opposite end from the top of the Amethyst list.
     """
     _log = log_fn or _noop
     if os.environ.get("AMM_DFU_MODS_JSON") == "0":
-        _log("  Mods.json sync disabled (AMM_DFU_MODS_JSON=0) — "
+        _log("  Mods.json sync disabled (AMM_DFU_MODS_JSON=0) - "
              "set the load order in DFU's Mod Loader.")
         return 0
 
     path = mods_json_path(game_path)
     _ensure_backup(path, _log)
 
+    existing = _load_existing(path)
+    existing_titles: dict[str, str] = {}
+    for entry in existing:
+        filename = entry.get("FileName")
+        title = _clean_title(entry.get("Title"))
+        if isinstance(filename, str) and title is not None:
+            existing_titles[filename] = title
+
     titles: list[tuple[str, str]] = []          # (FileName, Title)
     untitled: list[str] = []
+    deps_by_file: dict[str, tuple[ModDependency, ...]] = {}
+    info_cache = ModInfoCache(cache_path)
     for dfmod in ordered:
         stem = dfmod.name[: -len(".dfmod")]
-        title = read_mod_title(dfmod)
+        # The bundle is authoritative.  DFU's own previous entry is a safe
+        # fallback for an unusual/unsupported bundle format.
+        info = read_mod_info(dfmod, info_cache)
+        title = (info.title if info is not None else None) \
+            or existing_titles.get(stem)
         if title is None:
             untitled.append(stem)
             title = stem
+        # Keyed on the file name: that is what a dependency declaration names.
+        if info is not None and info.dependencies:
+            deps_by_file[stem] = info.dependencies
         titles.append((stem, title))
+    info_cache.save()
 
-    managed = {t for _, t in titles}
-    preserved = [e for e in _load_existing(path)
-                 if isinstance(e.get("Title"), str) and e["Title"] not in managed]
-    # Sit the managed block above anything hand-added so a manually dropped
-    # mod can never outrank a mod the user ordered in Amethyst.
+    # Amethyst's list order is winner-first; DFU's LoadPriority is load order,
+    # where the LAST mod loaded wins.  Reverse into load order so the top of
+    # the Amethyst list ends up with the highest LoadPriority.
+    load_order = list(reversed(titles))
+    # DFU refuses to load a mod placed before a declared dependency, so honour
+    # those declarations before assigning priorities.
+    issues = count_sort_issues(load_order, deps_by_file)
+    load_order, cycled = sort_by_dependencies(load_order, deps_by_file)
+    titles = load_order
+
+    managed = {filename for filename, _ in titles}
+    deployed_dir = (game_path / "DaggerfallUnity_Data" / "StreamingAssets" /
+                    "Mods")
+    deployed = ({path.name[:-len(".dfmod")] for path in
+                 deployed_dir.rglob("*.dfmod") if path.is_file()}
+                if deployed_dir.is_dir() else None)
+    # FileName identifies the on-disk bundle.  Reconcile on it rather than
+    # Title so a bad title from an older Amethyst deploy is replaced instead
+    # of being preserved as a duplicate entry.  Also discard stale entries
+    # for bundles no longer installed while retaining manually dropped mods.
+    preserved = [entry for entry in existing
+                 if _clean_title(entry.get("Title")) is not None
+                 and isinstance(entry.get("FileName"), str)
+                 and entry["FileName"] not in managed
+                 and (deployed is None or entry["FileName"] in deployed)]
+    # Keep the managed block together after anything hand-added.  Within that
+    # block, priorities increase down the load order, i.e. UP the Amethyst mod
+    # list, so the mod the user put on top is the last one DFU loads.
     base = max((e.get("LoadPriority", 0) for e in preserved
                 if isinstance(e.get("LoadPriority"), int)), default=-1) + 1
 
@@ -173,19 +706,25 @@ def sync_mods_json(game_path: Path, ordered: list[Path], log_fn=None) -> int:
             "FileName": stem,
             "Title": title,
             "Enabled": True,
-            "LoadPriority": base + (total - 1 - i),
+            "LoadPriority": base + i,
         })
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entries, indent=4), encoding="utf-8")
 
     _log(f"  Wrote {total} mod(s) to {path}.")
+    if issues:
+        _log(f"  Reordered to satisfy {issues} declared dependency(s) - DFU "
+             "would otherwise ask to sort the load order on startup.")
+    if cycled:
+        _log("  Circular dependencies between: " + ", ".join(cycled) +
+             " - left in mod-list order; DFU may still report these.")
     if preserved:
         _log(f"  Left {len(preserved)} entry(s) not managed by Amethyst untouched.")
     if untitled:
-        _log("  No ModTitle found for: " + ", ".join(untitled) +
-             " — these ship no .dfmod.json manifest, so DFU will keep its own "
-             "load position for them. Order them in DFU's Mod Loader.")
+        _log("  No readable ModTitle found for: " + ", ".join(untitled) +
+             " - DFU will keep its own load position for them. Order them in "
+             "DFU's Mod Loader.")
     return total
 
 

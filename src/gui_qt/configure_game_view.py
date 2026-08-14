@@ -1,4 +1,4 @@
-"""Configure-Game view — Qt port of gui/add_game_dialog.ReconfigureGamePanel.
+"""Configure-Game view - Qt port of gui/add_game_dialog.ReconfigureGamePanel.
 
 Opens as a (detachable) tab. Reads/writes LIVE game config via the toolkit-neutral
 backend setters/getters on BaseGame (set_game_path / set_prefix_path /
@@ -22,6 +22,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton, QScrollArea, QFrame, QRadioButton, QCheckBox, QButtonGroup,
+    QComboBox,
 )
 
 from gui_qt.theme_qt import active_palette, _c
@@ -33,7 +34,7 @@ from gui_qt.worker import run_in_worker, NO_EMIT
 from Utils.app_log import safe_print as print  # noqa: A004
 from Utils.deploy import LinkMode
 
-# Left column width — the image panel and the options panel share it.
+# Left column width - the image panel and the options panel share it.
 _LEFT_COL_W = 240
 _LOGO_SQ = 200
 
@@ -57,7 +58,7 @@ def _heroic_app_names(game) -> list[str]:
 
 def _lutris_available(game) -> bool:
     """True when a Lutris install exists and the game has an exe to match
-    against it — Lutris detection is keyed off the exe name, so any such game
+    against it - Lutris detection is keyed off the exe name, so any such game
     may have a Lutris prefix."""
     if not getattr(game, "exe_name", None):
         return False
@@ -83,13 +84,15 @@ def _faugus_available(game) -> bool:
 class _ScanSignals(QObject):
     # Scan results carry everything the worker discovered so the worker thread
     # never writes view attributes directly (the slots run on the GUI thread).
-    game_found = Signal(object, str, object, object, object, object)
-    # ^ (path|None, source, prefix|None, lutris_slug|None, heroic_app|None,
-    #    faugus_gameid|None)
-    drive_scan_found = Signal(object)       # (path|None) — full-drive Scan button
+    game_found = Signal(object, bool)
+    # ^ (candidates: list of {source, path, prefix, id} dicts - one per
+    #    launcher the game was detected on, in detection-priority order -
+    #    and auto_apply: False for the candidates-only rescan that fills the
+    #    launcher dropdown of an already-configured game)
+    drive_scan_found = Signal(object)       # (path|None) - full-drive Scan button
     prefix_found = Signal(object, object, object)
     # ^ (path|None, lutris_slug|None, faugus_gameid|None)
-    # Browse (portal) picks — fired from the portal WORKER thread, so they must
+    # Browse (portal) picks - fired from the portal WORKER thread, so they must
     # be marshalled to the GUI thread via a Signal before touching any widget.
     game_picked = Signal(object)            # (path|None)
     prefix_picked = Signal(object)          # (path|None)
@@ -121,6 +124,9 @@ class ConfigureGameView(QWidget):
         self._found_lutris_slug: str | None = None
         self._found_heroic_app: str | None = None
         self._found_faugus_gameid: str | None = None
+        # Dropdown choices when the game is installed via more than one
+        # launcher: {source, path, prefix, id} dicts, aligned with the combo.
+        self._install_choices: list[dict] = []
         self._custom_staging: Path | None = None
         self._custom_saves: Path | None = None
 
@@ -207,7 +213,7 @@ class ConfigureGameView(QWidget):
         hb = QHBoxLayout(header); hb.setContentsMargins(12, 8, 12, 8)
         verb = "Reconfigure" if configured else "Add"
         self._title_lbl = QLabel(
-            self.tr("{0} Game — {1}").format(verb, self._game.name))
+            self.tr("{0} Game - {1}").format(verb, self._game.name))
         self._title_lbl.setStyleSheet("font-size:15px; font-weight:600;")
         hb.addWidget(self._title_lbl)
         hb.addStretch(1)
@@ -223,7 +229,7 @@ class ConfigureGameView(QWidget):
         self._refresh_scope_header()
         outer.addWidget(header)
 
-        # Body — four distinct panels in a 2×2 grid: (top-left) image,
+        # Body - four distinct panels in a 2×2 grid: (top-left) image,
         # (bottom-left) options, (right, spanning both rows) path entries.
         body = QWidget(); body.setObjectName("FormBody")
         grid = QGridLayout(body)
@@ -282,7 +288,7 @@ class ConfigureGameView(QWidget):
 
     # ---- panel builders ---------------------------------------------------
     def _build_image_panel(self) -> QFrame:
-        """Top-left panel — the game's square logo (same source as Add-Game)."""
+        """Top-left panel - the game's square logo (same source as Add-Game)."""
         frame, v = self._panel()
         frame.setFixedWidth(_LEFT_COL_W)
         v.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
@@ -309,7 +315,7 @@ class ConfigureGameView(QWidget):
         return frame
 
     def _build_paths_panel(self) -> QFrame:
-        """Right panel — the three location entries (install / prefix / staging)."""
+        """Right panel - the three location entries (install / prefix / staging)."""
         frame, v = self._panel()
         g = self._game
 
@@ -317,6 +323,21 @@ class ConfigureGameView(QWidget):
         v.addWidget(self._section_header(self.tr("Game Installation Folder")))
         self._game_status = self._status(self.tr("Scanning Steam libraries…"), "TEXT_WARN")
         v.addWidget(self._game_status)
+        # Launcher picker - hidden unless the scan detects the game in more
+        # than one place (e.g. both a Heroic and a Lutris install).
+        self._install_row = QWidget()
+        pick = QHBoxLayout(self._install_row)
+        pick.setContentsMargins(0, 0, 0, 0)
+        pick.setSpacing(6)
+        pick.addWidget(QLabel(self.tr("Detected installs:")))
+        self._install_combo = QComboBox()
+        self._install_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._install_combo.setMinimumContentsLength(24)
+        self._install_combo.activated.connect(self._guard(self._on_install_combo))
+        pick.addWidget(self._install_combo, 1)
+        self._install_row.hide()
+        v.addWidget(self._install_row)
         self._game_edit = self._path_edit()
         self._game_edit.editingFinished.connect(self._on_game_typed)
         v.addWidget(self._game_edit)
@@ -338,7 +359,7 @@ class ConfigureGameView(QWidget):
                               or _faugus_available(g))
         self._prefix_status = self._status(
             self.tr("Scanning for prefix…") if has_prefix_src
-            else self.tr("No launcher ID — prefix not applicable."),
+            else self.tr("No launcher ID - prefix not applicable."),
             "TEXT_WARN" if has_prefix_src else "TEXT_DIM")
         v.addWidget(self._prefix_status)
         self._prefix_edit = self._path_edit()
@@ -394,7 +415,7 @@ class ConfigureGameView(QWidget):
         return frame
 
     def _build_options_panel(self) -> QFrame:
-        """Bottom-left panel — deploy method + game-dependent options, in an
+        """Bottom-left panel - deploy method + game-dependent options, in an
         independently-scrolling list so many options never blow out the frame."""
         frame, v = self._panel(self.tr("Options"))
         frame.setFixedWidth(_LEFT_COL_W)
@@ -462,6 +483,9 @@ class ConfigureGameView(QWidget):
         add_check("archive_invalidation",
                   self.tr("Automatic archive invalidation (prefer loose files over BSAs)"),
                   hasattr(self._game, "archive_invalidation_enabled"))
+        add_check("case_alias_links",
+                  self.tr("Create case-alias symlinks on deploy (Faster load times)"),
+                  bool(getattr(self._game, "case_alias_dirs", None)))
         add_check("profile_ini_files",
                   self.tr("Use profile-specific INI files"),
                   hasattr(self._game, "profile_ini_files"))
@@ -472,6 +496,9 @@ class ConfigureGameView(QWidget):
         add_check("prefix_numbering",
                   self.tr("Prepend load-order numbers to mod folders"),
                   hasattr(self._game, "prefix_numbering"))
+        add_check("manage_load_order_in_dfu",
+                  self.tr("Manage load order in DFU"),
+                  hasattr(self._game, "set_manage_load_order_in_dfu"))
 
         # BG3 patch-version radios.
         self._patch_group = None
@@ -486,7 +513,7 @@ class ConfigureGameView(QWidget):
                 self._patch_buttons[val] = rb
                 ov.addWidget(rb)
 
-        # plugins.txt filename casing — only for games that read a plugins.txt.
+        # plugins.txt filename casing - only for games that read a plugins.txt.
         self._plugins_txt_group = None
         if (getattr(self._game, "uses_plugins_txt", False)
                 and hasattr(self._game, "set_plugins_txt_filename")):
@@ -545,15 +572,22 @@ class ConfigureGameView(QWidget):
             self._set_check("auto_deploy", getattr(g, "auto_deploy", False))
             self._set_check("archive_invalidation",
                             getattr(g, "archive_invalidation", True))
+            self._set_check("case_alias_links", getattr(g, "case_alias_links", True))
             self._set_check("profile_ini_files", getattr(g, "profile_ini_files", False))
             self._set_check("profile_saves", getattr(g, "profile_saves", False))
             self._set_check("prefix_numbering", getattr(g, "prefix_numbering", True))
+            self._set_check("manage_load_order_in_dfu",
+                            getattr(g, "manage_load_order_in_dfu", False))
             if self._patch_group is not None and hasattr(g, "get_patch_version"):
                 rb = self._patch_buttons.get(int(g.get_patch_version()))
                 if rb:
                     rb.setChecked(True)
             self._select_plugins_txt_default()
             self._save_btn.setEnabled(True)
+            # Candidates-only rescan: fills the launcher dropdown so the user
+            # can switch to another detected install without touching the
+            # configured path until they pick one.
+            self._start_game_scan(auto_apply=False)
         else:
             self._rb_symlink.setChecked(rec_is_symlink := (
                 getattr(g, "default_deploy_mode", "symlink") == "symlink"))
@@ -566,9 +600,11 @@ class ConfigureGameView(QWidget):
             self._set_check("auto_4gb_patch", True)
             self._set_check("auto_deploy", False)
             self._set_check("archive_invalidation", True)
+            self._set_check("case_alias_links", True)
             self._set_check("profile_ini_files", False)
             self._set_check("profile_saves", False)
             self._set_check("prefix_numbering", True)
+            self._set_check("manage_load_order_in_dfu", False)
             if self._patch_group is not None and hasattr(g, "get_patch_version"):
                 rb = self._patch_buttons.get(int(g.get_patch_version()))
                 if rb:
@@ -606,7 +642,7 @@ class ConfigureGameView(QWidget):
         override could never be released)."""
         g = self._game
         # Clearing a game/prefix override changes the effective paths, which
-        # would strand deployed files — same guard as saving a path change.
+        # would strand deployed files - same guard as saving a path change.
         if g.is_configured() and g.get_deploy_active():
             self._game_status.setText(
                 self.tr("Cannot reset to shared settings while mods are deployed. "
@@ -741,7 +777,7 @@ class ConfigureGameView(QWidget):
         self._game_edit.setText(str(path))
         # Steam/Heroic/Lutris/Faugus library detection already verified the exe
         # lives here, so trust those sources. For manual browse / drive-scan / typed
-        # paths the folder is whatever the user picked — verify the exe is
+        # paths the folder is whatever the user picked - verify the exe is
         # actually inside and warn (rather than silently claiming "Found") if
         # it isn't.
         if source in ("steam", "heroic", "lutris", "faugus") or configured:
@@ -759,7 +795,7 @@ class ConfigureGameView(QWidget):
             present = self._exe_present_in(path)
             if present is False:
                 names = ", ".join(self._exe_names())
-                msg = self.tr("Executable ({0}) not found in this folder — "
+                msg = self.tr("Executable ({0}) not found in this folder - "
                               "double-check the path.").format(names)
                 tone = "TEXT_ERR"
             elif present is None:
@@ -769,6 +805,7 @@ class ConfigureGameView(QWidget):
         self._game_status.setText(msg)
         self._game_status.setStyleSheet(f"color:{self._c(tone)};")
         self._save_btn.setEnabled(True)
+        self._sync_install_combo(path)
 
     def _set_prefix(self, path: Path, configured=False):
         self._found_prefix = path
@@ -788,13 +825,14 @@ class ConfigureGameView(QWidget):
             if present is False:
                 names = ", ".join(self._exe_names())
                 self._game_status.setText(
-                    self.tr("Executable ({0}) not found in this folder — "
+                    self.tr("Executable ({0}) not found in this folder - "
                             "double-check the path.").format(names))
                 self._game_status.setStyleSheet(f"color:{self._c('TEXT_ERR')};")
             elif present is True:
                 self._game_status.setText(self.tr("Executable found."))
                 self._game_status.setStyleSheet(f"color:{self._c('TEXT_OK')};")
             self._save_btn.setEnabled(True)
+            self._sync_install_combo(path)
 
     def _on_prefix_typed(self):
         text = self._prefix_edit.text().strip()
@@ -810,7 +848,7 @@ class ConfigureGameView(QWidget):
 
     # ---- browse / open ----------------------------------------------------
     def _browse_game(self):
-        # pick_folder's callback fires on the portal WORKER thread — marshal to
+        # pick_folder's callback fires on the portal WORKER thread - marshal to
         # the GUI thread via a Signal before touching any widget (see the note
         # on _ScanSignals). Calling _set_game here directly would segfault Qt.
         from Utils.portal_filechooser import pick_folder
@@ -836,7 +874,7 @@ class ConfigureGameView(QWidget):
                     lambda path: self._sig.staging_picked.emit(path))
 
     def _browse_saves(self):
-        # Same worker-thread caveat as _browse_game — marshal via the signal.
+        # Same worker-thread caveat as _browse_game - marshal via the signal.
         from Utils.portal_filechooser import pick_folder
         pick_folder("Select saves folder",
                     lambda path: self._sig.saves_picked.emit(path))
@@ -875,11 +913,11 @@ class ConfigureGameView(QWidget):
         """Seed the staging field + _custom_staging with the preferred default.
 
         Priority: the user's Settings default_staging_path (if set), else the
-        built-in ~/Games/Amethyst/<game> — a per-game *root* that keeps mods
+        built-in ~/Games/Amethyst/<game> - a per-game *root* that keeps mods
         beside the game install on the same filesystem (hardlink-friendly),
         avoiding the Flatpak ~/.var/app cross-mount that forced symlink deploys.
-        We set _custom_staging (the value save persists) — not just the display
-        text — so the seeded default actually takes effect on save.
+        We set _custom_staging (the value save persists) - not just the display
+        text - so the seeded default actually takes effect on save.
         """
         try:
             from Utils.ui_config import load_default_staging_path
@@ -914,20 +952,29 @@ class ConfigureGameView(QWidget):
         self._start_game_scan()
 
     # ---- auto-detection (worker thread → signals) -------------------------
-    def _start_game_scan(self):
-        self._game_status.setText(self.tr("Scanning Steam libraries…"))
-        self._game_status.setStyleSheet(f"color:{self._c('TEXT_WARN')};")
-        threading.Thread(target=self._game_scan_worker, daemon=True).start()
+    def _start_game_scan(self, auto_apply=True):
+        """Scan every launcher for the game. With *auto_apply* the first hit
+        is written into the fields (fresh-game flow); without it the results
+        only feed the launcher dropdown (configured-game flow)."""
+        if auto_apply:
+            self._game_status.setText(self.tr("Scanning Steam libraries…"))
+            self._game_status.setStyleSheet(f"color:{self._c('TEXT_WARN')};")
+        threading.Thread(target=self._game_scan_worker, args=(auto_apply,),
+                         daemon=True).start()
 
-    def _game_scan_worker(self):
+    def _game_scan_worker(self, auto_apply=True):
         from Utils.app_log import app_log
         g = self._game
-        found = None
-        source = "steam"
-        found_prefix = None
-        lutris_slug = None
-        heroic_app = None
-        faugus_gameid = None
+        # One candidate per launcher the game is detected on, in the same
+        # priority order the old first-hit scan used (Heroic > Lutris >
+        # Faugus > Steam), so candidates[0] is what that scan would have
+        # returned.
+        candidates: list[dict] = []
+
+        def _add(source, path, prefix, launcher_id):
+            candidates.append({"source": source, "path": path,
+                               "prefix": prefix, "id": launcher_id})
+
         game_name = getattr(g, "name", repr(g))
         app_log(f"[Configure Game] Auto-detecting: {game_name}")
         try:
@@ -947,104 +994,151 @@ class ConfigureGameView(QWidget):
                 app_log(f"[Configure Game] Checking Heroic app names: {heroic_names}")
                 info = find_heroic_game_info_by_app_names(heroic_names)
                 if info:
-                    found, found_prefix, heroic_app = info
-                    source = "heroic"
+                    _add("heroic", info[0], info[1], info[2])
                     app_log(f"[Configure Game] Found via Heroic app name "
-                            f"({heroic_app}): {found}")
+                            f"({info[2]}): {info[0]}")
             else:
                 app_log(f"[Configure Game] Checking Heroic (exe names: {exe_names})")
                 for exe in exe_names:
                     info = find_heroic_game_info_by_exe(exe)
                     if info:
-                        found, found_prefix, heroic_app = info
-                        source = "heroic"
-                        app_log(f"[Configure Game] Found via Heroic exe scan ({exe}): {found}")
+                        _add("heroic", info[0], info[1], info[2])
+                        app_log(f"[Configure Game] Found via Heroic exe scan ({exe}): {info[0]}")
                         break
-            if not found:
-                from Utils.lutris_finder import find_lutris_game_info_by_exe
-                app_log(f"[Configure Game] Checking Lutris (exe names: {exe_names})")
+            from Utils.lutris_finder import find_lutris_game_info_by_exe
+            app_log(f"[Configure Game] Checking Lutris (exe names: {exe_names})")
+            for exe in exe_names:
+                info = find_lutris_game_info_by_exe(exe)
+                if info:
+                    _add("lutris", info[0], info[1], info[2])
+                    app_log(f"[Configure Game] Found via Lutris ({exe}): {info[0]}")
+                    break
+            from Utils.faugus_finder import find_faugus_game_info_by_exe
+            app_log(f"[Configure Game] Checking Faugus (exe names: {exe_names})")
+            for exe in exe_names:
+                info = find_faugus_game_info_by_exe(exe)
+                if info:
+                    _add("faugus", info[0], info[1], info[2])
+                    app_log(f"[Configure Game] Found via Faugus ({exe}): {info[0]}")
+                    break
+            libs = find_steam_libraries()
+            app_log(f"[Configure Game] Steam libraries found: "
+                    f"{libs if libs else 'none'}")
+            found = None
+            sid = getattr(g, "steam_id", None)
+            if sid:
+                app_log(f"[Configure Game] Checking Steam manifest "
+                        f"(app ID: {sid}, exes: {exe_names})")
                 for exe in exe_names:
-                    info = find_lutris_game_info_by_exe(exe)
-                    if info:
-                        found, found_prefix, lutris_slug = info
-                        source = "lutris"
-                        app_log(f"[Configure Game] Found via Lutris ({exe}): {found}")
+                    found = find_game_by_steam_id(libs, sid, exe)
+                    if found:
+                        app_log(f"[Configure Game] Found via Steam manifest "
+                                f"({exe}): {found}")
                         break
+            else:
+                app_log("[Configure Game] No Steam app ID configured for this game")
             if not found:
-                from Utils.faugus_finder import find_faugus_game_info_by_exe
-                app_log(f"[Configure Game] Checking Faugus (exe names: {exe_names})")
+                app_log("[Configure Game] Falling back to exe scan across Steam libraries")
                 for exe in exe_names:
-                    info = find_faugus_game_info_by_exe(exe)
-                    if info:
-                        found, found_prefix, faugus_gameid = info
-                        source = "faugus"
-                        app_log(f"[Configure Game] Found via Faugus ({exe}): {found}")
+                    found = find_game_in_libraries(libs, exe)
+                    if found:
+                        app_log(f"[Configure Game] Found via Steam exe scan "
+                                f"({exe}): {found}")
                         break
-            if not found:
-                libs = find_steam_libraries()
-                app_log(f"[Configure Game] Steam libraries found: "
-                        f"{libs if libs else 'none'}")
-                sid = getattr(g, "steam_id", None)
-                if sid:
-                    app_log(f"[Configure Game] Checking Steam manifest "
-                            f"(app ID: {sid}, exes: {exe_names})")
-                    for exe in exe_names:
-                        found = find_game_by_steam_id(libs, sid, exe)
-                        if found:
-                            app_log(f"[Configure Game] Found via Steam manifest "
-                                    f"({exe}): {found}")
-                            break
                 else:
-                    app_log("[Configure Game] No Steam app ID configured for this game")
-                if not found:
-                    app_log("[Configure Game] Falling back to exe scan across Steam libraries")
-                    for exe in exe_names:
-                        found = find_game_in_libraries(libs, exe)
-                        if found:
-                            app_log(f"[Configure Game] Found via Steam exe scan "
-                                    f"({exe}): {found}")
-                            break
-                    else:
-                        app_log(f"[Configure Game] Not found via Steam exe scan "
-                                f"(tried: {exe_names})")
+                    app_log(f"[Configure Game] Not found via Steam exe scan "
+                            f"(tried: {exe_names})")
+            if found:
+                # No prefix here: the Steam compatdata lookup needs the game
+                # path to pick the right library, so it runs as a follow-up
+                # scan once this candidate is applied.
+                _add("steam", found, None, None)
         except Exception as exc:
             import traceback
             app_log(f"[Configure Game] Scan failed: {exc}\n{traceback.format_exc()}")
-            found = None
-        if not found:
+        if not candidates:
             app_log(f"[Configure Game] Game location not auto-detected for: {game_name}")
-        safe_emit(self._sig.game_found, found, source, found_prefix,
-                  lutris_slug, heroic_app, faugus_gameid)
+        safe_emit(self._sig.game_found, candidates, auto_apply)
 
-    def _on_game_found(self, found, source, prefix, lutris_slug, heroic_app,
-                       faugus_gameid):
-        if lutris_slug:
-            self._found_lutris_slug = lutris_slug
-        if heroic_app:
-            self._found_heroic_app = heroic_app
-        if faugus_gameid:
-            self._found_faugus_gameid = faugus_gameid
-        if found:
-            self._set_game(Path(found), source=source)
-            if prefix is not None:
-                self._set_prefix(Path(prefix))
-            elif self._has_prefix_src:
-                self._start_prefix_scan()
+    def _on_game_found(self, candidates, auto_apply):
+        self._populate_install_choices(candidates)
+        if not auto_apply:
+            return
+        if candidates:
+            self._apply_install_choice(candidates[0])
         elif getattr(self._game, "auto_drive_scan", False):
             # Store-less games (manual downloads) can never be found by the
-            # library scan — the drive scan IS their auto-detection.
+            # library scan - the drive scan IS their auto-detection.
             self._start_drive_scan()
         else:
             self._game_status.setText(
                 self.tr("Not found automatically. Browse manually to locate the game folder."))
             self._game_status.setStyleSheet(f"color:{self._c('TEXT_ERR')};")
 
+    # ---- launcher dropdown -------------------------------------------------
+    def _populate_install_choices(self, candidates):
+        """Fill the launcher dropdown with every detected install, plus the
+        current path when detection didn't produce it. Shown only when that
+        leaves the user an actual choice (>= 2 entries)."""
+        choices = []
+        cur = self._found_path
+        if cur is not None and not any(Path(c["path"]) == Path(cur)
+                                       for c in candidates):
+            choices.append({"source": "current", "path": cur,
+                            "prefix": self._found_prefix, "id": None})
+        choices.extend(candidates)
+        self._install_choices = choices
+        names = {"steam": "Steam", "heroic": "Heroic", "lutris": "Lutris",
+                 "faugus": "Faugus"}
+        combo = self._install_combo
+        combo.clear()
+        for i, c in enumerate(choices):
+            label = (self.tr("Current: {0}").format(c["path"])
+                     if c["source"] == "current"
+                     else f"{names.get(c['source'], c['source'])} - {c['path']}")
+            combo.addItem(label)
+            combo.setItemData(i, str(c["path"]), Qt.ToolTipRole)
+        self._install_row.setVisible(len(choices) >= 2)
+        self._sync_install_combo(cur)
+
+    def _sync_install_combo(self, path):
+        """Point the dropdown at the choice matching *path* (or nothing)."""
+        combo = getattr(self, "_install_combo", None)
+        if combo is None or not self._install_choices:
+            return
+        for i, c in enumerate(self._install_choices):
+            if path is not None and Path(c["path"]) == Path(path):
+                combo.setCurrentIndex(i)
+                return
+        combo.setCurrentIndex(-1)
+
+    def _on_install_combo(self, index):
+        if 0 <= index < len(self._install_choices):
+            self._apply_install_choice(self._install_choices[index])
+
+    def _apply_install_choice(self, c):
+        """Write one scan candidate into the path fields + launcher-id state.
+        The ids are mutually exclusive - switching launchers must not leak the
+        previous selection's id into the save."""
+        source = c["source"]
+        self._found_heroic_app = c["id"] if source == "heroic" else None
+        self._found_lutris_slug = c["id"] if source == "lutris" else None
+        self._found_faugus_gameid = c["id"] if source == "faugus" else None
+        if source == "current":
+            self._set_game(Path(c["path"]), configured=True)
+        else:
+            self._set_game(Path(c["path"]), source=source)
+        if c["prefix"] is not None:
+            self._set_prefix(Path(c["prefix"]), configured=(source == "current"))
+        elif self._has_prefix_src:
+            self._start_prefix_scan()
+
     # ---- full-drive Scan button -------------------------------------------
     def _start_drive_scan(self):
         """The Scan button: walk every mounted drive for the game exe.
 
         Distinct from the automatic Steam/Heroic library detection that runs on
-        open — this catches non-Steam / GOG / manually-installed copies the
+        open - this catches non-Steam / GOG / manually-installed copies the
         library scan can't see (Tk parity: the Tk Scan button did the same
         all-drives walk, not a Steam re-scan)."""
         g = self._game
@@ -1164,7 +1258,7 @@ class ConfigureGameView(QWidget):
             return
 
         # Flatpak: a path outside the sandbox's filesystem grants looks like a
-        # typo (it simply doesn't exist in here) — tell the user what it
+        # typo (it simply doesn't exist in here) - tell the user what it
         # actually is and how to grant access before letting them save a
         # config that can never work.
         from Utils.sandbox_paths import flatpak_blocked_path_hint
@@ -1202,7 +1296,7 @@ class ConfigureGameView(QWidget):
                 else LinkMode.SYMLINK)
 
         # Capture the staging root currently on disk, before any setters mutate
-        # it — needed to offer a migration if the staging location changed.
+        # it - needed to offer a migration if the staging location changed.
         old_profile_root: Path | None = None
         try:
             if g.is_configured():
@@ -1216,7 +1310,7 @@ class ConfigureGameView(QWidget):
         # Proton prefix or native data dir), then block the save if any target
         # is on a different drive than the staging folder (Tk parity:
         # add_game_dialog save-time check). Setters persist, but so does the
-        # save we're about to do — an invalid mode is never written.
+        # save we're about to do - an invalid mode is never written.
         if mode == LinkMode.HARDLINK:
             g.set_game_path(self._found_path)
             if self._found_prefix is not None and hasattr(g, "set_prefix_path"):
@@ -1259,12 +1353,18 @@ class ConfigureGameView(QWidget):
             g.auto_deploy = self._opt_checks["auto_deploy"].isChecked()
         if "archive_invalidation" in self._opt_checks:
             g.archive_invalidation = self._opt_checks["archive_invalidation"].isChecked()
+        if "case_alias_links" in self._opt_checks:
+            g.case_alias_links = self._opt_checks["case_alias_links"].isChecked()
         if hasattr(g, "set_profile_ini_files") and "profile_ini_files" in self._opt_checks:
             g.set_profile_ini_files(self._opt_checks["profile_ini_files"].isChecked())
         if hasattr(g, "set_profile_saves") and "profile_saves" in self._opt_checks:
             g.set_profile_saves(self._opt_checks["profile_saves"].isChecked())
         if hasattr(g, "prefix_numbering") and "prefix_numbering" in self._opt_checks:
             g.prefix_numbering = self._opt_checks["prefix_numbering"].isChecked()
+        if (hasattr(g, "set_manage_load_order_in_dfu")
+                and "manage_load_order_in_dfu" in self._opt_checks):
+            g.set_manage_load_order_in_dfu(
+                self._opt_checks["manage_load_order_in_dfu"].isChecked())
         if hasattr(g, "set_patch_version") and self._patch_group is not None:
             for val, rb in self._patch_buttons.items():
                 if rb.isChecked():
@@ -1307,7 +1407,7 @@ class ConfigureGameView(QWidget):
 
     # ---- staging migration --------------------------------------------------
     def _start_staging_scan(self, old_root: Path, new_root: Path):
-        """Staging root changed — size up the old tree off-thread, then offer
+        """Staging root changed - size up the old tree off-thread, then offer
         to move it. The new path is already saved, so Skip just leaves the old
         files behind (Tk parity)."""
         self._save_btn.setEnabled(False)
@@ -1384,9 +1484,9 @@ class ConfigureGameView(QWidget):
         """Silently install this game's prefix dependencies in the background.
 
         Two mechanisms, both skipped when no Proton prefix is available:
-          * ``auto_install_deps`` — vcredist / d3dcompiler_47 via the same
+          * ``auto_install_deps`` - vcredist / d3dcompiler_47 via the same
             installers the Proton Tools menu uses (preferred; see base_game).
-          * ``winetricks_components`` — legacy winetricks verbs.
+          * ``winetricks_components`` - legacy winetricks verbs.
 
         Progress is reported via ``Utils.app_log.app_log`` (thread-safe; wired
         into the Qt log panel by gui_qt.glue), so this worker touches no widgets.
@@ -1434,12 +1534,12 @@ class ConfigureGameView(QWidget):
             for dep in deps:
                 if dep == "vcredist":
                     if is_dep_installed(prefix, VCREDIST_DEP_KEY):
-                        app_log(f"{game.name}: VC++ Redistributable already installed — skipping.")
+                        app_log(f"{game.name}: VC++ Redistributable already installed - skipping.")
                         skipped.append("vcredist")
                         continue
                     proton_script, env = _ensure_proton()
                     if proton_script is None:
-                        app_log(f"{game.name}: skipping vcredist — no Proton prefix available.")
+                        app_log(f"{game.name}: skipping vcredist - no Proton prefix available.")
                         skipped.append("vcredist")
                         continue
                     app_log(f"{game.name}: auto-installing VC++ Redistributable …")
@@ -1447,7 +1547,7 @@ class ConfigureGameView(QWidget):
                     (installed if ok else failed).append("vcredist")
                 elif dep == "d3dcompiler_47":
                     if is_dep_installed(prefix, D3D_DEP_KEY):
-                        app_log(f"{game.name}: d3dcompiler_47 already installed — skipping.")
+                        app_log(f"{game.name}: d3dcompiler_47 already installed - skipping.")
                         skipped.append("d3dcompiler_47")
                         continue
                     app_log(f"{game.name}: auto-installing d3dcompiler_47 …")
@@ -1458,14 +1558,14 @@ class ConfigureGameView(QWidget):
                     # Same installer the Proton Tools menu entry uses, so a
                     # manual install and this one share the skip marker.
                     if is_dep_installed(prefix, winetricks_verb_dep_key("lavfilters")):
-                        app_log(f"{game.name}: LAV Filters already installed — skipping.")
+                        app_log(f"{game.name}: LAV Filters already installed - skipping.")
                         skipped.append("lavfilters")
                         continue
                     app_log(f"{game.name}: auto-installing LAV Filters (radio/music codecs) …")
                     ok = install_lavfilters(game, log_fn=app_log)
                     (installed if ok else failed).append("lavfilters")
                 else:
-                    app_log(f"{game.name}: unknown auto_install dep '{dep}' — skipping.")
+                    app_log(f"{game.name}: unknown auto_install dep '{dep}' - skipping.")
                     skipped.append(dep)
 
             for comp in components:
@@ -1485,7 +1585,7 @@ class ConfigureGameView(QWidget):
                 summary.append(f"FAILED {', '.join(failed)}")
             app_log(
                 f"{game.name}: prefix dependency setup done"
-                + (f" — {'; '.join(summary)}." if summary else ".")
+                + (f" - {'; '.join(summary)}." if summary else ".")
             )
 
         threading.Thread(target=_worker, daemon=True,
@@ -1506,7 +1606,7 @@ class ConfigureGameView(QWidget):
             "Deleted: game config + generated caches; the game is restored to "
             "vanilla.\nKept: your mods, profiles, and overwrite folders.\n\n"
             "This cannot be undone.").format(g.name)
-        self._confirm(self.tr("Remove Instance — {0}").format(g.name), msg,
+        self._confirm(self.tr("Remove Instance - {0}").format(g.name), msg,
                       self._do_remove)
 
     def _do_remove(self):
@@ -1531,14 +1631,13 @@ class ConfigureGameView(QWidget):
             except Exception:
                 pass
             try:
-                from Utils.deploy import restore_root_folder
+                from Utils.deploy import restore_root_folder_for_game
                 rf = profile_root / "Root_Folder"
                 game_root = g.get_game_path()
                 if rf.is_dir() and game_root:
-                    restore_root_folder(
-                        rf, game_root,
-                        data_deploy_dirs=(g.root_restore_protect_dirs()
-                                          if hasattr(g, "root_restore_protect_dirs") else None))
+                    restore_root_folder_for_game(
+                        g, root_folder_dir=rf, game_root=game_root,
+                    )
             except Exception:
                 pass
             keep = {"mods", "profiles", "overwrite"}
@@ -1584,12 +1683,12 @@ class ConfigureGameView(QWidget):
             "Scan {0} and remove leftover deployed mod files (hardlinks/"
             "symlinks/copies) that weren't restored?\n\nVanilla game files are "
             "kept. This cannot be undone.").format(target)
-        self._confirm(self.tr("Clean Game Folder — {0}").format(g.name), msg,
+        self._confirm(self.tr("Clean Game Folder - {0}").format(g.name), msg,
                       lambda: self._do_clean(target))
 
     def _do_clean(self, target):
         """Scan the game folder for leftover deployed files on a daemon worker
-        (the scan walks the whole install — a long freeze on the GUI thread)."""
+        (the scan walks the whole install - a long freeze on the GUI thread)."""
         if self._destructive_busy:
             return
         self._destructive_busy = True
@@ -1633,5 +1732,5 @@ class ConfigureGameView(QWidget):
             self._game_status.setStyleSheet(f"color:{self._c('TEXT_ERR')};")
         else:
             self._game_status.setText(
-                self.tr("Clean complete — {0} deployed file(s) removed.").format(removed))
+                self.tr("Clean complete - {0} deployed file(s) removed.").format(removed))
             self._game_status.setStyleSheet(f"color:{self._c('TEXT_OK')};")

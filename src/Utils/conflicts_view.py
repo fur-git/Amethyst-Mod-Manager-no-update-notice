@@ -1,14 +1,14 @@
 """Toolkit-neutral file-level conflict computation for the "Show Conflicts" view.
 
 Given a mod, produces three lists of the files it provides plus a tint set:
-  - files_win        : (path, "modA, modB")  — this mod overrides those mods here
-  - files_lose       : (path, winning_mod)   — this mod is overridden here
-  - files_no_conflict: [path]                — no other enabled mod provides it
-  - bsa_win_paths    : {path}                — win rows beating archive contents
+  - files_win        : (path, "modA, modB")  - this mod overrides those mods here
+  - files_lose       : (path, winning_mod)   - this mod is overridden here
+  - files_no_conflict: [path]                - no other enabled mod provides it
+  - bsa_win_paths    : {path}                - win rows beating archive contents
                         only; the UI tints these cyan like the archive rows
 
 Ported verbatim from the Tk `gui/modlist_panel.py:_show_overwrites_dialog` worker
-(the logic is pure os/index/filemap I/O — no GUI). Both loose files and BSA/BA2
+(the logic is pure os/index/filemap I/O - no GUI). Both loose files and BSA/BA2
 archive contents are covered (BSA rows are prefixed ``archive.bsa : inner/path``).
 """
 
@@ -41,12 +41,13 @@ def compute_mod_conflicts(
     archive_name_ordering: bool = False,
     modlist_path: Optional[Path] = None,
     ckfn: Optional[Callable[[str], str]] = None,
+    root_ctx: Optional[tuple] = None,
 ) -> "tuple[list, list, list, set]":
     """Return (files_win, files_lose, files_no_conflict, bsa_win_paths) for
     *mod_name*.
 
-    *beaten_mods* — the set of mod names this mod overrides (mod-level conflict
-    data). *strip_prefixes* — the game-level folder strip set. *ckfn* — optional
+    *beaten_mods* - the set of mod names this mod overrides (mod-level conflict
+    data). *strip_prefixes* - the game-level folder strip set. *ckfn* - optional
     UE5 path remap (rel -> canonical key). *plugin_order* is the enabled plugin
     load order (high→low or as snapshotted); *modlist_path* defaults to
     profile_dir/modlist.txt.
@@ -60,6 +61,41 @@ def compute_mod_conflicts(
 
     per_mod = load_per_mod_strip_prefixes(profile_dir)
     strip_lower = {s.lower() for s in strip_prefixes}
+    if root_ctx and len(root_ctx) >= 3:
+        root_mods, root_tags, root_data_prefix = root_ctx[:3]
+    else:
+        root_mods, root_tags = root_ctx or (frozenset(), {})
+        root_data_prefix = ""
+    root_data_prefix = (
+        (root_data_prefix or "").replace("\\", "/").strip("/").lower()
+    )
+    _root_marker = "\0root/"
+
+    def _is_root(name: str, rel_key: str) -> bool:
+        return (name in root_mods
+                or rel_key in (root_tags.get(name) or frozenset()))
+
+    def _root_key(rel_key: str) -> str:
+        """Conflict key for a game-root entry.
+
+        Entries below the game's Data prefix alias the normal Data namespace;
+        other root files get a private marker so ``dinput8.dll`` at game root
+        never collides with a same-named file under Data/.
+        """
+        key = rel_key.replace("\\", "/").lower()
+        if root_data_prefix:
+            pfx = root_data_prefix + "/"
+            if key.startswith(pfx) and len(key) > len(pfx):
+                return key[len(pfx):]
+        return _root_marker + key
+
+    def _key_for(name: str, rel_key: str) -> str:
+        if _is_root(name, rel_key):
+            return _root_key(rel_key)
+        return ckfn(rel_key) if ckfn else rel_key.lower()
+
+    def _display_key(key: str) -> str:
+        return key[len(_root_marker):] if key.startswith(_root_marker) else key
 
     # Per-mod strip data memoized once per mod (the sort + set merge used to
     # be rebuilt on every _strip_for call, i.e. once per file walked).
@@ -97,7 +133,7 @@ def compute_mod_conflicts(
     winning_map: dict[str, tuple[str, str]] = {}
     if filemap_path.is_file():
         # surrogateescape: filemap.txt rel paths derive from on-disk filenames
-        # whose non-UTF-8 bytes decode to surrogate code points — a plain utf-8
+        # whose non-UTF-8 bytes decode to surrogate code points - a plain utf-8
         # read raises on them.
         with filemap_path.open(encoding="utf-8", errors="surrogateescape") as f:
             for line in f:
@@ -107,6 +143,19 @@ def compute_mod_conflicts(
                 rel_path, winner = line.split("\t", 1)
                 key = ckfn(rel_path) if ckfn else rel_path.lower()
                 winning_map[key] = (rel_path, winner)
+    root_filemap_path = filemap_path.parent / "filemap_root.txt"
+    if root_filemap_path.is_file():
+        with root_filemap_path.open(
+                encoding="utf-8", errors="surrogateescape") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if "\t" not in line:
+                    continue
+                rel_path, winner = line.split("\t", 1)
+                # Root deploy runs after the normal Data deploy, so assigning
+                # last intentionally replaces a normal winner at an aliased
+                # Data-relative key.
+                winning_map[_root_key(rel_path)] = (rel_path, winner)
 
     # Collect this mod's files. Prefer modindex.bin (already normalized with the
     # same strip logic filemap.py uses); fall back to a staging walk.
@@ -123,9 +172,9 @@ def compute_mod_conflicts(
     if _my_index_entry is not None:
         _normal, _root = _my_index_entry
         for _k, _rel_str in _normal.items():
-            my_files[_k] = _rel_str
+            my_files[_key_for(mod_name, _k)] = _rel_str
         for _k, _rel_str in _root.items():
-            my_files[_k] = _rel_str
+            my_files[_key_for(mod_name, _k)] = _rel_str
     else:
         my_staging = (staging_root.parent / "overwrite"
                       if mod_name == OVERWRITE_NAME else staging_root / mod_name)
@@ -136,9 +185,10 @@ def compute_mod_conflicts(
                         continue
                     full = os.path.join(dirpath, fname)
                     rel = os.path.relpath(full, my_staging).replace("\\", "/")
-                    rel = _strip_for(mod_name, rel)
+                    if mod_name not in root_mods:
+                        rel = _strip_for(mod_name, rel)
                     if rel:
-                        key = ckfn(rel) if ckfn else rel.lower()
+                        key = _key_for(mod_name, rel)
                         my_files[key] = rel
 
     # Classify each file.
@@ -152,7 +202,7 @@ def compute_mod_conflicts(
             else:
                 files_i_lose.append((deploy_key, winner))
         else:
-            files_i_lose.append((deploy_key, "(no winner — disabled?)"))
+            files_i_lose.append((deploy_key, "(no winner - disabled?)"))
 
     # Annotate wins: look up each beaten mod's files in modindex.bin.
     rel_to_losers: dict[str, list[str]] = {}
@@ -170,16 +220,18 @@ def compute_mod_conflicts(
                 continue
             normal_files, root_files = entry
             for _key in normal_files:
-                if _key in my_files:
-                    rel_to_losers.setdefault(_key, []).append(loser_mod)
+                effective = _key_for(loser_mod, _key)
+                if effective in my_files:
+                    rel_to_losers.setdefault(effective, []).append(loser_mod)
             for _key in root_files:
-                if _key in my_files:
-                    rel_to_losers.setdefault(_key, []).append(loser_mod)
+                effective = _key_for(loser_mod, _key)
+                if effective in my_files:
+                    rel_to_losers.setdefault(effective, []).append(loser_mod)
     # Per-path losers found only inside an archive (feeds bsa_win_paths).
     arch_loser_at: dict[str, set[str]] = {}
     # Wins against BSA-only losers (engine rule: loose > BSA). Scans EVERY
     # enabled mod's archives rather than *beaten_mods*, which the caller
-    # derives from cached conflict data — a stale entry there would drop these
+    # derives from cached conflict data - a stale entry there would drop these
     # rows and misfile the paths under "no conflict". UE paks keep the
     # beaten_mods scope: they resolve by mount order and loose assets don't
     # blanket-override them, so only engine-reported wins are trustworthy.
@@ -204,7 +256,7 @@ def compute_mod_conflicts(
                         if _fp in my_files and loser_mod not in rel_to_losers.get(_fp, ()):
                             rel_to_losers.setdefault(_fp, []).append(loser_mod)
                             # Loser known only via its archive (loose losers
-                            # were recorded above) — drives the cyan tint.
+                            # were recorded above) - drives the cyan tint.
                             arch_loser_at.setdefault(_fp, set()).add(loser_mod)
         except Exception:
             pass
@@ -219,13 +271,15 @@ def compute_mod_conflicts(
                     if fname.lower() == "meta.ini":
                         continue
                     full = os.path.join(dirpath, fname)
-                    rel = _strip_for(loser_mod, os.path.relpath(full, loser_staging).replace("\\", "/"))
+                    rel = os.path.relpath(full, loser_staging).replace("\\", "/")
+                    if loser_mod not in root_mods:
+                        rel = _strip_for(loser_mod, rel)
                     if rel:
-                        key = ckfn(rel) if ckfn else rel.lower()
+                        key = _key_for(loser_mod, rel)
                         if key in my_files:
                             rel_to_losers.setdefault(key, []).append(loser_mod)
 
-    # Rows beating archive contents only — tinted cyan. Rows that also beat a
+    # Rows beating archive contents only - tinted cyan. Rows that also beat a
     # loose mod keep the normal win colour: they're loose conflicts too.
     bsa_win_paths: set[str] = {
         k for k, losers in rel_to_losers.items()
@@ -233,7 +287,7 @@ def compute_mod_conflicts(
     }
 
     files_i_win_final: list[tuple[str, str]] = [
-        (deploy_key, beaten_str)
+        (_display_key(deploy_key), beaten_str)
         for deploy_key, _ in files_i_win
         if (beaten_str := ", ".join(rel_to_losers.get(deploy_key, [])))
     ]
@@ -243,14 +297,15 @@ def compute_mod_conflicts(
     for _lose_key, _ in files_i_lose:
         _losers_under = rel_to_losers.get(_lose_key)
         if _losers_under and _lose_key not in _win_keys:
-            files_i_win_final.append((_lose_key, ", ".join(_losers_under)))
+            files_i_win_final.append(
+                (_display_key(_lose_key), ", ".join(_losers_under)))
     files_no_conflict: list[str] = [
-        deploy_key
+        _display_key(deploy_key)
         for deploy_key, _ in files_i_win
         if not rel_to_losers.get(deploy_key)
     ]
 
-    # BSA-vs-BSA conflicts — append rows from this mod's archives.
+    # BSA-vs-BSA conflicts - append rows from this mod's archives.
     if archive_exts and bsa_index_path is not None and bsa_index_path.is_file():
         try:
             from Utils.bsa_filemap import read_bsa_index, compute_bsa_winner_map
@@ -292,4 +347,6 @@ def compute_mod_conflicts(
         except Exception:
             pass
 
+    files_i_lose = [(_display_key(path), winner)
+                    for path, winner in files_i_lose]
     return files_i_win_final, files_i_lose, files_no_conflict, bsa_win_paths

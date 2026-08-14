@@ -41,6 +41,7 @@ from .nxm_handler import NxmLink
 from Utils import bandwidth_limit
 from Utils.app_log import app_log
 from Utils.ca_bundle import resolve_ca_bundle
+from Utils.xdg import xdg_download_dir
 
 # Default chunk size for streaming downloads (256 KB)
 _CHUNK_SIZE = 256 * 1024
@@ -67,7 +68,7 @@ def _clean_nexus_stem(stem: str, mod_id_str: str) -> str:
     """
     if not mod_id_str:
         return stem
-    # Match the mod id only as a whole token — bounded by a hyphen, space or
+    # Match the mod id only as a whole token - bounded by a hyphen, space or
     # underscore (or the string ends), so "51073" inside "Mod510732" won't
     # match.  \b would treat "-" as a boundary but not reliably for digits
     # next to other digits, hence the explicit delimiter class.
@@ -115,11 +116,44 @@ def _write_sidecar_file_id(archive: Path, file_id: int) -> None:
         pass
 
 
+def ingest_archive_to_cache(path: Path, game_name: str,
+                            file_id: int) -> "Path | None":
+    """Copy a browser-downloaded archive into the per-game download cache.
+
+    Free-account redownloads land wherever the browser saves; cache lookups
+    (meta filename or .fileid sidecar) only scan the cache dirs, so the file
+    is copied in and stamped with its sidecar. The source is left where the
+    user put it. Returns the cached path, or None on failure. A source
+    already inside the destination folder is only stamped, never copied.
+    """
+    import shutil
+    from Utils.config_paths import get_download_cache_dir_for_game
+    src = Path(path)
+    try:
+        if not src.is_file():
+            return None
+        dest_dir = get_download_cache_dir_for_game(game_name or "")
+        dest = dest_dir / src.name
+        if src.parent.resolve() != dest_dir.resolve():
+            same = dest.is_file() and dest.stat().st_size == src.stat().st_size
+            if not same:
+                # Stage under a temp name: other threads scan the cache dirs
+                # with size heuristics, so the file must appear complete.
+                tmp = dest.with_name(dest.name + ".ingest-tmp")
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dest)
+        if file_id:
+            _write_sidecar_file_id(dest, int(file_id))
+    except OSError:
+        return None
+    return dest
+
+
 # -- md5 cache ---------------------------------------------------------------
 # Hashing a multi-GB archive is slow, so we cache results in a single JSON
 # file inside the app's download cache directory.  Entries are keyed by the
 # archive's absolute path and invalidated when size or mtime changes.  We
-# deliberately never write alongside the archive itself — that would pollute
+# deliberately never write alongside the archive itself - that would pollute
 # the user's Downloads folder / any external download locations they've
 # configured.
 
@@ -279,9 +313,9 @@ def _find_cached_archive(
 
     Returns
     -------
-    (path, is_complete) — both ``None``/``False`` when nothing suitable found.
+    (path, is_complete) - both ``None``/``False`` when nothing suitable found.
     """
-    _SIZE_TOLERANCE = 0.01   # ±1 % — file is considered complete
+    _SIZE_TOLERANCE = 0.01   # ±1 % - file is considered complete
     _PARTIAL_CUTOFF  = 0.95  # < 95 % of expected → treat as partial
 
     norm_name = re.sub(r'[^\w]', '', (display_name or '').lower())
@@ -308,14 +342,14 @@ def _find_cached_archive(
                     if ratio >= _PARTIAL_CUTOFF:
                         is_complete = ratio >= (1.0 - _SIZE_TOLERANCE) and _zip_is_intact(f)
                         return f, is_complete
-                    # Sidecar matched but file is clearly truncated — treat as partial
+                    # Sidecar matched but file is clearly truncated - treat as partial
                     return f, False
                 return f, _zip_is_intact(f)
 
     best_partial: "Path | None" = None
 
     for f in candidates:
-        # Skip files whose sidecar belongs to a different file_id — they are
+        # Skip files whose sidecar belongs to a different file_id - they are
         # unambiguously a different download and must never be treated as
         # partials of this one.  This prevents cross-contamination when two
         # files from the same mod (e.g. 76460) are being fetched in parallel
@@ -333,7 +367,7 @@ def _find_cached_archive(
         if expected_size_bytes > 0:
             ratio = actual / expected_size_bytes
             if 1.0 - _SIZE_TOLERANCE <= ratio <= 1.0 + _SIZE_TOLERANCE:
-                # Size match — also verify the mod ID appears in the filename
+                # Size match - also verify the mod ID appears in the filename
                 # to prevent false positives with similarly-sized archives from
                 # different mods.
                 if mod_id_str and mod_id_str not in f.name:
@@ -350,7 +384,7 @@ def _find_cached_archive(
                     )
                     if clean and norm_name not in clean and clean not in norm_name:
                         continue
-                # Size (and optional name hint) match — verify md5 when
+                # Size (and optional name hint) match - verify md5 when
                 # provided (e.g. from a collection manifest) to rule out
                 # unrelated archives that happen to share the same size.
                 if expected_md5 and not _md5_matches(f, expected_md5):
@@ -359,8 +393,8 @@ def _find_cached_archive(
             if ratio < _PARTIAL_CUTOFF:
                 # Might be a partial download of this file.  Require exact
                 # normalized-stem equality (not substring) so that files whose
-                # names are prefixes of each other — e.g. "Deathbell" vs
-                # "Deathbell ENB-light" under the same mod ID — do not get
+                # names are prefixes of each other - e.g. "Deathbell" vs
+                # "Deathbell ENB-light" under the same mod ID - do not get
                 # misidentified as partials of one another.  Strip any trailing
                 # ``(N)`` collision counter the downloader may have appended.
                 if not mod_id_str or mod_id_str in f.name:
@@ -419,10 +453,7 @@ class DownloadCancelled(Exception):
 
 def _get_downloads_dir() -> Path:
     """Return the user's Downloads directory."""
-    xdg = os.environ.get("XDG_DOWNLOAD_DIR")
-    if xdg:
-        return Path(xdg)
-    return Path.home() / "Downloads"
+    return xdg_download_dir()
 
 
 class NexusDownloader:
@@ -536,7 +567,7 @@ class NexusDownloader:
         prefetched_links: "list[NexusDownloadLink] | None" = None,
     ) -> DownloadResult:
         """
-        Download a file directly (premium users only — no key needed).
+        Download a file directly (premium users only - no key needed).
 
         Parameters
         ----------
@@ -556,7 +587,7 @@ class NexusDownloader:
                                unknown.
         prefetched_links     : Signed CDN links already fetched by the caller
                                (via :meth:`get_download_links`) so the in-line
-                               link-fetch round-trip can be skipped — lets a
+                               link-fetch round-trip can be skipped - lets a
                                caller pipeline the link fetch AHEAD of the
                                download so a worker starts transferring bytes
                                with zero link latency. Ignored when a complete
@@ -580,7 +611,7 @@ class NexusDownloader:
         if cached is not None:
             if is_complete:
                 app_log(
-                    f"Skipping download — cached archive found: {cached.name}"
+                    f"Skipping download - cached archive found: {cached.name}"
                 )
                 return DownloadResult(
                     success=True,
@@ -753,7 +784,7 @@ class NexusDownloader:
             # with the provided name as a last resort.
             _has_archive_ext = any(file_name.lower().endswith(e) for e in _ARCHIVE_EXTS)
             if not _has_archive_ext:
-                # Try the URL path first — CDN URLs always embed the real filename
+                # Try the URL path first - CDN URLs always embed the real filename
                 try:
                     from urllib.parse import urlparse, unquote
                     _url_path = unquote(urlparse(url).path)
@@ -781,7 +812,7 @@ class NexusDownloader:
                 total = 0
             dest = dest_dir / file_name
 
-            # Don't clobber existing files — add a suffix
+            # Don't clobber existing files - add a suffix
             counter = 1
             stem = dest.stem
             suffix = dest.suffix
@@ -812,11 +843,11 @@ class NexusDownloader:
                     if progress_cb:
                         progress_cb(downloaded, total)
 
-        # Verify against Content-Length — a dropped connection can end the
+        # Verify against Content-Length - a dropped connection can end the
         # stream early without raising; a short file must not look successful.
         if total and downloaded != total:
             app_log(f"Incomplete download of {file_name}: got {downloaded} "
-                    f"of {total} bytes — discarding")
+                    f"of {total} bytes - discarding")
             delete_archive_and_sidecar(dest)
             return DownloadResult(
                 success=False,

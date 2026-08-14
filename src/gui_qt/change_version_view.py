@@ -1,10 +1,10 @@
-"""Change Version overlay — lists a mod's Nexus files so the user can install a
+"""Change Version overlay - lists a mod's Nexus files so the user can install a
 different version. Opens as a plugins-panel-scoped tab (covers the whole plugins
 panel). Qt port of the Tk gui/mod_files_overlay.py; shares the pure highlight /
 sort helpers in Utils.mod_files_versions.
 
 The file list is fetched on a daemon thread (a Signal marshals the result back to
-the UI thread — never a QThread). Installing a chosen file reuses the same
+the UI thread - never a QThread). Installing a chosen file reuses the same
 download → build_meta → install_fn flow as the Nexus browser tab.
 """
 
@@ -162,7 +162,7 @@ class ChangeVersionView(QWidget):
         self._manual_watch = None
         self._pending_btn = None    # button of the install being prepped
         self._install_btns: list = []   # per-row buttons, for live relabelling
-        # The destroyed hook must not touch self (C++ side is gone by then) —
+        # The destroyed hook must not touch self (C++ side is gone by then) -
         # it captures these holders directly. _key_holder["k"] tracks the live
         # popup-card key so a mid-watch tab close still clears the card.
         self._watch_holder: dict = {}
@@ -199,7 +199,7 @@ class ChangeVersionView(QWidget):
         # Toolbar: title + Ignore Update + Close.
         bar = QWidget(); bar.setObjectName("HeaderBar")
         hb = QHBoxLayout(bar); hb.setContentsMargins(12, 8, 8, 8); hb.setSpacing(8)
-        self._title = QLabel(self.tr("Change Version — {0}").format(self._mod_name))
+        self._title = QLabel(self.tr("Change Version - {0}").format(self._mod_name))
         self._title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(self._title)
         hb.addStretch(1)
@@ -217,7 +217,7 @@ class ChangeVersionView(QWidget):
         hb.addWidget(close)
         v.addWidget(bar)
 
-        # Highlight key — explains the row tints. Reflows 1 row ↔ 2×2, centered.
+        # Highlight key - explains the row tints. Reflows 1 row ↔ 2×2, centered.
         v.addWidget(_LegendBar(p))
 
         # File table.
@@ -243,8 +243,7 @@ class ChangeVersionView(QWidget):
 
     # ---- fetch ------------------------------------------------------------
     def _start_fetch(self):
-        domain = getattr(self._game, "nexus_game_domain", "") or \
-            getattr(self._meta, "game_domain", "") or ""
+        domain = self._effective_domain()
         mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
         self._fetch_gen += 1
         gen = self._fetch_gen
@@ -306,8 +305,7 @@ class ChangeVersionView(QWidget):
         installed_id = int(getattr(self._meta, "file_id", 0) or 0)
         match_id, old_ids = resolve_latest_name_match(
             files, installed_id, self._mod_name)
-        domain = getattr(self._game, "nexus_game_domain", "") or \
-            getattr(self._meta, "game_domain", "") or ""
+        domain = self._effective_domain()
         mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
 
         hl = _hl_colors()
@@ -371,7 +369,7 @@ class ChangeVersionView(QWidget):
 
     def busy(self) -> bool:
         """True while an install kicked off here is still in flight (premium
-        check, download, browser-download watch, or the async install itself) —
+        check, download, browser-download watch, or the async install itself) -
         retargeting then would yank the flow out from under the user."""
         return bool(self._installing or self._manual_watch is not None
                     or self._install_status)
@@ -390,13 +388,13 @@ class ChangeVersionView(QWidget):
         the highlights from the cached list."""
         old_mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
         # The repopulate below deletes the row buttons a pending browser-watch
-        # flow still references — stop it first (same as an Install-click toggle).
+        # flow still references - stop it first (same as an Install-click toggle).
         if self._manual_watch is not None:
             self.cancel_manual_watch()
         self._pending_btn = None
         self._mod_name = mod_name
         self._meta = meta
-        self._title.setText(self.tr("Change Version — {0}").format(mod_name))
+        self._title.setText(self.tr("Change Version - {0}").format(mod_name))
         self._ignore_cb.blockSignals(True)
         self._ignore_cb.setChecked(bool(getattr(meta, "ignore_update", False)))
         self._ignore_cb.blockSignals(False)
@@ -439,17 +437,23 @@ class ChangeVersionView(QWidget):
             write_meta(meta_path, m)
             self._meta = m
         except Exception as exc:
-            self._log(f"Nexus: could not save ignore flag — {exc}")
+            self._log(f"Nexus: could not save ignore flag - {exc}")
 
     def _domain_and_mod_id(self):
-        domain = getattr(self._game, "nexus_game_domain", "") or \
-            getattr(self._meta, "game_domain", "") or ""
+        domain = self._effective_domain()
         return domain, int(getattr(self._meta, "mod_id", 0) or 0)
+
+    def _effective_domain(self) -> str:
+        from Nexus.nexus_meta import normalise_game_domain
+        return (normalise_game_domain(
+                    getattr(self._meta, "game_domain", "") or "")
+                or normalise_game_domain(
+                    getattr(self._game, "nexus_game_domain", "") or ""))
 
     def _info_stub(self, domain, mod_id):
         """A minimal mod_info-like fallback (used only if the API lookup
         fails). Real installs pass a full NexusModInfo so author / uploader /
-        summary / category land in meta.ini — fetch the same here."""
+        summary / category land in meta.ini - fetch the same here."""
         class _Info:
             pass
         stub = _Info()
@@ -460,7 +464,7 @@ class ChangeVersionView(QWidget):
 
     def _install_file(self, f, btn=None):
         if self._manual_watch is not None:
-            # Waiting for a browser download — any Install click stops that
+            # Waiting for a browser download - any Install click stops that
             # watch; the watched row's own button (showing Cancel) just stops.
             watched_fid = self._manual_watch[0]
             self.cancel_manual_watch()
@@ -474,7 +478,7 @@ class ChangeVersionView(QWidget):
         # change which mod the install replaces.
         self._install_prev = self._mod_name
 
-        # Premium gate ([dev] force_manual_install honoured — same switch as
+        # Premium gate ([dev] force_manual_install honoured - same switch as
         # the browser/collections): free accounts can't use the download API,
         # so they get the browser-download watch flow instead.
         def check():
@@ -484,11 +488,11 @@ class ChangeVersionView(QWidget):
                 if premium:
                     from Utils.ui_config import load_force_manual_install
                     if load_force_manual_install():
-                        self._log("Nexus: [dev] force_manual_install — using "
+                        self._log("Nexus: [dev] force_manual_install - using "
                                   "the manual browser-download flow.")
                         premium = False
             except Exception as exc:
-                self._log(f"Nexus: premium check failed ({exc}) — using the "
+                self._log(f"Nexus: premium check failed ({exc}) - using the "
                           "manual browser-download flow.")
             safe_emit(self._premium_checked, f, premium)
 
@@ -534,7 +538,7 @@ class ChangeVersionView(QWidget):
                     # Fetch full mod info (author, uploader, summary, category)
                     # so the change-version install stamps the same metadata as
                     # a fresh install or reinstall. Use GraphQL (like the NXM /
-                    # browser path) so this costs NO REST rate-limit call — the
+                    # browser path) so this costs NO REST rate-limit call - the
                     # download itself already spends the one allowed call. Fall
                     # back to the stub only if the lookup fails.
                     info = stub
@@ -571,12 +575,12 @@ class ChangeVersionView(QWidget):
         domain, mod_id = self._domain_and_mod_id()
         fname = f.file_name or f.name or ""
         # Drive the shared "Nexus Download" popup card (parity with the browser
-        # tab) — indeterminate until the watcher can see the in-flight download.
+        # tab) - indeterminate until the watcher can see the in-flight download.
         self._dl_key = f"chv-man-{mod_id}-{f.file_id}"
         self._key_holder["k"] = self._dl_key
         self._progress_fn(self._dl_key, fname, 0, 0)
 
-        # Callbacks run on the WATCHER thread — marshal via Signals.
+        # Callbacks run on the WATCHER thread - marshal via Signals.
         def on_archive(path, meta, _file):
             safe_emit(self._download_done, str(path), meta)
 
@@ -596,7 +600,7 @@ class ChangeVersionView(QWidget):
             on_timeout=on_timeout)
         if not already_downloaded:
             self._status.setText(self.tr(
-                "Waiting for the browser download of '{0}' — click Cancel to "
+                "Waiting for the browser download of '{0}' - click Cancel to "
                 "stop.").format(fname))
             self._status.setVisible(True)
             if btn is not None:
@@ -608,7 +612,7 @@ class ChangeVersionView(QWidget):
     def _on_watch_progress(self, done, total):
         from Utils.cache_tools import format_size
         self._status.setText(self.tr(
-            "Waiting for the browser download — {0} / {1}").format(
+            "Waiting for the browser download - {0} / {1}").format(
             format_size(done), format_size(total)))
         # Feed real bytes into the shared popup card (was indeterminate).
         if self._dl_key is not None:
@@ -632,11 +636,13 @@ class ChangeVersionView(QWidget):
             btn.setStyleSheet(button_qss("BTN_SUCCESS", padding="4px 10px"))
         self._status.setVisible(False)
 
-    def cancel_manual_watch(self, mod_id=None):
+    def cancel_manual_watch(self, mod_id=None, game_domain=""):
         """Stop the pending browser-download watch: the Install-click toggle,
         or the app when an nxm:// download for this mod arrives ('Download
-        with Mod Manager' — the nxm flow installs it, so the watch must not)."""
+        with Mod Manager' - the nxm flow installs it, so the watch must not)."""
         if self._manual_watch is None:
+            return
+        if game_domain and str(game_domain).strip().lower() != self._effective_domain():
             return
         if mod_id is not None and \
                 int(mod_id) != int(getattr(self._meta, "mod_id", 0) or 0):
@@ -662,17 +668,17 @@ class ChangeVersionView(QWidget):
             # install_fn without the previous_mod_name kwarg (defensive).
             queued = self._install_fn([archive], metas)
         # The host returns False when 'Download only' diverted it. Trust that
-        # rather than re-reading the setting — a toggle between the two reads
+        # rather than re-reading the setting - a toggle between the two reads
         # would leave _install_status set with no install to ever clear it, and
         # busy() would block retargeting this tab for good.
         if queued is False:
             self._status.setText(self.tr(
-                "Downloaded — install it from the Downloads tab."))
+                "Downloaded - install it from the Downloads tab."))
             self._status.setVisible(True)
             return
-        # The tab stays open — the install runs asynchronously and the host
+        # The tab stays open - the install runs asynchronously and the host
         # retargets this view (refreshing the highlights) once it lands.
         self._install_status = True
         self._status.setText(self.tr(
-            "Installing — the list will refresh when it finishes."))
+            "Installing - the list will refresh when it finishes."))
         self._status.setVisible(True)

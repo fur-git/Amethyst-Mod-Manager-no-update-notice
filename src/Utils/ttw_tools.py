@@ -273,10 +273,13 @@ def restore_to_vanilla(game: "BaseGame", current_profile: str,
 
         game.restore(log_fn=log_fn)
 
-        from Utils.deploy import restore_root_folder
+        from Utils.deploy import restore_root_folder_for_game
         root_folder_dir = game.get_effective_root_folder_path()
         if root_folder_dir.is_dir() and game_root:
-            restore_root_folder(root_folder_dir, game_root, log_fn=log_fn)
+            restore_root_folder_for_game(
+                game, root_folder_dir=root_folder_dir,
+                game_root=game_root, log_fn=log_fn,
+            )
     except Exception as exc:
         success = False
         log_fn(f"restore error: {exc}")
@@ -316,7 +319,7 @@ def seed_required_mods(game: "BaseGame",
         return
     meta_path = mod_dir / "meta.ini"
     if not meta_path.is_file():
-        log_fn("TTW meta.ini not found — skipping requirement seeding.")
+        log_fn("TTW meta.ini not found - skipping requirement seeding.")
         return
     meta = read_meta(meta_path)
     meta.missing_requirements = ";".join(f"{mid}:" for mid in TTW_REQUIRED_MOD_IDS)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import array
 import math
-import threading
+from itertools import chain
 from pathlib import Path
 from shiboken6 import VoidPtr
 
@@ -49,12 +49,15 @@ from gui_qt.flow_layout import FlowLayout, enable_height_for_width
 from gui_qt.gl_support import gl_status
 from gui_qt.safe_emit import safe_emit
 from gui_qt.theme_qt import active_palette, _c
+from gui_qt.worker import LatestWorker
 
 PREVIEW_EXTS = {".nif"}
 
 # Cap decoded textures: a 4K RGBA QImage is 67 MB, and a dozen of those
 # exhausts memory on a handheld.
 TEXTURE_MAX_DIM = 1024
+
+_IDENTITY_ROT = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
 # Indexed asset subtrees. materials/ (FO4 texture paths live there) and
 # geometries/ (Starfield meshes) are required, not optional.
@@ -375,13 +378,15 @@ def _model_space_normal(nrm_blob, spec_blob, log=None):
         import io
         from PIL import Image as PilImage
         from PySide6.QtGui import QImage
-        from Utils.dds_compat import sanitise_dds
+        from Utils.dds_compat import sanitise_dds, skip_dds_mips
+        nrm_blob = skip_dds_mips(nrm_blob, TEXTURE_MAX_DIM)
         with PilImage.open(io.BytesIO(sanitise_dds(nrm_blob))) as im:
             big = max(im.width, im.height)
             if big > TEXTURE_MAX_DIM:
                 im = im.reduce(max(1, big // TEXTURE_MAX_DIM))
             rgb = im.convert("RGB")
         if spec_blob:
+            spec_blob = skip_dds_mips(spec_blob, TEXTURE_MAX_DIM)
             with PilImage.open(io.BytesIO(sanitise_dds(spec_blob))) as sp:
                 gloss = sp.convert("RGB").split()[0]        # red channel
                 if gloss.size != rgb.size:
@@ -425,13 +430,16 @@ def _make_gl_texture(img):
 def _qimage_from_bytes(data: bytes, log=None):
     """Decode texture bytes pulled from an archive (DDS goes via Pillow)."""
     from PySide6.QtGui import QImage
+    from Utils.dds_compat import sanitise_dds, skip_dds_mips
+    # A DDS ships its own mip chain: decode the first level that fits the
+    # cap rather than a 4K top mip (~400ms of BC7) we would only shrink.
+    data = skip_dds_mips(data, TEXTURE_MAX_DIM)
     img = QImage()
     if img.loadFromData(data) and not img.isNull():
         return img
     try:
         import io
         from PIL import Image as PilImage
-        from Utils.dds_compat import sanitise_dds
         with PilImage.open(io.BytesIO(sanitise_dds(data))) as im:
             # Reduce BEFORE convert so the full-size RGBA never hits the heap.
             big = max(im.width, im.height)
@@ -447,7 +455,7 @@ def _qimage_from_bytes(data: bytes, log=None):
 
 
 def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None,
-                         override=None, slot: int = 0, log=None):
+                         override=None, slot: int = 0, log=None, cancel=None):
     """Return ``shape -> QImage|None``; resolver first, then roots/archives.
 
     FO4/Starfield shapes name a material file whose textures override the
@@ -461,11 +469,28 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
     srgb_albedo: dict[str, bool] = {}
     materials: dict[str, object] = {}
     requested: list[str] = []
+    requested_seen: set[str] = set()
     missing: list[str] = []
+
+    def note_request(rel: str) -> None:
+        key = rel.replace("\\", "/").lower().strip().lstrip("/")
+        if key.startswith("data/"):
+            key = key[5:]
+        if not key.startswith(("textures/", "materials/")):
+            if key.endswith((".bgsm", ".bgem", ".mat")):
+                key = "materials/" + key
+            elif key.endswith((".dds", ".tga", ".png", ".bmp", ".jpg",
+                               ".jpeg")):
+                key = "textures/" + key
+            else:
+                return
+        if key not in requested_seen:
+            requested_seen.add(key)
+            requested.append(key)
 
     def fetch(rel: str):
         """Raw bytes for a data-relative path; retries with textures/ prefix."""
-        if not rel:
+        if not rel or (cancel is not None and cancel()):
             return None
         blob = _fetch_exact(rel)
         if blob is not None:
@@ -486,6 +511,10 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
         return None
 
     def _fetch_exact(rel: str):
+        # Texture-source switching must include the material and every map it
+        # caused us to fetch, not just the diffuse map.  External Starfield
+        # geometry deliberately stays out of this texture-only picker.
+        note_request(rel)
         if override is not None:
             blob = override(rel)
             if blob:
@@ -641,9 +670,7 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
         if not rel:
             return None
         key = diffuse_key(shape)
-        if key not in seen:
-            requested.append(key)
-        else:
+        if key in seen:
             return seen[key]
         blob = fetch(rel)
         image = _qimage_from_bytes(blob, log) if blob else None
@@ -696,13 +723,15 @@ def _load_external_geometry(model, fetch):
         shape.triangles = mesh.triangles
 
 
-def _build_meshes(model, load_texture):
+def _build_meshes(model, load_texture, cancel=None):
     """Bake world transforms and interleave into GL-ready buffers."""
     meshes: list[_Mesh] = []
     lo = [float("inf")] * 3
     hi = [float("-inf")] * 3
 
     for shape in model.shapes:
+        if cancel is not None and cancel():
+            return [], None
         verts = shape.vertices
         tris = shape.triangles
         if not verts or not tris:
@@ -726,56 +755,57 @@ def _build_meshes(model, load_texture):
         tx, ty, tz = shape.translation
         r = shape.rotation
         s = shape.scale
-        flat = array.array("f")
-        push = flat.extend
-        # Per-shape bounds too: the centroid orders the blended pass.
-        mlo = [float("inf")] * 3
-        mhi = [float("-inf")] * 3
-        for i, ((x, y, z), (nx, ny, nz), (u, v), (gx, gy, gz)) in enumerate(zip(
-                verts, normals, uvs, tangents)):
-            wx = tx + s * (r[0] * x + r[1] * y + r[2] * z)
-            wy = ty + s * (r[3] * x + r[4] * y + r[5] * z)
-            wz = tz + s * (r[6] * x + r[7] * y + r[8] * z)
-            push((wx, wy, wz,
-                  r[0] * nx + r[1] * ny + r[2] * nz,
-                  r[3] * nx + r[4] * ny + r[5] * nz,
-                  r[6] * nx + r[7] * ny + r[8] * nz,
-                  u, v,
-                  r[0] * gx + r[1] * gy + r[2] * gz,
-                  r[3] * gx + r[4] * gy + r[5] * gz,
-                  r[6] * gx + r[7] * gy + r[8] * gz))
-            if colors is not None:
-                push(colors[i])
-            if wx < lo[0]:
-                lo[0] = wx
-            if wy < lo[1]:
-                lo[1] = wy
-            if wz < lo[2]:
-                lo[2] = wz
-            if wx > hi[0]:
-                hi[0] = wx
-            if wy > hi[1]:
-                hi[1] = wy
-            if wz > hi[2]:
-                hi[2] = wz
-            if wx < mlo[0]:
-                mlo[0] = wx
-            if wy < mlo[1]:
-                mlo[1] = wy
-            if wz < mlo[2]:
-                mlo[2] = wz
-            if wx > mhi[0]:
-                mhi[0] = wx
-            if wy > mhi[1]:
-                mhi[1] = wy
-            if wz > mhi[2]:
-                mhi[2] = wz
+        r0, r1, r2, r3, r4, r5, r6, r7, r8 = r
+        # Transform in whole-list passes; the identity case (most statics)
+        # reuses the parsed lists untouched.
+        if r == _IDENTITY_ROT and s == 1.0:
+            if (tx, ty, tz) == (0.0, 0.0, 0.0):
+                wverts = verts
+            else:
+                wverts = [(x + tx, y + ty, z + tz) for x, y, z in verts]
+            wnorms = normals
+            wtans = tangents
+        else:
+            wverts = [(tx + s * (r0 * x + r1 * y + r2 * z),
+                       ty + s * (r3 * x + r4 * y + r5 * z),
+                       tz + s * (r6 * x + r7 * y + r8 * z))
+                      for x, y, z in verts]
+            wnorms = [(r0 * x + r1 * y + r2 * z,
+                       r3 * x + r4 * y + r5 * z,
+                       r6 * x + r7 * y + r8 * z)
+                      for x, y, z in normals]
+            wtans = [(r0 * x + r1 * y + r2 * z,
+                      r3 * x + r4 * y + r5 * z,
+                      r6 * x + r7 * y + r8 * z)
+                     for x, y, z in tangents]
+
+        # Interleave pos/normal/uv/tangent(/colour) without a per-vertex
+        # Python loop: chain flattens the zipped tuples at C speed.
+        groups = (zip(wverts, wnorms, uvs, wtans, colors) if colors is not None
+                  else zip(wverts, wnorms, uvs, wtans))
+        flat = array.array("f", chain.from_iterable(
+            chain.from_iterable(groups)))
+
+        # Bounds from strided slices of the final buffer (C speed); the
+        # per-shape centroid orders the blended pass.
+        fpv = 15 if colors is not None else 11
+        xs, ys, zs = flat[0::fpv], flat[1::fpv], flat[2::fpv]
+        mlo = (min(xs), min(ys), min(zs))
+        mhi = (max(xs), max(ys), max(zs))
+        for k in range(3):
+            if mlo[k] < lo[k]:
+                lo[k] = mlo[k]
+            if mhi[k] > hi[k]:
+                hi[k] = mhi[k]
 
         nv = len(verts)
-        idx = array.array("I")
-        for a, b, c in tris:
-            if a < nv and b < nv and c < nv:
-                idx.extend((a, b, c))
+        idx = array.array("I", chain.from_iterable(tris))
+        if idx and max(idx) >= nv:
+            # Rare corrupt file: drop only the out-of-range triangles.
+            idx = array.array("I")
+            for a, b, c in tris:
+                if a < nv and b < nv and c < nv:
+                    idx.extend((a, b, c))
         if not idx:
             continue
 
@@ -825,13 +855,15 @@ def _neutralise_meshes(meshes) -> None:
     the GPU memory goes with the context's share group."""
     import shiboken6
     for m in meshes:
-        for obj in (m.vao, m.vbo, m.ibo, m.texture):
+        for obj in (m.vao, m.vbo, m.ibo, m.texture, m.normal_tex,
+                    m.env_tex, m.mask_tex, m.ao_tex):
             if obj is not None:
                 try:
                     shiboken6.invalidate(obj)
                 except Exception:                        # noqa: BLE001
                     pass
-        m.vao = m.vbo = m.ibo = m.texture = None
+        m.vao = m.vbo = m.ibo = m.texture = m.normal_tex = None
+        m.env_tex = m.mask_tex = m.ao_tex = None
 
 
 def _log(fn, message: str) -> None:
@@ -854,6 +886,32 @@ def _fmt_bytes(n: int) -> str:
             return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
         n /= 1024.0
     return f"{n:.1f}GB"
+
+
+def _model_cache_key(source, texture_roots, archive_roots, resolver, archives,
+                     mesh_rel, plugin_dirs):
+    """Identity of every input that can change the parsed/augmented model.
+
+    Texture choice and texture slot are deliberately absent: they only affect
+    decoded images and are the common reason for rebuilding the preview.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        source_key = ("memory", id(source), len(source))
+    else:
+        path = Path(source)
+        try:
+            stat = path.stat()
+            source_key = ("path", str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            source_key = ("path", str(path), None, None)
+
+    def path_key(paths):
+        return tuple(str(Path(p)) for p in (paths or ()))
+
+    effective_plugins = plugin_dirs or texture_roots
+    return (source_key, mesh_rel.replace("\\", "/").lower(),
+            path_key(texture_roots), path_key(archive_roots),
+            path_key(effective_plugins), id(resolver), id(archives))
 
 
 def _log_model(log, model) -> None:
@@ -979,6 +1037,11 @@ class _Viewport(QOpenGLWidget):
         self._uploaded = False
         self._gl_error = ""
         self._generation = 0
+        self._load_jobs = LatestWorker("nif-preview-load")
+        # Parsing, plugin overrides, hair tint and Starfield .mesh expansion
+        # are invariant when only the texture source/slot changes.
+        self._cached_model_key = None
+        self._cached_model = None
         self._reload_args = None
         self._needs_reload = False
         self._keep_view = False
@@ -1052,8 +1115,11 @@ class _Viewport(QOpenGLWidget):
             from Utils.nif_reader import read_nif
             t_start = time.monotonic()
             try:
+                model_key = _model_cache_key(
+                    source, texture_roots, archive_roots, resolver, archives,
+                    mesh_rel, plugin_dirs)
                 extra = archives
-                if extra is None and resolver is None and archive_roots:
+                if extra is None and archive_roots:
                     from Utils.archive_lookup import ArchiveLookup, find_archives
                     found = find_archives(archive_roots)
                     _log(log, f"  scanned {len(archive_roots)} archive root(s):"
@@ -1061,51 +1127,71 @@ class _Viewport(QOpenGLWidget):
                     extra = ArchiveLookup(found, keep_prefix=ASSET_PREFIXES)
                 loader = _make_texture_loader(texture_roots, extra, resolver,
                                               tex_override, self.texture_slot,
-                                              log)
-                t0 = time.monotonic()
-                model = read_nif(source)
-                _log(log, f"  parsed in {(time.monotonic() - t0) * 1000:.0f}ms")
-                _log_model(log, model)
-                if mesh_rel:
-                    # The game may swap the baked texture set via plugin
-                    # records; without this such meshes preview as white clay.
-                    from Utils.txst_lookup import apply_alt_textures
-                    dirs = plugin_dirs or texture_roots
-                    _log(log, "  plugin scan dirs: "
-                              + (", ".join(str(d) for d in dirs) or "none"))
-                    try:
-                        t0 = time.monotonic()
-                        n = apply_alt_textures(model, mesh_rel, dirs)
-                        _log(log, f"  plugin texture-set overrides: {n} shape(s)"
-                                  f" ({(time.monotonic() - t0) * 1000:.0f}ms)")
-                    except Exception as exc:             # noqa: BLE001
-                        _log(log, f"  ! texture-set override scan failed: {exc!r}")
-                    # Skyrim ships hair textures greyscale and tints them from
-                    # the NPC record, so FaceGen hair is white without this.
-                    try:
-                        from Utils.facegen_tint import apply_hair_tint
-                        t0 = time.monotonic()
-                        n = apply_hair_tint(model, mesh_rel, dirs)
-                        if n:
-                            tint = next((s.tint for s in model.shapes
-                                         if s.tint != (1.0, 1.0, 1.0)), None)
-                            rgb = (tuple(round(c * 255) for c in tint)
-                                   if tint else "?")
-                            _log(log, f"  hair tint {rgb} applied to {n} shape(s)"
+                                              log,
+                                              cancel=lambda: gen != self._generation)
+                if (model_key == self._cached_model_key
+                        and self._cached_model is not None):
+                    model = self._cached_model
+                    _log(log, "  reused parsed model and plugin/geometry lookups")
+                else:
+                    t0 = time.monotonic()
+                    model = read_nif(source)
+                    _log(log, f"  parsed in "
+                              f"{(time.monotonic() - t0) * 1000:.0f}ms")
+                    if gen != self._generation:
+                        return
+                    _log_model(log, model)
+                    if mesh_rel:
+                        # The game may swap the baked texture set via plugin
+                        # records; without this such meshes preview as white clay.
+                        from Utils.txst_lookup import apply_alt_textures
+                        dirs = plugin_dirs or texture_roots
+                        _log(log, "  plugin scan dirs: "
+                                  + (", ".join(str(d) for d in dirs) or "none"))
+                        try:
+                            t0 = time.monotonic()
+                            n = apply_alt_textures(
+                                model, mesh_rel, dirs,
+                                cancel=lambda: gen != self._generation)
+                            _log(log, f"  plugin texture-set overrides: {n} shape(s)"
                                       f" ({(time.monotonic() - t0) * 1000:.0f}ms)")
-                    except Exception as exc:             # noqa: BLE001
-                        _log(log, f"  ! hair tint lookup failed: {exc!r}")
-                # Starfield keeps geometry in external .mesh files.
-                external = [s for s in model.shapes if s.mesh_path]
-                if external:
-                    _log(log, f"  {len(external)} shape(s) use external "
-                              f".mesh geometry (Starfield)")
-                    _load_external_geometry(model, loader.fetch)
-                    filled = sum(1 for s in external if s.vertices)
-                    _log(log, f"  external geometry resolved for "
-                              f"{filled}/{len(external)}")
+                        except Exception as exc:         # noqa: BLE001
+                            _log(log, f"  ! texture-set override scan failed: {exc!r}")
+                        # Skyrim ships hair textures greyscale and tints them from
+                        # the NPC record, so FaceGen hair is white without this.
+                        try:
+                            from Utils.facegen_tint import apply_hair_tint
+                            t0 = time.monotonic()
+                            n = apply_hair_tint(model, mesh_rel, dirs)
+                            if n:
+                                tint = next((s.tint for s in model.shapes
+                                             if s.tint != (1.0, 1.0, 1.0)), None)
+                                rgb = (tuple(round(c * 255) for c in tint)
+                                       if tint else "?")
+                                _log(log, f"  hair tint {rgb} applied to {n} shape(s)"
+                                          f" ({(time.monotonic() - t0) * 1000:.0f}ms)")
+                        except Exception as exc:         # noqa: BLE001
+                            _log(log, f"  ! hair tint lookup failed: {exc!r}")
+                    if gen != self._generation:
+                        return
+                    # Starfield keeps geometry in external .mesh files.
+                    external = [s for s in model.shapes if s.mesh_path]
+                    if external:
+                        _log(log, f"  {len(external)} shape(s) use external "
+                                  f".mesh geometry (Starfield)")
+                        _load_external_geometry(model, loader.fetch)
+                        filled = sum(1 for s in external if s.vertices)
+                        _log(log, f"  external geometry resolved for "
+                                  f"{filled}/{len(external)}")
+                    if gen != self._generation:
+                        return
+                    self._cached_model_key = model_key
+                    self._cached_model = model
                 t0 = time.monotonic()
-                meshes, bounds = _build_meshes(model, loader)
+                meshes, bounds = _build_meshes(
+                    model, loader, cancel=lambda: gen != self._generation)
+                if gen != self._generation:
+                    return
                 _log(log, f"  built {len(meshes)} drawable mesh(es) in "
                           f"{(time.monotonic() - t0) * 1000:.0f}ms")
             except Exception as e:                       # noqa: BLE001
@@ -1121,7 +1207,7 @@ class _Viewport(QOpenGLWidget):
             safe_emit(self.loaded, meshes, bounds, gen,
                       list(dict.fromkeys(loader.requested)))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._load_jobs.submit(work)
 
     def reload(self, keep_view: bool = True):
         """Re-run the last load (e.g. after switching texture map)."""
@@ -1130,6 +1216,32 @@ class _Viewport(QOpenGLWidget):
 
     def _discard_pending(self):
         self._pending = None
+
+    def cancel_load(self):
+        """Invalidate queued/in-flight CPU work without clearing the viewport."""
+        self._generation += 1
+        self._reload_args = None
+        self._load_jobs.discard_pending()
+        self._pending = None
+
+    def clear(self):
+        """Cancel queued work and clear the displayed CPU/GPU mesh safely."""
+        self.cancel_load()
+        self._cached_model_key = None
+        self._cached_model = None
+        if self.context() is not None:
+            try:
+                self.makeCurrent()
+                self._release_gpu()
+                self.doneCurrent()
+            except RuntimeError:
+                _neutralise_meshes(self._meshes)
+                self._meshes = []
+        else:
+            _neutralise_meshes(self._meshes)
+            self._meshes = []
+        self._uploaded = False
+        self.update()
 
     def _on_loaded(self, meshes, bounds, gen, _tex_paths=None):
         if gen != self._generation:
@@ -1749,6 +1861,12 @@ class _NoGLViewport(QWidget):
     def reload(self, *_a, **_kw):
         self.load()
 
+    def clear(self):
+        self._generation += 1
+
+    def cancel_load(self):
+        self._generation += 1
+
     def set_brightness(self, *_a):
         pass
 
@@ -1964,11 +2082,24 @@ class NifPreview(QWidget):
         """Swap the previewed mesh in place; *keep_view* skips re-framing."""
         self._header.setText(display_name or path.name)
         self._stats.setText(self.tr("Loading…"))
+        roots = (default_texture_roots(path)
+                 if texture_roots is None else texture_roots)
+        archive_dirs = (default_archive_roots(path)
+                        if archive_roots is None else archive_roots)
         self._view.load(path,
-                        texture_roots or default_texture_roots(path),
-                        archive_roots or default_archive_roots(path),
+                        roots,
+                        archive_dirs,
                         resolver, None, tex_override,
                         mesh_rel=_mesh_rel_of(path), keep_view=keep_view)
+
+    def clear(self, status: str = ""):
+        """Clear a stale model after a definitive read/parse failure."""
+        self._view.clear()
+        self._stats.setText(status)
+
+    def cancel_load(self):
+        """Drop stale CPU work while retaining the last completed mesh."""
+        self._view.cancel_load()
 
     def set_texture_sources(self, items, current=None):
         """Fill the texture-source picker: [(label, data), …]; empty hides it."""
@@ -2034,7 +2165,8 @@ class NifPreview(QWidget):
         if gen != self._view._generation:
             return
         _log(self.log_fn, f"preview failed: {message}")
-        self._stats.setText(self.tr("failed: {0}").format(message))
+        status = self.tr("failed: {0}").format(message)
+        self.clear(status)
 
     def _on_textured(self, on):
         _log(self.log_fn, f"option: textures {'on' if on else 'off'}")
@@ -2111,6 +2243,10 @@ class NifPreview(QWidget):
     def event(self, e):
         # Scoped tabs close via deleteLater(); closeEvent never fires.
         if e.type() == QEvent.DeferredDelete:
+            ctl = getattr(self, "_tex_source_ctl", None)
+            if ctl is not None:
+                ctl.cancel()
+            self._view.cancel_load()
             self._view.release_gl()
         return super().event(e)
 
