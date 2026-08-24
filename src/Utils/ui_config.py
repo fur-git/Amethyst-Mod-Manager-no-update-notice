@@ -676,6 +676,86 @@ def save_fs_warning_ack(game_name: str, fingerprint: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Launcher handoff notice for loader/VFS games. The old Steam-only section is
+# retained below as a compatibility fallback for existing preferences.
+# ---------------------------------------------------------------------------
+_STEAM_LAUNCH_SECTION = "steam_launch_notice"
+_LAUNCH_HANDOFF_SECTION = "launch_handoff_notice"
+
+
+def get_launch_handoff_notice_hidden(game_name: str, launcher_id: str) -> bool:
+    """Whether this launcher's post-deploy wrapper notice is suppressed."""
+    if not game_name or not launcher_id:
+        return False
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    key = f"{launcher_id}.{game_name}"
+    try:
+        parser = _read_ini(path)
+        if parser.has_option(_LAUNCH_HANDOFF_SECTION, key):
+            return parser.getboolean(_LAUNCH_HANDOFF_SECTION, key,
+                                     fallback=False)
+        # Preserve the old Steam-only preference without suppressing a newly
+        # detected Heroic/Lutris/Faugus notice for the same game.
+        if launcher_id == "steam":
+            return parser.getboolean(_STEAM_LAUNCH_SECTION, game_name,
+                                     fallback=False)
+    except Exception:
+        pass
+    return False
+
+
+def save_launch_handoff_notice_hidden(
+    game_name: str, launcher_id: str, hidden: bool,
+) -> None:
+    """Persist suppression per game and launcher."""
+    if not game_name or not launcher_id:
+        return
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _LAUNCH_HANDOFF_SECTION not in parser:
+        parser[_LAUNCH_HANDOFF_SECTION] = {}
+    parser[_LAUNCH_HANDOFF_SECTION][f"{launcher_id}.{game_name}"] = (
+        "true" if hidden else "false"
+    )
+    _write_ini(parser, path)
+
+
+def get_steam_launch_notice_hidden(game_name: str) -> bool:
+    """Whether the post-deploy Steam launch-command notice is suppressed."""
+    if not game_name:
+        return False
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    try:
+        parser = _read_ini(path)
+        return parser.getboolean(_STEAM_LAUNCH_SECTION, game_name,
+                                 fallback=False)
+    except Exception:
+        return False
+
+
+def save_steam_launch_notice_hidden(game_name: str, hidden: bool) -> None:
+    """Persist whether to stop showing the Steam launch-command notice."""
+    if not game_name:
+        return
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _STEAM_LAUNCH_SECTION not in parser:
+        parser[_STEAM_LAUNCH_SECTION] = {}
+    parser[_STEAM_LAUNCH_SECTION][game_name] = "true" if hidden else "false"
+    _write_ini(parser, path)
+
+
+# ---------------------------------------------------------------------------
 # Fallout 3 Anniversary-Edition downgrade prompt: records the exe version the
 # user chose to "Deploy anyway" on (see Utils.fo3_version_check). Stored so the
 # prompt shows once per game, re-arming if a game update changes the exe again.
@@ -1900,6 +1980,90 @@ def save_onboarding_complete(value: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# "Don't show this again" reset
+#
+# Every notice a user can silence permanently writes its flag to amethyst.ini.
+# Listing them in one place lets Settings > General re-arm the lot in a single
+# click. Entries are (section, option); option None means "the whole section" -
+# those sections hold nothing but per-game/per-launcher dismissals, so dropping
+# them is exactly the reset. A named option clears one key out of a section
+# that also holds unrelated settings.
+#
+# Excluded on purpose: the update-notification mute, which the update banner
+# also writes but which already has its own visible checkbox in this same
+# General tab - resetting it from here would silently undo a deliberate choice.
+# ---------------------------------------------------------------------------
+_DISMISSIBLE_NOTICES: tuple[tuple[str, "str | None"], ...] = (
+    (_LAUNCH_HANDOFF_SECTION, None),    # post-deploy launcher handoff notice
+    (_STEAM_LAUNCH_SECTION, None),      # its legacy Steam-only predecessor
+    (_FS_WARNINGS_SECTION, None),       # Windows-filesystem warning, per game
+    (_FO3_DOWNGRADE_SECTION, None),     # Fallout 3 Anniversary downgrade prompt
+    (_FLATPAK_SECTION, "suppress_i386_warning"),
+)
+
+# Values that mean "not dismissed" even though the key exists: boolean notices
+# write "false" when unticked, and an empty ack string never suppressed a thing.
+_UNSET_NOTICE_VALUES = {"", "false", "0", "no", "off"}
+
+
+def _notice_is_set(value: str) -> bool:
+    return value.strip().lower() not in _UNSET_NOTICE_VALUES
+
+
+def _count_notice_flags(parser: "configparser.ConfigParser") -> int:
+    """How many dismissal flags in *parser* are actually suppressing a prompt."""
+    total = 0
+    for section, option in _DISMISSIBLE_NOTICES:
+        if not parser.has_section(section):
+            continue
+        try:
+            if option is None:
+                total += sum(1 for _k, v in parser.items(section)
+                             if _notice_is_set(v))
+            elif parser.has_option(section, option):
+                total += 1 if _notice_is_set(
+                    parser.get(section, option, fallback="")) else 0
+        except Exception:
+            continue
+    return total
+
+
+def count_dismissed_notices() -> int:
+    """Number of prompts currently hidden by a "Don't show this again" tick."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return 0
+    try:
+        return _count_notice_flags(_read_ini(path))
+    except Exception:
+        return 0
+
+
+def reset_dismissed_notices() -> int:
+    """Clear every dismissal flag; returns how many prompts were hidden."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return 0
+    parser = _new_parser()
+    try:
+        parser.read(path)
+    except Exception:
+        return 0
+    cleared = _count_notice_flags(parser)
+    changed = False
+    for section, option in _DISMISSIBLE_NOTICES:
+        if not parser.has_section(section):
+            continue
+        if option is None:
+            changed = parser.remove_section(section) or changed
+        else:
+            changed = parser.remove_option(section, option) or changed
+    if changed:
+        _write_ini(parser, path)
+    return cleared
+
+
+# ---------------------------------------------------------------------------
 # Custom install-name regex patterns
 #
 # User-defined search/replace rules applied to a downloaded archive's filename
@@ -2288,7 +2452,7 @@ def load_theme_colors() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Appearance mode - applied at startup, requires restart.
+# Appearance mode - persisted here; the Qt frontend can apply it live.
 #
 # Valid values are theme IDs (filenames) under src/gui/themes/ (e.g. "dark",
 # "light"). ui_config doesn't validate against that list to avoid importing

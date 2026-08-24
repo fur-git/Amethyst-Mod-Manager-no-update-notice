@@ -100,6 +100,24 @@ BUILTIN_WIZARD_TOOLS: list[dict] = [
         "category": "Other",
     },
     {
+        "id": "npc_viewer",
+        "label": "View NPCs",
+        "description": ("See what this profile's NPCs actually look like: every "
+                        "NPC with a baked FaceGen head, named, previewed in 3D, "
+                        "with the winning face flagged when mods disagree."),
+        # FaceGeom paths, NPC identity and actor assembly are verified for the
+        # Skyrim generation and Fallout 4. Other Bethesda titles lay records
+        # out differently and are not claimed here.
+        "game_ids": [
+            "skyrim_se", "skyrim", "skyrimvr", "enderal", "enderalse",
+            "Fallout4",
+        ],
+        "all_games": False,
+        # Qt-only tool: no Tk class exists behind this path, it is a registry key.
+        "dialog_class": "wizards.npc_viewer.NpcViewerWizard",
+        "category": "Other",
+    },
+    {
         "id": "bg3_import_modlist_json",
         "label": "Import BG3MM Load Order (.json)",
         "description": ("Convert a BG3 Mod Manager modlist.json into this "
@@ -135,6 +153,17 @@ BUILTIN_WIZARD_TOOLS: list[dict] = [
         "game_ids": ["My_Summer_Car"],
         "all_games": False,
         "dialog_class": "wizards.msc_mscloader.MSCLoaderWizard",
+        "category": "Setup and Installers",
+    },
+    {
+        "id": "nier_special_k",
+        "label": "Install Special K",
+        "description": ("Download Special K and install SpecialK64.dll as a "
+                        "root-flagged mod renamed to dxgi.dll."),
+        "game_ids": ["NieR__Automata"],
+        "all_games": False,
+        # Qt-only tool: no Tk class exists behind this path, it is a registry key.
+        "dialog_class": "wizards.special_k.SpecialKWizard",
         "category": "Setup and Installers",
     },
 ]
@@ -305,6 +334,9 @@ _WIZARD_CLASS_EXES: dict[str, set[str]] = {
     "wizards.bethini.BethINIWizard": {"bethini.exe"},
     "wizards.wrye_bash.WryeBashWizard": {"wrye bash.exe"},
     "wizards.script_merger_tw3.ScriptMergerWizard": {"witcherscriptmerger.exe"},
+    "wizards.fallout_4_downgrader.Fallout4DowngraderWizard": {
+        "fallout-4-steam-downgrader.exe",
+    },
 }
 
 

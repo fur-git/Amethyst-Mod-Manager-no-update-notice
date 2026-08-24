@@ -22,3 +22,5 @@ decky/
 AmethystModManager-AppImage/
 *.AppImage.zsync
 src/appimage/dist/
+/tests
+/assets

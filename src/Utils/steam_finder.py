@@ -18,12 +18,18 @@ from pathlib import Path
 # Known Steam base directories for different install methods
 # ---------------------------------------------------------------------------
 _HOME = Path.home()
+_XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or (_HOME / ".local" / "share"))
 
 _STEAM_CANDIDATES: list[Path] = [
     _HOME / ".local" / "share" / "Steam",                                          # Standard
+    _XDG_DATA / "Steam",                                                           # XDG_DATA_HOME override
     _HOME / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",  # Flatpak
+    _HOME / ".var" / "app" / "com.valvesoftware.Steam" / "data" / "Steam",         # Flatpak (ProtonPlus spelling)
     _HOME / "snap" / "steam" / "common" / ".local" / "share" / "Steam",            # Snap
+    _HOME / "snap" / "steam" / "common" / ".steam" / "root",                       # Snap (ProtonPlus spelling)
     _HOME / ".steam" / "steam",                                                     # Symlink fallback
+    _HOME / ".steam" / "root",                                                      # Symlink fallback (Debian/Arch)
+    _HOME / ".steam" / "debian-installation",                                       # Debian-packaged Steam
 ]
 
 # Steam normally writes "libraryfolders.vdf", but some installs (and older
@@ -198,15 +204,17 @@ def _parse_launch_options(localconfig: Path, app_id: str) -> str:
     return ""
 
 
-def steam_client_running() -> bool:
+def steam_client_running(*, strict: bool = False) -> bool:
     """True when a Steam client appears to be running.
 
     Reads Steam's own pid files (native + Flatpak Steam) and checks the pid
     is alive and still looks like Steam - a stale steam.pid whose pid was
     recycled by an unrelated process must not count.  Inside our own Flatpak
     sandbox /proc shows only the sandbox, so the check runs on the host via
-    flatpak-spawn; if that can't be determined, assume running (the safe
-    direction for callers that must not write Steam's config mid-session).
+    flatpak-spawn.  By default, an unverifiable host process is treated as
+    running (the safe direction for callers that must not write Steam's config
+    mid-session).  ``strict=True`` instead treats that uncertainty as not
+    running, for callers that must prove a client exists before launching.
     """
     pid_files = [
         _HOME / ".steam" / "steam.pid",
@@ -225,7 +233,7 @@ def steam_client_running() -> bool:
             import shutil as _shutil
             import subprocess as _subprocess
             if not _shutil.which("flatpak-spawn"):
-                return True  # can't verify; be conservative
+                return not strict
             try:
                 rc = _subprocess.run(
                     ["flatpak-spawn", "--host", "sh", "-c",
@@ -233,7 +241,7 @@ def steam_client_running() -> bool:
                     stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
                     timeout=5).returncode
             except Exception:
-                return True
+                return not strict
             if rc == 0:
                 return True
             continue

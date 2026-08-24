@@ -20,6 +20,7 @@ from Utils.app_log import safe_log as _safe_log
 from Utils.atomic_write import write_atomic_text
 from Utils.deploy_shared import (
     LinkMode,
+    OVERWRITE_LOG_NAME,
     _deploy_workers,
     _do_link_ex,
     _get_staging_source_path,
@@ -126,6 +127,7 @@ def deploy_root_folder(
     game_root: Path,
     mode: LinkMode = LinkMode.HARDLINK,
     log_fn=None,
+    metadata_dir: "Path | None" = None,
 ) -> int:
     """Transfer files from root_folder_dir into game_root.
 
@@ -156,15 +158,26 @@ def deploy_root_folder(
     _root_plen = len(_root_str) + 1
     for dirpath, _dirnames, filenames in os.walk(_root_str):
         for fname in filenames:
+            # Runtime-capture history belongs in overwrite/ but must never
+            # become payload when overwrite is deployed to the game root.
+            if fname == OVERWRITE_LOG_NAME:
+                continue
             full = dirpath + "/" + fname
             sources.append((Path(full), Path(full[_root_plen:])))
 
     if not sources:
         return 0
 
-    backup_dir = root_folder_dir.parent / _ROOT_BACKUP_NAME
-    log_path   = root_folder_dir.parent / _ROOT_LOG_NAME
-    identity_path = root_folder_dir.parent / _ROOT_IDENTITY_NAME
+    # Physical deploys keep recovery state beside Root_Folder.  Private VFS
+    # builds can supply an isolated metadata directory so resolving their
+    # synthetic root payload never consumes or replaces an older physical
+    # deployment's journal/backup.
+    artifacts_dir = (Path(metadata_dir) if metadata_dir is not None
+                     else root_folder_dir.parent)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = artifacts_dir / _ROOT_BACKUP_NAME
+    log_path   = artifacts_dir / _ROOT_LOG_NAME
+    identity_path = artifacts_dir / _ROOT_IDENTITY_NAME
 
     # Resolve destinations case-insensitively against the game tree (shared
     # dir cache - one iterdir per directory instead of one per file) and
@@ -258,6 +271,7 @@ def deploy_root_flagged_mods(
     per_mod_strip_prefixes: "dict[str, list[str]] | None" = None,
     excluded_raw: "dict[str, set[str]] | None" = None,
     log_fn=None,
+    metadata_dir: "Path | None" = None,
 ) -> int:
     """Deploy files from root-flagged mods (filemap_root.txt) directly into game_root.
 
@@ -293,9 +307,15 @@ def deploy_root_flagged_mods(
     if not entries:
         return 0
 
-    backup_dir = filemap_root_path.parent / _ROOT_BACKUP_NAME
-    log_path   = filemap_root_path.parent / _ROOT_LOG_NAME
-    identity_path = filemap_root_path.parent / _ROOT_IDENTITY_NAME
+    # See deploy_root_folder(): VFS resolution uses a disposable artifact
+    # directory, while physical deployments retain the historical sibling
+    # journal layout.
+    artifacts_dir = (Path(metadata_dir) if metadata_dir is not None
+                     else filemap_root_path.parent)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = artifacts_dir / _ROOT_BACKUP_NAME
+    log_path   = artifacts_dir / _ROOT_LOG_NAME
+    identity_path = artifacts_dir / _ROOT_IDENTITY_NAME
 
     # Read existing log so we can append (deploy_root_folder may run after us)
     existing_placed: list[str] = []

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QSizePolicy, QFrame,
 )
 
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, bind_theme, _c
 from Utils.save_header import format_play_time
 
 # Save screenshots are small (320x192 Skyrim, 512x288 New Vegas) - little to
@@ -28,8 +28,9 @@ _SHOT_MAX_W = 420
 _DATE_FMT = "%d %b %Y  %H:%M"
 
 # Format id → the label shown next to the save's engine version.
+# i18n: skip — game titles are proper names, identical in every locale.
 _KIND_LABELS = {
-    "TESV": "Skyrim",
+    "TESV": "Skyrim",  # i18n: skip — game titles are proper names
     "FO4": "Fallout 4",
     "FO3": "Fallout 3 / New Vegas",
     "TES4": "Oblivion",
@@ -48,8 +49,18 @@ class SavePreviewPane(QWidget):
         self._pixmap: "QPixmap | None" = None
         # The save the shown header came from - keys the lightbox tab.
         self._path = None
+        self._header = None
+        self._header_mtime = 0.0
         self._build()
+        bind_theme(self, roles={
+            "TEXT_MAIN", "TEXT_DIM", "TEXT_WARN", "TEXT_ERR",
+        })
         self.clear()
+
+    def refresh_theme(self, _p: dict) -> None:
+        if self._header is not None:
+            self._set_fields(self._header, self._header_mtime)
+            self._set_plugins(self._header)
 
     # ---- layout -----------------------------------------------------------
     def _build(self):
@@ -129,10 +140,14 @@ class SavePreviewPane(QWidget):
         self._known = {str(n).lower() for n in (names or [])}
 
     def clear(self):
+        self._header = None
+        self._header_mtime = 0.0
         self._show_message("")
 
     def set_message(self, text: str):
         """Show *text* instead of a save's details (reading / unreadable)."""
+        self._header = None
+        self._header_mtime = 0.0
         self._show_message(text)
 
     def _show_message(self, text: str):
@@ -146,6 +161,8 @@ class SavePreviewPane(QWidget):
         """Render a parsed SaveHeader. *path* names and keys the lightbox tab;
         *mtime* backs the date for formats carrying no timestamp (FO3/NV)."""
         self._path = path
+        self._header = header
+        self._header_mtime = mtime
         if header is None:
             self._show_message(self.tr("This file could not be read as a save."))
             return

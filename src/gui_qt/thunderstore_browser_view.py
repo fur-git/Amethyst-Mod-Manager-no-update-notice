@@ -38,6 +38,7 @@ from Thunderstore.thunderstore_api import (
     ORDERINGS, fetch_filters, fetch_latest_version, fetch_listing, package_url,
     total_pages)
 from gui_qt.flow_layout import FlowLayout
+from gui_qt.mouse_navigation import MouseNavigationFilter
 from gui_qt.nexus_mod_card import CARD_W, NexusModCard, ThumbnailLoader
 from gui_qt.safe_emit import safe_emit
 from gui_qt.selector_button import SelectorButton
@@ -162,6 +163,8 @@ class ThunderstoreBrowserView(QWidget):
         self._version_ready.connect(self._on_version_ready)
 
         self._build()
+        self._mouse_navigation = MouseNavigationFilter(
+            self, self._prev_page, self._next_page)
         self._load_filters()
         self._reload()
 
@@ -501,6 +504,7 @@ class ThunderstoreBrowserView(QWidget):
                 self.tr("{0} mod(s)").format(self._total))
         self._page_edit.setText(str(self._page + 1))
         self._page_total.setText(self.tr("/ {0}").format(pages))
+        self._scroll.verticalScrollBar().setValue(0)
         self._update_page_buttons()
 
     def _set_loading(self, on: bool):
@@ -728,11 +732,13 @@ class ThunderstoreBrowserView(QWidget):
     def _prev_page(self):
         if self._page > 0:
             self._page -= 1
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
 
     def _next_page(self):
         if self._page + 1 < total_pages(self._total):
             self._page += 1
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
 
     def _jump_to_page(self):
@@ -744,6 +750,7 @@ class ThunderstoreBrowserView(QWidget):
         want = max(0, min(want, total_pages(self._total) - 1))
         if want != self._page:
             self._page = want
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
 
     # -- app hooks ----------------------------------------------------------

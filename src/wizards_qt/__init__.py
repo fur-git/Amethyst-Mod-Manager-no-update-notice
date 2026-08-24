@@ -195,6 +195,9 @@ REGISTRY: dict[str, QtWizardSpec] = {
         QtWizardSpec(_simple("wizards_qt.fnv_4gb_view", "Fnv4GbView")),
     "wizards.fallout_downgrade.FalloutDowngradeWizard":
         QtWizardSpec(_simple("wizards_qt.fallout_downgrade_view", "FalloutDowngradeView")),
+    "wizards.fallout_4_downgrader.Fallout4DowngraderWizard":
+        QtWizardSpec(_simple("wizards_qt.fallout_4_downgrader_view",
+                             "Fallout4DowngraderView")),
     "wizards.wrye_bash.WryeBashWizard":
         QtWizardSpec(_simple("wizards_qt.wrye_bash_view", "WryeBashView")),
     "wizards.bethini.BethINIWizard":
@@ -255,6 +258,9 @@ REGISTRY: dict[str, QtWizardSpec] = {
     "wizards.nif_viewer.NifViewerWizard":
         QtWizardSpec(_simple("wizards_qt.nif_viewer_view", "NifViewerView"),
                      panel="full"),
+    "wizards.npc_viewer.NpcViewerWizard":
+        QtWizardSpec(_simple("wizards_qt.npc_viewer_view", "NpcViewerView"),
+                     panel="full"),
 
     # -- ported former external plugins (attached per game_id via
     #    Utils.plugin_loader.BUILTIN_WIZARD_TOOLS) --
@@ -270,6 +276,15 @@ REGISTRY: dict[str, QtWizardSpec] = {
         QtWizardSpec(_simple("wizards_qt.srml_view", "SRMLView")),
     "wizards.msc_mscloader.MSCLoaderWizard":
         QtWizardSpec(_simple("wizards_qt.mscloader_view", "MSCLoaderView")),
+    # Qt-only tool: no Tk class exists behind this path, it is a registry key.
+    "wizards.special_k.SpecialKWizard":
+        QtWizardSpec(_simple("wizards_qt.special_k_view", "SpecialKView")),
+    # Qt-only tool (FROMSOFTWARE / me3): registry key only, no Tk counterpart.
+    "wizards.me3_install.Me3InstallWizard":
+        QtWizardSpec(_simple("wizards_qt.me3_install_view", "Me3InstallView")),
+    "wizards.regulation_merge.RegulationMergeWizard":
+        QtWizardSpec(_simple("wizards_qt.regulation_merge_view",
+                             "RegulationMergeView")),
 }
 
 

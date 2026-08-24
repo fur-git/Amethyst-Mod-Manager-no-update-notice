@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from gui_qt import column_state
 
-from gui_qt.theme_qt import active_palette, _c, qc, qc_contrast
+from gui_qt.theme_qt import active_palette, bind_theme, _c, qc, qc_contrast
 from gui_qt.icons import icon
 from gui_qt.modlist_header import TkStyleHeader
 from gui_qt.plugin_model import (
@@ -29,7 +29,7 @@ from gui_qt.plugin_model import (
 )
 from gui_qt.plugin_state import (
     PF_MISSING, PF_LATE, PF_VMM, PF_ESL, PF_LOOT, PF_DIRTY, PF_TAGS,
-    PF_USERLIST, PF_UL_CYCLE, format_loot_tooltip,
+    PF_USERLIST, PF_UL_CYCLE, format_loot_tooltip, is_master_group,
 )
 
 _FLAG_SZ = 18
@@ -95,7 +95,15 @@ _TWO_STATE_KEYS = {"priority", "index"}
 class PluginDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
-        p = active_palette()
+        bind_theme(self, roles={
+            "BG_ROW", "BG_ROW_ALT", "BG_SELECT", "BG_ROW_HOVER",
+            "TEXT_MAIN", "TEXT_DIM", "TEXT_ON_ACCENT", "TEXT_ERR",
+            "CHECK_FILL", "BORDER", "BG_DEEP", "TONE_BLUE_SOFT",
+            "TEXT_WARN", "TEXT_WHITE", "STATUS_BADGE_RED", "FILE_WIN",
+            "FILE_LOSE", "FILE_ANCHOR", "BG_GREEN_ROW",
+        })
+
+    def refresh_theme(self, p: dict) -> None:
         self.c_row = qc(p, "BG_ROW")
         self.c_row_alt = qc(p, "BG_ROW_ALT")
         self.c_sel = qc(p, "BG_SELECT")
@@ -122,6 +130,12 @@ class PluginDelegate(QStyledItemDelegate):
         # Masters of the selected plugin get their own green row tint (Tk
         # BG_GREEN_ROW), distinct from the conflict-higher green.
         self.c_hl_master = qc(p, "BG_GREEN_ROW")
+        parent = self.parent()
+        if parent is not None:
+            try:
+                parent.viewport().update()
+            except AttributeError:
+                parent.update()
 
     def sizeHint(self, opt, index):
         return QSize(opt.rect.width(), ROW_H)
@@ -212,11 +226,24 @@ class PluginDelegate(QStyledItemDelegate):
 
         tx = box.right() + 10
         p.setPen(text_color)
-        _f = QFont(); _f.setPixelSize(FONT_PX); p.setFont(_f)
+        _f = QFont(); _f.setPixelSize(FONT_PX)
+        # MO2 parity: bold reads as "in the master block".
+        if row is not None and self._row_is_master(row):
+            _f.setBold(True)
+        p.setFont(_f)
         name_rect = QRect(tx, r.top(), r.right() - tx - 6, r.height())
+        # Elide with the bold metrics just installed, or the name overflows.
         elided = p.fontMetrics().elidedText(row.name if row else "",
                                             Qt.ElideRight, name_rect.width())
         p.drawText(name_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+
+    def _row_is_master(self, row) -> bool:
+        """Whether *row* is in the master block (gated on the game flag)."""
+        view = self.parent()
+        model = view.model() if view is not None else None
+        if model is None or not getattr(model, "_master_block", False):
+            return False
+        return is_master_group(row)
 
     @staticmethod
     def _flag_items(bits):
@@ -381,6 +408,16 @@ class PluginDelegate(QStyledItemDelegate):
             if self._lock_rect(opt.rect).contains(pos):
                 model.toggle_lock(index.row())
                 return True
+        elif index.column() == COL_FLAGS:
+            # Click the dirty-edit brush → open the xEdit QAC wizard, which
+            # lists the LOOT-flagged plugins and can clean them.
+            bits = index.data(PFlagsRole) or 0
+            if bits & PF_DIRTY and self._hit_flag_bit(pos, opt.rect, bits) == PF_DIRTY:
+                cb = getattr(self.parent(), "on_dirty_flag_clicked", None)
+                if callable(cb):
+                    row = index.data(RowRole)
+                    cb(row.name if row is not None else "")
+                    return True
         return False
 
 
@@ -397,6 +434,10 @@ class PluginView(QTreeView):
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 
+        # Set by the app: called with the plugin name when the dirty-edit brush
+        # glyph is clicked (opens the xEdit QAC wizard).
+        self.on_dirty_flag_clicked = None
+
         self._plugin_owner: dict = {}
         self._search_hidden: set[int] = set()
         self._filter_hidden: set[int] = set()
@@ -412,6 +453,14 @@ class PluginView(QTreeView):
         # Custom drag-reorder (vanilla pinned at top, locked rows immovable).
         self._drag_rows: list[int] = []
         self._drag_active = False
+        # Drop range for the dragged block, computed once at drag start (the row
+        # list can't change mid-drag) - read every mouse-move and 16ms tick.
+        self._drag_bounds: "tuple[int, int] | None" = None
+        # (direction, scroll value when the drop slot first hit its limit) - the
+        # autoscroll runs _scroll_overrun further before freezing, so the limit
+        # row isn't left jammed against the viewport edge.
+        self._freeze_anchor: "tuple[int, int] | None" = None
+        self._scroll_overrun = 3 * ROW_H
         self._press_row = -1
         self._press_pos = None
         self._drop_slot = -1
@@ -458,18 +507,27 @@ class PluginView(QTreeView):
         self._build_column_menu_button(h)
         self._restore_column_state()
 
-        from gui_qt.marker_strip import install_marker_strip, MarkerScrollBar
+        from gui_qt.marker_strip import install_marker_strip
         install_marker_strip(self, PHighlightRole, code_map={
-            -1: MarkerScrollBar._C_LOWER,    # loses conflict (red)
-            1: MarkerScrollBar._C_HIGHER,    # wins conflict (green)
-            2: MarkerScrollBar._C_ANCHOR,    # selected mod's plugins (orange)
-            3: MarkerScrollBar._C_MASTER,    # master of selected plugin (green)
+            -1: "CONFLICT_HL_LOSE",   # loses conflict (red)
+            1: "CONFLICT_HL_WIN",     # wins conflict (green)
+            2: "CONFLICT_HL_ANCHOR",  # selected mod's plugins (orange)
+            3: "TONE_GREEN",          # master of selected plugin (green)
         })
         self._reposition_marker_strip()
 
         # Right-click context menu (mirrors modlist_view).
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
+        bind_theme(self, roles={"TEXT_MAIN"})
+
+    def refresh_theme(self, palette: dict) -> None:
+        btn = getattr(self, "_col_menu_btn", None)
+        if btn is not None:
+            btn.setIcon(icon("eye1_white.png", 16,
+                             color=_c(palette, "TEXT_MAIN")))
+        self.viewport().update()
+        self.header().viewport().update()
 
     def _on_context_menu(self, pos):
         index = self.indexAt(pos)
@@ -864,6 +922,26 @@ class PluginView(QTreeView):
                 return carry
         return [row]
 
+    def _update_flag_cursor(self, pos):
+        """Pointing-hand over the clickable dirty-edit brush glyph, so it reads
+        as a button rather than a static badge."""
+        over = False
+        try:
+            idx = self.indexAt(pos)
+            if (idx.isValid() and idx.column() == COL_FLAGS
+                    and callable(self.on_dirty_flag_clicked)):
+                bits = idx.data(PFlagsRole) or 0
+                if bits & PF_DIRTY:
+                    deleg = self.itemDelegate()
+                    over = deleg._hit_flag_bit(
+                        pos, self.visualRect(idx), bits) == PF_DIRTY
+        except Exception:
+            over = False
+        if over:
+            self.viewport().setCursor(Qt.PointingHandCursor)
+        else:
+            self.viewport().unsetCursor()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             idx = self.indexAt(event.position().toPoint())
@@ -873,6 +951,7 @@ class PluginView(QTreeView):
 
     def mouseMoveEvent(self, event):
         if not (event.buttons() & Qt.LeftButton) or self._press_row < 0:
+            self._update_flag_cursor(event.position().toPoint())
             super().mouseMoveEvent(event)
             return
         if not self._drag_active:
@@ -903,6 +982,10 @@ class PluginView(QTreeView):
                 return
             self._drag_active = True
             self._drag_rows = block
+            self._drag_bounds = m.drop_bounds(block)
+            self._freeze_anchor = None
+            # The viewport cursor (flag hover) would otherwise mask the drag one.
+            self.viewport().unsetCursor()
             self.setCursor(Qt.ClosedHandCursor)
         self._last_mouse_y = event.position().toPoint().y()
         self._update_drop_slot(self._last_mouse_y)
@@ -917,6 +1000,8 @@ class PluginView(QTreeView):
                 self.model().move_rows(self._drag_rows, self._drop_slot)
             self._drag_active = False
             self._drag_rows = []
+            self._drag_bounds = None
+            self._freeze_anchor = None
             self._drop_slot = -1
             self.unsetCursor()
             self.viewport().update()
@@ -955,6 +1040,11 @@ class PluginView(QTreeView):
         if 0 < slot < n and self.isRowHidden(slot, self.rootIndex()):
             nxt = next((r for r in vis if r >= slot), None)
             slot = nxt if nxt is not None else n
+        # Keep the indicator in the block's legal range so the line visibly
+        # refuses to cross rather than snapping back on release.
+        if self._drag_bounds is not None:
+            lo, hi = self._drag_bounds
+            slot = max(lo, min(slot, hi))
         self._drop_slot = slot
 
     def _autoscroll_tick(self):
@@ -970,6 +1060,23 @@ class PluginView(QTreeView):
             step = -int(2 + (zone - y) / zone * 22)
         elif y > h - zone:
             step = int(2 + (y - (h - zone)) / zone * 22)
+        # With the slot pinned at its limit, scrolling on just slides the list
+        # under a stationary indicator. Freeze that direction (the other stays
+        # free) after a short overrun.
+        at_limit = 0
+        if step and self._drag_bounds is not None and self._drop_slot >= 0:
+            lo, hi = self._drag_bounds
+            if step < 0 and self._drop_slot <= lo:
+                at_limit = -1
+            elif step > 0 and self._drop_slot >= hi:
+                at_limit = 1
+        if at_limit:
+            if self._freeze_anchor is None or self._freeze_anchor[0] != at_limit:
+                self._freeze_anchor = (at_limit, bar.value())
+            if abs(bar.value() - self._freeze_anchor[1]) >= self._scroll_overrun:
+                step = 0
+        else:
+            self._freeze_anchor = None
         if step:
             bar.setValue(bar.value() + step)
             self._update_drop_slot(y)

@@ -13,6 +13,7 @@ from pathlib import Path
 import stat
 
 from Games.base_game import BaseGame, WizardTool
+from Utils.vfs import ProfileVFSGameMixin
 from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, move_to_core, restore_custom_rules, restore_data_core
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
@@ -20,7 +21,47 @@ from Utils.config_paths import get_profiles_dir
 _PROFILES_DIR = get_profiles_dir()
 
 
-class Subnautica(BaseGame):
+def _thunderstore_plugin_subdirs(staging_root: Path, entries,
+                                 log_fn=None) -> dict[str, str]:
+    """Return enabled mod -> Thunderstore package-ID deployment folder.
+
+    Risk of Thunder's preloader deliberately removes the legacy direct child
+    ``BepInEx/plugins/RoR2BepInExPack``.  r2modman avoids that path (and keeps
+    packages isolated generally) by installing plugin payloads below the full,
+    versionless package ID.  Amethyst keeps its staging names user-facing, so
+    apply the same namespace only when deploying ordinary plugin files.
+    """
+    from Thunderstore.thunderstore_meta import read_meta
+
+    _log = log_fn or (lambda _message: None)
+    subdirs: dict[str, str] = {}
+    for entry in entries:
+        if entry.is_separator or not entry.enabled:
+            continue
+        package_id = read_meta(staging_root / entry.name / "meta.ini").package_id
+        package_id = package_id.strip()
+        if not package_id:
+            continue
+        if (package_id in (".", "..") or "/" in package_id
+                or "\\" in package_id or "\x00" in package_id):
+            _log(f"  WARN: ignoring unsafe Thunderstore package ID "
+                 f"{package_id!r} for {entry.name!r}")
+            continue
+        subdirs[entry.name] = package_id
+    return subdirs
+
+
+class Subnautica(ProfileVFSGameMixin, BaseGame):
+
+    profile_overridable_settings = (
+        *BaseGame.profile_overridable_settings,
+        *ProfileVFSGameMixin.vfs_profile_setting_keys,
+    )
+
+    # This is consulted only for direct native binaries. Windows BepInEx games
+    # keep their existing Proton/launcher route; native Steam depots get the
+    # Steamworks IPC session their run_bepinex.sh wrapper expects.
+    native_steam_client_required = True
 
     def __init__(self):
         self._game_path: Path | None = None
@@ -91,6 +132,171 @@ class Subnautica(BaseGame):
     def mods_dir(self) -> str:
         return "BepInEx/plugins"
 
+    @property
+    def vfs_native_launcher_names(self) -> tuple[str, ...]:
+        """Root scripts that can inject BepInEx into a native Linux game.
+
+        The stock Unix distribution uses ``run_bepinex.sh``.  A few
+        game-specific packs use ``start_game_bepinex.sh`` instead, so retain
+        it as a fallback while allowing those handlers to reverse the order.
+        Both scripts wrap Steam's original command rather than replacing it.
+        """
+        return ("run_bepinex.sh", "start_game_bepinex.sh")
+
+    def _vfs_native_game_exe(self) -> Path | None:
+        """The selected native game executable, or ``None`` for Wine builds."""
+        from Utils.exe_launch import resolve_game_exe
+
+        resolved = resolve_game_exe(self)
+        if (resolved is not None
+                and resolved.suffix.lower() not in (".exe", ".bat")):
+            return resolved
+
+        # Some Steam depots (notably Inscryption) contain both the Windows and
+        # Linux players. resolve_game_exe prefers the declared .exe primary,
+        # even when this profile deployed the Unix BepInEx script. In that
+        # unified-depot case the deployed framework is the authoritative
+        # platform signal: choose a declared native alternative only when its
+        # loader exists in the private view.
+        if self._vfs_native_launcher() is None:
+            return None
+        game_root = self.get_game_path()
+        if game_root is None:
+            return None
+        from Utils.deploy import _resolve_nocase
+        for name in getattr(self, "exe_name_alts", None) or ():
+            if Path(name).suffix.lower() in (".exe", ".bat"):
+                continue
+            candidate = _resolve_nocase(Path(game_root), str(name))
+            if candidate is not None and candidate.is_file():
+                return candidate
+        return None
+
+    def get_vfs_launch_exe(self) -> Path | None:
+        """Prefer a native player selected by a deployed Unix BepInEx pack."""
+        native = self._vfs_native_game_exe()
+        game_root = self.get_vfs_game_root()
+        if native is not None and game_root is not None:
+            try:
+                relative = native.resolve(strict=False).relative_to(
+                    Path(game_root).resolve(strict=False))
+            except ValueError:
+                relative = None
+            if relative is not None:
+                from Utils.vfs import virtual_file_path
+                candidate = virtual_file_path(self, relative)
+                if candidate is not None:
+                    return candidate
+        return super().get_vfs_launch_exe()
+
+    @property
+    def vfs_direct_shadow_launch(self) -> bool:
+        # Native scripts must execute with the materialized view as cwd.  Keep
+        # Windows BepInEx games on their already-validated Proton/UMU/bwrap
+        # path by opting into direct shadow launch only for a native install.
+        return self._vfs_native_game_exe() is not None
+
+    def _vfs_native_launcher(self) -> Path | None:
+        """Return the first available loader script in the published view."""
+        from Utils.vfs import virtual_file_path
+
+        for name in self.vfs_native_launcher_names:
+            candidate = virtual_file_path(self, name)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def _vfs_native_command_index(
+        self, command: list[str], native_exe: Path,
+    ) -> int | None:
+        """Index of the selected native game executable in a command."""
+        wanted = native_exe.name.casefold()
+        for index in range(len(command) - 1, -1, -1):
+            if Path(command[index]).name.casefold() == wanted:
+                return index
+        return None
+
+    def _vfs_wrap_native_loader(
+        self, command: list[str], *, require_selected_exe: bool,
+    ) -> list[str]:
+        """Prefix a native game command with its virtual BepInEx script."""
+        command = list(command)
+        if not self.vfs_launch_enabled:
+            return command
+
+        native_exe = self._vfs_native_game_exe()
+        if native_exe is None:
+            return command
+        exe_index = self._vfs_native_command_index(command, native_exe)
+        if require_selected_exe and exe_index is None:
+            # ``wrap_launch_command`` is also used for game-folder tools.  A
+            # native install must not turn an unrelated utility invocation
+            # into a second game launch.
+            return command
+
+        script_names = {
+            Path(name).name.casefold()
+            for name in self.vfs_native_launcher_names
+        }
+        if any(Path(token).name.casefold() in script_names for token in command):
+            return command
+
+        if exe_index is None:
+            raise RuntimeError(
+                "the launcher command does not contain the selected native "
+                f"game executable ({native_exe.name}); check the generated "
+                "VFS wrapper settings."
+            )
+
+        launcher = self._vfs_native_launcher()
+        if launcher is None:
+            expected = " or ".join(self.vfs_native_launcher_names)
+            raise RuntimeError(
+                "the native BepInEx launch script is missing from the "
+                f"profile VFS ({expected}); install the Linux BepInEx pack "
+                "and deploy again."
+            )
+
+        # Use an explicit interpreter: archives commonly lose executable bits.
+        # Insert the BepInEx script immediately before the actual Unity binary,
+        # not before launcher prefixes such as gamemoderun/SteamLaunch. Unix
+        # BepInEx treats its first argument as the executable it must inject
+        # into; wrapping the prefix itself would launch without BepInEx.
+        return [
+            *command[:exe_index],
+            "/bin/sh", str(launcher),
+            *command[exe_index:],
+        ]
+
+    def wrap_launch_command(self, command: list[str], *,
+                            env: dict[str, str] | None = None) -> list[str]:
+        command = self._vfs_wrap_native_loader(
+            command, require_selected_exe=True)
+        return super().wrap_launch_command(command, env=env)
+
+    def get_vfs_passthrough_command(
+        self, vanilla_command: list[str],
+    ) -> list[str]:
+        # Launcher passthrough can contain wrapper tokens before the selected
+        # executable. The native helper inserts the BepInEx script at that
+        # exact boundary so its first argument remains the Unity player.
+        if self._vfs_native_game_exe() is not None:
+            command = self._vfs_wrap_native_loader(
+                vanilla_command, require_selected_exe=False)
+            return super().wrap_launch_command(command)
+        return super().get_vfs_passthrough_command(vanilla_command)
+
+    def get_vfs_sandbox_passthrough_command(
+        self, vanilla_command: list[str],
+    ):
+        """Retain the native Unix loader inside a Flatpak launcher's argv."""
+        if self._vfs_native_game_exe() is not None:
+            from Utils.vfs import sandbox_passthrough_command
+            command = self._vfs_wrap_native_loader(
+                vanilla_command, require_selected_exe=False)
+            return sandbox_passthrough_command(self, command)
+        return super().get_vfs_sandbox_passthrough_command(vanilla_command)
+
     def runtime_snapshot_exclude_dirs(self) -> set[str] | None:
         # plugins/ is reverted via its _Core backup; capture everything else
         # (BepInEx/config, caches, root loader files) into Root_Folder/.
@@ -110,8 +316,10 @@ class Subnautica(BaseGame):
     @property
     def frameworks(self) -> "dict[str, tuple[str, ...]]":
         # Windows builds proxy-load via winhttp.dll; native Linux builds ship
-        # run_bepinex.sh instead - either one means BepInEx is present.
-        return {"BepInEx": ("winhttp.dll", "run_bepinex.sh")}
+        # a game-launch script instead - any one means BepInEx is present.
+        return {"BepInEx": (
+            "winhttp.dll", "run_bepinex.sh", "start_game_bepinex.sh",
+        )}
 
     @property
     def custom_routing_rules(self) -> list:
@@ -145,7 +353,8 @@ class Subnautica(BaseGame):
             ], flatten=True, loose_only=True),
             CustomRule(dest="", folders=[
                 "qmods",
-                "doorstop_libs"
+                "doorstop_libs",
+                "dotnet",
             ], flatten=True, loose_only=True),
         ]
     
@@ -199,6 +408,12 @@ class Subnautica(BaseGame):
     # Deployment
     # -----------------------------------------------------------------------
 
+    def _vfs_per_mod_subdirs(self, profile_dir: Path, staging: Path,
+                             log_fn=None) -> dict[str, str]:
+        entries = read_modlist(profile_dir / "modlist.txt")
+        return _thunderstore_plugin_subdirs(
+            staging, entries, log_fn=log_fn)
+
     def deploy(self, log_fn=None, mode: LinkMode = LinkMode.HARDLINK,
                profile: str = "default", progress_fn=None) -> None:
         """Deploy staged mods into BepInEx/Plugins/.
@@ -219,12 +434,21 @@ class Subnautica(BaseGame):
         staging     = self.get_effective_mod_staging_path()
         core        = self.mods_dir + "_Core"
 
-        plugins_dir.mkdir(parents=True, exist_ok=True)
         if not filemap.is_file():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
             )
+        if self.vfs_launch_enabled:
+            return self._deploy_vfs(
+                profile=profile,
+                filemap=filemap,
+                staging=staging,
+                log_fn=_log,
+                progress_fn=progress_fn,
+            )
+
+        plugins_dir.mkdir(parents=True, exist_ok=True)
 
         _log(f"Step 1: Moving {plugins_dir.name}/ → {core}/ ...")
         move_to_core(plugins_dir, log_fn=_log)
@@ -232,11 +456,14 @@ class Subnautica(BaseGame):
 
         profile_dir = self.get_profile_root() / "profiles" / profile
         per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
+        entries = read_modlist(profile_dir / "modlist.txt")
+        package_subdirs = _thunderstore_plugin_subdirs(
+            staging, entries, log_fn=_log)
 
         # Separator overrides - loaded from the real profile_dir and passed
         # explicitly so shared-staging layouts get the right link modes.
         _sep_deploy = load_separator_deploy_paths(profile_dir)
-        _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
+        _sep_entries = entries if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
@@ -267,7 +494,8 @@ class Subnautica(BaseGame):
                                             log_fn=_log,
                                             progress_fn=progress_fn,
                                             exclude=custom_exclude or None,
-                                            core_dir=plugins_dir.parent / (plugins_dir.name + "_Core"))
+                                            core_dir=plugins_dir.parent / (plugins_dir.name + "_Core"),
+                                            per_mod_subdirs=package_subdirs)
         _log(f"  Transferred {linked_mod} mod file(s).")
 
         _log(f"Step 3: Filling gaps with vanilla files from {core}/ ...")
@@ -307,6 +535,17 @@ class Subnautica(BaseGame):
                 rules=custom_rules,
                 log_fn=_log,
             )
+
+        # Restore must follow what is actually deployed, not the current
+        # setting: a stale/hand-edited setting must not strand the private view
+        # or any physical external separator targets.
+        from Utils.vfs import cleanup_deployment, has_deployment_state
+        if has_deployment_state(self):
+            cleanup_deployment(self, preserve_upper=True, log_fn=_log)
+            if not core_dir.is_dir():
+                _log("Restore complete.")
+                return
+            _log("Restore: a physical deployment also remains; restoring it now ...")
 
         if core_dir.is_dir():
             _log(f"Restore: clearing {plugins_dir.name}/ and moving {core}/ back ...")
@@ -424,6 +663,12 @@ class Lethal_Company(Subnautica):
 
 class Valheim(Subnautica):
     @property
+    def vfs_native_launcher_names(self) -> tuple[str, ...]:
+        # The Thunderstore Valheim pack supplies this wrapper and documents it
+        # as `./start_game_bepinex.sh %command%`.
+        return ("start_game_bepinex.sh", "run_bepinex.sh")
+
+    @property
     def name(self) -> str:
         return "Valheim"
 
@@ -466,6 +711,20 @@ class Valheim(Subnautica):
 
         """Run after all deployment steps, including Root_Folder moves."""
         _log = log_fn or (lambda _: None)
+        if self.vfs_launch_enabled and self._vfs_native_game_exe() is not None:
+            _log(
+                "VFS launch: Amethyst automatically wraps Valheim with "
+                "start_game_bepinex.sh. Launch through Amethyst or the "
+                "launcher-specific VFS command."
+            )
+            return
+        if self.vfs_launch_enabled:
+            _log(
+                "VFS launch: launch Valheim through Amethyst or the "
+                "launcher-specific VFS command so the private game view is "
+                "active."
+            )
+            return
         game_path = self.get_game_path()
         root_folder = self.get_effective_root_folder_path()
         candidates = []
@@ -662,3 +921,28 @@ class DysonSphereProgram(Subnautica):
     @property
     def thunderstore_community(self) -> str:
         return "dyson-sphere-program"
+
+class SupermarketSimulator(Subnautica):
+    @property
+    def name(self) -> str:
+        return "Supermarket Simulator"
+
+    @property
+    def game_id(self) -> str:
+        return "Supermarket_Simulator"
+
+    @property
+    def exe_name(self) -> str:
+        return "Supermarket Simulator.exe"
+
+    @property
+    def steam_id(self) -> str:
+        return "2670630"
+
+    @property
+    def nexus_game_domain(self) -> str:
+        return "supermarketsimulator"
+
+    @property
+    def thunderstore_community(self) -> str:
+        return ""

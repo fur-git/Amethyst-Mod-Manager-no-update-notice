@@ -1,6 +1,7 @@
 subdir('games')
 
 py.install_sources(
+  'AmethystBanner.png',
   'archive-conflict-loser.png',
   'archive-conflict-mixed.png',
   'archive-conflict-redundant.png',
@@ -24,12 +25,15 @@ py.install_sources(
   'eye1_white.png',
   'eye2_black.png',
   'eye2_white.png',
+  'faugus.png',
+  'heroic.png',
   'info.png',
   'install.png',
   'left.png',
   'lock.png',
   'Logo.png',
   'Loot_info.png',
+  'lutris.png',
   'minus.png',
   'nexus.png',
   'note.png',
@@ -44,6 +48,7 @@ py.install_sources(
   'root.png',
   'search.png',
   'settings.png',
+  'steam.png',
   'tag.png',
   'tick.png',
   'title-bar.png',

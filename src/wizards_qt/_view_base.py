@@ -32,7 +32,8 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
+from gui_qt.theme_qt import (active_palette, _c, button_qss, ok_text, err_text,
+                             warn_text)
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 # theme, which is fine for wizards (created after the theme is applied).
 GREEN = ok_text()
 RED = err_text()
+AMBER = warn_text()
 
 
 def parse_nexus_mod_url(url: str) -> "tuple[str, int] | None":
@@ -613,6 +615,7 @@ class WizardViewBase(QWidget):
     def _enter_proton(self, exe, exe_name: str, display_name: str, on_chosen,
                       *, allow_game_prefix: bool = True,
                       isolated_prefix_dir_fn=None,
+                      default_prefix_mode: str | None = None,
                       title: str | None = None,
                       missing_text: str = ""):
         """(Re)build the Proton step on entry - the exe may only exist after
@@ -641,6 +644,7 @@ class WizardViewBase(QWidget):
             log_fn=self._log,
             allow_game_prefix=allow_game_prefix,
             isolated_prefix_dir_fn=isolated_prefix_dir_fn,
+            default_prefix_mode=default_prefix_mode,
             title=title,
         ))
 

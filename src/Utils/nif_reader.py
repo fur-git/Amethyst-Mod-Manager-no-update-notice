@@ -83,8 +83,17 @@ _BSTRISHAPE_TYPES = {
     "BSTriShape", "BSDynamicTriShape", "BSSubIndexTriShape", "BSMeshLODTriShape",
 }
 
+# These all inherit NiTriShape/NiTriBasedGeom and keep that base layout at the
+# start of their block. Their LOD/segment payload follows the base fields, so a
+# preview can decode the shared geometry without needing the derived metadata.
+_NITRISHAPE_TYPES = {
+    "NiTriShape", "NiTriStrips", "BSLODTriShape", "BSSegmentedTriShape",
+}
+
 _SKIN_INSTANCE_TYPES = {
     "NiSkinInstance", "BSDismemberSkinInstance", "BSSkinInstance",
+    # Fallout 4/76 use the namespaced spelling in the NIF block table.
+    "BSSkin::Instance",
 }
 
 _SHADER_TYPES = {
@@ -211,6 +220,10 @@ class NifShape:
     vertices: list[tuple[float, float, float]] = field(default_factory=list)
     normals: list[tuple[float, float, float]] = field(default_factory=list)
     tangents: list[tuple[float, float, float]] = field(default_factory=list)
+    # Sign of the stored bitangent relative to cross(normal, tangent). Skyrim
+    # uses both signs for mirrored UV islands; dropping it makes a normal map
+    # light those islands in opposite directions.
+    bitangent_signs: list[float] = field(default_factory=list)
     uvs: list[tuple[float, float]] = field(default_factory=list)
     # RGBA 0-1. Only modulates the diffuse when `vertex_colors` is set, which
     # is the engine's rule (SLSF2_Vertex_Colors); meshes routinely carry a
@@ -226,6 +239,9 @@ class NifShape:
     scale: float = 1.0
     textures: list[str] = field(default_factory=list)
     shader_type: str = ""
+    # Numeric Skyrim subtype from BSLightingShaderProperty. The block type
+    # alone cannot distinguish ordinary fabric from runtime-tinted skin.
+    lighting_shader_type: int = 0
     # Material file named by the shader; overrides `textures` when set.
     material: str = ""
     # Starfield external geometry path (under geometries/, no suffix).
@@ -238,15 +254,44 @@ class NifShape:
     # Non-zero only for environment-mapped shaders (type 1): the cubemap in
     # texture slot 4 is added at this strength, masked by slot 5.
     env_map_scale: float = 0.0
+    # Bethesda shader-wide UV transform and sampler addressing. TexClampMode:
+    # 0 clamp/clamp, 1 clamp/wrap, 2 wrap/clamp, 3 wrap/wrap.
+    uv_offset: tuple[float, float] = (0.0, 0.0)
+    uv_scale: tuple[float, float] = (1.0, 1.0)
+    texture_clamp_mode: int = 3
+    double_sided: bool = False
+    depth_test: bool = True
+    depth_write: bool = True
     # Community Shaders TruePBR (PGPatcher output). The classic specular and
     # texture-slot meanings do NOT apply to these.
     pbr: bool = False
     # Runtime colour multiply, filled in by callers (see Utils/facegen_tint).
     tint: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # FO4 hair CLFM value: row in texture slot 3's colour-remapping LUT.
+    palette_index: float | None = None
+    # SLSF1_Greyscale_To_PaletteColor. Kept separately from the numeric
+    # lighting subtype because ordinary FO4 hair meshes use several subtypes.
+    greyscale_to_palette: bool = False
+    # SLSF1_Model_Space_Normals.  The texture suffix is not authoritative:
+    # Fallout 4 FaceGen calls its per-NPC tangent-space map ``_msn`` too.
+    model_space_normals: bool = False
+    # Runtime texture multiplied over the diffuse, filled in by callers: the
+    # per-NPC FaceGen tint map carrying makeup, brows and skin tone.
+    tint_overlay: str = ""
+    # Skinning, for posing against a skeleton (see Utils.nif_skin). Bone names
+    # and their skin->bone bind transforms, plus per-vertex (indices, weights)
+    # when the shape is deformed by more than one bone; rigid shapes (every
+    # FaceGen head part) carry no weights and ride their single bone.
+    bones: list[str] = field(default_factory=list)
+    binds: list[tuple] = field(default_factory=list)
+    skin_weights: list = field(default_factory=list)
     # NiAlphaProperty: cut-out fur/hair/foliage need the test, glass the blend.
     alpha_test: bool = False
     alpha_blend: bool = False
     alpha_threshold: int = 128
+    # NiAVObject bit 0, inherited from parent nodes. Hidden editor/helper
+    # geometry should remain parsed but must not be sent to the renderer.
+    hidden: bool = False
 
     @property
     def diffuse(self) -> str:
@@ -389,10 +434,7 @@ def _read_avobject(c: _Cur, h: NifHeader) -> dict:
     c.refs()                                       # extra data list
     c.i32()                                        # controller
     # Flags widened to 32 bits in Fallout 3 and later.
-    if h.bs_version > 26:
-        c.u32()
-    else:
-        c.u16()
+    flags = c.u32() if h.bs_version > 26 else c.u16()
     translation = c.vec3()
     rotation = c.mat33()
     scale = c.f32()
@@ -403,8 +445,21 @@ def _read_avobject(c: _Cur, h: NifHeader) -> dict:
         "translation": translation,
         "rotation": rotation,
         "scale": scale,
+        "flags": flags,
         "properties": properties,
     }
+
+
+def _hidden_in_graph(index: int, local: dict[int, dict],
+                     parent: dict[int, int]) -> bool:
+    """Whether *index* or one of its NiAVObject ancestors is app-culled."""
+    seen: set[int] = set()
+    while index in local and index not in seen:
+        seen.add(index)
+        if local[index].get("flags", 0) & 1:
+            return True
+        index = parent.get(index, -1)
+    return False
 
 
 def _decode_bstrishape(c: _Cur, h: NifHeader, av: dict, shape: NifShape,
@@ -477,6 +532,26 @@ def _decode_vertex_buffer(vbuf: bytes, desc: int, count: int, bpv: int,
     if flags & VF_TANGENT:
         # Needed to apply tangent-space normal maps.
         shape.tangents = _signed_bytes(vbuf, off_tan, bpv, count)
+        # BSVertexData stores a packed bitangent alongside the normal and
+        # tangent. Its full vector is redundant once the handedness is known,
+        # so retain one float per vertex rather than widening the model by a
+        # further vec3. ``off_uv`` is also the size of the position/extra-data
+        # section; bitangent X is its last value.
+        main_size = off_uv
+        off_bx = ((main_size - 4) if main_size > 16
+                  else (12 if fullprec else 6))
+        bx_fmt = "<f" if fullprec or main_size > 16 else "<e"
+        if (flags & VF_NORMAL and main_size > 0
+                and off_bx + struct.calcsize(bx_fmt) <= bpv
+                and off_norm + 4 <= bpv and off_tan + 4 <= bpv):
+            bx = (v[0] for v in _strided(vbuf, off_bx, bpv, count, bx_fmt))
+            end = bpv * count
+            lut = _SNORM_LUT.__getitem__
+            bitangents = zip(bx,
+                             map(lut, vbuf[off_norm + 3:end:bpv]),
+                             map(lut, vbuf[off_tan + 3:end:bpv]))
+            shape.bitangent_signs = _bitangent_signs(
+                shape.normals, shape.tangents, bitangents)
     if flags & VF_COLORS:
         # One RGBA byte quad per vertex, unlike NiTriShapeData's floats.
         end = off_col + bpv * count
@@ -485,6 +560,36 @@ def _decode_vertex_buffer(vbuf: bytes, desc: int, count: int, bpv: int,
                                 map(lut, vbuf[off_col + 1:end:bpv]),
                                 map(lut, vbuf[off_col + 2:end:bpv]),
                                 map(lut, vbuf[off_col + 3:end:bpv])))
+    if flags & VF_SKINNED:
+        shape.skin_weights = _inline_skin_weights(
+            vbuf, desc, count, bpv) or []
+
+
+def _inline_skin_weights(vbuf: bytes, desc: int, count: int,
+                         stride: int):
+    """Four half-float weights + four bone indices in a BS vertex buffer.
+
+    SSE stores this buffer on ``NiSkinPartition`` while FO4 stores it directly
+    on the ``BSSubIndexTriShape``.  Decoding at the shared vertex-buffer layer
+    supports both layouts and, importantly, retains the weights before the
+    FO4 ``BSSkin::Instance`` is followed later in the parse.
+    """
+    if not ((desc >> 44) & VF_SKINNED):
+        return None
+    offset = ((desc >> 28) & 0xF) * 4
+    if offset <= 0 or offset + 12 > stride:
+        return None
+    have = min(count, len(vbuf) // stride)
+    out = []
+    for i in range(have):
+        pos = i * stride + offset
+        try:
+            weights = struct.unpack_from("<4e", vbuf, pos)
+            indices = struct.unpack_from("<4B", vbuf, pos + 8)
+        except struct.error:
+            break
+        out.append((indices, weights))
+    return out or None
 
 
 _SNORM_LUT = tuple(b / 127.5 - 1.0 for b in range(256))
@@ -499,6 +604,23 @@ def _signed_bytes(vbuf: bytes, offset: int, stride: int, count: int) -> list:
     return list(zip(map(lut, vbuf[offset:end:stride]),
                     map(lut, vbuf[offset + 1:end:stride]),
                     map(lut, vbuf[offset + 2:end:stride])))
+
+
+def _bitangent_signs(normals, tangents, bitangents) -> list[float]:
+    """Reduce stored bitangents to tangent-basis handedness.
+
+    Bethesda calls the V direction ``tangent`` and the U direction
+    ``bitangent``. The renderer reconstructs the latter from N x T, retaining
+    this sign so mirrored UV islands keep the orientation authored in the NIF.
+    """
+    out = []
+    for n, t, b in zip(normals, tangents, bitangents):
+        cx = n[1] * t[2] - n[2] * t[1]
+        cy = n[2] * t[0] - n[0] * t[2]
+        cz = n[0] * t[1] - n[1] * t[0]
+        out.append(-1.0 if cx * b[0] + cy * b[1] + cz * b[2] < 0.0
+                   else 1.0)
+    return out
 
 
 def _decode_bsgeometry(c: _Cur, h: NifHeader, shape: NifShape) -> None:
@@ -584,7 +706,7 @@ def _strided(buf: bytes, offset: int, stride: int, count: int, fmt: str) -> list
 def _decode_geometry_data(c: _Cur, h: NifHeader, block_type: str) -> dict:
     """Decode NiTriShapeData / NiTriStripsData into vertices/normals/uvs/tris."""
     out: dict = {"vertices": [], "normals": [], "uvs": [], "triangles": [],
-                 "tangents": [], "colors": []}
+                 "tangents": [], "bitangent_signs": [], "colors": []}
 
     # Bethesda 20.2.0.7 files use BSGeometryDataFlags, where only bit 0 counts
     # UV sets; everyone else packs the count into the low 6 bits.
@@ -611,7 +733,10 @@ def _decode_geometry_data(c: _Cur, h: NifHeader, block_type: str) -> dict:
         if data_flags & 0x1000:
             raw = c.take(num_verts * 12)
             out["tangents"] = list(struct.iter_unpack("<3f", raw))
-            c.skip(num_verts * 12)                 # bitangents (derived instead)
+            raw = c.take(num_verts * 12)
+            bitangents = struct.iter_unpack("<3f", raw)
+            out["bitangent_signs"] = _bitangent_signs(
+                out["normals"], out["tangents"], bitangents)
 
     c.skip(16)                                     # bounding sphere
     has_colors = c.u8()
@@ -687,9 +812,18 @@ def _decode_alpha_property(c: _Cur, h: NifHeader) -> "tuple[bool, bool, int]":
     return bool(flags & 0x200), bool(flags & 0x1), c.u8()
 
 
+def _record_shader_render_state(state: dict | None,
+                                flags1: int, flags2: int) -> None:
+    if state is not None:
+        state.update(depth_test=bool(flags1 & 0x80000000),
+                     depth_write=bool(flags2 & 0x1),
+                     double_sided=bool(flags2 & 0x10))
+
+
 def _decode_shader(c: _Cur, h: NifHeader,
-                   block_type: str) -> "tuple[int, int, str, tuple | None]":
-    """Return ``(texture_set_ref, name_string_index, source_texture, spec)``.
+                   block_type: str, material_state: dict | None = None
+                   ) -> "tuple[int, int, str, tuple | None, int, int, int]":
+    """Return texture/name/source/spec/type plus both shader flag words.
 
     On Fallout 4 the name is the path to a .bgsm/.bgem material file, and THAT
     is where the real textures live - the block's own texture set is often
@@ -699,19 +833,29 @@ def _decode_shader(c: _Cur, h: NifHeader,
     *spec* is ``(enabled, color, strength, glossiness)`` from Skyrim/SSE
     BSLightingShaderProperty blocks, None elsewhere.
     """
+    if material_state is not None:
+        material_state.update(uv_offset=(0.0, 0.0), uv_scale=(1.0, 1.0),
+                              texture_clamp_mode=3)
     if block_type == "BSEffectShaderProperty":
         name_idx = c.u32() if h.version >= 0x14010003 else -1
         c.refs()                                   # extra data
         c.i32()                                    # controller
-        c.u32()                                    # shader flags 1
-        c.u32()                                    # shader flags 2
+        flags1 = c.u32()                           # shader flags 1
+        flags2 = c.u32()                           # shader flags 2
+        _record_shader_render_state(material_state, flags1, flags2)
         if h.bs_version >= 132:
             c.skip(4 * c.u32())                    # SF1 CRCs
             if h.bs_version >= 152:
                 c.skip(4 * c.u32())                # SF2 CRCs
-        c.skip(8)                                  # uv offset
-        c.skip(8)                                  # uv scale
-        return -1, name_idx, c.sized_str(), None   # source texture
+        uv_offset = (c.f32(), c.f32())
+        uv_scale = (c.f32(), c.f32())
+        source = c.sized_str()
+        clamp_mode = (c.u8() if h.bs_version <= 130 and c.p < len(c.d)
+                      else 3)
+        if material_state is not None:
+            material_state.update(uv_offset=uv_offset, uv_scale=uv_scale,
+                                  texture_clamp_mode=clamp_mode)
+        return -1, name_idx, source, None, 0, flags1, flags2
     if block_type == "BSLightingShaderProperty":
         shader_type = 0
         if 83 <= h.bs_version <= 130:
@@ -724,11 +868,14 @@ def _decode_shader(c: _Cur, h: NifHeader,
             c.i32()                                # controller
             flags1 = c.u32()                       # shader flags 1
             flags2 = c.u32()                       # shader flags 2
-            c.skip(8)                              # uv offset
-            c.skip(8)                              # uv scale
+            _record_shader_render_state(material_state, flags1, flags2)
+            uv_offset = (c.f32(), c.f32())
+            uv_scale = (c.f32(), c.f32())
+            if material_state is not None:
+                material_state.update(uv_offset=uv_offset, uv_scale=uv_scale)
             tref = c.i32()                         # texture set
         except (NifError, struct.error):
-            return -1, name_idx, "", None
+            return -1, name_idx, "", None, shader_type, 0, 0
         spec = None
         if h.bs_version <= 100:
             # Skyrim/SSE only: FO4 inserts a wet-material ref here and swaps
@@ -736,17 +883,25 @@ def _decode_shader(c: _Cur, h: NifHeader,
             try:
                 c.skip(12)                         # emissive color
                 c.f32()                            # emissive multiple
-                c.u32()                            # texture clamp mode
+                clamp_mode = c.u32()               # texture clamp mode
+                if material_state is not None:
+                    material_state["texture_clamp_mode"] = clamp_mode
                 c.f32()                            # alpha
                 c.f32()                            # refraction strength
                 gloss = c.f32()
                 color = (c.f32(), c.f32(), c.f32())
                 strength = c.f32()
+                # Soft-lighting and rim-light power are present for every
+                # Skyrim shader. Conditional data follows them: vanilla
+                # FaceGen stores its fallback skin/hair tint directly here.
+                c.f32()                            # lighting effect 1
+                c.f32()                            # lighting effect 2
                 env = 0.0
+                shader_tint = (1.0, 1.0, 1.0)
                 if shader_type == 1:               # environment map
-                    c.f32()                        # lighting effect 1
-                    c.f32()                        # lighting effect 2
                     env = c.f32()
+                elif shader_type in (5, 6):        # skin / hair tint
+                    shader_tint = c.vec3()
                 # Flags 2 bit 23 is nominally SLSF2_Unused01; Community
                 # Shaders' TruePBR claims it, and PGPatcher stamps it on
                 # every mesh it converts.
@@ -754,22 +909,25 @@ def _decode_shader(c: _Cur, h: NifHeader,
                 # Bit 0 of flags 1 is SLSF1_Specular, bit 5 of flags 2 is
                 # SLSF2_Vertex_Colors.
                 spec = (bool(flags1 & 1), color, strength, gloss, env, pbr,
-                        bool(flags2 & 0x20))
+                        bool(flags2 & 0x20), shader_tint)
             except (NifError, struct.error):
                 pass
-        return tref, name_idx, "", spec
+        return tref, name_idx, "", spec, shader_type, flags1, flags2
     if block_type == "BSShaderPPLightingProperty":
         c.u32()                                    # name
         c.refs()                                   # extra data
         c.i32()                                    # controller
         c.u16()                                    # NiShadeProperty flags
         c.u32()                                    # shader type
-        c.u32()                                    # shader flags 1
-        c.u32()                                    # shader flags 2
+        flags1 = c.u32()                           # shader flags 1
+        flags2 = c.u32()                           # shader flags 2
+        _record_shader_render_state(material_state, flags1, flags2)
         c.f32()                                    # env map scale
-        c.u32()                                    # texture clamp mode
-        return c.i32(), -1, "", None              # texture set
-    return -1, -1, "", None
+        clamp_mode = c.u32()                       # texture clamp mode
+        if material_state is not None:
+            material_state["texture_clamp_mode"] = clamp_mode
+        return c.i32(), -1, "", None, 0, flags1, flags2  # texture set
+    return -1, -1, "", None, 0, 0, 0
 
 
 # Block types the pre-20.2.0.5 walk keeps array contents for. Everything else
@@ -1005,6 +1163,9 @@ def read_nif(source: "str | Path | bytes", *,
     material_of_shader: dict[int, str] = {}
     source_of_shader: dict[int, str] = {}
     spec_of_shader: dict[int, tuple] = {}
+    lighting_type_of_shader: dict[int, int] = {}
+    flags_of_shader: dict[int, tuple[int, int]] = {}
+    material_state_of_shader: dict[int, dict] = {}
     shader_of_block: dict[int, int] = {}
     data_of_shape: dict[int, int] = {}
 
@@ -1046,13 +1207,19 @@ def read_nif(source: "str | Path | bytes", *,
                 _decode_bsgeometry(c, h, sh)
                 shader_of_block[i] = getattr(sh, "_shader_ref", -1)
                 shapes.append(sh)
-            elif bt in ("NiTriShape", "NiTriStrips"):
+            elif bt in _NITRISHAPE_TYPES:
                 c = _Cur(blob)
                 av = _read_avobject(c, h)
                 local[i] = av
                 sh = NifShape(name=av["name"], block_index=i, block_type=bt)
                 data_ref = c.i32()
-                c.i32()                            # skin instance
+                # Skyrim LE keeps geometry in NiTriShape, and its FaceGen
+                # heads are skinned exactly like the SSE BSTriShape ones.
+                # Dropping the reference here left every LE shape looking
+                # unskinned, so nothing could be posed: a Bijin head rendered
+                # with the hair already at neck height while the face, brows
+                # and eyes sat at the origin, a metre below it.
+                sh._skin_ref = c.i32()             # type: ignore[attr-defined]
                 if h.version >= 0x14020005:        # MaterialData
                     nm = c.u32()
                     c.skip(4 * nm)                 # material names
@@ -1078,7 +1245,13 @@ def read_nif(source: "str | Path | bytes", *,
             elif bt == "BSShaderTextureSet":
                 tex_of_shader[i] = _decode_texture_set(_Cur(blob))
             elif bt in _SHADER_TYPES:
-                ref, name_idx, src_tex, spec = _decode_shader(_Cur(blob), h, bt)
+                material_state: dict = {}
+                (ref, name_idx, src_tex, spec, lighting_type,
+                 flags1, flags2) = _decode_shader(
+                     _Cur(blob), h, bt, material_state)
+                lighting_type_of_shader[i] = lighting_type
+                flags_of_shader[i] = flags1, flags2
+                material_state_of_shader[i] = material_state
                 if src_tex:
                     source_of_shader[i] = src_tex
                 if spec is not None:
@@ -1112,6 +1285,7 @@ def read_nif(source: "str | Path | bytes", *,
             sh.vertices = got["vertices"]
             sh.normals = got["normals"]
             sh.tangents = got["tangents"]
+            sh.bitangent_signs = got["bitangent_signs"]
             sh.uvs = got["uvs"]
             sh.triangles = got["triangles"]
             sh.colors = got["colors"]
@@ -1124,7 +1298,12 @@ def read_nif(source: "str | Path | bytes", *,
             skin = getattr(sh, "_skin_ref", -1)
             if skin is None or skin < 0 or skin >= n:
                 continue
-            if h.type_of(skin) not in _SKIN_INSTANCE_TYPES:
+            skin_type = h.type_of(skin)
+            if skin_type not in _SKIN_INSTANCE_TYPES:
+                continue
+            # FO4 BSSkin geometry and its weights are inline on the shape;
+            # BSSkin::Instance points at bone transforms, not a partition.
+            if skin_type == "BSSkin::Instance":
                 continue
             try:
                 sc = _Cur(data[offs[skin]:offs[skin] + h.block_sizes[skin]])
@@ -1163,11 +1342,25 @@ def read_nif(source: "str | Path | bytes", *,
         if sref is None or sref < 0 or sref >= n:
             continue
         sh.shader_type = h.type_of(sref)
+        sh.lighting_shader_type = lighting_type_of_shader.get(sref, 0)
+        flags1, flags2 = flags_of_shader.get(sref, (0, 0))
+        # FO4's eye AO/wet/iris layers put their opacity in vertex colour.
+        # Ignoring this flag makes the solid-grey wet map cover the eyeballs.
+        sh.vertex_colors = bool(sh.colors) and bool(flags2 & 0x20)
+        sh.greyscale_to_palette = bool(flags1 & 0x10)
+        sh.model_space_normals = bool(flags1 & 0x1000)
         sh.material = material_of_shader.get(sref, "")
+        material_state = material_state_of_shader.get(sref, {})
+        sh.uv_offset = material_state.get("uv_offset", (0.0, 0.0))
+        sh.uv_scale = material_state.get("uv_scale", (1.0, 1.0))
+        sh.texture_clamp_mode = material_state.get("texture_clamp_mode", 3)
+        sh.depth_test = material_state.get("depth_test", True)
+        sh.depth_write = material_state.get("depth_write", True)
+        sh.double_sided = material_state.get("double_sided", False)
         if sref in spec_of_shader:
             (sh.spec_enabled, sh.spec_color, sh.spec_strength,
              sh.glossiness, sh.env_map_scale, sh.pbr,
-             sh.vertex_colors) = spec_of_shader[sref]
+             sh.vertex_colors, sh.tint) = spec_of_shader[sref]
         tref = shader_of_block.get(-1000 - sref, -1)
         if tref >= 0:
             sh.textures = tex_of_shader.get(tref, [])
@@ -1178,12 +1371,362 @@ def read_nif(source: "str | Path | bytes", *,
                 sh.textures = [src]
 
     # Compose world transforms down the node graph.
+    #
+    # A SKINNED shape is the exception: its vertices are already in skeleton
+    # space, so its node transform has been baked in and applying it again
+    # displaces the shape. FaceGen heads are the visible case - the head node
+    # sits at the skeleton's neck height (z~120) while the brows, eyes, mouth
+    # and hair sit at zero, so the head alone flies off up the screen.
     for sh in shapes:
+        sh.hidden = _hidden_in_graph(sh.block_index, local, parent)
+        if _is_skinned(sh, h, n):
+            if want_geometry:
+                # Kept for Utils.nif_skin, which can pose the shape against a
+                # real skeleton; without one the bind below is the best there
+                # is, and it is what a head-only preview uses.
+                got = _read_skin(data, offs, h, n, sh)
+                if got is not None:
+                    sh.bones, binds, weights = got
+                    sh.binds = [(t, r, s) for t, r, s, _v in binds]
+                    sh.skin_weights = weights or []
+            bind = _skin_bind(data, offs, h, n, sh)
+            if bind is not None:
+                sh.translation, sh.rotation, sh.scale = _invert_bind(bind)
+            else:
+                sh.translation, sh.rotation, sh.scale = (
+                    (0.0, 0.0, 0.0), (1, 0, 0, 0, 1, 0, 0, 0, 1), 1.0)
+            continue
         t, r, s = _world_transform(sh.block_index, local, parent)
         sh.translation, sh.rotation, sh.scale = t, r, s
 
     model.shapes = shapes
     return model
+
+
+def _is_skinned(shape, h: "NifHeader", n: int) -> bool:
+    """Whether a shape's vertices are already in skeleton space.
+
+    Keyed on a REAL skin instance block, not merely a stored reference: a
+    stale or out-of-range index must not strand an ordinary shape at the
+    origin.
+    """
+    skin = getattr(shape, "_skin_ref", -1)
+    if skin is None or not 0 <= skin < n:
+        return False
+    return h.type_of(skin) in _SKIN_INSTANCE_TYPES
+
+
+def _skin_bone_names(data: bytes, offs, h: "NifHeader", n: int, skin: int,
+                     num_bones: int) -> list[str]:
+    """The node names a skin instance's bone list points at, in bone order."""
+    out: list[str] = []
+    # NiSkinInstance begins with data, partition, skeleton and count; FO4's
+    # BSSkin::Instance begins with skeleton, bone data and count.
+    refs_at = 12 if h.type_of(skin) == "BSSkin::Instance" else 16
+    for i in range(num_bones):
+        try:
+            ref = struct.unpack_from(
+                "<i", data, offs[skin] + refs_at + i * 4)[0]
+        except struct.error:
+            break
+        name = ""
+        if 0 <= ref < n:
+            try:
+                name = h.string(struct.unpack_from("<i", data, offs[ref])[0])
+            except struct.error:
+                name = ""
+        out.append(name)
+    return out
+
+
+def _le_vertex_weights(data: bytes, offs, h: "NifHeader", part: int,
+                       count: int):
+    """Per-vertex ``(bone indices, weights)`` from a pre-SSE skin partition.
+
+    Skyrim LE keeps skinning in the partition's PARALLEL ARRAYS rather than
+    SSE's interleaved vertex buffer, and its bone indices are LOCAL to each
+    partition - they index that partition's own bone list, which in turn
+    indexes the skin instance's. Without this an LE hand mesh reports 36 bones
+    and no weights, so it is placed rigidly on ONE of them and the fingers
+    collapse into a flat paddle.
+    """
+    base = offs[part]
+    end = base + h.block_sizes[part]
+    cur = _Cur(data[base:end])
+    try:
+        num_partitions = cur.u32()
+        out: list = [None] * count
+        for _ in range(num_partitions):
+            num_verts = cur.u16()
+            num_tris = cur.u16()
+            num_bones = cur.u16()
+            num_strips = cur.u16()
+            num_weights = cur.u16()
+            bones = struct.unpack_from(f"<{num_bones}H", cur.d,
+                                       cur._adv(2 * num_bones))
+            has_map = cur.u8() if h.version >= 0x0A010000 else 1
+            vmap = (struct.unpack_from(f"<{num_verts}H", cur.d,
+                                       cur._adv(2 * num_verts))
+                    if has_map else range(num_verts))
+            has_weights = cur.u8() if h.version >= 0x0A010000 else 1
+            weights = (struct.unpack_from(
+                f"<{num_verts * num_weights}f", cur.d,
+                cur._adv(4 * num_verts * num_weights))
+                if has_weights else ())
+            if num_strips:
+                lengths = struct.unpack_from(f"<{num_strips}H", cur.d,
+                                             cur._adv(2 * num_strips))
+            else:
+                lengths = ()
+            has_faces = cur.u8() if h.version >= 0x0A010000 else 1
+            if has_faces and num_strips:
+                for length in lengths:
+                    cur.skip(length * 2)
+            elif has_faces and num_tris:
+                cur.skip(num_tris * 6)
+            has_indices = cur.u8()
+            local = (struct.unpack_from(f"<{num_verts * num_weights}B", cur.d,
+                                        cur._adv(num_verts * num_weights))
+                     if has_indices else ())
+            if h.bs_version > 34:
+                cur.u8()                           # LOD level
+                cur.u8()                           # global VB
+            if not (has_weights and has_indices):
+                continue
+            for i in range(num_verts):
+                vert = vmap[i] if has_map else i
+                if not 0 <= vert < count:
+                    continue
+                lo = i * num_weights
+                idx = tuple(bones[b] if b < num_bones else 0
+                            for b in local[lo:lo + num_weights])
+                out[vert] = (idx, weights[lo:lo + num_weights])
+        if not any(out):
+            return None
+        blank = ((0,) * 4, (0.0,) * 4)
+        return [v if v is not None else blank for v in out]
+    except (NifError, struct.error, IndexError):
+        return None
+
+
+def _skin_vertex_weights(data: bytes, offs, h: "NifHeader", n: int, part: int,
+                         count: int):
+    """Per-vertex ``(bone indices, weights)`` from an SSE skin partition.
+
+    Skyrim SE packs skinning into the partition's interleaved vertex buffer
+    rather than the old parallel arrays. Returns None when the buffer carries
+    no skinning data - a rigidly attached shape (every FaceGen head part) has
+    one bone and no per-vertex weights at all, and reading the descriptor's
+    zero offset would decode POSITIONS as weights.
+    """
+    if not 0 <= part < n or h.type_of(part) != "NiSkinPartition":
+        return None
+    if h.bs_version != 100:
+        # Only SSE puts an interleaved vertex buffer at the head of the
+        # partition; earlier games go straight into the per-partition arrays,
+        # so the data_size/vertex_size read below would be garbage.
+        return _le_vertex_weights(data, offs, h, part, count)
+    base = offs[part]
+    try:
+        data_size, vertex_size = struct.unpack_from("<II", data, base + 4)
+        desc = struct.unpack_from("<Q", data, base + 12)[0]
+    except struct.error:
+        return None
+    if not data_size or not vertex_size:
+        return None
+    if not (desc >> 44) & VF_SKINNED:
+        return None
+    off_skin = ((desc >> 28) & 0xF) * 4
+    if off_skin <= 0 or off_skin + 12 > vertex_size:
+        return None
+    vbuf_at = base + 20
+    have = min(count, data_size // vertex_size)
+    out = []
+    for i in range(have):
+        p = vbuf_at + i * vertex_size + off_skin
+        try:
+            w = struct.unpack_from("<4e", data, p)
+            idx = struct.unpack_from("<4B", data, p + 8)
+        except struct.error:
+            break
+        out.append((idx, w))
+    return out or None
+
+
+def _read_skin(data: bytes, offs, h: "NifHeader", n: int, shape):
+    """Bone names, bind transforms and per-vertex weights for a skinned shape.
+
+    Returns ``(names, binds, weights|None)``; *weights* is None for a rigidly
+    attached shape, which is placed by its single bone instead.
+    """
+    skin = getattr(shape, "_skin_ref", -1)
+    if skin is None or not 0 <= skin < n:
+        return None
+    if h.type_of(skin) == "BSSkin::Instance":
+        return _read_bs_skin(data, offs, h, n, shape, skin)
+    try:
+        sd, part = struct.unpack_from("<ii", data, offs[skin])
+        num_bones = struct.unpack_from("<I", data, offs[skin] + 12)[0]
+    except struct.error:
+        return None
+    if not 0 <= sd < n or h.type_of(sd) != "NiSkinData":
+        return None
+    if num_bones <= 0 or num_bones > 4096:
+        return None
+    binds = _skin_binds(data, offs, h, sd)
+    if not binds:
+        return None
+    names = _skin_bone_names(data, offs, h, n, skin, num_bones)
+    weights = None
+    if num_bones > 1:
+        weights = _skin_vertex_weights(data, offs, h, n, part,
+                                       len(shape.vertices))
+    return names, binds, weights
+
+
+def _read_bs_skin(data: bytes, offs, h: "NifHeader", n: int, shape,
+                  skin: int):
+    """FO4/76 names, bind transforms and inline vertex weights.
+
+    ``BSSkin::Instance`` has no NiSkinPartition. Its second reference points
+    at ``BSSkin::BoneData`` (one 68-byte transform per bone), while weights
+    are already part of the shape's BS vertex buffer.
+    """
+    base = offs[skin]
+    try:
+        bone_data = struct.unpack_from("<i", data, base + 4)[0]
+        num_bones = struct.unpack_from("<I", data, base + 8)[0]
+    except struct.error:
+        return None
+    if (num_bones <= 0 or num_bones > 4096
+            or not 0 <= bone_data < n
+            or h.type_of(bone_data) != "BSSkin::BoneData"):
+        return None
+    binds = _bs_skin_binds(data, offs, h, bone_data, num_bones)
+    if not binds:
+        return None
+    names = _skin_bone_names(data, offs, h, n, skin, num_bones)
+    weights = getattr(shape, "skin_weights", None) or None
+    influence = [0.0] * len(binds)
+    for indices, amounts in weights or ():
+        for index, amount in zip(indices, amounts):
+            if 0 <= index < len(influence) and amount > 0.0:
+                influence[index] += float(amount)
+    counted = [(tr, rot, scale, influence[i])
+               for i, (tr, rot, scale, _unused) in enumerate(binds)]
+    return names, counted, weights
+
+
+def _bs_skin_binds(data: bytes, offs, h: "NifHeader", bone_data: int,
+                   expected: int):
+    """BSSkin::BoneData transforms as legacy-compatible four-tuples."""
+    base = offs[bone_data]
+    end = base + h.block_sizes[bone_data]
+    try:
+        count = struct.unpack_from("<I", data, base)[0]
+    except struct.error:
+        return []
+    count = min(count, expected)
+    if count <= 0 or count > 4096 or base + 4 + count * 68 > end:
+        return []
+    out = []
+    for i in range(count):
+        pos = base + 4 + i * 68
+        try:
+            rotation = struct.unpack_from("<9f", data, pos + 16)
+            translation = struct.unpack_from("<3f", data, pos + 52)
+            scale = struct.unpack_from("<f", data, pos + 64)[0]
+        except struct.error:
+            return []
+        out.append((translation, rotation, scale or 1.0, 0.0))
+    return out
+
+
+def _skin_binds(data: bytes, offs, h: "NifHeader", sd: int):
+    """Every bone's skin->bone bind transform, in bone order.
+
+    The count comes from the NiSkinData being walked, not the skin instance:
+    the two agree in practice, but a mismatch would desynchronise this walk
+    from the variable-length per-bone records.
+    """
+    base = offs[sd]
+    end = base + h.block_sizes[sd]
+    try:
+        num_bones = struct.unpack_from("<I", data, base + 52)[0]
+        has_weights = struct.unpack_from("<B", data, base + 56)[0]
+    except struct.error:
+        return []
+    if num_bones <= 0 or num_bones > 4096:
+        return []
+    pos = base + 57
+    out = []
+    for _ in range(num_bones):
+        if pos + 70 > end:
+            break
+        try:
+            rot = struct.unpack_from("<9f", data, pos)
+            tr = struct.unpack_from("<3f", data, pos + 36)
+            scale = struct.unpack_from("<f", data, pos + 48)[0]
+            verts = struct.unpack_from("<H", data, pos + 68)[0]
+        except struct.error:
+            break
+        out.append((tr, rot, scale or 1.0, verts))
+        pos += 70 + (verts * 6 if has_weights else 0)
+    return out
+
+
+def _skin_bind(data: bytes, offs, h: "NifHeader", n: int, shape):
+    """The dominant bone's bind transform, as (rotation, T, scale).
+
+    Used when no skeleton is available: a skinned shape's vertices sit in ITS
+    BONE's space, and a FaceGen head mixes two - the mod's own parts bound to
+    the head bone (T z=-120.34) while untouched vanilla parts like the mouth
+    and brows are bound at the origin, so the raw vertices scatter the face
+    over 120 units. Applying the bind puts every part in one shared frame.
+
+    The bone holding the most vertices wins - correct whenever a shape is
+    rigidly attached, which is the case for every part of a face.
+    """
+    skin = getattr(shape, "_skin_ref", -1)
+    if skin is None or not 0 <= skin < n:
+        return None
+    if h.type_of(skin) == "BSSkin::Instance":
+        got = _read_bs_skin(data, offs, h, n, shape, skin)
+        if got is None:
+            return None
+        _names, binds, _weights = got
+        best = max(binds, key=lambda bind: bind[3], default=None)
+        if best is None:
+            return None
+        tr, rot, scale, _influence = best
+        return rot, tr, scale
+    try:
+        sd = struct.unpack_from("<i", data, offs[skin])[0]
+        num_bones = struct.unpack_from("<I", data, offs[skin] + 12)[0]
+    except struct.error:
+        return None
+    if not 0 <= sd < n or h.type_of(sd) != "NiSkinData":
+        return None
+    if num_bones <= 0 or num_bones > 4096:
+        return None
+    best = None
+    best_verts = -1
+    for tr, rot, scale, verts in _skin_binds(data, offs, h, sd):
+        if verts > best_verts:
+            best_verts, best = verts, (rot, tr, scale)
+    return best
+
+
+def _invert_bind(bind):
+    """A bind transform as the (translation, rotation, scale) to place by.
+
+    NiSkinData stores the SKIN->BONE transform, so it applies directly:
+    a part bound at the origin (an untouched vanilla mouth) stays put, while
+    one bound to the head bone is carried up to the head. Inverting it instead
+    moves the head parts a second time, to double the neck height.
+    """
+    rot, tr, scale = bind
+    return tuple(tr), tuple(rot), (scale or 1.0)
 
 
 def _mat_mul(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, ...]:

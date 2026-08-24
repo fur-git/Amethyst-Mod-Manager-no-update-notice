@@ -166,7 +166,7 @@ class PGPatcherView(WizardViewBase):
         proton_name, prefix_mode = self._proton_name, self._prefix_mode
 
         def worker():
-            from Utils.exe_launch import resolve_tool_prefix
+            from Utils.exe_launch import PREFIX_MODE_GAME, resolve_tool_prefix
             from Utils.protontricks import (
                 D3D_DEP_KEY, dotnet_dep_key, install_d3dcompiler_47,
                 is_dep_installed,
@@ -178,10 +178,16 @@ class PGPatcherView(WizardViewBase):
                 result = resolve_tool_prefix(
                     exe, game, proton_name, prefix_mode, log_fn=_wlog)
                 if result is None:
-                    safe_emit(self._d3d_status_sig,
-                              self.tr("Could not find Proton '{0}' - check "
-                              "that it is installed in Steam, then reopen this "
-                              "wizard.").format(proton_name), RED)
+                    if prefix_mode == PREFIX_MODE_GAME:
+                        safe_emit(self._d3d_status_sig,
+                            self.tr("Could not resolve the Proton version for "
+                            "the game's own prefix - launch the game once, or "
+                            "pick a different prefix option."), RED)
+                    else:
+                        safe_emit(self._d3d_status_sig,
+                            self.tr("Could not find Proton '{0}' - check that "
+                            "it is installed in Steam, Heroic or ProtonPlus, "
+                            "then reopen this wizard.").format(proton_name), RED)
                     safe_emit(self._deps_done_sig, False)
                     return
                 self._prefix_env = result
@@ -351,8 +357,8 @@ class PGPatcherView(WizardViewBase):
         def worker():
             from Utils.bethesda_registry import maybe_register_for_game
             from Utils.exe_launch import (
-                link_plugins_txt, resolve_tool_prefix, run_tool_logged,
-                shutdown_prefix_wineserver,
+                PREFIX_MODE_GAME, link_plugins_txt, resolve_tool_prefix,
+                run_tool_logged, shutdown_prefix_wineserver,
             )
             _wlog = lambda m: self._log(f"PGPatcher Wizard: {m}")
             proton_script = compat_data = None
@@ -360,10 +366,16 @@ class PGPatcherView(WizardViewBase):
                 result = prefix_env or resolve_tool_prefix(
                     exe, game, proton_name, prefix_mode, log_fn=_wlog)
                 if result is None:
-                    safe_emit(self._run_status_sig,
-                              self.tr("Could not find Proton '{0}' - "
-                              "check that it is installed in Steam.").format(
-                                  proton_name), RED)
+                    if prefix_mode == PREFIX_MODE_GAME:
+                        safe_emit(self._run_status_sig,
+                            self.tr("Could not resolve the Proton version for the "
+                            "game's own prefix - launch the game once, or pick a "
+                            "different prefix option."), RED)
+                    else:
+                        safe_emit(self._run_status_sig,
+                            self.tr("Could not find Proton '{0}' - check that it "
+                            "is installed in Steam, Heroic or ProtonPlus.").format(
+                                proton_name), RED)
                     return
                 proton_script, compat_data, env = result
 
@@ -404,7 +416,8 @@ class PGPatcherView(WizardViewBase):
                           "click Done."), GREEN)
                 safe_emit(self._run_started_sig)
                 run_tool_logged(proton_script, exe, env, log_fn=_wlog,
-                                extra_args=extra_args, label="PGPatcher")
+                                extra_args=extra_args, label="PGPatcher",
+                                game=game)
                 _wlog("PGPatcher closed.")
                 safe_emit(self._run_status_sig, self.tr("PGPatcher finished."), GREEN)
                 safe_emit(self._run_finished_sig)

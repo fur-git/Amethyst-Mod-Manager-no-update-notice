@@ -48,21 +48,40 @@ Restore:
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from Games.base_game import BaseGame
-from Utils.deploy import LinkMode, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, expand_separator_link_modes, _resolve_nocase, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
-from Utils.deploy_custom_rules import deploy_custom_rules, restore_custom_rules, compute_prefix_handled, canonicalize_declared_folders
+from Utils.vfs import ProfileVFSGameMixin
+from Utils.deploy import (
+    LinkMode, RestoreIncompleteError, load_per_mod_strip_prefixes,
+    load_separator_deploy_paths,
+    expand_separator_deploy_paths, expand_separator_raw_deploy,
+    expand_separator_link_modes, _resolve_nocase, _resolve_root_path,
+    _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME,
+)
+from Utils.deploy_custom_rules import (
+    deploy_custom_rules, restore_custom_rules, compute_prefix_handled,
+    canonicalize_declared_folders,
+)
 from Utils.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
+from Utils.atomic_write import write_atomic_text
 
 _PROFILES_DIR = get_profiles_dir()
 
 # Manifest written next to filemap.txt so restore knows exactly what to remove
 _DEPLOYED_MANIFEST = "ue5_deployed.txt"
+
+# VFS keeps deliberate physical separator targets separate from the normal
+# UE5 manifest. A private-layer build must never leave synthetic relative
+# entries where physical restore could interpret them against the real game.
+_VFS_EXTERNAL_DEPLOYED_MANIFEST = "ue5_vfs_external_deployed.txt"
+_VFS_PREFIX_CONTEXT = "ue5_vfs_prefix_context.json"
+_VFS_CUSTOM_BACKUP_TEMP_DIR = "ue5_custom_vanilla_backup.build"
 
 # Vanilla files displaced by mod files are backed up here (inside the game root)
 _VANILLA_BACKUP_DIR = "Amethyst_vanilla_files"
@@ -179,10 +198,16 @@ def _declared_folders(rule: UE5Rule) -> tuple[str, ...]:
 # Base class
 # ---------------------------------------------------------------------------
 
-class UE5Game(BaseGame):
+class UE5Game(ProfileVFSGameMixin, BaseGame):
     """Abstract base for Unreal Engine 5 games with multi-target mod routing."""
 
     _PREFIX_SKIP_DEST = "__prefix_skip__"
+    vfs_root_payload_targets_data = True
+
+    profile_overridable_settings = (
+        *BaseGame.profile_overridable_settings,
+        *ProfileVFSGameMixin.vfs_profile_setting_keys,
+    )
 
     def __init__(self) -> None:
         self._game_path: Path | None = None
@@ -466,6 +491,157 @@ class UE5Game(BaseGame):
 
     def get_mod_data_path(self) -> Path | None:
         return self._game_path
+
+    def get_vfs_game_root(self) -> Path | None:
+        """Full install root, including sibling Engine/ and bootstraps."""
+        if self._game_path is None:
+            return None
+        configured = Path(self._game_path)
+        exe_rel = Path(self.exe_name.replace("\\", "/"))
+        # Configure historically pre-populated nested UE project roots. Walk a
+        # few parents to recover the outer install when exe_name includes the
+        # project prefix (MarvelGame/Marvel, OblivionRemastered, etc.).
+        candidates = [configured, *list(configured.parents)[:3]]
+        for candidate in candidates:
+            hit = _resolve_nocase(candidate, exe_rel.as_posix())
+            if hit is not None and hit.is_file():
+                return candidate
+        return configured
+
+    def get_vfs_data_root(self) -> Path | None:
+        """Nested UE project root used by all UE5 routing destinations."""
+        return self.get_game_path()
+
+    def vfs_relative_path(self, relative: str | Path) -> Path:
+        """Translate project-relative framework paths to the outer install."""
+        rel = Path(str(relative).replace("\\", "/"))
+        if rel.is_absolute() or ".." in rel.parts:
+            raise RuntimeError(
+                f"UE5 VFS paths must be relative to the install: {relative}"
+            )
+        mount_root = self.get_vfs_game_root()
+        project_root = self.get_vfs_data_root()
+        if mount_root is None or project_root is None:
+            return rel
+        mount_root = Path(mount_root)
+        project_root = Path(project_root)
+        try:
+            project_rel = project_root.resolve().relative_to(mount_root.resolve())
+        except (OSError, ValueError):
+            return rel
+        rel_folded = tuple(part.casefold() for part in rel.parts)
+        project_folded = tuple(part.casefold() for part in project_rel.parts)
+        # Prefer an existing outer-root path and preserve its actual on-disk
+        # casing. This covers top-level bootstraps and definitions whose
+        # project prefix casing differs from the Linux install.
+        outer_hit = _resolve_nocase(mount_root, rel.as_posix())
+        if outer_hit is not None and outer_hit.is_file():
+            return outer_hit.relative_to(mount_root)
+
+        def _project_mapped(project_relative: Path) -> Path:
+            # The loader itself can be mod-only, but its parent folders often
+            # already exist in the vanilla project with unexpected casing.
+            # Mirror the materializer's case-insensitive parent resolution so
+            # virtual_file probes the exact path that was published.
+            resolved = _resolve_root_path(project_root, project_relative)
+            try:
+                inner = resolved.relative_to(project_root)
+            except ValueError:
+                inner = project_relative
+            return project_rel / inner
+
+        if project_folded and rel_folded[:len(project_folded)] == project_folded:
+            return _project_mapped(
+                Path(*rel.parts[len(project_rel.parts):]))
+        # Bootstrap executables and definitions already rooted at the outer
+        # install win when present there. Mod-provided loaders/framework files
+        # otherwise use the project-relative convention of UE5 handlers.
+        return _project_mapped(rel)
+
+    def _ue5_active_deploy_root(self) -> Path | None:
+        target = getattr(self, "_vfs_ue5_target_root", None)
+        return Path(target) if target is not None else self.get_game_path()
+
+    def _ue5_deployed_manifest_path(self) -> Path:
+        target = getattr(self, "_vfs_ue5_manifest_path", None)
+        if target is not None:
+            return Path(target)
+        return self.get_profile_root() / _DEPLOYED_MANIFEST
+
+    def _ue5_runtime_snapshot_path(self) -> Path:
+        target = getattr(self, "_vfs_ue5_snapshot_path", None)
+        if target is not None:
+            return Path(target)
+        return self.get_profile_root() / _FILEMAP_SNAPSHOT_NAME
+
+    def _vfs_external_manifest_path(self, profile: str | None = None) -> Path:
+        from Utils.vfs import state_dir
+        return state_dir(self, profile) / _VFS_EXTERNAL_DEPLOYED_MANIFEST
+
+    def _vfs_prefix_context_path(self, profile: str | None = None) -> Path:
+        from Utils.vfs import state_dir
+        return state_dir(self, profile) / _VFS_PREFIX_CONTEXT
+
+    def _write_vfs_prefix_context(
+        self, filemap: Path, profile: str | None = None,
+    ) -> None:
+        context_path = self._vfs_prefix_context_path(profile)
+        prefix_root = self.get_prefix_path()
+        if not self._prefix_routing_rules() or prefix_root is None:
+            context_path.unlink(missing_ok=True)
+            return
+        context_path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic_text(
+            context_path,
+            json.dumps({
+                "filemap": str(Path(filemap)),
+                "prefix_root": str(Path(prefix_root)),
+            }, indent=2, sort_keys=True) + "\n",
+        )
+
+    def _restore_vfs_prefix_targets(
+        self, log_fn, profile: str | None = None,
+    ) -> None:
+        """Restore prefix routes using the paths captured at VFS deploy."""
+        context_path = self._vfs_prefix_context_path(profile)
+        filemap = self.get_effective_filemap_path()
+        prefix_root = self.get_prefix_path()
+        if context_path.is_file():
+            try:
+                payload = json.loads(context_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    saved_filemap = payload.get("filemap")
+                    saved_prefix = payload.get("prefix_root")
+                    if saved_filemap:
+                        filemap = Path(saved_filemap)
+                    if saved_prefix:
+                        prefix_root = Path(saved_prefix)
+            except (OSError, ValueError):
+                pass
+
+        metadata = Path(filemap).parent
+        artifacts = (
+            metadata / "custom_rules_deployed.txt",
+            metadata / "custom_rules_prefix_backup",
+        )
+        if artifacts[0].is_file():
+            restore_custom_rules(
+                Path(filemap),
+                Path(self.get_vfs_game_root() or self._game_path),
+                rules=[],
+                log_fn=log_fn,
+                prefix_root=Path(prefix_root) if prefix_root is not None else None,
+            )
+        elif artifacts[1].is_dir() and prefix_root is not None:
+            # Interrupted placement can move an original into the backup
+            # before the deployed-path log is published.
+            from Utils.deploy_shared import _restore_backup_dir
+            _restore_backup_dir(artifacts[1], Path(prefix_root), log_fn)
+        if any(path.exists() for path in artifacts):
+            raise RestoreIncompleteError(
+                "Could not fully restore UE5 VFS files routed into the game prefix."
+            )
+        context_path.unlink(missing_ok=True)
 
     def get_mod_staging_path(self) -> Path:
         if self._staging_path is not None:
@@ -905,7 +1081,70 @@ class UE5Game(BaseGame):
                         (sr, mn, self._PREFIX_SKIP_DEST, sr.replace("\\", "/"))
                     )
 
-        return self._apply_companion_routing(entries, per_entry)
+        per_entry = self._apply_companion_routing(entries, per_entry)
+        return self._canonicalize_routed_dir_casing(per_entry)
+
+    def _canonicalize_routed_dir_casing(
+        self, resolved: list[tuple[str, str, str, str]],
+    ) -> list[tuple[str, str, str, str]]:
+        """Unify folder casing after every UE5 route has been resolved.
+
+        The filemap's normal casing pass runs in *staged* coordinates. Two
+        paths can therefore be unrelated there but converge after a custom
+        rule strips their different wrappers. For example::
+
+            PalSchema/mods/A/file.lua
+            wrapper/PalSchema/Mods/B/file.lua
+
+        A flattening ``PalSchema`` rule puts both below the same deployed
+        ``PalSchema`` directory. On a case-sensitive host that used to create
+        sibling ``mods`` and ``Mods`` directories even though the Data tab's
+        final-coordinate casing pass displayed only one of them.
+
+        Canonicalize the complete ``dest/final`` paths here, after sibling,
+        companion, and LogicMods routing. Every consumer of this resolver
+        (deployment, conflict keys, and the Data tab) then sees the same final
+        layout. Prefix-routed entries are excluded because their sentinel path
+        is consumed by ``deploy_custom_rules`` in a separate namespace.
+        """
+        if not resolved or not getattr(self, "normalize_folder_case", True):
+            return resolved
+        try:
+            from Utils.ui_config import load_normalize_folder_case
+            if not load_normalize_folder_case():
+                return resolved
+            from Utils.filemap import canonicalize_dir_casing
+        except Exception:
+            return resolved
+
+        joined: list[str] = []
+        eligible: list[tuple[int, int]] = []
+        for idx, (_staged, _mod, dest, final) in enumerate(resolved):
+            if dest == self._PREFIX_SKIP_DEST:
+                continue
+            dest_norm = dest.replace("\\", "/").strip("/")
+            final_norm = final.replace("\\", "/").lstrip("/")
+            full = f"{dest_norm}/{final_norm}" if dest_norm else final_norm
+            joined.append(full)
+            eligible.append((idx, len(dest_norm.split("/")) if dest_norm else 0))
+        if not joined:
+            return resolved
+
+        mapping = canonicalize_dir_casing(
+            joined,
+            getattr(self, "filemap_casing", "upper") or "upper",
+            getattr(self, "filemap_casing_pins", None),
+        )
+        for (idx, dest_parts), full in zip(eligible, joined):
+            canonical = mapping.get(full, full)
+            if canonical == full:
+                continue
+            parts = canonical.split("/")
+            dest = "/".join(parts[:dest_parts]) if dest_parts else ""
+            final = "/".join(parts[dest_parts:])
+            staged, mod, _old_dest, _old_final = resolved[idx]
+            resolved[idx] = (staged, mod, dest, final)
+        return resolved
 
     def _logicmods_staging_root(self, core_entries) -> "Path | None":
         """Staging root the entries in *core_entries* actually live under.
@@ -1263,13 +1502,15 @@ class UE5Game(BaseGame):
         dest_rel = self._resolve_ue4ss_mods_dest()
         if dest_rel is None:
             return
-        if self._game_path is None:
-            return
-        game_path = self.get_game_path()
+        game_path = self._ue5_active_deploy_root()
         if game_path is None:
             return
 
-        mods_file = game_path / dest_rel / "mods.txt"
+        # Match every existing directory segment case-insensitively. A
+        # custom route may spell this destination ``mods`` while UE4SS or a
+        # framework already created ``Mods`` on the case-sensitive host.
+        mods_file = _resolve_root_path(
+            game_path, Path(dest_rel) / "mods.txt")
 
         existing_lines: list[str] = []
         if mods_file.is_file():
@@ -1419,12 +1660,11 @@ class UE5Game(BaseGame):
 
         # Filter against the live game tree: folder must have Scripts/main.lua
         # and must NOT have enabled.txt.
-        if self._game_path is None:
-            return candidate_folders
-        game_path = self.get_game_path()
+        game_path = self._ue5_active_deploy_root()
         if game_path is None:
             return candidate_folders
-        mods_root = game_path / dest_rel
+        mods_root = _resolve_root_path(
+            game_path, Path(dest_rel) / "mods.txt").parent
 
         kept: set[str] = set()
         for folder in candidate_folders:
@@ -1459,7 +1699,7 @@ class UE5Game(BaseGame):
         if self._game_path is None:
             raise RuntimeError("Game path is not configured.")
 
-        game_path = self.get_game_path()
+        game_path = self._ue5_active_deploy_root()
         if game_path is None:
             raise RuntimeError("Game path is not configured.")
 
@@ -1468,6 +1708,16 @@ class UE5Game(BaseGame):
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
+            )
+
+        if (self.vfs_launch_enabled
+                and not getattr(self, "_vfs_ue5_populating", False)):
+            return self._deploy_vfs(
+                profile=profile,
+                filemap=filemap,
+                staging=self.get_effective_mod_staging_path(),
+                log_fn=_log,
+                progress_fn=progress_fn,
             )
 
         staging = self.get_effective_mod_staging_path()
@@ -1479,17 +1729,62 @@ class UE5Game(BaseGame):
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries)
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries)
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
+        prefix_per_mod_modes = per_mod_modes
+        vfs_external_mods: set[str] = set()
+
+        if getattr(self, "_vfs_ue5_populating", False):
+            source_game = Path(getattr(self, "_vfs_ue5_source_game_root"))
+            source_data = Path(getattr(self, "_vfs_ue5_source_data_root"))
+            target_root = Path(getattr(self, "_vfs_ue5_outer_layer"))
+            mapped: dict[str, Path] = {}
+            external_mods: set[str] = set()
+            for mod_name, raw_target in per_mod_deploy.items():
+                target = Path(raw_target).expanduser()
+                if not target.is_absolute():
+                    target = source_data / target
+                try:
+                    rel = target.resolve().relative_to(source_data.resolve())
+                    mapped[mod_name] = game_path / rel
+                    continue
+                except (OSError, ValueError):
+                    pass
+                try:
+                    rel = target.resolve().relative_to(source_game.resolve())
+                    mapped[mod_name] = target_root / rel
+                except (OSError, ValueError):
+                    mapped[mod_name] = target
+                    external_mods.add(mod_name)
+                    vfs_external_mods.add(mod_name)
+            per_mod_deploy = mapped
+            mapped_modes = dict(per_mod_modes or {})
+            external_default = getattr(
+                self, "_vfs_ue5_external_deploy_mode", LinkMode.HARDLINK)
+            for mod_name in mapped:
+                if mod_name in external_mods:
+                    mapped_modes.setdefault(mod_name, external_default)
+                else:
+                    # Internal synthetic layers must never contain links back
+                    # to staging, regardless of a separator override.
+                    mapped_modes[mod_name] = LinkMode.HARDLINK
+            per_mod_modes = mapped_modes or None
 
         prefix_rules = self._prefix_routing_rules()
         if prefix_rules:
             _log("Routing prefix-bound files via custom rules ...")
             deploy_custom_rules(
-                filemap, self._game_path, staging,
+                filemap, game_path, staging,
                 rules=prefix_rules,
-                mode=mode,
+                mode=(getattr(
+                    self, "_vfs_ue5_external_deploy_mode", mode)
+                    if getattr(self, "_vfs_ue5_populating", False)
+                    else mode),
                 strip_prefixes=self.mod_folder_strip_prefixes,
                 per_mod_strip_prefixes=per_mod_strip,
-                per_mod_link_modes=per_mod_modes,
+                per_mod_link_modes=(
+                    prefix_per_mod_modes
+                    if getattr(self, "_vfs_ue5_populating", False)
+                    else per_mod_modes
+                ),
                 raw_mods=per_mod_raw or None,
                 log_fn=_log,
                 prefix_root=self.get_prefix_path(),
@@ -1503,8 +1798,16 @@ class UE5Game(BaseGame):
             overwrite_dir, self.mod_folder_strip_prefixes)
 
         manifest: list[str] = []
-        vanilla_backup_dir = (self._game_path or game_path) / _VANILLA_BACKUP_DIR
-        custom_vanilla_backup_dir = self.get_profile_root() / _CUSTOM_VANILLA_BACKUP_DIR
+        vanilla_backup_dir = (
+            game_path / _VANILLA_BACKUP_DIR
+            if getattr(self, "_vfs_ue5_populating", False)
+            else (self._game_path or game_path) / _VANILLA_BACKUP_DIR
+        )
+        custom_vanilla_backup_dir = Path(getattr(
+            self,
+            "_vfs_ue5_custom_backup_dir",
+            self.get_profile_root() / _CUSTOM_VANILLA_BACKUP_DIR,
+        ))
         linked = 0
         skipped = 0
         backed_up = 0
@@ -1537,6 +1840,7 @@ class UE5Game(BaseGame):
             )
         }
         resolved_by_dest: dict[str, tuple[int, str, str, str, Path, Path, bool, str]] = {}
+        dest_case_cache: dict = {}
         prefix_skip_dest = getattr(self, "_PREFIX_SKIP_DEST", None)
         for staged_rel, mod_name in parsed:
             base_dir = per_mod_deploy.get(mod_name, game_path)
@@ -1544,17 +1848,31 @@ class UE5Game(BaseGame):
             if mod_name in per_mod_raw:
                 final_rel = staged_rel.replace("\\", "/")
                 dest_rel = ""
-                dest_dir = base_dir
-                dest_file = dest_dir / final_rel
             else:
                 dest_rel, final_rel = rule_resolved[(staged_rel, mod_name)]
                 # Files routed into the Proton/Wine prefix are placed by
                 # deploy_custom_rules before this loop runs; skip them here.
                 if prefix_skip_dest is not None and dest_rel == prefix_skip_dest:
                     continue
-                dest_dir = (base_dir / dest_rel) if dest_rel else base_dir
-                dest_file = dest_dir / final_rel
-            key = str(dest_file)
+            effective_rel = (Path(dest_rel) / final_rel
+                             if dest_rel else Path(final_rel))
+            # Resolve against folders already present in the target. This is
+            # the final guard against creating ``mods`` beside an existing
+            # ``Mods`` directory on Linux. The post-route canonicalization
+            # above handles case variants created within this deploy batch;
+            # this resolver handles directories that predate the deploy.
+            dest_file = _resolve_root_path(
+                base_dir, effective_rel, dest_case_cache)
+            if getattr(self, "_vfs_ue5_populating", False):
+                try:
+                    dest_file.resolve().relative_to(base_dir.resolve())
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "UE5 VFS routing destination escapes its selected "
+                        f"deployment root: {effective_rel}"
+                    ) from exc
+            dest_dir = dest_file.parent
+            key = str(dest_file).casefold()
             # Overwrite-folder files layer user/runtime edits on top of every
             # mod, so they must win destination collisions - without this the
             # sentinel name (absent from modlist.txt) would rank LAST.
@@ -1571,12 +1889,17 @@ class UE5Game(BaseGame):
         deploy_order = list(resolved_by_dest.values())
         total = len(deploy_order)
 
-        # The managed UE4SS mods.txt path - we own this file entirely; skip
-        # any mod-shipped copy from being placed at this exact location.
+        # A VFS build seeds the physical UE4SS mods.txt into the private layer
+        # before entering this loop, then regenerates it after placement. Skip
+        # a mod-shipped copy only in that private build. Physical deployment
+        # must keep its established backup/restore path for this file.
         ue4ss_dest_rel = self._resolve_ue4ss_mods_dest()
         managed_mods_txt: Path | None = (
-            game_path / ue4ss_dest_rel / "mods.txt"
-            if ue4ss_dest_rel is not None else None
+            _resolve_root_path(
+                game_path, Path(ue4ss_dest_rel) / "mods.txt", dest_case_cache)
+            if (ue4ss_dest_rel is not None
+                and getattr(self, "_vfs_ue5_populating", False))
+            else None
         )
 
         for i, (_rank, staged_rel, mod_name, final_rel,
@@ -1606,8 +1929,14 @@ class UE5Game(BaseGame):
                     progress_fn(i + 1, total)
                 continue
 
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
             try:
+                if (dest_file.exists() and not dest_file.is_file()
+                        and not dest_file.is_symlink()):
+                    raise OSError(
+                        "deployment destination exists but is not a regular "
+                        "file or symlink"
+                    )
+
                 # Back up any real vanilla file before overwriting it.
                 # Symlinks are our own previous deploys - don't back those up.
                 if dest_file.is_file() and not dest_file.is_symlink():
@@ -1620,14 +1949,53 @@ class UE5Game(BaseGame):
                         backup_target = vanilla_backup_dir / game_rel
                     if not backup_target.exists():
                         backup_target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(dest_file, backup_target)
+                        if (getattr(self, "_vfs_ue5_populating", False)
+                                and mod_name in vfs_external_mods):
+                            # Never expose a partially copied backup to crash
+                            # recovery. The temporary mirror is disposable
+                            # while os.replace publishes the completed copy
+                            # atomically on the same profile filesystem.
+                            backup_temp_root = Path(getattr(
+                                self, "_vfs_ue5_custom_backup_temp_dir"))
+                            backup_temp = backup_temp_root / rel_abs
+                            backup_temp.parent.mkdir(
+                                parents=True, exist_ok=True)
+                            shutil.copy2(dest_file, backup_temp)
+                            os.replace(backup_temp, backup_target)
+                        else:
+                            shutil.copy2(dest_file, backup_target)
                         backed_up += 1
 
+                # External separator targets are the only deliberate physical
+                # writes made by a UE5 VFS build. Journal each one after any
+                # original has been safely copied, but before unlinking or
+                # placing the mod file. This makes an interrupted deploy
+                # rollback-safe even when the final UE5 manifest was never
+                # written (for example if a progress callback raises).
+                if (getattr(self, "_vfs_ue5_populating", False)
+                        and mod_name in vfs_external_mods):
+                    journal_path = Path(getattr(
+                        self, "_vfs_ue5_external_journal_path"))
+                    destination_line = str(dest_file)
+                    journaled = getattr(
+                        self, "_vfs_ue5_external_journal_entries")
+                    if destination_line not in journaled:
+                        # JSON-lines lets restore ignore an incomplete final
+                        # record after a process crash. Flush the record to
+                        # disk before changing the physical destination.
+                        with journal_path.open("a", encoding="utf-8") as stream:
+                            stream.write(json.dumps(destination_line) + "\n")
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        journaled.add(destination_line)
+
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
                 if dest_file.exists() or dest_file.is_symlink():
                     dest_file.unlink()
-                if mode == LinkMode.SYMLINK:
+                effective_mode = (per_mod_modes or {}).get(mod_name, mode)
+                if effective_mode == LinkMode.SYMLINK:
                     dest_file.symlink_to(src)
-                elif mode == LinkMode.COPY:
+                elif effective_mode == LinkMode.COPY:
                     shutil.copy2(src, dest_file)
                 else:
                     try:
@@ -1638,9 +2006,9 @@ class UE5Game(BaseGame):
                 if in_custom_dir:
                     manifest.append(str(dest_file))
                 else:
-                    manifest.append(
-                        ((dest_rel + "/" + final_rel) if dest_rel else final_rel)
-                    )
+                    # Record the resolved, actual on-disk casing. Restore must
+                    # address the path Linux created, not the route's spelling.
+                    manifest.append(dest_file.relative_to(game_path).as_posix())
                 linked += 1
             except OSError as exc:
                 _log(f"  ERROR placing {final_rel}: {exc}")
@@ -1650,7 +2018,8 @@ class UE5Game(BaseGame):
                 progress_fn(i + 1, total)
 
         # Write manifest so restore() knows exactly what to remove
-        manifest_path = self.get_profile_root() / _DEPLOYED_MANIFEST
+        manifest_path = self._ue5_deployed_manifest_path()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text("\n".join(manifest), encoding="utf-8")
 
         # Sync UE4SS mods.txt for games that need it (Palworld-style loaders
@@ -1678,14 +2047,190 @@ class UE5Game(BaseGame):
 
         # Snapshot the game root so restore() can identify runtime-generated files
         # (saves, shader cache, config files written by the game after launch).
-        snapshot_path = self.get_profile_root() / _FILEMAP_SNAPSHOT_NAME
-        try:
-            _write_deploy_snapshot(game_path, snapshot_path, log_fn=_log)
-        except Exception as exc:
-            _log(f"  WARN: could not write deploy snapshot: {exc}")
+        if not getattr(self, "_vfs_ue5_populating", False):
+            snapshot_path = self._ue5_runtime_snapshot_path()
+            try:
+                _write_deploy_snapshot(game_path, snapshot_path, log_fn=_log)
+            except Exception as exc:
+                _log(f"  WARN: could not write deploy snapshot: {exc}")
 
         backed_msg = f", {backed_up} vanilla file(s) backed up" if backed_up else ""
         _log(f"Deploy complete. {linked} file(s) placed{backed_msg}, {skipped} skipped.")
+
+    def _vfs_populate_data_layer(
+        self,
+        *,
+        destination: Path,
+        outer_layer: Path,
+        game_root: Path,
+        data_root: Path,
+        profile: str,
+        filemap: Path,
+        staging: Path,
+        external_deploy_mode: LinkMode,
+        log_fn,
+        progress_fn=None,
+    ) -> int:
+        """Populate a private UE project layer with the normal UE5 resolver."""
+        del staging  # Resolved through the handler's effective path.
+        destination = Path(destination)
+        outer_layer = Path(outer_layer)
+        temp_manifest = outer_layer.parent / "ue5-private-deployed.txt"
+        external_manifest = self._vfs_external_manifest_path(profile)
+
+        def _read_manifest(path: Path) -> list[str]:
+            try:
+                raw_lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return []
+            lines: list[str] = []
+            for raw_line in raw_lines:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith('"'):
+                    try:
+                        decoded = json.loads(line)
+                    except (TypeError, ValueError):
+                        # A torn append can only be the final record and was
+                        # flushed before no corresponding placement occurred.
+                        continue
+                    if not isinstance(decoded, str):
+                        continue
+                    line = decoded
+                lines.append(line)
+            return lines
+
+        def _inside_layer(path: Path) -> bool:
+            for parent in (destination, outer_layer):
+                try:
+                    path.relative_to(parent)
+                    return True
+                except ValueError:
+                    continue
+            return False
+
+        def _publish_external_entries(lines: list[str]) -> list[str]:
+            # Merge the completed inner manifest with destinations journaled
+            # incrementally by deploy(). The latter survives exceptions before
+            # ue5-private-deployed.txt can be published.
+            external = _read_manifest(external_manifest)
+            external.extend(
+                line for line in lines
+                if Path(line).is_absolute() and not _inside_layer(Path(line))
+            )
+            external = list(dict.fromkeys(external))
+            external_manifest.parent.mkdir(parents=True, exist_ok=True)
+            # Keep an empty marker too: it distinguishes an interrupted VFS
+            # build with possible prefix side effects from a physical deploy.
+            write_atomic_text(
+                external_manifest,
+                "".join(json.dumps(line) + "\n" for line in external),
+            )
+            return external
+
+        # Reverse deliberate physical side effects from the previous VFS view
+        # before resolving its replacement. The normal UE5 manifest is never
+        # involved, so a failed private build cannot endanger the real project.
+        if external_manifest.exists():
+            self._restore_vfs_external_targets(
+                log_fn, manifest_path=external_manifest)
+        if self._vfs_prefix_context_path(profile).exists():
+            self._restore_vfs_prefix_targets(log_fn, profile)
+        external_manifest.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic_text(external_manifest, "")
+        self._write_vfs_prefix_context(Path(filemap), profile)
+
+        # Seed a physical UE4SS mods.txt into the private project layer so its
+        # comments, manual states and built-ins survive regeneration without
+        # ever writing through a hardlink to the vanilla inode.
+        ue4ss_dest = self._resolve_ue4ss_mods_dest()
+        if ue4ss_dest is not None:
+            source_mods_txt = _resolve_root_path(
+                Path(data_root), Path(ue4ss_dest) / "mods.txt")
+            if source_mods_txt.is_file():
+                private_mods_txt = _resolve_root_path(
+                    destination, Path(ue4ss_dest) / "mods.txt")
+                private_mods_txt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_mods_txt, private_mods_txt)
+
+        self._vfs_ue5_populating = True
+        self._vfs_ue5_target_root = destination
+        self._vfs_ue5_outer_layer = outer_layer
+        self._vfs_ue5_source_game_root = Path(game_root)
+        self._vfs_ue5_source_data_root = Path(data_root)
+        self._vfs_ue5_manifest_path = temp_manifest
+        self._vfs_ue5_custom_backup_dir = (
+            external_manifest.parent / _CUSTOM_VANILLA_BACKUP_DIR)
+        self._vfs_ue5_custom_backup_temp_dir = (
+            external_manifest.parent / _VFS_CUSTOM_BACKUP_TEMP_DIR)
+        self._vfs_ue5_external_journal_path = external_manifest
+        self._vfs_ue5_external_journal_entries: set[str] = set()
+        self._vfs_ue5_external_deploy_mode = external_deploy_mode
+        try:
+            # Call the base implementation explicitly so a built-in subclass's
+            # physical post-deploy step cannot escape into the real install.
+            UE5Game.deploy(
+                self,
+                log_fn=log_fn,
+                mode=LinkMode.HARDLINK,
+                profile=profile,
+                progress_fn=progress_fn,
+            )
+            extra_layer_files = getattr(
+                self, "_vfs_populate_ue5_layer_files", None)
+            if callable(extra_layer_files):
+                extra_layer_files(destination, profile, log_fn)
+            manifest_lines = _read_manifest(temp_manifest)
+            _publish_external_entries(manifest_lines)
+        except BaseException:
+            # Record whatever the inner deploy managed to place before trying
+            # to reverse it. If cleanup itself fails, the marker and remaining
+            # backup are deliberately retained so Restore can retry safely.
+            _publish_external_entries(_read_manifest(temp_manifest))
+            try:
+                self._restore_vfs_external_targets(
+                    log_fn, manifest_path=external_manifest)
+            except Exception as cleanup_exc:
+                log_fn(
+                    "  WARN: failed to roll back external UE5 VFS targets: "
+                    f"{cleanup_exc}"
+                )
+            try:
+                self._restore_vfs_prefix_targets(log_fn, profile)
+            except Exception as cleanup_exc:
+                log_fn(
+                    "  WARN: failed to roll back prefix-routed UE5 VFS "
+                    f"targets: {cleanup_exc}"
+                )
+            raise
+        finally:
+            for name in (
+                "_vfs_ue5_populating",
+                "_vfs_ue5_target_root",
+                "_vfs_ue5_outer_layer",
+                "_vfs_ue5_source_game_root",
+                "_vfs_ue5_source_data_root",
+                "_vfs_ue5_manifest_path",
+                "_vfs_ue5_custom_backup_dir",
+                "_vfs_ue5_custom_backup_temp_dir",
+                "_vfs_ue5_external_journal_path",
+                "_vfs_ue5_external_journal_entries",
+                "_vfs_ue5_external_deploy_mode",
+            ):
+                try:
+                    delattr(self, name)
+                except AttributeError:
+                    pass
+            temp_manifest.unlink(missing_ok=True)
+            synthetic_backup = destination / _VANILLA_BACKUP_DIR
+            if synthetic_backup.is_dir():
+                shutil.rmtree(synthetic_backup, ignore_errors=True)
+            backup_temp = (
+                external_manifest.parent / _VFS_CUSTOM_BACKUP_TEMP_DIR)
+            if backup_temp.is_dir():
+                shutil.rmtree(backup_temp, ignore_errors=True)
+        return len(manifest_lines)
 
     def _find_staged_file(
         self,
@@ -1750,6 +2295,147 @@ class UE5Game(BaseGame):
     # Restore
     # -----------------------------------------------------------------------
 
+    def _restore_vfs_external_targets(
+        self, log_fn, *, manifest_path: Path | None = None,
+    ) -> tuple[int, int]:
+        """Undo UE5 separator writes that intentionally sit outside the view.
+
+        The manifest and backups remain retryable until every original has
+        been restored. Successfully completed entries are removed from a
+        partial manifest so a later retry cannot delete a restored vanilla
+        file.
+        """
+        manifest_path = Path(
+            manifest_path or self._vfs_external_manifest_path())
+        # A process can stop while copying an original, before the completed
+        # backup is atomically published. That temporary mirror is never a
+        # valid restore source: the physical original has not been changed yet.
+        backup_temp_dir = manifest_path.parent / _VFS_CUSTOM_BACKUP_TEMP_DIR
+        if backup_temp_dir.is_dir():
+            try:
+                shutil.rmtree(backup_temp_dir)
+            except OSError as exc:
+                log_fn(
+                    "  WARN: could not clear an incomplete external UE5 "
+                    f"backup: {exc}"
+                )
+        try:
+            raw_lines = manifest_path.read_text(
+                encoding="utf-8").splitlines()
+        except OSError:
+            raw_lines = []
+        decoded_lines: list[str] = []
+        for raw_line in raw_lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith('"'):
+                try:
+                    decoded = json.loads(line)
+                except (TypeError, ValueError):
+                    # Ignore a torn final append. Placement only starts after
+                    # the complete journal record has been flushed to disk.
+                    continue
+                if not isinstance(decoded, str):
+                    continue
+                line = decoded
+            if Path(line).is_absolute():
+                decoded_lines.append(line)
+        lines = list(dict.fromkeys(decoded_lines))
+        removed = 0
+        restored = 0
+        dirs_to_check: set[Path] = set()
+        unresolved: list[str] = []
+        backup_dir = manifest_path.parent / _CUSTOM_VANILLA_BACKUP_DIR
+        handled_backups: set[Path] = set()
+
+        for line in lines:
+            target = Path(line)
+            dirs_to_check.add(target.parent)
+            rel_abs = target.relative_to(target.anchor)
+            backup_file = backup_dir / rel_abs
+            if backup_file.is_file():
+                handled_backups.add(backup_file)
+            try:
+                if target.is_file() or target.is_symlink():
+                    target.unlink()
+                    removed += 1
+                elif target.exists():
+                    raise OSError("target is not a regular file")
+            except OSError as exc:
+                unresolved.append(line)
+                log_fn(f"  WARN: could not remove external target {line}: {exc}")
+                continue
+
+            if backup_file.is_file():
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(backup_file), target)
+                    restored += 1
+                except OSError as exc:
+                    unresolved.append(line)
+                    log_fn(
+                        f"  WARN: could not restore external vanilla "
+                        f"{target}: {exc}"
+                    )
+
+        # A process can stop after moving an original aside but before the
+        # deploy manifest is written. The empty VFS marker plus the mirrored
+        # backup still gives us enough information to restore that original.
+        if backup_dir.is_dir():
+            for backup_file in list(backup_dir.rglob("*")):
+                if not backup_file.is_file():
+                    continue
+                if backup_file in handled_backups:
+                    continue
+                rel = backup_file.relative_to(backup_dir)
+                destination = Path("/") / rel
+                try:
+                    if destination.is_file() or destination.is_symlink():
+                        destination.unlink()
+                        removed += 1
+                    elif destination.exists():
+                        raise OSError("target is not a regular file")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(backup_file), destination)
+                    restored += 1
+                except OSError as exc:
+                    log_fn(
+                        f"  WARN: could not restore external vanilla "
+                        f"{destination}: {exc}"
+                    )
+
+        backups_remain = bool(
+            backup_dir.is_dir()
+            and any(path.is_file() for path in backup_dir.rglob("*"))
+        )
+        if unresolved or backups_remain:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic_text(
+                manifest_path,
+                "".join(
+                    json.dumps(line) + "\n"
+                    for line in dict.fromkeys(unresolved)
+                ),
+            )
+            raise RestoreIncompleteError(
+                "Some external UE5 VFS files could not be restored; "
+                "bookkeeping was retained for another Restore attempt."
+            )
+
+        if backup_dir.is_dir():
+            shutil.rmtree(backup_dir)
+
+        for directory in sorted(
+                dirs_to_check, key=lambda path: len(path.parts), reverse=True):
+            try:
+                if directory.is_dir() and not any(directory.iterdir()):
+                    directory.rmdir()
+            except OSError:
+                pass
+        manifest_path.unlink(missing_ok=True)
+        return removed, restored
+
     def restore(self, log_fn=None, progress_fn=None) -> None:
         """Remove every file listed in ue5_deployed.txt, then delete empty dirs."""
         _log = log_fn or (lambda _: None)
@@ -1761,25 +2447,50 @@ class UE5Game(BaseGame):
         if game_path is None:
             raise RuntimeError("Game path is not configured.")
 
+        from Utils.vfs import cleanup_deployment, has_deployment_state
+        external_manifest = self._vfs_external_manifest_path()
+        prefix_context = self._vfs_prefix_context_path()
+        if (has_deployment_state(self)
+                or external_manifest.exists()
+                or prefix_context.exists()):
+            self._restore_vfs_prefix_targets(_log)
+            removed = restored = 0
+            if external_manifest.exists():
+                removed, restored = self._restore_vfs_external_targets(
+                    _log, manifest_path=external_manifest)
+            cleanup_deployment(self, preserve_upper=True, log_fn=_log)
+            detail = ""
+            if removed or restored:
+                detail = (
+                    f" ({removed} external file(s) removed, "
+                    f"{restored} original file(s) restored)"
+                )
+            if not self._ue5_deployed_manifest_path().is_file():
+                _log(f"Restore complete{detail}.")
+                return
+            _log(
+                f"VFS restore complete{detail}; a physical UE deployment "
+                "also remains and will be restored now."
+            )
+
         prefix_rules = self._prefix_routing_rules()
         if prefix_rules:
             filemap = self.get_effective_filemap_path()
-            if filemap.is_file():
-                _log("Restore: removing prefix-routed files ...")
-                restore_custom_rules(
-                    filemap, self._game_path,
-                    rules=prefix_rules, log_fn=_log,
-                    prefix_root=self.get_prefix_path(),
-                )
+            _log("Restore: removing prefix-routed files ...")
+            restore_custom_rules(
+                filemap, self._game_path,
+                rules=prefix_rules, log_fn=_log,
+                prefix_root=self.get_prefix_path(),
+            )
 
-        manifest_path = self.get_profile_root() / _DEPLOYED_MANIFEST
+        manifest_path = self._ue5_deployed_manifest_path()
         if not manifest_path.is_file():
             _log("Restore: no deployed manifest found - nothing to remove.")
             return
 
         # Move runtime-generated files (saves, shader cache, etc.) to overwrite/
         # before removing deployed files, using the snapshot taken at deploy time.
-        snapshot_path = self.get_profile_root() / _FILEMAP_SNAPSHOT_NAME
+        snapshot_path = self._ue5_runtime_snapshot_path()
         overwrite_dir = self.get_effective_overwrite_path()
         if snapshot_path.is_file():
             _log("  Scanning game root for runtime-generated files ...")
@@ -1825,7 +2536,8 @@ class UE5Game(BaseGame):
                 self._update_ue4ss_mods_txt(set(), log_fn=_log)
                 # Add the mods dir to the empty-dir sweep set so it can be
                 # cleaned up if mods.txt was removed and nothing else remains.
-                dirs_to_check.add(game_path / ue4ss_dest)
+                dirs_to_check.add(_resolve_root_path(
+                    game_path, Path(ue4ss_dest) / "mods.txt").parent)
             except Exception as exc:
                 _log(f"  WARN: could not clean UE4SS mods.txt: {exc}")
 

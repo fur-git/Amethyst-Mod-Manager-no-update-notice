@@ -2,8 +2,9 @@
 
 A dimmed borderless child overlay (NOT a top-level window - gaming-mode opens
 top-levels behind the app) with a centered card: title, a search box, a
-scrollable checklist of ``.exe`` files found in the profile's staging area, and
-Cancel / Add buttons. Checked exes are added to the play-bar exe dropdown.
+scrollable checklist of the launchable files found in the profile's staging
+area, and Cancel / Add buttons. Checked entries are added to the play-bar exe
+dropdown.
 
 Modeled on ``favourite_wizards_overlay.py``. Items are ``(label, Path)`` pairs.
 Add → ``on_done(list[Path])``; Cancel / Esc / backdrop click → ``on_done(None)``.
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.overlay_base import OverlayBase
-from gui_qt.theme_qt import active_palette, _c, qc, qc_contrast
+from gui_qt.theme_qt import active_palette, bind_theme, _c, qc, qc_contrast
 
 CHECK_BOX = 17        # same as the modlist checkbox
 
@@ -31,7 +32,12 @@ class _CheckDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        p = active_palette()
+        bind_theme(self, roles={
+            "TEXT_MAIN", "TEXT_ON_ACCENT", "CHECK_FILL", "BORDER_FAINT",
+            "BG_DEEP", "BG_SELECT", "BG_ROW_HOVER",
+        })
+
+    def refresh_theme(self, p):
         self.c_text = qc(p, "TEXT_MAIN")
         self.c_on_sel = qc(p, "TEXT_ON_ACCENT")
         self.c_tick = qc_contrast(p, "CHECK_FILL")   # tick reads on the checkbox fill
@@ -40,6 +46,9 @@ class _CheckDelegate(QStyledItemDelegate):
         self.c_check_off = qc(p, "BG_DEEP")
         self.c_sel = qc(p, "BG_SELECT")
         self.c_hover = qc(p, "BG_ROW_HOVER")
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "viewport"):
+            parent.viewport().update()
 
     def paint(self, p, opt, index):
         r = opt.rect

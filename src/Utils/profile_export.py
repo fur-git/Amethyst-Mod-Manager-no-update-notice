@@ -1071,6 +1071,13 @@ def decode_manifest(code: str) -> dict:
     text = "".join(code.split())   # strip all whitespace / newlines
     if text.startswith(CODE_PREFIX):
         text = text[len(CODE_PREFIX):]
+    # A pasted paste-service link is not a code - tell the user that rather than
+    # letting base64 fail with something meaningless. The caller (the import
+    # overlay) resolves links via fetch_code_url before ever getting here.
+    from Utils.paste_upload import is_url
+    if is_url(text):
+        raise ValueError("That looks like a link, not a code - it could not be "
+                         "downloaded.")
     try:
         packed = base64.urlsafe_b64decode(text.encode("ascii"))
         raw = zlib.decompress(packed)
@@ -1080,3 +1087,33 @@ def decode_manifest(code: str) -> dict:
     if not isinstance(manifest, dict) or not manifest.get("mods"):
         raise ValueError("Code does not contain a valid manifest.")
     return manifest
+
+
+
+# ---------------------------------------------------------------------------
+# Share code links - uploading a code to a paste service
+# ---------------------------------------------------------------------------
+#
+# A code for a large modlist runs to tens of kilobytes, which is awkward to send
+# over chat. Uploading it to a paste host turns it into a short URL the recipient
+# pastes into the same Import code box.
+#
+# The transport lives in Utils/paste_upload.py (the log panel uploads through it
+# too). These wrappers keep the code-flavoured names and defaults.
+
+from Utils.paste_upload import (            # noqa: E402  (kept beside its users)
+    PASTE_HOST, RETENTION_NOTE, is_url as is_code_url,
+)
+
+
+def upload_code(code: str, *, timeout: float = 30.0) -> str:
+    """Upload a share *code* and return its URL. Raises ``RuntimeError`` with a
+    user-facing message on failure - callers fall back to the raw code."""
+    from Utils.paste_upload import upload_text
+    return upload_text(code, timeout=timeout)
+
+
+def fetch_code_url(url: str, *, timeout: float = 20.0) -> str:
+    """Download a share code from *url*. Raises ``RuntimeError`` on failure."""
+    from Utils.paste_upload import fetch_text
+    return fetch_text(url, timeout=timeout)

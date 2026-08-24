@@ -13,29 +13,16 @@ from __future__ import annotations
 import threading
 
 from PySide6.QtCore import Qt, Signal, QT_TRANSLATE_NOOP
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
-from gui_qt.theme_qt import active_palette, _c, danger_close_button, button_qss, qc
+from gui_qt.theme_qt import (
+    active_palette, bind_theme, _c, danger_close_button, button_qss, qc,
+)
 from gui_qt.safe_emit import safe_emit
 from Utils.mod_files_versions import resolve_latest_name_match, fmt_size, sort_key
-
-# File-row highlight colours, resolved from the active theme so a monotone /
-# high-contrast theme actually takes effect (were hardcoded Tk hex before).
-def _hl_colors(p: dict | None = None) -> dict[str, QColor]:
-    p = p or active_palette()
-    return {
-        "installed_bg": qc(p, "BG_GREEN_DEEP"),
-        "installed_fg": qc(p, "TEXT_OK_BRIGHT"),
-        "match_bg":     qc(p, "BG_ORANGE_DEEP"),
-        "match_fg":     qc(p, "STATUS_QUEUED"),
-        "old_bg":       qc(p, "BG_RED_DEEP"),
-        "old_fg":       qc(p, "TEXT_ERR_BRIGHT"),
-    }
-
 
 # Translated at display time (setHorizontalHeaderLabels); register for lupdate.
 _COLS = [
@@ -45,6 +32,8 @@ _COLS = [
     QT_TRANSLATE_NOOP("ChangeVersionView", "Size"),
     "",
 ]
+
+_ROW_THEME_ROLE = Qt.UserRole + 41
 
 
 class _LegendBar(QWidget):
@@ -62,24 +51,25 @@ class _LegendBar(QWidget):
         self._grid.setContentsMargins(self._MARGIN, 4, self._MARGIN, 4)
         self._grid.setHorizontalSpacing(self._COL_GAP)
         self._grid.setVerticalSpacing(2)
-        hl = _hl_colors(p)
         legend_items = [
-            (hl["installed_fg"], "Currently installed"),
-            (hl["match_fg"], "Newest matching version"),
-            (hl["old_fg"], "Older matching version"),
+            ("TEXT_OK_BRIGHT", "Currently installed"),
+            ("STATUS_QUEUED", "Newest matching version"),
+            ("TEXT_ERR_BRIGHT", "Older matching version"),
             (None, "No name match"),
         ]
-        self._entries = [self._make_entry(p, c, lbl) for c, lbl in legend_items]
+        self._entries = [self._make_entry(p, key, lbl)
+                         for key, lbl in legend_items]
         self._cols = 0          # force first layout
         self._one_row_min = self._one_row_width()
         self._relayout(force=True)
 
-    def _make_entry(self, p, color, label) -> QWidget:
+    def _make_entry(self, p, color_key, label) -> QWidget:
         e = QWidget()
         h = QHBoxLayout(e); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
         sw = QLabel(); sw.setFixedSize(12, 12)
-        bg = color.name() if color is not None else _c(p, "BG_DEEP")
-        border = "" if color is not None else f" border:1px solid {_c(p,'TEXT_DIM')};"
+        bg = _c(p, color_key) if color_key else _c(p, "BG_DEEP")
+        border = ("" if color_key else
+                  f" border:1px solid {_c(p,'TEXT_DIM')};")
         sw.setStyleSheet(f"background:{bg}; border-radius:2px;{border}")
         h.addWidget(sw)
         lbl = QLabel(label); lbl.setStyleSheet(f"color:{_c(p,'TEXT_DIM')};")
@@ -134,7 +124,7 @@ class ChangeVersionView(QWidget):
     _premium_checked = Signal(object, object)
     # Browser-download watch progress (bytes; 64-bit: >2GB files).
     _watch_progress = Signal("qlonglong", "qlonglong")
-    # Premium API-download progress → shared popup card (key, name, done, total).
+    # Premium API-download progress → shared item (key, name, done, total).
     _api_progress = Signal(str, str, "qlonglong", "qlonglong")
 
     def __init__(self, api, game, mod_name, meta, install_fn,
@@ -147,11 +137,11 @@ class ChangeVersionView(QWidget):
         self._install_fn = install_fn or (lambda paths, metas=None: None)
         self._on_close = on_close or (lambda: None)
         self._log = log_fn or (lambda _m: None)
-        # progress_fn(key, name, downloaded, total) drives the shared "Nexus
-        # Download" popup card (same one the Nexus browser uses); total<0 marks
+        # progress_fn(key, name, downloaded, total) drives the shared download
+        # item in the notification menu; total<0 marks
         # this key finished. Defaults to a no-op if the host didn't supply one.
-        self._progress_fn = progress_fn or (lambda key, name, d, t: None)
-        self._dl_key = None    # popup card key while a manual watch is armed
+        self._progress_fn = progress_fn or (lambda *args: None)
+        self._dl_key = None    # progress-item key while a manual watch is armed
         self._installing = False
         self._files = None          # cached (sorted) file list for _meta.mod_id
         self._fetch_gen = 0         # invalidates in-flight fetches on retarget
@@ -164,15 +154,19 @@ class ChangeVersionView(QWidget):
         self._install_btns: list = []   # per-row buttons, for live relabelling
         # The destroyed hook must not touch self (C++ side is gone by then) -
         # it captures these holders directly. _key_holder["k"] tracks the live
-        # popup-card key so a mid-watch tab close still clears the card.
+        # progress key so a mid-watch tab close still clears the item.
         self._watch_holder: dict = {}
         self._key_holder: dict = {}
+        self._cancel_holder: dict = {}
 
         def _stop_watch(*_, h=self._watch_holder, kh=self._key_holder,
-                        pf=self._progress_fn):
+                        ch=self._cancel_holder, pf=self._progress_fn):
             for w in list(h.values()):
                 w.stop()
             h.clear()
+            for event in list(ch.values()):
+                event.set()
+            ch.clear()
             k = kh.pop("k", None)
             if k is not None:
                 pf(k, "", 0, -1)
@@ -187,7 +181,28 @@ class ChangeVersionView(QWidget):
             lambda k, n, d, t: self._progress_fn(k, n, int(d), int(t)))
 
         self._build()
+        bind_theme(self, roles={
+            "BG_GREEN_DEEP", "TEXT_OK_BRIGHT", "BG_ORANGE_DEEP",
+            "STATUS_QUEUED", "BG_RED_DEEP", "TEXT_ERR_BRIGHT",
+        })
         self._start_fetch()
+
+    def refresh_theme(self, p):
+        """Recolour populated rows without replacing their widgets or state."""
+        for row in range(self._table.rowCount()):
+            for col in range(4):
+                item = self._table.item(row, col)
+                if item is None:
+                    continue
+                spec = item.data(_ROW_THEME_ROLE)
+                if not spec:
+                    continue
+                bg_key, fg_key = spec
+                if bg_key:
+                    item.setBackground(qc(p, bg_key))
+                if fg_key:
+                    item.setForeground(qc(p, fg_key))
+        self._table.viewport().update()
 
     # ---- layout -----------------------------------------------------------
     def _build(self):
@@ -308,7 +323,7 @@ class ChangeVersionView(QWidget):
         domain = self._effective_domain()
         mod_id = int(getattr(self._meta, "mod_id", 0) or 0)
 
-        hl = _hl_colors()
+        p = active_palette()
         self._install_btns = []      # the old row widgets are about to be replaced
         if not self._install_status:
             self._status.setVisible(False)   # drop a stale download-only notice
@@ -319,13 +334,13 @@ class ChangeVersionView(QWidget):
             is_match = not is_installed and match_id > 0 and f.file_id == match_id
             is_old = not is_installed and not is_match and f.file_id in old_ids
             if is_installed:
-                bg, name_fg = hl["installed_bg"], hl["installed_fg"]
+                bg_key, name_fg_key = "BG_GREEN_DEEP", "TEXT_OK_BRIGHT"
             elif is_match:
-                bg, name_fg = hl["match_bg"], hl["match_fg"]
+                bg_key, name_fg_key = "BG_ORANGE_DEEP", "STATUS_QUEUED"
             elif is_old:
-                bg, name_fg = hl["old_bg"], hl["old_fg"]
+                bg_key, name_fg_key = "BG_RED_DEEP", "TEXT_ERR_BRIGHT"
             else:
-                bg = name_fg = None
+                bg_key = name_fg_key = None
 
             name_text = (f.name or f.file_name or "") + ("  ✓" if is_installed else "")
             size = f.size_in_bytes or (f.size_kb * 1024 if f.size_kb else 0)
@@ -333,17 +348,19 @@ class ChangeVersionView(QWidget):
                      (f.category_name or "").capitalize(), fmt_size(size)]
             for col, text in enumerate(cells):
                 it = QTableWidgetItem(text)
-                if bg is not None:
-                    it.setBackground(bg)
-                if col == 0 and name_fg is not None:
-                    it.setForeground(name_fg)
+                fg_key = name_fg_key if col == 0 else None
+                it.setData(_ROW_THEME_ROLE, (bg_key, fg_key))
+                if bg_key is not None:
+                    it.setBackground(qc(p, bg_key))
+                if fg_key is not None:
+                    it.setForeground(qc(p, fg_key))
                 self._table.setItem(row, col, it)
 
             # Buttons cell (View + Install).
             cell = QWidget()
-            if bg is not None:
+            if bg_key is not None:
                 cell.setAutoFillBackground(True)
-                cell.setStyleSheet(f"background:{bg.name()};")
+                cell.setStyleSheet(f"background:{_c(p, bg_key)};")
             cb = QHBoxLayout(cell); cb.setContentsMargins(8, 4, 8, 4); cb.setSpacing(6)
             view_url = (f"https://www.nexusmods.com/{domain}/mods/{mod_id}"
                         f"?tab=files&file_id={f.file_id}")
@@ -511,12 +528,14 @@ class ChangeVersionView(QWidget):
         dl_label = f.file_name or f.name or self._mod_name
         self._log(f"Nexus: downloading {dl_label}…")
         stub = self._info_stub(domain, mod_id)
-        # Shared "Nexus Download" popup card (parity with the browser tab);
+        # Shared notification-menu progress item (parity with the browser tab);
         # cleared in _on_download_done. Indeterminate until first progress_cb.
         self._dl_key = f"chv-api-{mod_id}-{f.file_id}"
         self._key_holder["k"] = self._dl_key
         dl_key = self._dl_key
-        self._progress_fn(dl_key, dl_label, 0, 0)
+        cancel = threading.Event()
+        self._cancel_holder["event"] = cancel
+        self._progress_fn(dl_key, dl_label, 0, 0, cancel.set)
 
         def worker():
             archive = meta = None
@@ -532,7 +551,8 @@ class ChangeVersionView(QWidget):
                     dest_dir=dest, known_file_name=f.file_name,
                     expected_size_bytes=size,
                     progress_cb=lambda d, t: safe_emit(
-                        self._api_progress, dl_key, dl_label, int(d), int(t)))
+                        self._api_progress, dl_key, dl_label, int(d), int(t)),
+                    cancel=cancel)
                 if result.success and result.file_path is not None:
                     archive = str(result.file_path)
                     # Fetch full mod info (author, uploader, summary, category)
@@ -556,8 +576,11 @@ class ChangeVersionView(QWidget):
                     except Exception:
                         meta = None
                 else:
-                    self._log(f"Nexus: download failed: "
-                              f"{result.error or 'unknown error'}")
+                    if "cancel" in (result.error or "").lower():
+                        self._log("Nexus: download cancelled.")
+                    else:
+                        self._log(f"Nexus: download failed: "
+                                  f"{result.error or 'unknown error'}")
             except Exception as exc:
                 self._log(f"Nexus: download error: {exc}")
             safe_emit(self._download_done, archive, meta)
@@ -574,7 +597,7 @@ class ChangeVersionView(QWidget):
         self._installing = False
         domain, mod_id = self._domain_and_mod_id()
         fname = f.file_name or f.name or ""
-        # Drive the shared "Nexus Download" popup card (parity with the browser
+        # Drive the shared notification progress item (parity with the browser
         # tab) - indeterminate until the watcher can see the in-flight download.
         self._dl_key = f"chv-man-{mod_id}-{f.file_id}"
         self._key_holder["k"] = self._dl_key
@@ -614,13 +637,13 @@ class ChangeVersionView(QWidget):
         self._status.setText(self.tr(
             "Waiting for the browser download - {0} / {1}").format(
             format_size(done), format_size(total)))
-        # Feed real bytes into the shared popup card (was indeterminate).
+        # Feed real bytes into the shared progress item (was indeterminate).
         if self._dl_key is not None:
             self._progress_fn(self._dl_key, self._mod_name, int(done), int(total))
 
     def _end_manual_watch(self):
         """Stop the watcher (if any) and restore the row button + status."""
-        # Clear this download's popup card (total<0 = finished/cancelled).
+        # Clear this download's progress item (total<0 = finished/cancelled).
         if self._dl_key is not None:
             self._progress_fn(self._dl_key, "", 0, -1)
             self._dl_key = None
@@ -652,7 +675,8 @@ class ChangeVersionView(QWidget):
 
     def _on_download_done(self, archive, meta):
         self._installing = False
-        # Clears the popup card + (for the manual path) restores the row button.
+        self._cancel_holder.clear()
+        # Clears the progress item + (for the manual path) restores the row button.
         self._end_manual_watch()
         prev, self._install_prev = self._install_prev, None
         if not archive:

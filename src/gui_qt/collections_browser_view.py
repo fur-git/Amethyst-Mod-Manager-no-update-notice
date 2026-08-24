@@ -32,6 +32,7 @@ from gui_qt.safe_emit import safe_emit
 from gui_qt.nexus_mod_card import ThumbnailLoader
 from gui_qt.collection_card import CollectionCard, CARD_W, IMG_W, IMG_H
 from gui_qt.selector_button import SelectorButton
+from gui_qt.mouse_navigation import MouseNavigationFilter
 
 PAGE_SIZE = 20            # Tk parity (collections_dialog PAGE_SIZE)
 
@@ -81,6 +82,8 @@ class CollectionsBrowserView(QWidget):
         self._results_ready.connect(self._on_results)
 
         self._build()
+        self._mouse_navigation = MouseNavigationFilter(
+            self, self._prev_page, self._next_page)
         self._reload()
 
     # -- construction -------------------------------------------------------
@@ -288,18 +291,23 @@ class CollectionsBrowserView(QWidget):
     def _prev_page(self):
         if self._page > 0:
             self._page -= 1
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
 
     def _next_page(self):
         # Only allow next when the last page filled (more likely exist).
         if len(self._entries) >= self._page_size():
             self._page += 1
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
 
     def _jump_to_page(self):
         txt = self._page_edit.text().strip()
         if txt.isdigit():
-            self._page = max(0, int(txt) - 1)
+            page = max(0, int(txt) - 1)
+            if page != self._page:
+                self._scroll.verticalScrollBar().setValue(0)
+            self._page = page
             self._reload()
 
     # -- fetch --------------------------------------------------------------

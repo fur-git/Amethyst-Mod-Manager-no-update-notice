@@ -67,17 +67,26 @@ class _HoverFadeMixin:
         from PySide6.QtGui import QCursor
         return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
 
+    def _fade_out(self):
+        if not self._faded:
+            self._faded = True
+            self._fade_to(self._FADED_OPACITY)
+            self._unhover_timer.start()
+
     def _check_unhover(self):
         if not self._cursor_over_self():
             self._faded = False
             self._unhover_timer.stop()
             self._fade_to(1.0)
 
+    def _sync_hover_fade(self):
+        """Fade if we were shown/moved under an already-stationary cursor - no
+        enterEvent arrives in that case."""
+        if self.isVisible() and self._cursor_over_self():
+            self._fade_out()
+
     def enterEvent(self, event):
-        if not self._faded:
-            self._faded = True
-            self._fade_to(self._FADED_OPACITY)
-            self._unhover_timer.start()
+        self._fade_out()
         super().enterEvent(event)
 
 
@@ -165,6 +174,7 @@ class ProgressPopup(_HoverFadeMixin, QFrame):
         x = self._host.width() - self.width() - m
         y = self._host.height() - self.height() - m - self._stack_offset
         self.move(max(0, x), max(0, y))
+        self._sync_hover_fade()
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
@@ -344,4 +354,5 @@ class NotificationManager:
             x = self._host.width() - t.width() - m
             t.move(max(0, x), y)
             t.raise_()
+            t._sync_hover_fade()
             y += t.height() + 8

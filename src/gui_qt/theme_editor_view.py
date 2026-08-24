@@ -7,30 +7,29 @@ custom theme), edits colours grouped by role, and saves the result as a JSON
 theme in ``<config>/themes/`` (see ``Utils.custom_themes``). Saving selects the
 new theme as the active ``appearance_mode``.
 
-Grouping + derivation come from ``theme_editor_groups``: editing a *base* colour
-(e.g. ``BTN_CANCEL``) recomputes its variants (``BTN_CANCEL_HOV``) automatically
-unless "Advanced" is ticked, which reveals and unlocks every individual key.
+Grouping + derivation come from ``theme_editor_groups``. The default view is a
+compact semantic palette; editing a colour also updates equivalent roles and
+hover variants. "Fine tune" reveals the implemented app-specific roles and
+unlocks each one individually.
 
-The app itself is never live-restyled: ~72 widgets snapshot the palette at
-build time and set inline stylesheets, so a partial live re-style looked broken
-(some elements updated, others didn't). Instead the theme is applied on a full
-app restart - the top bar has a **Restart to apply** button, and Save offers
-the same. To still see choices before committing, the editor is split: colour
-swatches on the left, and a sandboxed dummy preview (``ThemePreviewPanel``) on
-the right that re-renders the working palette after every pick without
-touching the rest of the app.
+The working palette is applied to the running Qt application after a source
+theme is loaded or a colour is confirmed. It remains temporary until Save/Save
+As persists it; permanently closing the editor restores the persisted theme.
+The sandbox preview stays useful while this full-screen tab hides most of the
+real application.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QT_TRANSLATE_NOOP
+from PySide6.QtCore import Qt, QT_TRANSLATE_NOOP, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame,
     QLabel, QComboBox, QPushButton, QCheckBox, QGroupBox, QSplitter,
+    QApplication,
 )
 
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, apply_theme, _c
 from gui_qt.theme_preview import ThemePreviewPanel
 from gui_qt.color_picker_overlay import ColorPickerOverlay
 from gui_qt.confirm_overlay import ConfirmOverlay
@@ -210,6 +209,76 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ThemeEditorView", "Root Folder band (text)"),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Checkboxes"),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Checkbox fill (checked)"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Surfaces"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Window background"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Panels and dialogs"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Toolbars and headers"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "List / tree background"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "List row background"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Secondary text"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Accent and selection"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Accent, links and controls"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Selected rows"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Borders and dividers"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Action buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Confirm / install"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Delete / remove"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Warning / update"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Info / select"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Secondary action"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "The main layers of the app, from the window to list rows."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "General text plus the three semantic status colours."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Brand colour, selected rows, focus controls and dividers."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Button colours are shared by actions with the same meaning."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Surfaces and rows"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Status text"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Accent and links"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Selection and focus"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Borders and separators"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Danger buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Success buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Warning buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Information buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Secondary buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Special accent buttons"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Scrollbars and checkboxes"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Icons and small highlights"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Tinted content rows"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Required and optional mods"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Notifications and queues"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Plugin cycle"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "File conflicts"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Conflict and requirement highlights"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Framework status"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Mod list separator bands"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Alternate list row"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Hovered list row"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Card background"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Text on accent / selection"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Separator row background"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Separator row text"),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Window, panel, card, list and row backgrounds."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Primary, secondary and faint text used throughout the app."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Success, warning and error messages shown on neutral backgrounds."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Brand accent, contrasting text, hyperlinks and control glyphs."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Hover, selected-row and drag-selection colours."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Frames, divider lines and separator rows."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Delete, remove and other destructive actions."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Install, confirm, Done and Play actions."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Update, reinstall and cautionary actions."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Select, Groups, Plugin Rules and similar actions."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "View and other low-emphasis actions."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Special-purpose accent buttons such as Ko-Fi."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Scrollbar track/thumb and checked-box fill."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Shared tones used by icons, flags and file-tree markers."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Coloured information rows and their foreground text."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Required/optional indicators in collection views."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Error badges, notifications and queued states."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Cycle status rows and before/after rule keywords."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Winning, overridden, inactive and anchor files."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Related mod rows highlighted across Mods, Plugins and Data."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Installed, staged, disabled and missing framework banners."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Pinned Overwrite and Root Folder rows."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Window, panels, list rows and input fields - the app's surfaces."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Label and list text throughout the app, plus success/warning/error text."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "The highlight colour: links, dropdown arrows and accented controls."),
@@ -251,7 +320,9 @@ class ThemeEditorView(QWidget):
         self._editing_id: str | None = None
         self._working: dict = {}                 # palette being edited
         self._swatches: dict[str, QPushButton] = {}
+        self._swatch_labels: dict[str, QLabel] = {}
         self._dirty = False                      # unsaved edits since last save
+        self._closing = False
 
         # UI ----------------------------------------------------------------
         outer = QVBoxLayout(self)
@@ -265,9 +336,10 @@ class ThemeEditorView(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
 
-        # Left: colour swatches. Right: sandboxed live preview of the working
-        # palette (only the preview subtree is restyled, never the app).
+        # Left: colour swatches. Right: a compact preview that remains visible
+        # while this full-screen editor covers the rest of the application.
         self._preview = ThemePreviewPanel()
+        self._preview.rolesSelected.connect(self._reveal_preview_roles)
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self._scroll)
         split.addWidget(self._preview)
@@ -327,7 +399,7 @@ class ThemeEditorView(QWidget):
         self._start_combo.activated.connect(self._on_start_changed)
         h.addWidget(self._start_combo)
 
-        self._advanced_cb = QCheckBox(self.tr("Advanced (show all colours)"))
+        self._advanced_cb = QCheckBox(self.tr("Fine tune app-specific colours"))
         self._advanced_cb.toggled.connect(self._on_advanced_toggled)
         h.addWidget(self._advanced_cb)
 
@@ -339,26 +411,17 @@ class ThemeEditorView(QWidget):
         self._save_btn.clicked.connect(lambda: self._save(save_as=False))
         h.addWidget(self._save_btn)
 
-        save_as = QPushButton(self.tr("Save As…"))
-        save_as.setObjectName("FormButton")
-        save_as.setCursor(Qt.PointingHandCursor)
-        save_as.clicked.connect(lambda: self._save(save_as=True))
-        h.addWidget(save_as)
+        self._save_as_btn = QPushButton(self.tr("Save As…"))
+        self._save_as_btn.setObjectName("FormButton")
+        self._save_as_btn.setCursor(Qt.PointingHandCursor)
+        self._save_as_btn.clicked.connect(lambda: self._save(save_as=True))
+        h.addWidget(self._save_as_btn)
 
         self._delete_btn = QPushButton(self.tr("Delete"))
         self._delete_btn.setObjectName("FormButton")
         self._delete_btn.setCursor(Qt.PointingHandCursor)
         self._delete_btn.clicked.connect(self._delete)
         h.addWidget(self._delete_btn)
-
-        # Applying a theme touches ~72 widgets that cache their colours at build
-        # time, so it's applied by a full restart rather than a partial live
-        # re-style. This button saves (if needed) then restarts.
-        self._restart_btn = QPushButton(self.tr("Restart to apply"))
-        self._restart_btn.setObjectName("PrimaryButton")
-        self._restart_btn.setCursor(Qt.PointingHandCursor)
-        self._restart_btn.clicked.connect(self._restart_to_apply)
-        h.addWidget(self._restart_btn)
 
         close = QPushButton(self.tr("✕ Close"))
         close.setObjectName("FormButton")
@@ -388,9 +451,16 @@ class ThemeEditorView(QWidget):
         self._delete_btn.setVisible(ct.is_custom_theme(theme_id))
         self._save_btn.setText(self.tr("Save") if self._editing_id
                                else self.tr("Save As New…"))
+        # A built-in cannot be overwritten, so its primary action is already
+        # Save As. Avoid presenting two buttons that perform the same action.
+        self._save_as_btn.setVisible(self._editing_id is not None)
         self._dirty = False
         self._rebuild_body()
-        self._preview.refresh(self._working)
+        # Seed the preview's explicit QPalette before the app-wide apply. The
+        # runtime's selective repolish then resolves palette(...) expressions
+        # in this subtree once, using the new working colours.
+        self._preview.refresh(self._working, restyle=False)
+        self._apply_working_preview()
 
     def _rebuild_body(self):
         body = QWidget()
@@ -399,26 +469,27 @@ class ThemeEditorView(QWidget):
         v.setSpacing(14)
 
         note = QLabel(self.tr(
-            "Editing a base colour adjusts its hover/variants automatically. "
-            "Tick Advanced to edit every colour individually. Use \"Restart to "
-            "apply\" to save your theme and see it across the whole app."))
+            "Related colours are linked automatically. Enable fine tuning to "
+            "adjust individual app-specific colours. Changes preview across "
+            "the open app; save the theme to keep them."))
         note.setWordWrap(True)
         note.setStyleSheet(f"color:{_c(self._pal, 'TEXT_DIM')};")
         v.addWidget(note)
 
         self._swatches.clear()
-        for title, keys in teg.grouped_for_palette(self._working):
-            visible_keys = [(k, lbl) for k, lbl in keys
-                            if self._advanced or k not in teg.DERIVED_KEYS]
-            if not visible_keys:
-                continue
+        self._swatch_labels.clear()
+        groups = (teg.grouped_for_palette(self._working) if self._advanced
+                  else teg.simple_grouped_for_palette(self._working))
+        descriptions = (teg.GROUP_DESCRIPTIONS if self._advanced
+                        else teg.SIMPLE_GROUP_DESCRIPTIONS)
+        for title, visible_keys in groups:
             box = QGroupBox(self.tr(title))
             grid = QGridLayout(box)
             grid.setContentsMargins(12, 8, 12, 12)
             grid.setHorizontalSpacing(12)
             grid.setVerticalSpacing(6)
             row = 0
-            desc = teg.GROUP_DESCRIPTIONS.get(title)
+            desc = descriptions.get(title)
             if desc:
                 d = QLabel(self.tr(desc))
                 d.setWordWrap(True)
@@ -426,7 +497,9 @@ class ThemeEditorView(QWidget):
                 grid.addWidget(d, row, 0, 1, 3)
                 row += 1
             for key, label in visible_keys:
-                grid.addWidget(QLabel(self.tr(label)), row, 0)
+                key_label = QLabel(self.tr(label))
+                self._swatch_labels[key] = key_label
+                grid.addWidget(key_label, row, 0)
                 grid.addWidget(self._make_swatch(key), row, 1, Qt.AlignLeft)
                 row += 1
             grid.setColumnStretch(2, 1)
@@ -474,15 +547,46 @@ class ThemeEditorView(QWidget):
             self._working[key] = hexval
             self._paint_swatch(key)
         else:
-            for k, v in teg.derive(key, hexval).items():
+            for k, v in teg.derive_simple(
+                    key, hexval, self._working).items():
                 self._working[k] = v
                 self._paint_swatch(k)
         self._dirty = True
-        self._preview.refresh(self._working)
+        self._preview.refresh(self._working, restyle=False)
+        self._apply_working_preview()
 
     def _on_advanced_toggled(self, on: bool):
         self._advanced = bool(on)
         self._rebuild_body()
+
+    def _reveal_preview_roles(self, _label: str, roles) -> None:
+        """Reveal and highlight the settings used by a preview item."""
+        role_keys = tuple(role for role in roles if role in teg.ROLE_LABELS)
+        visible = [role for role in role_keys if role in self._swatches]
+        if not visible and role_keys and not self._advanced:
+            # App-specific samples such as framework or plugin-cycle rows have
+            # no compact equivalent. Fine tuning is the only place their exact
+            # roles can be shown, so reveal it automatically.
+            self._advanced_cb.setChecked(True)
+            visible = [role for role in role_keys if role in self._swatches]
+        if not visible:
+            return
+
+        self._clear_role_highlight()
+        accent = _c(self._working, "ACCENT")
+        for role in visible:
+            label = self._swatch_labels.get(role)
+            if label is not None:
+                label.setStyleSheet(
+                    f"color:{accent}; font-weight:700;")
+
+        target = self._swatches[visible[0]]
+        QTimer.singleShot(
+            0, lambda w=target: self._scroll.ensureWidgetVisible(w, 40, 100))
+
+    def _clear_role_highlight(self) -> None:
+        for label in self._swatch_labels.values():
+            label.setStyleSheet("")
 
     def _on_start_changed(self, idx: int):
         tid = self._start_combo.itemData(idx)
@@ -490,27 +594,25 @@ class ThemeEditorView(QWidget):
             self._load_theme(tid)
 
     # ---- save / delete ----------------------------------------------------
-    def _save(self, save_as: bool, then_restart: bool = False):
+    def _save(self, save_as: bool):
         if not save_as and self._editing_id:
             self._do_save(self._editing_id,
-                          self._names.get(self._editing_id, "Theme"),
-                          then_restart=then_restart)
+                          self._names.get(self._editing_id, "Theme"))
             return
         # Save As (or a first save on a built-in): ask for a name.
         from gui_qt.text_input_overlay import TextInputOverlay
         suggestion = self._names.get(self._start_combo.currentData(), "My Theme")
         TextInputOverlay.show_over(
             self, self.tr("Save Theme"), self.tr("Theme name:"),
-            lambda name: self._on_name_entered(name, then_restart),
+            self._on_name_entered,
             initial=suggestion, ok_label=self.tr("Save"))
 
-    def _on_name_entered(self, name, then_restart: bool = False):
+    def _on_name_entered(self, name):
         if not name or not name.strip():
             return
-        self._do_save(None, name.strip(), then_restart=then_restart)
+        self._do_save(None, name.strip())
 
-    def _do_save(self, theme_id, name, then_restart: bool = False,
-                 overwrite: bool = False) -> str | None:
+    def _do_save(self, theme_id, name, overwrite: bool = False) -> str | None:
         # Base clone from the palette we started from guarantees a full key set.
         start_id = self._start_combo.currentData() or "dark"
         base = self._palettes.get(start_id, {})
@@ -528,56 +630,37 @@ class ThemeEditorView(QWidget):
         self._names = load_display_names()
         self._editing_id = new_id
         self._dirty = False
-        # Make the saved theme the active one (applied on next launch).
+        # Make the saved theme active now and on subsequent launches.
         try:
             uc.save_appearance_mode(new_id)
         except Exception:
             pass
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app)
         self._refresh_start_combo(new_id)
+        self._refresh_open_theme_selectors(new_id)
         self._delete_btn.setVisible(True)
         self._save_btn.setText(self.tr("Save"))
-        if then_restart:
-            self._request_restart()
+        self._save_as_btn.setVisible(True)
         return new_id
 
-    def _restart_to_apply(self):
-        """Apply the palette CURRENTLY on screen and restart - no name prompt.
+    def _apply_working_preview(self):
+        app = QApplication.instance()
+        if app is not None and self._working:
+            apply_theme(app, self._working)
 
-        Whatever colours are shown are written verbatim and made the active
-        theme, so "Restart to apply" always applies exactly what you're editing:
-          * editing an existing custom theme  → overwrite it in place;
-          * a pristine custom theme selected  → just re-select + restart;
-          * editing a built-in (or unsaved)   → write to an auto-named custom
-            theme (e.g. "Dark (edited)") so the on-screen palette applies as-is
-            and stays re-editable. Use Save As to give it a different name.
-        """
-        # Pristine existing custom theme: nothing to write, just select it.
-        if self._editing_id is not None and not self._dirty:
-            try:
-                uc.save_appearance_mode(self._editing_id)
-            except Exception:
-                pass
-            self._request_restart()
+    def _refresh_open_theme_selectors(self, select_id: str | None = None):
+        app = QApplication.instance()
+        if app is None:
             return
-
-        # Editing an existing custom theme: overwrite it in place.
-        if self._editing_id is not None:
-            self._do_save(self._editing_id,
-                          self._names.get(self._editing_id, "Theme"),
-                          then_restart=True)
-            return
-
-        # Editing a built-in / unsaved: apply verbatim to an auto-named theme,
-        # overwriting a prior auto-theme of the same name in place.
-        start_id = self._start_combo.currentData() or "dark"
-        base_name = self._names.get(start_id, "Custom")
-        self._do_save(None, self.tr("{0} (edited)").format(base_name),
-                      then_restart=True, overwrite=True)
-
-    def _request_restart(self):
-        fn = getattr(self._window, "_request_restart", None)
-        if callable(fn):
-            fn()
+        for widget in app.allWidgets():
+            refresh = getattr(widget, "refresh_theme_options", None)
+            if callable(refresh):
+                try:
+                    refresh(select_id)
+                except (RuntimeError, TypeError):
+                    pass
 
     def _refresh_start_combo(self, select_id):
         self._start_combo.blockSignals(True)
@@ -611,6 +694,7 @@ class ThemeEditorView(QWidget):
             pass
         self._palettes = load_palettes()
         self._names = load_display_names()
+        self._refresh_open_theme_selectors()
         self._refresh_start_combo("dark")
         self._load_theme("dark" if "dark" in self._palettes
                          else next(iter(self._palettes), "dark"))
@@ -624,4 +708,14 @@ class ThemeEditorView(QWidget):
                 return
             except Exception:
                 pass
+        self.tab_closing()
         self.hide()
+
+    def tab_closing(self):
+        """Restore the persisted theme before this editor is destroyed."""
+        if self._closing:
+            return
+        self._closing = True
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app)

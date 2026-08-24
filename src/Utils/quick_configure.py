@@ -36,6 +36,22 @@ def _toggle_attr(game, attr: str, default: bool):
     return bool(getattr(game, attr, default)), apply
 
 
+def current_deploy_method(game) -> str | None:
+    """The deploy method *game* is set to right now - ``"symlink"``,
+    ``"hardlink"`` or ``"vfs"`` - or None when the handler has no deploy-method
+    setting at all. VFS is profile-scoped, so this follows the active profile."""
+    if game is None or not hasattr(game, "get_deploy_mode"):
+        return None
+    try:
+        if (getattr(game, "supports_profile_vfs", False)
+                and getattr(game, "vfs_enabled", False)):
+            return "vfs"
+        return ("hardlink" if game.get_deploy_mode() == LinkMode.HARDLINK
+                else "symlink")
+    except Exception:
+        return None
+
+
 def build_quick_configure_options(game) -> list[dict[str, Any]]:
     """Return the quick-configure descriptors for *game*'s active profile.
 
@@ -56,20 +72,37 @@ def build_quick_configure_options(game) -> list[dict[str, Any]]:
                      "value": value, "choices": list(choices), "apply": apply,
                      "needs_reload": needs_reload})
 
-    # --- Deploy method (Symlink / Hardlink) ---------------------------------
+    # --- Deploy method (Symlink / Hardlink / optional VFS) ------------------
     if hasattr(game, "set_deploy_mode") and hasattr(game, "get_deploy_mode"):
-        cur = (LinkMode.HARDLINK if game.get_deploy_mode() == LinkMode.HARDLINK
-               else LinkMode.SYMLINK)
         rec = getattr(game, "default_deploy_mode", "symlink")
+        supports_vfs = bool(
+            getattr(game, "supports_profile_vfs", False)
+            and hasattr(game, "set_vfs_enabled")
+        )
+        choices = [
+            ("symlink",
+             "Symlink (Recommended)" if rec == "symlink" else "Symlink"),
+            ("hardlink",
+             "Hardlink (Recommended)" if rec == "hardlink" else "Hardlink"),
+        ]
+        if supports_vfs:
+            choices.append(("vfs", "Virtual filesystem (VFS)"))
+
+        def apply_deploy_method(value: str) -> None:
+            if value == "vfs":
+                game.set_vfs_enabled(True)
+                return
+            game.set_deploy_mode(
+                LinkMode.HARDLINK if value == "hardlink" else LinkMode.SYMLINK)
+            if supports_vfs:
+                game.set_vfs_enabled(False)
+
         add_choice(
             "deploy_mode", "Deploy Method",
-            "hardlink" if cur == LinkMode.HARDLINK else "symlink",
-            [("symlink",
-              "Symlink (Recommended)" if rec == "symlink" else "Symlink"),
-             ("hardlink",
-              "Hardlink (Recommended)" if rec == "hardlink" else "Hardlink")],
-            lambda v: game.set_deploy_mode(
-                LinkMode.HARDLINK if v == "hardlink" else LinkMode.SYMLINK))
+            current_deploy_method(game) or "symlink",
+            choices,
+            apply_deploy_method,
+        )
 
     # --- Boolean option toggles (mirror the Configure view gating) ----------
     if hasattr(game, "set_script_extender_swap"):
@@ -129,6 +162,21 @@ def build_quick_configure_options(game) -> list[dict[str, Any]]:
             getattr(game, "manage_load_order_in_dfu", False),
             lambda v: game.set_manage_load_order_in_dfu(v))
 
+    # me3 options are read-only properties with explicit setters, so bind the
+    # setter rather than going through _toggle_attr's setattr().
+    for _key, _label, _default in (
+            ("me3_save_isolation",
+             "Use a separate save file for each profile (me3)", True),
+            ("me3_start_online",
+             "Enable online play (me3, risks a ban with mods)", False),
+            ("me3_disable_arxan",
+             "Neutralize Arxan anti-tamper (me3, improves stability)", True),
+            ("me3_mem_patch", "Raise the game's memory limits (me3)", False)):
+        setter = getattr(game, f"set_{_key}", None)
+        if setter is not None:
+            add_toggle(_key, _label, getattr(game, _key, _default),
+                       (lambda s: lambda v: s(bool(v)))(setter))
+
     # --- Game patch version (BG3-style) -------------------------------------
     if hasattr(game, "get_patch_version") and hasattr(game, "set_patch_version"):
         try:
@@ -161,5 +209,4 @@ def deploy_mode_change_blocked(game, new_value: str) -> bool:
             return False
     except Exception:
         return False
-    cur = "hardlink" if game.get_deploy_mode() == LinkMode.HARDLINK else "symlink"
-    return new_value != cur
+    return new_value != current_deploy_method(game)

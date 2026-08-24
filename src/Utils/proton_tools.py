@@ -190,6 +190,14 @@ def resolve_proton_env(game, log_fn: LogFn = _noop):
         log_fn("Proton Tools: prefix not configured for this game.")
         return None, None
 
+    # winecfg's "Show dot files", so anything we run in this prefix (Run EXE,
+    # winecfg, winetricks, dependency installers) can browse to the manager's
+    # dot-dirs from a Wine file dialog. A cheap user.reg edit - this resolver is
+    # called on the UI thread - applied before the prefix has a live wineserver
+    # that would rewrite user.reg from memory and drop the edit.
+    from Utils.deploy_wine_dll import set_show_dot_files
+    set_show_dot_files(prefix_path, log_fn=lambda m: log_fn(f"Proton Tools: {m}"))
+
     wine_bin, wenv = _resolve_lutris_wine_env(prefix_path, log_fn)
     if wine_bin is not None:
         return wine_bin, wenv
@@ -372,6 +380,11 @@ def launch_winetricks(game, log_fn: LogFn = _noop) -> None:
         log_fn("Proton Tools: prefix not configured for this game - cannot launch winetricks.")
         return
 
+    # This path never goes through resolve_proton_env, so apply "Show dot files"
+    # here too (winetricks' own file pickers benefit as much as the tools').
+    from Utils.deploy_wine_dll import set_show_dot_files
+    set_show_dot_files(prefix_path, log_fn=lambda m: log_fn(f"Proton Tools: {m}"))
+
     if not winetricks_installed():
         log_fn("Proton Tools: winetricks not found - downloading …")
         if not install_winetricks(log_fn=lambda m: log_fn(f"Proton Tools: {m}")):
@@ -462,6 +475,95 @@ def install_lavfilters(game, log_fn: LogFn = _noop) -> bool:
     300 s default the DLL-drop verbs get."""
     from Utils.protontricks import install_winetricks_verb
     return install_winetricks_verb(game, "lavfilters", log_fn=log_fn, timeout=600)
+
+
+def repair_lavfilters(game, log_fn: LogFn = _noop) -> bool:
+    """Repair an unhealthy LAV Filters installation.
+
+    The normal installer is intentionally skip-if-installed.  That makes it
+    the wrong operation for the prefix-health warning where all three ``.ax``
+    files exist but their COM registrations have disappeared: both Amethyst
+    and winetricks see the files and return success without changing the
+    prefix.  Re-register the existing 32-bit filters directly in that case.
+    Missing/incomplete installs still go through the normal installer.
+    """
+    from Utils import wine_reg
+
+    try:
+        prefix_path = game.get_prefix_path()
+    except Exception as exc:
+        log_fn(f"LAV Filters: could not read the prefix path: {exc}")
+        return False
+    if prefix_path is None:
+        log_fn("LAV Filters: no prefix is configured for this game.")
+        return False
+
+    pfx = wine_reg.normalize_pfx(Path(prefix_path))
+    lav_dir = pfx / "drive_c" / "Program Files (x86)" / "LAV Filters" / "x86"
+    filter_names = ("LAVSplitter.ax", "LAVAudio.ax", "LAVVideo.ax")
+    if not all((lav_dir / name).is_file() for name in filter_names):
+        log_fn("LAV Filters: files are missing or incomplete; running the installer.")
+        return install_lavfilters(game, log_fn=log_fn)
+
+    proton_script, resolved_env = resolve_proton_env(game, log_fn)
+    if proton_script is None:
+        return False
+    env = dict(resolved_env or {})
+    env.setdefault("WINEDEBUG", "-all")
+
+    from Utils.proton_prefix import resolve_compat_data
+    from Utils.protontricks import prefix_downgrade_warning, run_prefix_installer
+
+    compat_data = resolve_compat_data(pfx)
+    stale_prefix = prefix_downgrade_warning(proton_script, compat_data)
+    if stale_prefix:
+        log_fn(f"LAV Filters: {stale_prefix}")
+        return False
+
+    log_fn("LAV Filters: files are present; repairing DirectShow registrations …")
+    all_ok = True
+    for name in filter_names:
+        win_filter = rf"C:\Program Files (x86)\LAV Filters\x86\{name}"
+        cmd = proton_run_command(
+            proton_script,
+            "runinprefix",
+            r"C:\windows\syswow64\regsvr32.exe",
+            "/s",
+            win_filter,
+            env=env,
+            host_cwd=lav_dir,
+        )
+        rc, output = run_prefix_installer(
+            cmd,
+            env,
+            lav_dir,
+            label=f"LAV Filters ({name})",
+            log_fn=log_fn,
+            timeout=60,
+            proton_script=proton_script,
+            compat_data=compat_data,
+        )
+        if rc == 0:
+            log_fn(f"LAV Filters: registered {name}.")
+            continue
+        all_ok = False
+        if rc is not None:
+            detail = f": {output}" if output else ""
+            log_fn(f"LAV Filters: regsvr32 failed for {name} (exit {rc}){detail}")
+
+    if not all_ok:
+        return False
+
+    # Do not claim success merely because regsvr32 returned zero.  The same
+    # registry-backed check that raised the warning is the source of truth.
+    from Utils.prefix_health import HealthStatus, check_lavfilters
+    check = check_lavfilters(pfx)
+    if check.status is not HealthStatus.OK:
+        log_fn("LAV Filters: registration commands completed, but the DirectShow "
+               "registrations are still not visible in the prefix.")
+        return False
+    log_fn("LAV Filters: DirectShow registrations repaired successfully.")
+    return True
 
 
 def install_dotnet(game, version: str, log_fn: LogFn = _noop) -> bool:

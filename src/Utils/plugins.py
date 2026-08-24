@@ -31,6 +31,53 @@ class PluginEntry:
     enabled: bool
 
 
+def primary_plugin_order(game) -> list[str]:
+    """Return a game's case-preserving, de-duplicated fixed plugin order.
+
+    An empty list is intentional: games without a known engine-defined order
+    continue to use their saved order or LOOT result.
+    """
+    try:
+        configured = list(getattr(game, "primary_plugin_order", []) or [])
+    except Exception:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for name in configured:
+        name = str(name).strip()
+        low = name.lower()
+        if name and low not in seen:
+            result.append(name)
+            seen.add(low)
+    return result
+
+
+def enforce_primary_plugin_order(game, entries: list) -> "tuple[list, bool]":
+    """Move present primary plugins to the front in the game's fixed order.
+
+    Entry objects are reused (``PluginEntry`` and the GUI's ``PluginRow`` both
+    expose ``.name``).  Non-primary entries retain their relative order.  The
+    returned boolean says whether the incoming order changed.
+    """
+    original = list(entries)
+    preferred = primary_plugin_order(game)
+    if not preferred or not original:
+        return original, False
+
+    rank = {name.lower(): i for i, name in enumerate(preferred)}
+    buckets: list[list] = [[] for _ in preferred]
+    rest: list = []
+    for entry in original:
+        name = entry if isinstance(entry, str) else getattr(entry, "name", "")
+        pos = rank.get(str(name).lower())
+        if pos is None:
+            rest.append(entry)
+        else:
+            buckets[pos].append(entry)
+    ordered = [entry for bucket in buckets for entry in bucket] + rest
+    return ordered, ordered != original
+
+
 # Per-path mtime-keyed cache of the *parsed* plugins.txt / loadorder.txt content.
 # A single plugin-tab refresh reads plugins.txt 2-3× (the two sync passes plus
 # _refresh_plugins_tab) for a ~1300-line file; on a toggle that writes nothing,
@@ -192,18 +239,52 @@ def insert_by_loadorder(entries: list[PluginEntry], entry: PluginEntry,
     entries.append(entry)
 
 
+def sweep_plugins_variants(directory: Path, filename: str, log_fn=None,
+                           keep: "Path | None" = None) -> int:
+    """Delete every case-variant of `filename` in `directory`; return the count.
+
+    Wine resolves paths case-insensitively but the prefix sits on a
+    case-sensitive Linux filesystem, so `plugins.txt` and `Plugins.txt` can
+    both exist on disk at once. The engine then reads whichever one Wine
+    happens to resolve first, which may be a stale file we didn't write.
+    `keep` (already-resolved path) is left in place.
+    """
+    _log = log_fn or (lambda _msg: None)
+    wanted = filename.lower()
+    removed = 0
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if entry.name.lower() != wanted:
+            continue
+        if keep is not None and entry == keep:
+            continue
+        try:
+            entry.unlink()
+        except OSError as exc:
+            _log(f"  WARN: could not remove stale {entry}: {exc}")
+            continue
+        removed += 1
+        _log(f"  Removed stale {entry.name}: {entry}")
+    return removed
+
+
 def deploy_plugins_copy(directory: Path, filename: str, content: str, log_fn=None) -> None:
     """Write `content` into `directory / filename` as a real file (not a symlink).
 
     GOG builds of Bethesda games can't read a *symlinked* plugins.txt, so we
-    deploy a real copy. The Proton prefix is case-insensitive, so a single file
-    resolves under any casing; games that write to a real (case-sensitive) game
+    deploy a real copy. Any pre-existing case-variant (`Plugins.txt` next to
+    `plugins.txt`) is swept first so the one we write is the only one the
+    engine can resolve; games that write to a real (case-sensitive) game
     directory pass their own `filename` casing.
     """
     _log = log_fn or (lambda _msg: None)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / filename
     try:
+        sweep_plugins_variants(directory, filename, _log)
         if target.exists() or target.is_symlink():
             target.unlink()
         # The engine parses plugins.txt as Windows-1252 - write the copy it
@@ -215,7 +296,11 @@ def deploy_plugins_copy(directory: Path, filename: str, content: str, log_fn=Non
 
 
 def remove_plugins_copy(directory: Path, filename: str, log_fn=None) -> None:
-    """Remove `directory / filename` (a deployed copy or legacy symlink)."""
+    """Remove `directory / filename` (a deployed copy or legacy symlink).
+
+    Sweeps every case-variant so restore can't leave a stray `Plugins.txt`
+    behind for the engine to pick up on the next launch.
+    """
     _log = log_fn or (lambda _msg: None)
     target = directory / filename
     if target.exists() or target.is_symlink():
@@ -224,6 +309,7 @@ def remove_plugins_copy(directory: Path, filename: str, log_fn=None) -> None:
             _log(f"  Removed {filename}: {target}")
         except OSError as exc:
             _log(f"  WARN: could not remove {target}: {exc}")
+    sweep_plugins_variants(directory, filename, _log)
 
 
 def read_loadorder(path: Path) -> list[str]:

@@ -21,7 +21,7 @@ from Utils.deploy import (
     load_per_mod_strip_prefixes,
     restore_root_folder_for_game,
 )
-from Utils.deploy_shared import _FILEMAP_SNAPSHOT_NAME
+from Utils.deploy_shared import RestoreIncompleteError, _FILEMAP_SNAPSHOT_NAME
 from Utils.filemap import build_filemap
 from Utils.profile_backup import create_backup
 from Utils.profile_state import read_root_mod_files
@@ -108,6 +108,27 @@ def _safe(fn, default=None):
         return default
 
 
+def _top_level_exempt_mods(game, modlist_path: Path, staging: Path,
+                           log_fn: LogFn) -> "set[str] | None":
+    """Mods the game exempts from its allowed-top-level-folder filter.
+
+    Only meaningful when the game sets ``filemap_exclude_unknown_top_level``;
+    a handler opts individual mods out by implementing
+    ``filemap_top_level_exempt_mods(modlist_path, staging)``.  A handler that
+    raises must not fail the deploy - the filter simply stays fully applied.
+    """
+    if not getattr(game, "filemap_exclude_unknown_top_level", False):
+        return None
+    hook = getattr(game, "filemap_top_level_exempt_mods", None)
+    if not callable(hook):
+        return None
+    try:
+        return set(hook(modlist_path, staging)) or None
+    except Exception as exc:
+        log_fn(f"Top-level exemption check failed, filtering all mods: {exc}")
+        return None
+
+
 def _log_deploy_context(game, profile: str, profile_dir: Path,
                         deploy_mode: "LinkMode", *, log_fn: LogFn) -> None:
     """Emit a diagnostic header describing the full deploy environment.
@@ -131,12 +152,14 @@ def _log_deploy_context(game, profile: str, profile_dir: Path,
     prefix     = _safe(game.get_prefix_path)
     last_dep   = _safe(game.get_last_deployed_profile)
     enabled, seps = _count_enabled_mods(profile_dir)
+    vfs_active = bool(getattr(game, "vfs_launch_enabled", False))
+    method_name = "VFS" if vfs_active else deploy_mode.name
 
     log_fn("=" * 60)
     log_fn(f"Deploy: {game.name} - profile '{profile}'")
     log_fn(f"  Mod Manager {app_version} on {platform.system()} "
            f"{platform.release()}")
-    log_fn(f"  Deploy mode:   {deploy_mode.name}")
+    log_fn(f"  Deploy mode:   {method_name}")
     log_fn(f"  Game path:     {game_root or '(not set)'}")
     if data_path is not None and data_path != game_root:
         log_fn(f"  Mod data dir:  {data_path}")
@@ -152,7 +175,8 @@ def _log_deploy_context(game, profile: str, profile_dir: Path,
     # Hardlink viability: compare the filesystem of the deploy destination
     # against the staging folder. Different devices ⇒ hardlinks will fall
     # back to symlink/copy. Warn proactively rather than after-the-fact.
-    if deploy_mode is LinkMode.HARDLINK and staging is not None:
+    if (not vfs_active and deploy_mode is LinkMode.HARDLINK
+            and staging is not None):
         dest = data_path or game_root
         if dest is not None:
             dev_dest = _fs_id(Path(dest))
@@ -165,7 +189,7 @@ def _log_deploy_context(game, profile: str, profile_dir: Path,
 
     # Flatpak-sandboxed launchers can't read symlink targets outside their
     # own sandbox - symlinks into host-home staging look broken to the game.
-    if deploy_mode is LinkMode.SYMLINK and game_root:
+    if not vfs_active and deploy_mode is LinkMode.SYMLINK and game_root:
         _app = flatpak_runtime_app(Path(game_root))
         if _app and (staging is None or flatpak_runtime_app(Path(staging)) != _app):
             log_fn(f"  NOTE: game runs inside the {_app} flatpak - sandbox "
@@ -450,6 +474,8 @@ def _build_filemap_for_game(game, profile, *, log_fn: LogFn,
                     if getattr(game, "filemap_exclude_unknown_top_level", False)
                     else None
                 ),
+                allowed_top_level_exempt_mods=_top_level_exempt_mods(
+                    game, modlist_path, staging, log_fn),
                 exclude_dirs=getattr(game, "filemap_exclude_dirs", None) or None,
                 normalize_folder_case=norm_case,
                 filemap_casing=getattr(game, "filemap_casing", "upper"),
@@ -590,6 +616,7 @@ def run_deploy_pipeline(
         # deployed with the same link mode → skip the restore and let the
         # standard primitives diff against the previous deploy instead.
         incr_plan = None
+        vfs_redeploy = False
         if last_deployed == profile:
             _probe_mode = (
                 game.get_deploy_mode()
@@ -598,6 +625,9 @@ def run_deploy_pipeline(
             )
             incr_plan = _incr.plan_incremental(game, profile, _probe_mode,
                                                log_fn=log_fn)
+            if incr_plan is None:
+                vfs_redeploy = _incr.plan_vfs_redeploy(
+                    game, profile, log_fn=log_fn)
         if incr_plan is not None:
             log_fn("Incremental deploy: existing deployment reused - "
                    "skipping restore.")
@@ -611,12 +641,19 @@ def run_deploy_pipeline(
                     game._restore_launcher(log_fn)
                 except Exception as exc:
                     log_fn(f"  WARN: launcher un-swap failed: {exc}")
+        elif vfs_redeploy:
+            log_fn("Incremental VFS deploy: existing private view retained - "
+                   "skipping restore.")
         elif getattr(game, "restore_before_deploy", True) and hasattr(game, "restore"):
             try:
                 if progress_fn is not None:
                     game.restore(log_fn=log_fn, progress_fn=progress_fn)
                 else:
                     game.restore(log_fn=log_fn)
+            except RestoreIncompleteError:
+                # Recovery state is still authoritative. Never place another
+                # deployment over files/backups which Restore could not clear.
+                raise
             except RuntimeError as restore_err:
                 # Expected on first deploy / unconfigured paths; the deploy
                 # steps have their own leftover-deploy guards, so continue -
@@ -675,13 +712,18 @@ def run_deploy_pipeline(
                     game.restore(log_fn=log_fn, progress_fn=progress_fn)
                 else:
                     game.restore(log_fn=log_fn)
+            except RestoreIncompleteError:
+                raise
             except RuntimeError as restore_err:
                 log_fn(f"Restore before deploy failed: {restore_err} - continuing.")
         # Games launched by a flatpak launcher (Heroic flatpak et al.) run in
         # its sandbox and can't follow symlinks whose targets aren't mounted
         # there - grant staging/profile access up front (GH#275).
         try:
-            from Utils.flatpak_sandbox import ensure_symlink_target_access
+            from Utils.flatpak_sandbox import (
+                ensure_launcher_handoff_access,
+                ensure_symlink_target_access,
+            )
             ensure_symlink_target_access(
                 game,
                 game_root=Path(game_root) if game_root else None,
@@ -689,6 +731,7 @@ def run_deploy_pipeline(
                 profile_dir=profile_dir,
                 log_fn=log_fn,
             )
+            ensure_launcher_handoff_access(game, log_fn=log_fn)
         except Exception as exc:
             log_fn(f"  WARN: flatpak sandbox access check failed: {exc}")
 
@@ -710,6 +753,11 @@ def run_deploy_pipeline(
         # the handler walking the game root now and the pipeline walking it
         # again for the refresh.
         game.begin_deferred_runtime_snapshot()
+        # A VFS-aware handler consumes Root_Folder itself while building its
+        # private layer. Keep the session toggle available without widening
+        # every game's long-standing deploy() signature.
+        if getattr(game, "virtualizes_game_root", False):
+            game._pipeline_root_folder_enabled = bool(root_folder_enabled)
         try:
             # Source resolution must never pick a disabled variant when two
             # staged files collapse onto one filemap key. Set inside the try so
@@ -731,6 +779,8 @@ def run_deploy_pipeline(
                             game.restore(log_fn=log_fn, progress_fn=progress_fn)
                         else:
                             game.restore(log_fn=log_fn)
+                    except RestoreIncompleteError:
+                        raise
                     except RuntimeError as restore_err:
                         log_fn(f"Restore before deploy failed: {restore_err} "
                                f"- continuing.")
@@ -741,6 +791,10 @@ def run_deploy_pipeline(
                 _run_game_deploy()
         finally:
             set_deploy_excluded_raw(None)
+            try:
+                delattr(game, "_pipeline_root_folder_enabled")
+            except AttributeError:
+                pass
             (generic_snapshot_requested,
              direct_snapshot_requests) = game.end_deferred_runtime_snapshot()
 
@@ -750,10 +804,17 @@ def run_deploy_pipeline(
                 game.name, pfx, game.wine_dll_overrides, log_fn=log_fn
             )
 
-        game.save_last_deployed_profile(profile, deploy_mode=deploy_mode.name)
+        method_name = (
+            "VFS" if getattr(game, "vfs_launch_enabled", False)
+            else deploy_mode.name
+        )
+        game.save_last_deployed_profile(profile, deploy_mode=method_name)
 
         target_rf = game.get_effective_root_folder_path()
-        rf_allowed = getattr(game, "root_folder_deploy_enabled", True)
+        rf_allowed = (
+            getattr(game, "root_folder_deploy_enabled", True)
+            and not getattr(game, "virtualizes_game_root", False)
+        )
 
         # Step A: shared Root_Folder must run first - its log file is what
         # Step B's root-flagged-mods deploy merges into.
@@ -764,7 +825,10 @@ def run_deploy_pipeline(
             if count:
                 log_fn("Root Folder: transferred files to game root.")
 
-        if game_root:
+        # rf_allowed=False means this game never writes into the game folder at
+        # all (its mods are served by an external loader), so per-mod root-flagged
+        # files must be skipped too - not just the shared Root_Folder above.
+        if game_root and rf_allowed:
             filemap_root_path = (
                 game.get_effective_filemap_path().parent / "filemap_root.txt"
             )
@@ -848,7 +912,22 @@ def run_deploy_pipeline(
         except Exception as pd_err:
             log_fn(f"post_deploy warning: {pd_err}")
 
-        _tag = " (incremental)" if incr_plan is not None else ""
+        # External launchers retain one short per-game script. Refresh it after
+        # every successful deploy (including silent Play/wizard deployments),
+        # so an AppImage upgrade or moved source checkout cannot leave stale
+        # implementation details hidden in the launcher's saved settings.
+        try:
+            from Utils.launch_handoff import refresh_launch_handoff_script
+            refresh_launch_handoff_script(game, log_fn=log_fn)
+        except Exception as handoff_err:
+            log_fn(f"Launcher handoff warning: {handoff_err}")
+
+        if incr_plan is not None:
+            _tag = " (incremental)"
+        elif vfs_redeploy:
+            _tag = " (incremental VFS rebuild)"
+        else:
+            _tag = ""
         log_fn(f"Deploy finished OK in {_time.perf_counter() - _t_start:.1f}s "
                f"- profile '{profile}'.{_tag}")
         return True

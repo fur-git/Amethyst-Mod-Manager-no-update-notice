@@ -14,7 +14,7 @@ import re as _re
 import shutil
 import threading as _threading
 import time as _time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from Utils.app_log import safe_log as _safe_log, app_log as _app_log
 from Utils.atomic_write import atomic_writer
@@ -441,6 +441,10 @@ def deploy_filemap(
     exclude: set[str] | None = None,
     core_dir: "Path | None" = None,
     flatten_extensions: set[str] | None = None,
+    per_mod_subdirs: dict[str, str] | None = None,
+    path_remap: dict[str, str] | None = None,
+    replace_existing: bool = False,
+    source_resolver=None,
 ) -> tuple[int, set[str]]:
     """Read filemap.txt and transfer every listed file into deploy_dir.
 
@@ -461,6 +465,26 @@ def deploy_filemap(
                      the top of the deploy dir (basename only), regardless of
                      their staging subfolder.  BG3 passes {".pak"} because the
                      game only loads paks at the top level of the Mods folder.
+    per_mod_subdirs - optional mapping of mod name to one destination folder
+                     below deploy_dir.  Applied only to the normal deploy_dir,
+                     never separator/custom destinations.  BepInEx uses this
+                     to isolate Thunderstore plugins below their versionless
+                     package ID, matching r2modman's package layout.
+    path_remap     - optional destination-only path-prefix replacements. Source
+                     lookup always uses the original filemap path. This is the
+                     standard-directory equivalent of deploy_filemap_to_root's
+                     remapping support.
+    replace_existing - unlink regular files/symlinks already present at normal
+                     deploy destinations before transfer. Private VFS layer
+                     construction uses this to preserve physical deploy's
+                     ordering when an earlier custom route and a later normal
+                     or remapped entry converge on one destination.
+    source_resolver - optional handler callback for filemaps whose displayed
+                     destination differs from the staged source layout. It is
+                     called with keyword arguments ``staging_root``,
+                     ``mod_name``, ``relative``, ``strip_prefixes``,
+                     ``overwrite_dir``, and ``cache``. The normal resolver is
+                     unchanged when this is omitted.
 
     Returns:
         (count, placed_lower)
@@ -470,8 +494,33 @@ def deploy_filemap(
     _log = _safe_log(log_fn)
     _strip = {p.lower() for p in strip_prefixes} if strip_prefixes else set()
     _per_mod = per_mod_strip_prefixes or {}
+    _remap: list[tuple[str, str]] = []
+    for old, new in (path_remap or {}).items():
+        old_normalized = str(old).replace("\\", "/")
+        new_normalized = str(new).replace("\\", "/")
+        if (not old_normalized
+                or _has_traversal(old_normalized)
+                or Path(old_normalized).is_absolute()
+                or PureWindowsPath(old_normalized).is_absolute()
+                or _has_traversal(new_normalized)
+                or Path(new_normalized).is_absolute()
+                or PureWindowsPath(new_normalized).is_absolute()):
+            raise RuntimeError(
+                "Unsafe deployment path remap: "
+                f"{old!r} -> {new!r}"
+            )
+        _remap.append((old_normalized.lower(), new_normalized))
     _flatten_exts = {e.lower() for e in flatten_extensions} if flatten_extensions else None
     _per_deploy = per_mod_deploy_dirs or {}
+    _per_subdir: dict[str, str] = {}
+    for _mod_name, _raw_subdir in (per_mod_subdirs or {}).items():
+        _subdir = str(_raw_subdir).strip()
+        if (not _subdir or _subdir in (".", "..") or "/" in _subdir
+                or "\\" in _subdir or "\x00" in _subdir):
+            _log(f"  WARN: ignoring unsafe deployment subdirectory "
+                 f"{_raw_subdir!r} for {_mod_name!r}")
+            continue
+        _per_subdir[_mod_name] = _subdir
     _per_mode = per_mod_link_modes
     _per_merge: set[str] = set()
     try:
@@ -493,6 +542,11 @@ def deploy_filemap(
     overwrite_dir = staging_root.parent / "overwrite"
 
     already_seen: set[str] = set()
+    # Prefix remaps, flattening, and package subdirectories can make distinct
+    # filemap paths converge on one destination. Keep the first effective
+    # winner for each actual target, without conflating explicit separator
+    # targets that happen to use the same relative path.
+    already_seen_dst: set[tuple[str, str]] = set()
     tasks: list[tuple[Path, Path, str]] = []
     placed_lower: set[str] = set()
     _exclude: set[str] = exclude or set()
@@ -513,12 +567,13 @@ def deploy_filemap(
     total_lines = len(_tab_lines)
     line_idx = 0
 
-    _prebuild_mod_indexes(
-        _tab_lines, overwrite_dir, staging_root, mod_index_cache,
-        index_dir=filemap_path.parent,
-        strip_prefixes=strip_prefixes,
-        per_mod_strip_prefixes=per_mod_strip_prefixes,
-    )
+    if not callable(source_resolver):
+        _prebuild_mod_indexes(
+            _tab_lines, overwrite_dir, staging_root, mod_index_cache,
+            index_dir=filemap_path.parent,
+            strip_prefixes=strip_prefixes,
+            per_mod_strip_prefixes=per_mod_strip_prefixes,
+        )
     print(f"  [TIMER] deploy_filemap - pre-build mod indexes: "
           f"{_time.perf_counter() - _t_resolve_start:.3f}s")
 
@@ -572,39 +627,62 @@ def deploy_filemap(
             continue
         line_idx += 1
 
-        # --- Fast path: O(1) mod-index lookup (no syscall) ---
-        _idx = _mod_index_by_name.get(mod_name, _IDX_UNSET)
-        if _idx is _IDX_UNSET:
-            _mr = overwrite_dir if mod_name == _OVERWRITE_NAME else staging_root / mod_name
-            _mod_root_cache[mod_name] = _mr
-            _idx = mod_index_cache.get(_mr)
-            _mod_index_by_name[mod_name] = _idx
         src_str: str | None = None
-        if _idx is not None:
-            _hit = _idx.get(rel_lower)
-            if _hit is not None:
-                src_str = _hit if isinstance(_hit, str) else str(_hit)
-                _index_hits += 1
-        if src_str is None:
-            # Fall back to full resolve (stat-based)
-            src_str = _resolve_source(
-                mod_name, rel_str, rel_lower, overwrite_dir, staging_root,
-                _overwrite_str, _staging_str, sorted_strip, _per_mod,
-                nocase_cache, mod_index_cache,
+        if callable(source_resolver):
+            resolved = source_resolver(
+                staging_root=staging_root,
+                mod_name=mod_name,
+                relative=rel_str,
+                strip_prefixes=list(_per_mod.get(mod_name, ())),
+                overwrite_dir=overwrite_dir,
+                cache=nocase_cache,
             )
-            if src_str is not None:
+            if resolved is not None:
+                src_str = str(resolved)
                 _slow_hits += 1
-                _mod_index_by_name[mod_name] = mod_index_cache.get(
-                    _mod_root_cache[mod_name])
+        else:
+            # --- Fast path: O(1) mod-index lookup (no syscall) ---
+            _idx = _mod_index_by_name.get(mod_name, _IDX_UNSET)
+            if _idx is _IDX_UNSET:
+                _mr = (overwrite_dir if mod_name == _OVERWRITE_NAME
+                       else staging_root / mod_name)
+                _mod_root_cache[mod_name] = _mr
+                _idx = mod_index_cache.get(_mr)
+                _mod_index_by_name[mod_name] = _idx
+            if _idx is not None:
+                _hit = _idx.get(rel_lower)
+                if _hit is not None:
+                    src_str = _hit if isinstance(_hit, str) else str(_hit)
+                    _index_hits += 1
+            if src_str is None:
+                # Fall back to full resolve (stat-based)
+                src_str = _resolve_source(
+                    mod_name, rel_str, rel_lower, overwrite_dir, staging_root,
+                    _overwrite_str, _staging_str, sorted_strip, _per_mod,
+                    nocase_cache, mod_index_cache,
+                )
+                if src_str is not None:
+                    _slow_hits += 1
+                    _mod_index_by_name[mod_name] = mod_index_cache.get(
+                        _mod_root_cache[mod_name])
         if src_str is None:
             _log(f"  WARN: source not found - {rel_str} ({mod_name})")
             continue
 
+        # Destination remapping deliberately happens after source resolution:
+        # staged files retain their original filemap layout. This is used by
+        # Cyberpunk, for example, to expose archive/pc/patch payloads below
+        # archive/pc/mod in the resolved view.
+        dst_rel = rel_str
+        for old_prefix, new_prefix in _remap:
+            if rel_lower.startswith(old_prefix):
+                dst_rel = new_prefix + rel_str[len(old_prefix):]
+                break
+        dst_rel_lower = dst_rel.lower()
+
         # Flatten matching files to the top of the deploy dir. Source
         # resolution above used the original rel path; only the destination
         # changes. Collisions on the flattened name keep the first entry.
-        dst_rel = rel_str
-        dst_rel_lower = rel_lower
         if _flatten_exts is not None and "/" in rel_str \
                 and os.path.splitext(rel_str)[1].lower() in _flatten_exts:
             dst_rel = rel_str.rsplit("/", 1)[1]
@@ -616,6 +694,32 @@ def deploy_filemap(
             already_seen.add(dst_rel_lower)
 
         effective_dir = _per_deploy.get(mod_name, deploy_dir)
+        # r2modman installs each Thunderstore plugin package below its full,
+        # versionless package ID (e.g. RiskofThunder-RoR2BepInExPack). Apart
+        # from preventing package collisions, that keeps current payloads away
+        # from legacy paths which a loader may intentionally remove. Apply the
+        # namespace only to the normal destination: separator/custom deploy
+        # paths are explicit user choices and must retain their exact layout.
+        _package_subdir = _per_subdir.get(mod_name)
+        if _package_subdir and effective_dir is deploy_dir:
+            _first_segment = dst_rel.split("/", 1)[0]
+            if _first_segment.casefold() != _package_subdir.casefold():
+                dst_rel = f"{_package_subdir}/{dst_rel}"
+                dst_rel_lower = dst_rel.lower()
+
+        if (_has_traversal(dst_rel)
+                or Path(dst_rel).is_absolute()
+                or PureWindowsPath(dst_rel).is_absolute()):
+            _log(f"  WARN: skipping unsafe remapped destination - "
+                 f"{dst_rel!r} ({mod_name})")
+            continue
+
+        _dst_key = (str(effective_dir).casefold(), dst_rel_lower)
+        if _dst_key in already_seen_dst:
+            _log(f"  WARN: remapped destination collision - skipping "
+                 f"{rel_str} ({mod_name})")
+            continue
+        already_seen_dst.add(_dst_key)
         _core_s = _core_base_str if effective_dir is deploy_dir else None
         _eff_s = _deploy_dir_str if effective_dir is deploy_dir else str(effective_dir)
         # Inline _resolve_root_path_str's two O(1) outcomes (no dir part /
@@ -952,6 +1056,23 @@ def deploy_filemap(
             bak = _custom_backup_dir / dst_p.relative_to(dst_p.anchor)
             _move_crash_safe(dst_s, bak)
             _log(f"  Backed up existing {os.path.basename(dst_s)} → custom_deploy_backup/")
+
+    if replace_existing:
+        # Custom-rule placement runs before ordinary filemap placement in both
+        # the physical root flow and the VFS builder. Physical root deploy
+        # replaces an earlier routed target; the synthetic layer must do the
+        # same instead of letting os.link fail with EEXIST. Custom/external
+        # destinations already use the backup-and-replace loop above.
+        for _src_s, dst_s, _rel_lower, is_custom, _use_sym, _ov in tasks:
+            if is_custom:
+                continue
+            try:
+                _st = os.lstat(dst_s)
+            except OSError:
+                continue
+            if (_stat_module.S_ISREG(_st.st_mode)
+                    or _stat_module.S_ISLNK(_st.st_mode)):
+                os.unlink(dst_s)
 
     linked = 0
     done_count = 0

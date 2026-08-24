@@ -1,15 +1,14 @@
-"""Settings view - a panel-scoped tab that overlays the Modlist panel.
+"""Settings modal opened from the top-bar gear button.
 
-Opened from the top-bar gear button (app.py `_open_settings_tab`) via
-`DetachableTabWidget.open_scoped_tab(..., self._modlist_panel_stack, key="settings")`
-- the same modlist-scoped mechanism as the image preview / text editor. The
-modlist content is swapped out for this widget while the rest of the UI (plugins
-panel, headers, footers) stays live; closing the tab restores the modlist.
+The settings UI is a dimmed, in-window modal rather than a detachable or
+panel-scoped tab. Six tabs group the existing settings into Appearance,
+Downloads, General, Paths, Advanced and About while keeping every setting's
+existing save-on-change behaviour.
 
 Save-on-change: every control writes straight to amethyst.ini through the
 toolkit-free `Utils.ui_config` load_*/save_* helpers the moment it changes - there
-is no Save/Cancel button. A few settings (Language, Theme, UI Scale) only take
-effect on restart and say so inline.
+is no Save/Cancel button. Language and UI Scale take effect on restart; themes
+are applied to the running Qt application immediately.
 
 A curated subset of the Tk Settings panel (gui/status_bar.py `SettingsPanel`):
 User Interface (incl. Theme + UI Scale), Archives, Downloads, Extraction,
@@ -18,62 +17,153 @@ intentionally omitted (Qt has no colour-override system yet).
 
 Option descriptions are tooltips (on the row and on its accent "?" marker), not
 inline labels - rows stay one line tall and nothing clips at narrow widths.
+
+Layout contract for every section (see :meth:`_section`):
+
+    col 0                col 1
+    label / checkbox     control (combo, slider, path row, …)
+
+so controls start at a common x down the whole page. The "?" marker is not a
+column - it rides inside each row's own layout, immediately after the widget it
+describes, which keeps it visibly attached to that option.
+
+Action buttons never sit between options: `_action_row` queues them into a
+per-section footer that `_finish_section` flushes at the bottom of the group.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QRectF, QSize
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame,
     QLabel, QCheckBox, QComboBox, QSlider, QLineEdit, QPushButton, QGroupBox,
+    QApplication, QTabWidget, QAbstractButton, QSizePolicy,
 )
 
 from gui_qt.theme_qt import active_palette, _c
 from gui_qt.help_marker import tip_text, make_help_marker, help_mark_qss
 from gui_qt.wheel_guard import no_wheel
+from gui_qt.flow_layout import FlowLayout, enable_height_for_width
+from gui_qt.overlay_base import OverlayBase
 from Utils import ui_config as uc
 
 
 # ---------------------------------------------------------------------------
+def _palette_colour(palette: dict, key: str, fallback: str) -> QColor:
+    """Return a concrete QColor from a theme palette role."""
+    value = palette.get(key, fallback)
+    if isinstance(value, (tuple, list)):
+        value = value[-1]
+    colour = QColor(str(value))
+    return colour if colour.isValid() else QColor(fallback)
+
+
+class _ThemePreviewButton(QAbstractButton):
+    """Keyboard-accessible square that paints a tiny sample of one theme."""
+
+    TILE_SIZE = 64
+
+    def __init__(self, theme_id: str, display_name: str, palette: dict,
+                 parent=None):
+        super().__init__(parent)
+        self.theme_id = theme_id
+        self._theme_palette = dict(palette)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(self.TILE_SIZE, self.TILE_SIZE)
+        self.setToolTip(display_name)
+        self.setAccessibleName(display_name)
+        self.setAccessibleDescription(self.tr("Theme preview"))
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt virtual
+        return QSize(self.TILE_SIZE, self.TILE_SIZE)
+
+    def paintEvent(self, _event):  # noqa: N802 - Qt virtual
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pal = self._theme_palette
+        deep = _palette_colour(pal, "BG_DEEP", "#171717")
+        panel = _palette_colour(pal, "BG_PANEL", "#242424")
+        header = _palette_colour(pal, "BG_HEADER", "#303030")
+        row = _palette_colour(pal, "BG_ROW", "#383838")
+        text = _palette_colour(pal, "TEXT_MAIN", "#eeeeee")
+        dim = _palette_colour(pal, "TEXT_DIM", "#999999")
+        accent = _palette_colour(pal, "ACCENT", "#0078d4")
+        border = _palette_colour(pal, "BORDER", "#555555")
+
+        outer = QRectF(1.5, 1.5, self.width() - 3, self.height() - 3)
+        p.setBrush(deep)
+        p.setPen(QPen(accent if self.isChecked() else border,
+                      3.0 if self.isChecked() else 1.0))
+        p.drawRoundedRect(outer, 7, 7)
+
+        # A tiny but recognisable app: raised panel, header, list rows, accent
+        # selection and short foreground strokes. It is intentionally painted
+        # from semantic roles so custom themes need no preview image asset.
+        content = QRectF(7, 7, self.width() - 14, self.height() - 14)
+        p.setPen(Qt.NoPen)
+        p.setBrush(panel)
+        p.drawRoundedRect(content, 4, 4)
+        p.setBrush(header)
+        p.drawRoundedRect(QRectF(7, 7, self.width() - 14, 11), 4, 4)
+        p.drawRect(QRectF(7, 13, self.width() - 14, 5))
+
+        p.setBrush(row)
+        p.drawRoundedRect(QRectF(11, 23, self.width() - 22, 9), 2, 2)
+        p.setBrush(accent)
+        p.drawRoundedRect(QRectF(11, 36, self.width() - 22, 9), 2, 2)
+        p.setBrush(row)
+        p.drawRoundedRect(QRectF(11, 49, self.width() - 22, 7), 2, 2)
+
+        p.setPen(QPen(text, 1.6, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(15, 27, 34, 27)
+        p.setPen(QPen(dim, 1.4, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(15, 52, 39, 52)
+
+        if self.isChecked():
+            # Compact active-state tick; contrast by drawing a dark shadow
+            # under the light stroke so it reads on both bright/dark accents.
+            p.setPen(QPen(deep, 3.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawLine(46, 12, 49, 15)
+            p.drawLine(49, 15, 55, 9)
+            p.setPen(QPen(text, 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawLine(46, 12, 49, 15)
+            p.drawLine(49, 15, 55, 9)
+
+        if self.hasFocus():
+            focus_pen = QPen(text, 1.0, Qt.DashLine)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(focus_pen)
+            p.drawRoundedRect(outer.adjusted(3, 3, -3, -3), 5, 5)
+
+
 # ---------------------------------------------------------------------------
-class SettingsView(QWidget):
+class SettingsView(OverlayBase):
+    """Save-on-change settings presented as a single in-window modal."""
+
+    CARD_W = 700
+    CARD_H = 700
+    MIN_W = 600
+    MIN_H = 420
+    CLICK_OUTSIDE_CANCELS = True
+
     # Carries the cache-size scan result from a daemon worker thread to the UI
     # pick_folder's callback fires on the portal WORKER thread; marshal the
     # (edit, save_fn, path) result to the GUI thread before touching a widget.
     _folder_picked = Signal(object)
 
-    # Shared width for the Language / Theme combos so the buttons that follow
-    # them ("Sync language files" / "Edit / Create Theme…") align on one edge.
+    # Stable width for the language selector within the common settings grid.
     COMBO_W = 180
 
-    def __init__(self, window):
-        super().__init__()
+    def __init__(self, window, on_closed=None):
+        super().__init__(window, on_done=on_closed)
+        self.setFocusPolicy(Qt.StrongFocus)
         self._window = window          # main window - for _notify, threads
         self._pal = active_palette()
-        self.setObjectName("SettingsView")
+        # id(grid) -> [(button, help, extra), ...]; see _action_row.
+        self._pending_actions: dict[int, list] = {}
         self._folder_picked.connect(self._on_folder_picked)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        outer.addWidget(scroll)
-
-        body = QWidget()
-        scroll.setWidget(body)
-        self._v = QVBoxLayout(body)
-        self._v.setContentsMargins(16, 14, 16, 18)
-        self._v.setSpacing(14)
-
-        title = QLabel(self.tr("Settings"))
-        f = title.font(); f.setPointSize(f.pointSize() + 4); f.setBold(True)
-        title.setFont(f)
-        self._v.addWidget(title)
-
-        self.setStyleSheet(self._qss())
 
         # Collection settings - read once here; both the Downloads and the
         # Extraction sections persist through this shared dict.
@@ -88,19 +178,90 @@ class SettingsView(QWidget):
             "clear_archive_after_install": bool(cs.get("clear_archive_after_install", False)),
         }
 
-        self._build_user_interface()
-        self._build_archives()
-        self._build_downloads()
-        self._build_extraction()
-        self._build_general()
-        self._build_paths()
-        self._build_advanced()
+        _card, outer = self._make_card(
+            "SettingsCard", margins=(0, 0, 0, 0), spacing=0,
+            bg_key="BG_DEEP")
+        self._build_toolbar(outer)
+
+        self._tabs = QTabWidget()
+        self._tabs.setObjectName("SettingsTabs")
+        self._tabs.setDocumentMode(True)
+        self._tabs.tabBar().setExpanding(False)
+        outer.addWidget(self._tabs, 1)
+
+        self._add_tab(self.tr("Appearance"), self._build_user_interface)
+        self._add_tab(
+            self.tr("Downloads"), self._build_archives,
+            self._build_downloads, self._build_extraction)
+        self._add_tab(self.tr("General"), self._build_general)
+        self._add_tab(self.tr("Paths"), self._build_paths)
+        self._add_tab(self.tr("Advanced"), self._build_advanced)
+        self._add_tab(self.tr("About"), self._build_system_info)
+        self._tabs.setCurrentIndex(0)
+
+        self.setStyleSheet(self._qss())
+        self._present()
+        self.setFocus(Qt.OtherFocusReason)
+
+    @classmethod
+    def show_over(cls, host, on_closed=None):
+        top = host.window() if host is not None else None
+        return cls(top or host, on_closed=on_closed)
+
+    def _build_toolbar(self, outer: QVBoxLayout) -> None:
+        bar = QFrame()
+        bar.setObjectName("SettingsToolbar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(16, 10, 10, 10)
+        row.setSpacing(8)
+        title = QLabel(self.tr("Settings"))
+        title.setObjectName("SettingsTitle")
+        row.addWidget(title)
+        row.addStretch(1)
+        close = QPushButton(self.tr("Close"))
+        close.setObjectName("FormButton")
+        close.setCursor(Qt.PointingHandCursor)
+        close.clicked.connect(self._finish)
+        row.addWidget(close)
+        outer.addWidget(bar)
+
+    def _add_tab(self, label: str, *builders) -> None:
+        """Build one independently scrollable settings tab."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        body = QWidget()
+        body.setObjectName("SettingsPage")
+        self._v = QVBoxLayout(body)
+        self._v.setContentsMargins(16, 14, 16, 18)
+        self._v.setSpacing(14)
+        for build in builders:
+            build()
         self._v.addStretch(1)
+        scroll.setWidget(body)
+        self._tabs.addTab(scroll, label)
 
     # ---- styling ----------------------------------------------------------
     def _qss(self) -> str:
         c = lambda k: _c(self._pal, k)
         return f"""
+        #SettingsToolbar {{
+            background: {c('BG_HEADER')};
+            border-bottom: 1px solid {c('BORDER')};
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }}
+        #SettingsTitle {{
+            color: {c('TEXT_MAIN')};
+            font-size: 17px;
+            font-weight: 600;
+        }}
+        #SettingsTabs > QTabBar {{
+            background: {c('BG_HEADER')};
+        }}
+        #SettingsPage {{ background: {c('BG_DEEP')}; }}
         QGroupBox {{
             border: 1px solid {c('BORDER')};
             border-radius: 6px;
@@ -128,24 +289,88 @@ class SettingsView(QWidget):
         """
 
     # ---- section + control builders --------------------------------------
+    # Grid columns shared by every section, so labels and controls line up down
+    # the whole page. Help markers are NOT a column - each "?" lives inside its
+    # own row's layout, right after the widget it describes.
+    COL_LABEL = 0
+    COL_CTRL = 1
+
     def _section(self, title: str) -> QGridLayout:
-        """Add a QGroupBox and return a QGridLayout to fill (label | control)."""
+        """Add a QGroupBox and return its (label | control) QGridLayout."""
         box = QGroupBox(title)
         grid = QGridLayout(box)
-        grid.setContentsMargins(8, 6, 8, 6)
+        grid.setContentsMargins(10, 8, 10, 8)
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(8)
-        grid.setColumnStretch(0, 0)
-        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(self.COL_LABEL, 0)
+        grid.setColumnStretch(self.COL_CTRL, 1)
         self._v.addWidget(box)
         # Track the next free row per grid via a dynamic attribute.
         grid.setProperty("_row", 0)
+        # Buttons queued by _action_row, flushed by _finish_section.
+        self._pending_actions[id(grid)] = []
         return grid
 
     def _next_row(self, grid: QGridLayout) -> int:
         r = int(grid.property("_row") or 0)
         grid.setProperty("_row", r + 1)
         return r
+
+    def _add_help(self, wrap: QHBoxLayout, help: str | None, *targets) -> None:
+        """Tooltip `targets` and append a "?" marker to the row's own layout.
+
+        Deliberately not a grid column: the marker belongs beside the text it
+        describes, so it rides in the row layout right after the widget.
+        """
+        if not help:
+            return
+        tip = self._tip_text(help)
+        for w in targets:
+            if w is not None:
+                w.setToolTip(tip)
+        wrap.addWidget(self._help_marker(help))
+
+    def _action_row(self, grid: QGridLayout, label: str, on_click,
+                    help: str | None = None,
+                    extra: QWidget | None = None) -> QPushButton:
+        """Queue an action button for this section's footer.
+
+        Buttons are collected rather than placed inline so they never split the
+        run of options above them (the screenshot bug: "Edit custom
+        install-name rules…" landed mid-list). :meth:`_finish_section` lays the
+        whole queue out as one left-aligned row at the bottom of the group.
+        """
+        btn = QPushButton(label)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(on_click)
+        if help:
+            btn.setToolTip(self._tip_text(help))
+        self._pending_actions[id(grid)].append((btn, help, extra))
+        return btn
+
+    def _finish_section(self, grid: QGridLayout) -> None:
+        """Flush queued action buttons into a footer row at the group's bottom.
+
+        Call once per section, after every option row has been added.
+        """
+        pending = self._pending_actions.pop(id(grid), [])
+        if not pending:
+            return
+        row = self._next_row(grid)
+        wrap = QHBoxLayout()
+        # Top margin separates the action row from the options above it, so the
+        # footer reads as a distinct band rather than one more option.
+        wrap.setContentsMargins(0, 6, 0, 0)
+        wrap.setSpacing(8)
+        for btn, help, extra in pending:
+            wrap.addWidget(btn)
+            if help:
+                wrap.addWidget(self._help_marker(help))
+            if extra is not None:
+                wrap.addWidget(extra, 1)
+        wrap.addStretch(1)
+        holder = QWidget(); holder.setLayout(wrap)
+        grid.addWidget(holder, row, self.COL_LABEL, 1, 2)
 
     def _tip_text(self, text: str) -> str:
         return tip_text(text)
@@ -172,24 +397,23 @@ class SettingsView(QWidget):
         cb.toggled.connect(_toggled)
         row = self._next_row(grid)
         if help:
-            cb.setToolTip(self._tip_text(help))
             wrap = QHBoxLayout()
             wrap.setContentsMargins(0, 0, 0, 0)
             wrap.addWidget(cb)
-            wrap.addWidget(self._help_marker(help))
+            self._add_help(wrap, help, cb)
             wrap.addStretch(1)
             holder = QWidget(); holder.setLayout(wrap)
-            grid.addWidget(holder, row, 0, 1, 2)
+            grid.addWidget(holder, row, self.COL_LABEL, 1, 2)
         else:
-            grid.addWidget(cb, row, 0, 1, 2)
+            grid.addWidget(cb, row, self.COL_LABEL, 1, 2)
         return cb
 
     def _combo(self, grid: QGridLayout, label: str,
-               pairs: list[tuple[str, str]], current_value: str, save_fn,
-               restart_note: bool = False) -> QComboBox:
+               pairs: list[tuple[str, str]], current_value: str,
+               save_fn) -> QComboBox:
         """`pairs` = [(display, value), ...]; selecting saves the value."""
         row = self._next_row(grid)
-        grid.addWidget(QLabel(label), row, 0)
+        grid.addWidget(QLabel(label), row, self.COL_LABEL)
         combo = QComboBox()
         values = [v for _d, v in pairs]
         for disp, _v in pairs:
@@ -199,11 +423,8 @@ class SettingsView(QWidget):
         combo.currentIndexChanged.connect(
             lambda i: self._safe_save(save_fn, values[i]))
         no_wheel(combo)
-        grid.addWidget(combo, row, 1, Qt.AlignLeft)
-        if restart_note:
-            note = QLabel(self.tr("Changes take effect after restart."))
-            note.setObjectName("RestartNote")
-            grid.addWidget(note, self._next_row(grid), 0, 1, 2)
+        combo.setFixedWidth(self.COMBO_W)
+        grid.addWidget(combo, row, self.COL_CTRL, Qt.AlignLeft)
         return combo
 
     def _slider(self, grid: QGridLayout, label: str, lo: int, hi: int,
@@ -211,35 +432,43 @@ class SettingsView(QWidget):
         """Integer slider lo..hi with a live value label. `on_change(int)`."""
         row = self._next_row(grid)
         lbl = QLabel(label)
-        grid.addWidget(lbl, row, 0)
+        grid.addWidget(lbl, row, self.COL_LABEL)
         wrap = QHBoxLayout()
+        wrap.setContentsMargins(0, 0, 0, 0)
+        # Gap so a handle parked at maximum doesn't sit on top of the readout.
+        wrap.setSpacing(10)
         sld = QSlider(Qt.Horizontal)
         sld.setMinimum(lo); sld.setMaximum(hi)
         sld.setValue(max(lo, min(hi, value)))
-        sld.setFixedWidth(220)
+        sld.setFixedWidth(200)
         val_lbl = QLabel(str(sld.value()))
-        val_lbl.setMinimumWidth(48)
+        # Fixed (not minimum) width: the readout text varies per slider
+        # ("Unlimited", "All", "150%"), and a minimum width would let each one
+        # size itself, staggering the "?" markers that follow it.
+        val_lbl.setFixedWidth(68)
         sld.valueChanged.connect(lambda v: val_lbl.setText(str(v)))
         sld.valueChanged.connect(lambda v: on_change(v))
         no_wheel(sld)
         wrap.addWidget(sld)
         wrap.addWidget(val_lbl)
-        if help:
-            tip = self._tip_text(help)
-            lbl.setToolTip(tip)
-            sld.setToolTip(tip)
-            wrap.addWidget(self._help_marker(help))
+        self._add_help(wrap, help, lbl, sld)
         wrap.addStretch(1)
         holder = QWidget(); holder.setLayout(wrap)
-        grid.addWidget(holder, row, 1)
+        grid.addWidget(holder, row, self.COL_CTRL)
         return sld, val_lbl
 
-    def _path_row(self, grid: QGridLayout, label: str, load_fn, save_fn,
-                  help: str | None = None) -> QLineEdit:
+    def _browse_row(self, grid: QGridLayout, label: str, load_fn, save_fn,
+                    on_browse, help: str | None = None) -> QLineEdit:
+        """Shared body of :meth:`_path_row` / :meth:`_file_row`.
+
+        `on_browse()` opens whichever picker the caller wants; everything else
+        (edit, Browse/Clear buttons, alignment) is identical between them.
+        """
         row = self._next_row(grid)
         lbl = QLabel(label)
-        grid.addWidget(lbl, row, 0)
+        grid.addWidget(lbl, row, self.COL_LABEL)
         wrap = QHBoxLayout()
+        wrap.setContentsMargins(0, 0, 0, 0)
         edit = QLineEdit()
         try:
             edit.setText(load_fn() or "")
@@ -249,20 +478,28 @@ class SettingsView(QWidget):
             lambda: self._safe_save(save_fn, edit.text().strip()))
         browse = QPushButton(self.tr("Browse"))
         browse.setCursor(Qt.PointingHandCursor)
-        browse.clicked.connect(lambda: self._browse_into(edit, save_fn, label))
+        browse.clicked.connect(lambda: on_browse())
         clear = QPushButton(self.tr("Clear"))
         clear.setCursor(Qt.PointingHandCursor)
         clear.clicked.connect(lambda: self._clear_path(edit, save_fn))
+        # Equal widths so the Browse/Clear pair forms a straight right edge
+        # down the Paths section regardless of translated label lengths.
+        for b in (browse, clear):
+            b.setFixedWidth(max(browse.sizeHint().width(),
+                                clear.sizeHint().width()))
         wrap.addWidget(edit, 1)
         wrap.addWidget(browse)
         wrap.addWidget(clear)
-        if help:
-            tip = self._tip_text(help)
-            lbl.setToolTip(tip)
-            edit.setToolTip(tip)
-            wrap.addWidget(self._help_marker(help))
+        self._add_help(wrap, help, lbl, edit)
         holder = QWidget(); holder.setLayout(wrap)
-        grid.addWidget(holder, row, 1)
+        grid.addWidget(holder, row, self.COL_CTRL)
+        return edit
+
+    def _path_row(self, grid: QGridLayout, label: str, load_fn, save_fn,
+                  help: str | None = None) -> QLineEdit:
+        edit = self._browse_row(
+            grid, label, load_fn, save_fn,
+            lambda: self._browse_into(edit, save_fn, label), help=help)
         return edit
 
     def _file_row(self, grid: QGridLayout, label: str, load_fn, save_fn,
@@ -270,72 +507,45 @@ class SettingsView(QWidget):
                   help: str | None = None) -> QLineEdit:
         """Like :meth:`_path_row` but the Browse button picks a single file
         (e.g. an AppImage) instead of a folder."""
-        row = self._next_row(grid)
-        lbl = QLabel(label)
-        grid.addWidget(lbl, row, 0)
-        wrap = QHBoxLayout()
-        edit = QLineEdit()
-        try:
-            edit.setText(load_fn() or "")
-        except Exception:
-            pass
-        edit.editingFinished.connect(
-            lambda: self._safe_save(save_fn, edit.text().strip()))
-        browse = QPushButton(self.tr("Browse"))
-        browse.setCursor(Qt.PointingHandCursor)
-        browse.clicked.connect(
-            lambda: self._browse_file_into(edit, save_fn, label, filters))
-        clear = QPushButton(self.tr("Clear"))
-        clear.setCursor(Qt.PointingHandCursor)
-        clear.clicked.connect(lambda: self._clear_path(edit, save_fn))
-        wrap.addWidget(edit, 1)
-        wrap.addWidget(browse)
-        wrap.addWidget(clear)
-        if help:
-            tip = self._tip_text(help)
-            lbl.setToolTip(tip)
-            edit.setToolTip(tip)
-            wrap.addWidget(self._help_marker(help))
-        holder = QWidget(); holder.setLayout(wrap)
-        grid.addWidget(holder, row, 1)
+        edit = self._browse_row(
+            grid, label, load_fn, save_fn,
+            lambda: self._browse_file_into(edit, save_fn, label, filters),
+            help=help)
         return edit
 
     # ---- sections ---------------------------------------------------------
     def _build_user_interface(self):
-        # Language, Theme and UI Scale are all applied once at startup (Qt reads
-        # QT_SCALE_FACTOR / the palette / the translator only at launch), so each
-        # change persists to amethyst.ini and offers a self-restart. They are
-        # grouped together with a single shared restart note beneath them; the
-        # Hide BSA conflicts toggle (which applies live) sits below that.
+        # Put the visual choice first, matching the Appearance tab's purpose.
+        # Themes persist and apply live; language and UI scale are startup-only.
+        theme_group = self._section(self.tr("Theme"))
+        self._build_theme(theme_group)
+        self._action_row(
+            theme_group, self.tr("Edit / Create Theme…"),
+            self._open_theme_editor)
+        self._finish_section(theme_group)
+
         g = self._section(self.tr("User Interface"))
-        # Language row: combo + a "Sync language files" button that pulls the
-        # latest translations from the Resources branch on demand.
+        # Language row: the combo sits in the shared control column; its
+        # "Sync language files" button moves to the section footer with the
+        # other actions, so the option rows stay a clean label|control grid.
         row = self._next_row(g)
-        g.addWidget(QLabel(self.tr("Language")), row, 0)
+        g.addWidget(QLabel(self.tr("Language")), row, self.COL_LABEL)
         self._lang_combo = QComboBox()
         no_wheel(self._lang_combo)
-        # Fixed width shared with the Theme combo so both trailing buttons
-        # ("Sync language files" / "Edit / Create Theme…") start at the same x.
+        # Keep the selector compact instead of stretching across the modal.
         self._lang_combo.setFixedWidth(self.COMBO_W)
-        self._lang_sync_btn = QPushButton(self.tr("Sync language files"))
-        self._lang_sync_btn.setCursor(Qt.PointingHandCursor)
-        self._lang_sync_btn.clicked.connect(self._on_sync_languages)
-        lang_wrap = QHBoxLayout()
-        lang_wrap.setContentsMargins(0, 0, 0, 0)
-        lang_wrap.addWidget(self._lang_combo)
-        lang_wrap.addWidget(self._lang_sync_btn)
-        lang_wrap.addStretch(1)
-        lang_holder = QWidget(); lang_holder.setLayout(lang_wrap)
-        g.addWidget(lang_holder, row, 1)
+        g.addWidget(self._lang_combo, row, self.COL_CTRL, Qt.AlignLeft)
         self._populate_language_combo()
 
-        self._build_theme(g)
         self._build_ui_scale(g)
 
-        # Single shared restart note beneath Language / Theme / UI Scale.
-        note = QLabel(self.tr("Changes take effect after restart."))
+        # Theme is live; only Language / UI Scale still need a restart.
+        # Indented to the control column so it reads as a note about the
+        # controls above rather than a row label of its own.
+        note = QLabel(self.tr(
+            "Language and UI scale changes take effect after restart."))
         note.setObjectName("RestartNote")
-        g.addWidget(note, self._next_row(g), 0, 1, 2)
+        g.addWidget(note, self._next_row(g), self.COL_CTRL)
 
         self._checkbox(
             g, self.tr("Hide BSA conflicts"),
@@ -364,6 +574,10 @@ class SettingsView(QWidget):
             help=self.tr("Hide the Endorse AMM button in the status bar."),
             on_changed=lambda _v: self._apply_support_buttons())
 
+        self._lang_sync_btn = self._action_row(
+            g, self.tr("Sync language files"), self._on_sync_languages)
+        self._finish_section(g)
+
     def _apply_support_buttons(self):
         """Ask the window to re-apply Ko-Fi / Endorse button visibility live."""
         win = self._window
@@ -374,71 +588,115 @@ class SettingsView(QWidget):
                 pass
 
     def _build_theme(self, g):
-        """Theme picker (formerly its own Appearance section). Takes effect on
-        restart, like Language / UI Scale - selecting a new theme persists it and
-        offers a self-restart via the window's theme restart prompt. The
-        "Edit / Create Theme…" button sits to the right of the dropdown (mirrors
-        the Language row's combo + sync button layout)."""
-        try:
-            from Utils.themes import load_display_names
-            themes = load_display_names() or {"dark": "Dark"}
-        except Exception:
-            themes = {"dark": "Dark", "light": "Light"}
-        try:
-            current = uc.get_appearance_mode()
-        except Exception:
-            current = "dark"
-
+        """Responsive theme gallery. Selections persist and apply immediately."""
         row = self._next_row(g)
-        g.addWidget(QLabel(self.tr("Theme")), row, 0)
+        self._theme_gallery_host = QWidget()
+        self._theme_gallery_host.setObjectName("ThemeGallery")
+        self._theme_gallery = FlowLayout(
+            self._theme_gallery_host, margin=0, spacing=12)
+        enable_height_for_width(self._theme_gallery_host)
+        g.addWidget(self._theme_gallery_host, row, self.COL_LABEL, 1, 2)
+        self.refresh_theme_options()
 
-        combo = QComboBox()
-        no_wheel(combo)
-        combo.setFixedWidth(self.COMBO_W)
-        values = [tid for tid in themes]
-        for tid, disp in themes.items():
-            combo.addItem(disp, tid)
-        if current in values:
-            combo.setCurrentIndex(values.index(current))
-        combo.currentIndexChanged.connect(
-            lambda i: self._on_theme_changed(values[i]))
+    def refresh_theme_options(self, select_id: str | None = None):
+        """Reload built-in/custom palettes and rebuild their preview tiles."""
+        try:
+            from Utils.themes import load_display_names, load_palettes
+            names = load_display_names()
+            palettes = load_palettes()
+        except Exception:
+            names = {"dark": "Dark", "light": "Light"}
+            palettes = {}
+        current = select_id
+        if current is None:
+            try:
+                current = uc.get_appearance_mode()
+            except Exception:
+                current = "dark"
+        gallery = getattr(self, "_theme_gallery", None)
+        if gallery is None:
+            return
 
-        edit_btn = QPushButton(self.tr("Edit / Create Theme…"))
-        edit_btn.setCursor(Qt.PointingHandCursor)
-        edit_btn.clicked.connect(self._open_theme_editor)
+        while gallery.count():
+            item = gallery.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
 
-        wrap = QHBoxLayout()
-        wrap.setContentsMargins(0, 0, 0, 0)
-        wrap.addWidget(combo)
-        wrap.addWidget(edit_btn)
-        wrap.addStretch(1)
-        holder = QWidget(); holder.setLayout(wrap)
-        g.addWidget(holder, row, 1)
+        # A malformed custom theme is deliberately absent from load_palettes;
+        # do not show a dead choice just because its display name was readable.
+        ordered_ids = list(palettes)
+        if not ordered_ids:
+            # The app itself uses the same dark fallback if discovery fails.
+            palettes = {"dark": active_palette()}
+            ordered_ids = ["dark"]
+            names.setdefault("dark", "Dark")
+        selected = (current if current in palettes else
+                    "dark" if "dark" in palettes else ordered_ids[0])
+
+        self._theme_buttons: dict[str, _ThemePreviewButton] = {}
+        for tid in ordered_ids:
+            display = names.get(tid, tid.replace("_", " ").title())
+            holder = QWidget()
+            holder.setObjectName("ThemeOption")
+            holder.setFixedWidth(108)
+            holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            layout = QVBoxLayout(holder)
+            layout.setContentsMargins(2, 2, 2, 2)
+            layout.setSpacing(4)
+            layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+
+            tile = _ThemePreviewButton(tid, display, palettes[tid], holder)
+            tile.setChecked(tid == selected)
+            tile.clicked.connect(
+                lambda _checked=False, theme_id=tid:
+                self._on_theme_changed(theme_id))
+            layout.addWidget(tile, 0, Qt.AlignHCenter)
+
+            label = QLabel(display)
+            label.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            label.setWordWrap(True)
+            label.setToolTip(display)
+            layout.addWidget(label)
+            self._theme_buttons[tid] = tile
+            gallery.addWidget(holder)
+
+        self._active_theme_id = selected
+
+    def _set_active_theme(self, theme_id: str) -> None:
+        self._active_theme_id = theme_id
+        for tid, button in getattr(self, "_theme_buttons", {}).items():
+            button.setChecked(tid == theme_id)
+            button.update()
 
     def _on_theme_changed(self, tid: str):
-        """Persist the chosen theme, then offer a restart (same pattern as UI
-        scale / language) so the new palette applies on a fresh launch."""
+        """Persist and immediately apply the selected theme."""
+        self._set_active_theme(tid)
         self._safe_save(uc.save_appearance_mode, tid)
-        from gui_qt.theme_qt import invalidate_palette_cache
-        invalidate_palette_cache()
-        self._prompt_restart("theme")
+        from gui_qt.theme_qt import apply_theme
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app)
 
     def _open_theme_editor(self):
-        """Open the full-screen theme editor tab via the main window."""
+        """Close Settings, then open the full-screen theme editor tab."""
         opener = getattr(self._window, "_open_theme_editor_tab", None)
         if callable(opener):
+            self._finish()
             opener()
 
     def _open_install_name_patterns(self):
-        """Open the custom install-name rules editor tab via the main window."""
+        """Close Settings, then open the install-name rules editor tab."""
         opener = getattr(self._window, "_open_install_name_patterns_tab", None)
         if callable(opener):
+            self._finish()
             opener()
 
     def _open_env_vars(self):
-        """Open the app environment-variable editor tab via the main window."""
+        """Close Settings, then open the environment-variable editor tab."""
         opener = getattr(self._window, "_open_env_vars_tab", None)
         if callable(opener):
+            self._finish()
             opener()
 
     def _build_ui_scale(self, g):
@@ -475,10 +733,12 @@ class SettingsView(QWidget):
         self._scale_slider.setEnabled(not is_auto)
 
         # Auto checkbox - sits below the slider; ticking it disables the slider.
+        # Placed in the control column (not spanning from the label column) so
+        # it reads as a modifier of the UI Scale slider directly above it.
         self._scale_auto_cb = QCheckBox(self.tr("Auto (match display)"))
         self._scale_auto_cb.setChecked(is_auto)
         self._scale_auto_cb.toggled.connect(self._on_ui_scale_auto_toggled)
-        g.addWidget(self._scale_auto_cb, self._next_row(g), 0, 1, 2)
+        g.addWidget(self._scale_auto_cb, self._next_row(g), self.COL_CTRL, 1, 2)
 
     def _on_ui_scale_auto_toggled(self, on: bool):
         self._scale_slider.setEnabled(not on)
@@ -520,18 +780,14 @@ class SettingsView(QWidget):
         self._prompt_restart("scale")
 
     def _prompt_restart(self, kind: str):
-        """Offer a self-restart so a startup-only setting (UI scale / theme /
-        language) applies. Reuses the window's matching restart flow, falling
-        back to the UI-scale prompt (any of them just re-execs the app)."""
+        """Offer a self-restart for startup-only UI scale/language changes."""
         win = self._window
         by_kind = {
             "scale": "_prompt_ui_scale_restart",
-            "theme": "_prompt_theme_restart",
             "language": "_prompt_language_restart",
         }
         names = [by_kind.get(kind, "")]
-        names += ["_prompt_ui_scale_restart", "_prompt_theme_restart",
-                  "_prompt_language_restart"]
+        names += ["_prompt_ui_scale_restart", "_prompt_language_restart"]
         for name in names:
             prompt = getattr(win, name, None)
             if callable(prompt):
@@ -571,7 +827,7 @@ class SettingsView(QWidget):
 
     def _on_language_changed(self, code):
         """Persist the chosen language, then offer a restart (same pattern as UI
-        scale / theme) so the new translator applies on a fresh launch."""
+        scale) so the new translator applies on a fresh launch."""
         self._safe_save(uc.save_language, code)
         self._prompt_restart("language")
 
@@ -610,6 +866,7 @@ class SettingsView(QWidget):
             help=self.tr("Newly installed mods start disabled in the modlist instead "
                  "of enabled. Applies to every install path except collection "
                  "installs."))
+        self._finish_section(g)
 
     def _build_downloads(self):
         # Collection settings - all persisted together via save_collection_settings.
@@ -642,17 +899,12 @@ class SettingsView(QWidget):
                  "from the Downloads tab or the Install Mod button."),
             on_changed=self._on_download_only_changed)
 
-        # Manage Caches action.
-        row = self._next_row(g)
-        g.addWidget(QLabel(self.tr("Caches")), row, 0)
-        self._cache_btn = QPushButton(self.tr("Manage Caches…"))
-        self._cache_btn.setCursor(Qt.PointingHandCursor)
-        self._cache_btn.clicked.connect(self._on_manage_caches)
-        cwrap = QHBoxLayout()
-        cwrap.addWidget(self._cache_btn)
-        cwrap.addStretch(1)
-        holder = QWidget(); holder.setLayout(cwrap)
-        g.addWidget(holder, row, 1)
+        # Manage Caches action - a footer button like every other action,
+        # rather than a "Caches" label paired with a button as if it were a
+        # setting with a value.
+        self._cache_btn = self._action_row(
+            g, self.tr("Manage Caches…"), self._on_manage_caches)
+        self._finish_section(g)
 
     def _build_extraction(self):
         # Extraction resource limits - apply to every install (single mods,
@@ -684,6 +936,7 @@ class SettingsView(QWidget):
             help=self.tr("Run extractions at low CPU and disk priority so they yield "
                  "to other applications instead of slowing them down. Extraction "
                  "speed is unaffected while the system is otherwise idle."))
+        self._finish_section(g)
 
     def _build_general(self):
         g = self._section(self.tr("General"))
@@ -697,21 +950,15 @@ class SettingsView(QWidget):
             uc.load_rename_mod_after_install, uc.save_rename_mod_after_install,
             help=self.tr("Show a rename prompt after installing a mod."))
         # Custom install-name rules - a full editor (opened as its own tab)
-        # rather than a single control, so it gets a button row here.
-        patt_help = self.tr(
-            "Add your own regex search/replace rules to clean up mod names on "
-            "install - useful when a download site changes its filename format.")
-        patt_btn = QPushButton(self.tr("Edit custom install-name rules…"))
-        patt_btn.setCursor(Qt.PointingHandCursor)
-        patt_btn.clicked.connect(self._open_install_name_patterns)
-        patt_btn.setToolTip(self._tip_text(patt_help))
-        wrap = QHBoxLayout()
-        wrap.setContentsMargins(0, 0, 0, 0)
-        wrap.addWidget(patt_btn)
-        wrap.addWidget(self._help_marker(patt_help))
-        wrap.addStretch(1)
-        holder = QWidget(); holder.setLayout(wrap)
-        g.addWidget(holder, self._next_row(g), 0, 1, 2)
+        # rather than a single control, so it goes in the section footer
+        # instead of interrupting the run of checkboxes.
+        self._action_row(
+            g, self.tr("Edit custom install-name rules…"),
+            self._open_install_name_patterns,
+            help=self.tr(
+                "Add your own regex search/replace rules to clean up mod names "
+                "on install - useful when a download site changes its filename "
+                "format."))
         self._checkbox(
             g, self.tr("Restore on close"),
             uc.load_restore_on_close, uc.save_restore_on_close,
@@ -729,8 +976,50 @@ class SettingsView(QWidget):
                  "is available. Turning this off only mutes the notification "
                  "- you can still update via your package manager or by "
                  "toggling the pre-release setting."))
+        self._action_row(
+            g, self.tr("Reset dismissed prompts…"),
+            self._on_reset_dismissed_notices,
+            help=self.tr(
+                "Bring back every notice you hid by ticking \"Don't show this "
+                "again\" - the launcher handoff notice, the Windows filesystem "
+                "warning and the rest."))
 
         self._maybe_add_flatpak_enroll(g)
+        self._finish_section(g)
+
+    def _on_reset_dismissed_notices(self):
+        """Confirm, then re-arm every "Don't show this again" notice."""
+        from gui_qt.confirm_overlay import ConfirmOverlay
+        hidden = uc.count_dismissed_notices()
+        if not hidden:
+            ConfirmOverlay.show_message(
+                self._window, self.tr("Nothing to reset"),
+                self.tr("No prompts are currently hidden."))
+            return
+
+        def _go(ok: bool):
+            if not ok:
+                return
+            n = uc.reset_dismissed_notices()
+            if n == 1:
+                done = self.tr("{0} hidden prompt will show again.").format(n)
+            else:
+                done = self.tr("{0} hidden prompts will show again.").format(n)
+            ConfirmOverlay.show_message(
+                self._window, self.tr("Prompts reset"), done)
+
+        if hidden == 1:
+            body = self.tr("{0} prompt is hidden. It will start showing "
+                           "again.").format(hidden)
+        else:
+            body = self.tr("{0} prompts are hidden. They will start showing "
+                           "again.").format(hidden)
+        ConfirmOverlay.show_over(
+            self._window, self.tr("Reset dismissed prompts?"), body, _go,
+            confirm_label=self.tr("Reset"),
+            cancel_label=self.tr("Cancel"),
+            danger=False,
+        )
 
     def _maybe_add_flatpak_enroll(self, g):
         """Offer a one-time 'Enable automatic updates' button to flatpak users
@@ -745,22 +1034,14 @@ class SettingsView(QWidget):
         )
         if not is_flatpak() or flatpak_installed_from_remote():
             return
-        enroll_help = self.tr(
-            "Switch this Flatpak to the Amethyst update remote so future "
-            "updates arrive automatically through your package manager "
-            "(GNOME Software / Discover) with smaller downloads. This "
-            "reinstalls the app once from the remote and relaunches it.")
-        btn = QPushButton(self.tr("Enable automatic updates…"))
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(self._on_enroll_flatpak_remote)
-        btn.setToolTip(self._tip_text(enroll_help))
-        wrap = QHBoxLayout()
-        wrap.setContentsMargins(0, 0, 0, 0)
-        wrap.addWidget(btn)
-        wrap.addWidget(self._help_marker(enroll_help))
-        wrap.addStretch(1)
-        holder = QWidget(); holder.setLayout(wrap)
-        g.addWidget(holder, self._next_row(g), 0, 1, 2)
+        self._action_row(
+            g, self.tr("Enable automatic updates…"),
+            self._on_enroll_flatpak_remote,
+            help=self.tr(
+                "Switch this Flatpak to the Amethyst update remote so future "
+                "updates arrive automatically through your package manager "
+                "(GNOME Software / Discover) with smaller downloads. This "
+                "reinstalls the app once from the remote and relaunches it."))
 
     def _on_enroll_flatpak_remote(self):
         """Confirm, then add the remote + reinstall-from-remote (relaunches)."""
@@ -856,18 +1137,10 @@ class SettingsView(QWidget):
             uc.load_steam_libraries_vdf_path, uc.save_steam_libraries_vdf_path,
             help=self.tr("Path to libraryfolders.vdf (or its folder). Blank = auto-detect "
                  "(standard, Flatpak and Snap locations)."))
+        self._finish_section(g)
 
     def _build_advanced(self):
         g = self._section(self.tr("Advanced"))
-        env_help = self.tr(
-            "Set environment variables that Amethyst applies to itself every "
-            "time it starts - kill switches, diagnostics and graphics options "
-            "that otherwise need a terminal launch. Pick from the supported "
-            "list or add your own.")
-        env_btn = QPushButton(self.tr("Edit environment variables…"))
-        env_btn.setCursor(Qt.PointingHandCursor)
-        env_btn.clicked.connect(self._open_env_vars)
-        env_btn.setToolTip(self._tip_text(env_help))
         # Summarise what's already set so the section isn't a blind door.
         try:
             active = [e["name"] for e in uc.load_app_env_vars() if e.get("enabled")]
@@ -878,13 +1151,68 @@ class SettingsView(QWidget):
             if active else self.tr("None set"))
         summary.setObjectName("Help")
         summary.setWordWrap(True)
-        wrap = QHBoxLayout()
-        wrap.setContentsMargins(0, 0, 0, 0)
-        wrap.addWidget(env_btn)
-        wrap.addWidget(self._help_marker(env_help))
-        wrap.addWidget(summary, 1)
-        holder = QWidget(); holder.setLayout(wrap)
-        g.addWidget(holder, self._next_row(g), 0, 1, 2)
+        self._action_row(
+            g, self.tr("Edit environment variables…"), self._open_env_vars,
+            help=self.tr(
+                "Set environment variables that Amethyst applies to itself "
+                "every time it starts - kill switches, diagnostics and "
+                "graphics options that otherwise need a terminal launch. Pick "
+                "from the supported list or add your own."),
+            extra=summary)
+        self._finish_section(g)
+
+    def _build_system_info(self):
+        """Read-only environment facts + a Copy button, for bug reports."""
+        g = self._section(self.tr("System Information"))
+        from Utils import system_info
+
+        try:
+            pairs = system_info.collect()
+        except Exception:
+            pairs = []
+
+        # Labels are translated here as literals - lupdate cannot extract a
+        # `tr(variable)`, so the keys from system_info map to real tr() calls.
+        names = {
+            "App version": self.tr("App version"),
+            "OS": self.tr("OS"),
+            "Distribution": self.tr("Distribution"),
+            "Kernel": self.tr("Kernel"),
+            "Python": self.tr("Python"),
+            "Qt": self.tr("Qt"),
+            "Run mode": self.tr("Run mode"),
+            "Package": self.tr("Package"),
+            "Desktop": self.tr("Desktop"),
+            "Session": self.tr("Session"),
+            "OpenGL": self.tr("OpenGL"),
+            "Env overrides": self.tr("Env overrides"),
+        }
+
+        # Tighter than the option sections: these are dense read-only pairs,
+        # not controls that need room to be clicked.
+        g.setVerticalSpacing(4)
+        for label, value in pairs:
+            row = self._next_row(g)
+            g.addWidget(QLabel(names.get(label, label)), row, self.COL_LABEL)
+            edit = QLineEdit(str(value))
+            edit.setReadOnly(True)
+            # Selectable so a single value can be copied without the whole block.
+            edit.setCursorPosition(0)
+            edit.setToolTip(str(value))
+            g.addWidget(edit, row, self.COL_CTRL)
+
+        self._action_row(
+            g, self.tr("Copy to clipboard"), self._copy_system_info)
+        self._finish_section(g)
+
+    def _copy_system_info(self):
+        from PySide6.QtWidgets import QApplication
+        from Utils import system_info
+        try:
+            QApplication.clipboard().setText("\n".join(system_info.log_lines()))
+        except Exception:
+            return
+        self._notify(self.tr("System information copied."), "info")
 
     # ---- collection setting handlers (all persist the whole group) --------
     def _persist_collection(self):

@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.icons import icon
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, bind_theme, _c
 from gui_qt.worker import run_in_worker
 from Utils.prefix_manager import fmt_size, get_dir_size
 from Utils.save_paths import matches_patterns, save_paths_for_game
@@ -252,10 +252,31 @@ class SavesView(QWidget):
         self.export_path_picked.connect(self._on_export_path_picked)
         self.import_path_picked.connect(self._on_import_path_picked)
         self.transfer_done.connect(self._on_transfer_done)
+        bind_theme(self, roles={"TEXT_DIM", "ACCENT", "DROPDOWN_ARROW"})
         # Warm the manifest off-thread -app.py's _saves_supported() would
         # otherwise pay the ~70 ms first load on the UI thread mid game-switch.
         from Utils.ludusavi_manifest import data_info
         run_in_worker(data_info, None, name="ludusavi-warm")
+
+    def refresh_theme(self, p: dict) -> None:
+        """Recolour existing item brushes/icons without rebuilding the tree."""
+        tree = getattr(self, "_tree", None)
+        if tree is None:
+            return
+
+        def walk(item):
+            if item.data(0, _INFO_ROLE):
+                item.setForeground(0, self._brush(_c(p, "TEXT_DIM")))
+            elif isinstance(item, _SaveItem) and item._group == _GRP_LOCATION:
+                item.setForeground(0, self._brush(_c(p, "ACCENT")))
+            if item.data(0, _DIR_ROLE) or item.childCount():
+                self._sync_arrow(item)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(tree.topLevelItemCount()):
+            walk(tree.topLevelItem(i))
+        tree.viewport().update()
 
     # ---- lazy-build plumbing (mirrors the other sub-tabs) -----------------
     def configure(self, game, profile_name: str = ""):
@@ -459,9 +480,31 @@ class SavesView(QWidget):
 
     # ---- rendering --------------------------------------------------------
     def _on_item_clicked(self, item, _column):
-        """Toggle a location or folder row's children on a plain click."""
+        """Toggle a folder row on a plain click; open a file row's preview."""
         if item.childCount() or item.data(0, _DIR_ROLE):
             item.setExpanded(not item.isExpanded())
+            return
+        self._maybe_open_file(item)
+
+    def _maybe_open_file(self, item):
+        """Single-click a file → open a panel-scoped image preview or text
+        editor, the way the Mod Files tree does, via the host's callback."""
+        raw = item.data(0, _PATH_ROLE)
+        if not raw:
+            return
+        path = Path(raw)
+        ext = path.suffix.lower()
+        from gui_qt.image_preview import PREVIEW_EXTS
+        from Utils.text_files import TEXT_EXTENSIONS
+        if ext in PREVIEW_EXTS:
+            cb = getattr(self, "on_open_image", None)
+        elif ext in TEXT_EXTENSIONS:
+            cb = getattr(self, "on_open_text", None)
+        else:
+            return
+        if cb is None or not path.is_file():
+            return
+        cb(path, path.name)
 
     def _on_item_double_clicked(self, _item, _column):
         """Open the folder. A double-click's two clicks toggle the row twice,

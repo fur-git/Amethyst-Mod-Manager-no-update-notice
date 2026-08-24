@@ -35,6 +35,7 @@ from gui_qt.safe_emit import safe_emit
 from gui_qt.worker import run_in_worker
 from gui_qt.selector_button import SelectorButton
 from gui_qt.nexus_mod_card import NexusModCard, ThumbnailLoader, CARD_W
+from gui_qt.mouse_navigation import MouseNavigationFilter
 
 # label → API value (verbatim from Tk browse_mods_panel.SORT_KEYS / TIME_RANGES)
 SORT_KEYS = [
@@ -88,6 +89,22 @@ PAGE_SIZE_BROWSE = 30
 PAGE_SIZE_CHOICES = [20, 30, 40, 50]
 
 
+def _category_key(value: str) -> str:
+    """Normalise a category/game name for comparison with a Nexus domain."""
+    return "".join(char for char in (value or "").casefold()
+                   if char.isalnum())
+
+
+def _visible_categories(categories, game_name: str, domain: str):
+    """Exclude Nexus's synthetic game-name category from the filter list."""
+    game_keys = {_category_key(game_name), _category_key(domain)} - {""}
+    return [
+        category for category in categories
+        if category.category_id != 0
+        and _category_key(category.name) not in game_keys
+    ]
+
+
 class NexusBrowserView(QWidget):
     """Required: *api* (authed NexusAPI), *domain* (game.nexus_game_domain),
     *game*. Optional: *install_fn(list[str])* (defaults to a no-op), *log_fn*."""
@@ -96,6 +113,7 @@ class NexusBrowserView(QWidget):
     _cats_ready = Signal(object, str)               # (list[NexusCategory], domain)
     _tags_ready = Signal(object, str)               # (list[NexusTag], domain)
     _premium_checked = Signal(object, object)       # (entry, is_premium|None)
+    _file_premium_checked = Signal(object, object, object)  # (entry, file, premium|None)
     _files_ready = Signal(object, object)           # (entry, list[NexusModFile])
     _manual_files_ready = Signal(object, object)    # (entry, list[NexusModFile]|None)
     _manual_watch_ended = Signal(int)               # (mod_id) - found or timed out
@@ -115,9 +133,9 @@ class NexusBrowserView(QWidget):
         self._log = log_fn or (lambda m: None)
         # progress_fn(key, name, downloaded, total) reports one download's
         # bytes to the host (which combines concurrent downloads into a single
-        # progress card); total<0 means "this download finished". Defaults to
+        # progress item); total<0 means "this download finished". Defaults to
         # a no-op.
-        self._progress_fn = progress_fn or (lambda key, name, d, t: None)
+        self._progress_fn = progress_fn or (lambda *args: None)
         self._dl_seq = 0                # unique progress-card key per download
 
         # state
@@ -176,6 +194,7 @@ class NexusBrowserView(QWidget):
         self._cats_ready.connect(self._on_cats)
         self._tags_ready.connect(self._on_tags_ready)
         self._premium_checked.connect(self._on_premium_checked)
+        self._file_premium_checked.connect(self._on_file_premium_checked)
         self._files_ready.connect(self._on_files_ready)
         self._manual_files_ready.connect(self._on_manual_files_ready)
         # Bound method (NOT a lambda): slot connections to a QObject method are
@@ -204,6 +223,8 @@ class NexusBrowserView(QWidget):
         self.destroyed.connect(_stop_watchers)
 
         self._build()
+        self._mouse_navigation = MouseNavigationFilter(
+            self, self._mouse_back, self._mouse_forward)
         self._update_section_buttons()
         self._update_browse_controls_visibility()
         self._load_categories()
@@ -726,6 +747,8 @@ class NexusBrowserView(QWidget):
         if domain != self._domain:
             return                       # stale result from the previous domain
         self._cats_loaded = True
+        cats = _visible_categories(
+            cats, getattr(self._game, "name", "") or "", domain)
         # clear existing (checks + any indent-wrapper rows + the status label)
         while self._cat_layout.count():
             it = self._cat_layout.takeAt(0)
@@ -1124,18 +1147,35 @@ class NexusBrowserView(QWidget):
     def _prev_page(self):
         if self._page > 0:
             self._page -= 1
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
 
     def _next_page(self):
         # Only allow next when the last page filled (more likely exist).
         if len(self._entries) >= self._page_size():
             self._page += 1
+            self._scroll.verticalScrollBar().setValue(0)
             self._reload()
+
+    def _mouse_back(self):
+        """Mouse 4: leave a mod detail page, otherwise go back one page."""
+        if getattr(self, "_detail_view", None) is not None:
+            self._close_detail()
+        else:
+            self._prev_page()
+
+    def _mouse_forward(self):
+        """Mouse 5: advance the listing, but never page behind a detail view."""
+        if getattr(self, "_detail_view", None) is None:
+            self._next_page()
 
     def _jump_to_page(self):
         txt = self._page_edit.text().strip()
         if txt.isdigit():
-            self._page = max(0, int(txt) - 1)
+            page = max(0, int(txt) - 1)
+            if page != self._page:
+                self._scroll.verticalScrollBar().setValue(0)
+            self._page = page
             self._reload()
 
     # -- fetch --------------------------------------------------------------
@@ -1146,6 +1186,7 @@ class NexusBrowserView(QWidget):
 
     def _retarget_domain(self, domain: str):
         """Reset domain-scoped state and fetch the selected Nexus game."""
+        self._close_detail()
         # Pending browser-download watches would install into the NEW game's
         # modlist - stop them (and their progress cards) instead.
         self._cancel_manual_watches()
@@ -1378,6 +1419,28 @@ class NexusBrowserView(QWidget):
         except Exception:
             return set()
 
+    def _installed_file_ids(self, mod_id: int) -> set[int]:
+        """Installed Nexus file IDs for one mod in the active profile/domain."""
+        game = self._game
+        if game is None or not getattr(game, "is_configured", lambda: False)():
+            return set()
+        try:
+            from pathlib import Path
+            from Nexus.nexus_meta import scan_installed_mods
+            staging = game.get_effective_mod_staging_path()
+            if not staging or not Path(staging).is_dir():
+                return set()
+            domain = (self._domain or "").lower()
+            primary = (getattr(game, "nexus_game_domain", "") or "").lower()
+            return {
+                int(meta.file_id) for meta in scan_installed_mods(Path(staging))
+                if meta.mod_id == int(mod_id or 0) and int(meta.file_id or 0) > 0
+                and (not domain
+                     or ((meta.game_domain or "").lower() or primary) == domain)
+            }
+        except Exception:
+            return set()
+
     def _rebuild_cards(self):
         for c in self._cards:
             c.setParent(None)
@@ -1402,6 +1465,10 @@ class NexusBrowserView(QWidget):
         installed = self._installed_ids()
         for card in self._cards:
             card.set_installed(card.entry.mod_id in installed)
+        detail = getattr(self, "_detail_view", None)
+        if detail is not None:
+            detail.set_installed(detail.mod_id in installed)
+            detail.set_installed_files(self._installed_file_ids(detail.mod_id))
 
     @staticmethod
     def _download_only() -> bool:
@@ -1417,6 +1484,9 @@ class NexusBrowserView(QWidget):
         flag = self._download_only()
         for card in self._cards:
             card.set_download_only(flag)
+        detail = getattr(self, "_detail_view", None)
+        if detail is not None:
+            detail.set_download_only(flag)
 
     def _cols_for_width(self) -> int:
         vp = self._scroll.viewport().width()
@@ -1452,6 +1522,9 @@ class NexusBrowserView(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        detail = getattr(self, "_detail_view", None)
+        if detail is not None:
+            detail.setGeometry(self.rect())
         if self._cols_for_width() != self._cols:
             self._relayout()
 
@@ -1461,12 +1534,38 @@ class NexusBrowserView(QWidget):
         return f"https://www.nexusmods.com/{dom}/mods/{entry.mod_id}"
 
     def _on_view(self, entry):
+        """Open a native detail page inside the existing Nexus browser tab."""
+        self._close_detail()
+        from gui_qt.nexus_mod_detail_view import NexusModDetailView
+        detail = NexusModDetailView(
+            self._api, entry, domain=self._domain,
+            on_install=self._on_install, on_install_file=self._on_install_file,
+            installed_file_ids=self._installed_file_ids(entry.mod_id),
+            is_installed=entry.mod_id in self._installed_ids(),
+            download_only=self._download_only(), log_fn=self._log,
+            parent=self)
+        detail.back_requested.connect(self._close_detail)
+        detail.setGeometry(self.rect())
+        detail.show()
+        detail.raise_()
+        detail.setFocus()
+        self._detail_view = detail
+
+    def _close_detail(self):
+        detail = getattr(self, "_detail_view", None)
+        self._detail_view = None
+        if detail is not None:
+            detail.hide()
+            detail.deleteLater()
+
+    def _open_on_nexus(self, entry):
         from Utils.xdg import open_url
         open_url(self._mod_url(entry), log_fn=self._log)
 
     def _show_card_menu(self, entry, global_pos):
         menu = QMenu(self)
-        menu.addAction(self.tr("Open on Nexus"), lambda: self._on_view(entry))
+        menu.addAction(self.tr("View details"), lambda: self._on_view(entry))
+        menu.addAction(self.tr("Open on Nexus"), lambda: self._open_on_nexus(entry))
         # _on_install toggles: while a browser-download watch is pending for
         # this mod, the same action cancels it instead.
         _act = (self.tr("Download") if self._download_only()
@@ -1547,6 +1646,18 @@ class NexusBrowserView(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     # -- install (premium check → file pick → download → install queue) ----
+    def _premium_install_allowed(self) -> bool:
+        premium = bool(self._api.validate().is_premium)
+        if premium:
+            # Developer switch used to exercise the browser/manual path even
+            # while signed in with a Premium account.
+            from Utils.ui_config import load_force_manual_install
+            if load_force_manual_install():
+                self._log("Nexus: [dev] force_manual_install - using the "
+                          "manual browser-download flow.")
+                premium = False
+        return premium
+
     def _on_install(self, entry):
         if entry.mod_id in self._manual_watchers:
             # Waiting for this mod's browser download - the click cancels the
@@ -1564,20 +1675,35 @@ class NexusBrowserView(QWidget):
         self._log(f"Nexus: preparing install for {name}…")
 
         def _check_premium():
-            premium = bool(self._api.validate().is_premium)
-            if premium:
-                # [dev] force_manual_install = true → exercise the manual
-                # browser-download flow (same switch the collections use).
-                from Utils.ui_config import load_force_manual_install
-                if load_force_manual_install():
-                    self._log("Nexus: [dev] force_manual_install - using the "
-                              "manual browser-download flow.")
-                    premium = False
-            return (entry, premium)
+            return (entry, self._premium_install_allowed())
 
         run_in_worker(_check_premium,
                       self._premium_checked, name="nexus-premium-check",
                       unpack=True, error_result=(entry, None))
+
+    def _on_install_file(self, entry, file):
+        """Install one explicitly selected Files-tab row without a chooser."""
+        if entry.mod_id in self._manual_watchers:
+            self.cancel_manual_watch(entry.mod_id)
+            self._log(f"Nexus: cancelled download detection for "
+                      f"{entry.name or entry.mod_id}.")
+            return
+        if self._installing:
+            self._log("Nexus: an install is already in progress.")
+            return
+        self._installing = True
+        label = file.name or file.file_name or f"File {file.file_id}"
+        self._log(f"Nexus: preparing install for {label}…")
+        run_in_worker(
+            lambda: (entry, file, self._premium_install_allowed()),
+            self._file_premium_checked, name="nexus-file-premium-check",
+            unpack=True, error_result=(entry, file, None))
+
+    def _on_file_premium_checked(self, entry, file, is_premium):
+        if is_premium:
+            self._start_download(entry, file)
+        else:
+            self._open_manual_file(entry, file)
 
     def _on_premium_checked(self, entry, is_premium):
         domain = getattr(entry, "domain_name", "") or self._domain
@@ -1715,6 +1841,9 @@ class NexusBrowserView(QWidget):
         for card in self._cards:
             if card.entry.mod_id == mod_id:
                 card.set_watching(watching)
+        detail = getattr(self, "_detail_view", None)
+        if detail is not None and detail.mod_id == mod_id:
+            detail.set_watching(watching)
 
     def _on_files_ready(self, entry, files):
         """UI thread: pick the file to install. Main/optional/misc; >1 → chooser."""
@@ -1744,9 +1873,10 @@ class NexusBrowserView(QWidget):
         self._dl_seq += 1
         dl_key = f"nxb-{self._dl_seq}"
         self._log(f"Nexus: downloading {dl_label}…")
+        cancel = threading.Event()
         # Show the popup immediately (indeterminate) so there's feedback even
         # before the first progress callback arrives.
-        self._progress_fn(dl_key, dl_label, 0, 0)
+        self._progress_fn(dl_key, dl_label, 0, 0, cancel.set)
 
         def worker():
             archive = None
@@ -1764,7 +1894,8 @@ class NexusBrowserView(QWidget):
                     dest_dir=dest, known_file_name=file.file_name,
                     expected_size_bytes=size,
                     progress_cb=lambda d, t: safe_emit(
-                        self._download_progress, dl_key, dl_label, int(d), int(t)))
+                        self._download_progress, dl_key, dl_label, int(d), int(t)),
+                    cancel=cancel)
                 if result.success and result.file_path is not None:
                     archive = str(result.file_path)
                     # Build the meta from the KNOWN mod_id/file_id (the archive
@@ -1779,8 +1910,11 @@ class NexusBrowserView(QWidget):
                     except Exception:
                         meta = None
                 else:
-                    self._log(f"Nexus: download failed: "
-                              f"{result.error or 'unknown error'}")
+                    if "cancel" in (result.error or "").lower():
+                        self._log("Nexus: download cancelled.")
+                    else:
+                        self._log(f"Nexus: download failed: "
+                                  f"{result.error or 'unknown error'}")
             except Exception as exc:
                 self._log(f"Nexus: download error: {exc}")
             safe_emit(self._download_done, archive, meta, dl_key)
@@ -1793,7 +1927,7 @@ class NexusBrowserView(QWidget):
         self._installing = False
 
     def _on_download_progress(self, key, name, downloaded, total):
-        """UI thread: forward download bytes to this download's progress card."""
+        """UI thread: forward download bytes to its notification progress item."""
         self._progress_fn(key, name, downloaded, total)
 
     def _on_download_done(self, archive, meta, dl_key):
