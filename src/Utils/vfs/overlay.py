@@ -26,6 +26,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 from pathlib import Path, PureWindowsPath
 from typing import Iterable
 
@@ -46,6 +47,7 @@ from Utils.deploy_shared import (
     _resolve_root_path,
 )
 from Utils.deploy_shared import (
+    OVERWRITE_LOG_NAME,
     _move_runtime_files,
     _write_deploy_snapshot,
     create_probe_stub_dirs,
@@ -79,9 +81,75 @@ _CUSTOM_DEPLOY_ARTIFACTS = (
     "custom_deploy_backup",
 )
 
+_helper_inventory_cache: str | None = None
+_helper_inventory_lock = threading.Lock()
+
 
 def _inside_flatpak() -> bool:
     return Path("/.flatpak-info").exists()
+
+
+def _output_tail(text: str, limit: int = 600) -> str:
+    clean = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+    return clean if len(clean) <= limit else clean[-limit:]
+
+
+def _helper_inventory() -> str:
+    global _helper_inventory_cache
+    with _helper_inventory_lock:
+        if _helper_inventory_cache is not None:
+            return _helper_inventory_cache
+        names = ("bwrap", "fuse-overlayfs", "fusermount3", "mountpoint", "flock")
+        details = []
+        if _inside_flatpak():
+            if not shutil.which("flatpak-spawn"):
+                _helper_inventory_cache = (
+                    "execution=Flatpak sandbox; flatpak-spawn=missing")
+                return _helper_inventory_cache
+            script = (
+                'for name in "$@"; do path=$(command -v "$name" 2>/dev/null || true); '
+                'if [ -z "$path" ]; then printf "%s=missing\\n" "$name"; continue; fi; '
+                'version=$("$path" --version 2>&1 | head -n 1); '
+                'printf "%s=%s [%s]\\n" "$name" "$path" "$version"; done; '
+                'if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then echo "/dev/fuse=rw"; '
+                'else echo "/dev/fuse=unavailable"; fi'
+            )
+            try:
+                probe = subprocess.run(
+                    ["flatpak-spawn", "--host", "/bin/sh", "-c", script,
+                     "amethyst-vfs-inventory", *names],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=8, check=False)
+                details.append("execution=Flatpak host")
+                details.extend(line.strip() for line in (probe.stdout or "").splitlines()
+                               if line.strip())
+                if probe.returncode != 0:
+                    details.append(f"inventory rc={probe.returncode}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                details.append(f"host inventory failed: {exc}")
+        else:
+            details.append("execution=native/AppImage")
+            for name in names:
+                path = shutil.which(name)
+                if path is None:
+                    details.append(f"{name}=missing")
+                    continue
+                version = ""
+                try:
+                    probe = subprocess.run(
+                        [path, "--version"], text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, timeout=2, check=False)
+                    version = next(iter((probe.stdout or "").splitlines()), "").strip()
+                    version = version[:300]
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                details.append(f"{name}={path}" + (f" [{version}]" if version else ""))
+            fuse = Path("/dev/fuse")
+            details.append("/dev/fuse=" + (
+                "rw" if fuse.exists() and os.access(fuse, os.R_OK | os.W_OK)
+                else "unavailable"))
+        _helper_inventory_cache = "; ".join(details)
+        return _helper_inventory_cache
 
 
 def _profile_dir(game, profile: str | None = None) -> Path:
@@ -130,14 +198,16 @@ def pending_path(game, profile: str | None = None) -> Path:
 
 
 def has_deployment_state(game, profile: str | None = None) -> bool:
-    """Whether a published or interrupted profile VFS deployment exists."""
+    """Whether published, interrupted, or retained profile VFS state exists."""
     state = state_dir(game, profile)
     # Keep an invalid state root discoverable so Restore reports the safety
     # problem instead of silently treating the profile as undeployed.
     if state.is_symlink():
         return True
     return (manifest_path(game, profile).is_file()
-            or pending_path(game, profile).is_file())
+            or pending_path(game, profile).is_file()
+            or (_uses_root_folder_runtime(game)
+                and _legacy_shadow_upper(state)))
 
 
 def deployment_state_profiles(game) -> tuple[str, ...]:
@@ -168,6 +238,12 @@ def deployment_state_profiles(game) -> tuple[str, ...]:
         for name in (MANIFEST_NAME, PENDING_NAME):
             try:
                 stamps.append((state / name).stat().st_mtime_ns)
+            except OSError:
+                pass
+        if _uses_root_folder_runtime(game) and _legacy_shadow_upper(state):
+            try:
+                log_path = state / "root-upper" / OVERWRITE_LOG_NAME
+                stamps.append(log_path.stat().st_mtime_ns)
             except OSError:
                 pass
         if stamps:
@@ -289,7 +365,9 @@ def _bubblewrap_help() -> tuple[bool, str, str]:
         return False, f"bubblewrap could not be queried: {exc}", ""
     help_text = probe.stdout or ""
     if probe.returncode != 0:
-        return False, "bubblewrap returned an error during its capability check", help_text
+        detail = _output_tail(help_text)
+        reason = f"bubblewrap capability check exited {probe.returncode}"
+        return False, f"{reason}: {detail}" if detail else reason, help_text
     return True, "", help_text
 
 
@@ -319,11 +397,16 @@ def fuse_overlay_status() -> tuple[bool, str]:
     if _inside_flatpak():
         if not shutil.which("flatpak-spawn"):
             return False, "Flatpak host spawning is unavailable"
-        checks = " && ".join(f"command -v {name} >/dev/null" for name in required)
-        checks += " && test -r /dev/fuse && test -w /dev/fuse"
+        checks = (
+            'for name in "$@"; do command -v "$name" >/dev/null 2>&1 '
+            '|| echo "missing:$name"; done; '
+            'if ! test -r /dev/fuse || ! test -w /dev/fuse; '
+            'then echo "fuse:unavailable"; fi'
+        )
         try:
             probe = subprocess.run(
-                ["flatpak-spawn", "--host", "/bin/sh", "-c", checks],
+                ["flatpak-spawn", "--host", "/bin/sh", "-c", checks,
+                 "amethyst-vfs-probe", *required],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -332,10 +415,17 @@ def fuse_overlay_status() -> tuple[bool, str]:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return False, f"host FUSE tools could not be queried: {exc}"
+        output = (probe.stdout or "").strip()
         if probe.returncode != 0:
-            return False, (
-                "the host needs bwrap, fuse-overlayfs, fuse3 and access to /dev/fuse"
-            )
+            detail = _output_tail(output)
+            return False, (f"host capability probe exited {probe.returncode}: {detail}"
+                           if detail else f"host capability probe exited {probe.returncode}")
+        problems = [line.removeprefix("missing:") for line in output.splitlines()
+                    if line.startswith("missing:")]
+        if problems:
+            return False, "required host tool(s) not found: " + ", ".join(problems)
+        if "fuse:unavailable" in output.splitlines():
+            return False, "/dev/fuse is unavailable to the host process"
         return True, ""
 
     missing = [name for name in required if shutil.which(name) is None]
@@ -403,18 +493,14 @@ def _mapped_separator_dirs(per_mod_deploy: dict[str, Path], game_root: Path,
     return mapped, external
 
 
-def _overwrite_entries(filemap: Path) -> set[str]:
+def _overwrite_entries() -> set[str]:
     """Paths supplied by [Overwrite], which is mounted as Data's upper layer."""
-    out: set[str] = set()
-    with filemap.open(encoding="utf-8", errors="surrogateescape") as handle:
-        for line in handle:
-            line = line.rstrip("\n")
-            if "\t" not in line:
-                continue
-            rel, owner = line.split("\t", 1)
-            if owner == "[Overwrite]":
-                out.add(rel.replace("\\", "/").lower())
-    return out
+    from Utils.filegraph_deploy import legacy_rows
+    return {
+        rel.replace("\\", "/").lower()
+        for rel, owner in legacy_rows()
+        if owner == "[Overwrite]"
+    }
 
 
 def _reject_symlink_payload(layer: Path) -> None:
@@ -857,17 +943,29 @@ def effective_tool_data_root(game) -> Path:
 
 
 def _capture_shadow_runtime(game, payload: dict, state: Path,
-                            log_fn=None) -> int:
+                            log_fn=None, *, retain_root: bool = True) -> int:
     """Move files created in a published shadow view into profile storage."""
     if payload.get("backend") != BACKEND_SHADOW:
         return 0
     (view, view_data, data_rel, _game_root, _data_root,
      root_upper, data_upper) = _validated_shadow_paths(
         game, payload, state, use_recorded_roots=True)
-    if not view.is_dir() or not view_data.is_dir():
-        return 0
 
     _log = log_fn or (lambda _message: None)
+    root_destination = (
+        _root_runtime_destination(game, state, root_upper)
+        if retain_root else root_upper
+    )
+    promoted = (
+        _promote_shadow_root_upper(root_upper, root_destination)
+        if retain_root else 0
+    )
+    if promoted:
+        _log(
+            f"VFS: moved {promoted} retained root file(s) into Root_Folder/."
+        )
+    if not view.is_dir() or not view_data.is_dir():
+        return 0
     moved_data = _move_runtime_files(
         view_data,
         state / DATA_SNAPSHOT_NAME,
@@ -884,7 +982,7 @@ def _capture_shadow_runtime(game, payload: dict, state: Path,
     moved_root = _move_runtime_files(
         view,
         state / ROOT_SNAPSHOT_NAME,
-        root_upper,
+        root_destination,
         log_fn=_log,
         exclude_dirs=(data_rel.as_posix(),),
     )
@@ -892,6 +990,47 @@ def _capture_shadow_runtime(game, payload: dict, state: Path,
     if moved:
         _log(f"VFS: captured {moved} runtime-created file(s) from the shadow view.")
     return moved
+
+
+def _uses_root_folder_runtime(game) -> bool:
+    if getattr(game, "vfs_root_payload_targets_data", False):
+        return False
+    enabled = getattr(game, "root_folder_deploy_enabled", True)
+    if callable(enabled):
+        enabled = enabled()
+    return bool(enabled) and callable(
+        getattr(game, "get_effective_root_folder_path", None))
+
+
+def _legacy_shadow_upper(state: Path) -> bool:
+    root_upper = state / "root-upper"
+    return (not root_upper.is_symlink()
+            and (root_upper / OVERWRITE_LOG_NAME).is_file())
+
+
+def _root_runtime_destination(game, state: Path, root_upper: Path) -> Path:
+    if not _uses_root_folder_runtime(game):
+        return root_upper
+    try:
+        destination = Path(game.get_effective_root_folder_path())
+        destination.resolve(strict=False).relative_to(
+            state.resolve(strict=False))
+    except ValueError:
+        return destination
+    except (OSError, TypeError):
+        pass
+    return root_upper
+
+
+def _promote_shadow_root_upper(
+    root_upper: Path, destination: Path,
+) -> int:
+    if (destination.resolve(strict=False) == root_upper.resolve(strict=False)
+            or not root_upper.is_dir() or root_upper.is_symlink()):
+        return 0
+
+    return sum(_materialize_tree(
+        root_upper, destination, replace=False, move=True))
 
 
 def _snapshot_shadow_view(
@@ -1293,14 +1432,12 @@ def build_layers(
         prefix_rules and game.get_prefix_path() is None)
     routing_entries: list[tuple[str, str]] = []
     if needs_claim_partition or needs_prefix_probe:
-        with filemap.open(encoding="utf-8", errors="surrogateescape") as handle:
-            for line in handle:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                relative, mod_name = line.split("\t", 1)
-                if not raw_mods or mod_name not in raw_mods:
-                    routing_entries.append((relative, mod_name))
+        from Utils.filegraph_deploy import legacy_rows
+        routing_entries = [
+            (relative, mod_name)
+            for relative, mod_name in legacy_rows()
+            if not raw_mods or mod_name not in raw_mods
+        ]
         game_claims, prefix_claims = compute_rule_claims(
             routing_entries, custom_rules)
 
@@ -1328,11 +1465,10 @@ def build_layers(
         # physical prefix-route journal and destroy its recoverable backup.
         routing_metadata = build / "routing-metadata"
         routing_metadata.mkdir()
-        routing_filemap = routing_metadata / "filemap.txt"
-        shutil.copy2(filemap, routing_filemap)
+        routing_state = routing_metadata / "catalog-input"
         try:
             custom_exclude |= deploy_custom_rules(
-                routing_filemap, routed_layer, staging,
+                routing_state, routed_layer, staging,
                 rules=game_rules,
                 mode=LinkMode.HARDLINK,
                 strip_prefixes=game.mod_folder_strip_prefixes,
@@ -1385,7 +1521,7 @@ def build_layers(
     # destination is remapped are the exception: they must pass through
     # deploy_filemap so the source remains at its original overwrite path but
     # appears at the handler-defined destination in the shadow.
-    overwrite_entries = _overwrite_entries(filemap)
+    overwrite_entries = _overwrite_entries()
     routed_overwrite_entries = custom_exclude & overwrite_entries
     path_remap = dict(getattr(game, "mod_deploy_path_remap", None) or {})
     remap_prefixes = tuple(
@@ -1475,7 +1611,7 @@ def build_layers(
                 mode=LinkMode.HARDLINK, log_fn=_log,
                 metadata_dir=root_metadata)
         linked_root += deploy_root_flagged_mods(
-            filemap.parent / "filemap_root.txt", root_payload, staging,
+            root_metadata / "catalog-input", root_payload, staging,
             mode=LinkMode.HARDLINK,
             strip_prefixes=game.mod_folder_strip_prefixes,
             per_mod_strip_prefixes=per_mod_strip,
@@ -2051,8 +2187,8 @@ def _direct_shadow_opt_in_command(command: list[str], game_root: Path,
     return [*wrapper, *host_command]
 
 
-def wrap_command(game, command: list[str],
-                 env: dict[str, str] | None = None) -> list[str]:
+def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
+                 log_fn=None) -> list[str]:
     """Wrap *command* in the deployed profile's private game view."""
     if not command:
         raise RuntimeError("No launch command was supplied to the profile VFS.")
@@ -2060,6 +2196,26 @@ def wrap_command(game, command: list[str],
     payload = _load_manifest(game)
     state = manifest_path(game).parent
     backend = payload.get("backend", BACKEND_KERNEL)
+
+    if log_fn is None:
+        try:
+            from Utils.app_log import app_log
+            log_fn = app_log
+        except Exception:
+            log_fn = lambda _message: None
+
+    def routed(route: str, wrapped: list[str], *, helpers: bool = False) -> list[str]:
+        try:
+            from Utils.process_watch import format_command
+            location = "Flatpak host" if _inside_flatpak() else "native/AppImage"
+            log_fn(
+                f"VFS launch: backend={backend}, route={route}, execution={location}.")
+            log_fn(f"VFS launch wrapper: {format_command(wrapped)}")
+            if helpers:
+                log_fn(f"VFS helper inventory: {_helper_inventory()}")
+        except Exception:
+            pass
+        return wrapped
 
     if backend == BACKEND_SHADOW:
         (view, view_data, _data_rel, game_root, data_root,
@@ -2078,33 +2234,34 @@ def wrap_command(game, command: list[str],
             bound_runtime = _bound_shadow_steam_runtime_command(
                 command, game_root, view, env)
             if bound_runtime is not None:
-                return bound_runtime
+                return routed("shadow Steam Runtime bind", bound_runtime)
         if not bind_at_game_root:
             direct_umu = _direct_shadow_umu_command(
                 command, game_root, view, env)
             if direct_umu is not None:
-                return direct_umu
+                return routed("direct shadow UMU", direct_umu)
             direct_runtime = _direct_shadow_steam_runtime_command(
                 command, game_root, view, env)
             if direct_runtime is not None:
-                return direct_runtime
+                return routed("direct shadow Steam Runtime", direct_runtime)
         if (not bind_at_game_root
                 and getattr(game, "vfs_direct_shadow_launch", False)):
-            return _direct_shadow_opt_in_command(
-                command, game_root, view, env)
+            return routed(
+                "direct shadow opt-in",
+                _direct_shadow_opt_in_command(command, game_root, view, env))
         ok, reason = _bubblewrap_status()
         if not ok:
             raise RuntimeError(f"Profile VFS is unavailable: {reason}.")
         wrapper, host_command = _place_wrapper_on_host(
             [_bubblewrap_binary() or "bwrap"], command)
-        return [
+        return routed("bubblewrap shadow bind", [
             *wrapper,
             "--die-with-parent",
             "--dev-bind", "/", "/",
             "--bind", str(view), str(game_root),
             "--",
             *host_command,
-        ]
+        ], helpers=True)
 
     keys = (
         "game_root", "data_root", "root_layer", "data_layer",
@@ -2146,7 +2303,7 @@ def wrap_command(game, command: list[str],
             ],
             command,
         )
-        return [*wrapper, *host_command]
+        return routed("fuse-overlayfs", [*wrapper, *host_command], helpers=True)
 
     if backend != BACKEND_KERNEL:
         raise RuntimeError(
@@ -2160,7 +2317,7 @@ def wrap_command(game, command: list[str],
     wrapper, host_command = _place_wrapper_on_host(
         [_bubblewrap_binary() or "bwrap"], command)
 
-    return [
+    return routed("bubblewrap kernel OverlayFS", [
         *wrapper,
         "--die-with-parent",
         "--dev-bind", "/", "/",
@@ -2174,7 +2331,7 @@ def wrap_command(game, command: list[str],
         str(paths["data_root"]),
         "--",
         *host_command,
-    ]
+    ], helpers=True)
 
 
 def _mapped_virtual_relative(game, relative: str | Path) -> Path:
@@ -2337,7 +2494,10 @@ def cleanup_deployment(game, *, preserve_upper: bool = True, log_fn=None) -> Non
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                _capture_shadow_runtime(game, payload, state, log_fn=_log)
+                _capture_shadow_runtime(
+                    game, payload, state, log_fn=_log,
+                    retain_root=preserve_upper,
+                )
         except (OSError, ValueError, RuntimeError) as exc:
             _log(f"  WARN: could not capture the VFS shadow view: {exc}")
     elif manifest.is_file():
@@ -2345,6 +2505,16 @@ def cleanup_deployment(game, *, preserve_upper: bool = True, log_fn=None) -> Non
             "VFS: removing an unfinalized view without capturing partial "
             "deploy output."
         )
+    if (preserve_upper and _uses_root_folder_runtime(game)
+            and _legacy_shadow_upper(state)):
+        root_upper = state / "root-upper"
+        root_destination = _root_runtime_destination(game, state, root_upper)
+        promoted = _promote_shadow_root_upper(root_upper, root_destination)
+        if promoted:
+            _log(
+                f"VFS: moved {promoted} retained root file(s) into "
+                "Root_Folder/."
+            )
     for name in (
         MANIFEST_NAME, RUNTIME_NAME, "runtime.lock", "lower", "lower.build",
         "root-work", "data-work", SHADOW_NAME, SHADOW_BUILD_NAME,

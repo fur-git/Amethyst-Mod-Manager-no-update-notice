@@ -38,7 +38,9 @@ from PySide6.QtWidgets import (
     QStackedWidget,
 )
 
-from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
+from gui_qt.theme_qt import (
+    active_palette, _c, button_qss, close_button, ok_text, err_text,
+)
 from gui_qt.safe_emit import safe_emit
 from Utils.xedit_tools import tool_exe_path
 
@@ -162,10 +164,7 @@ class XEditView(QWidget):
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(
-            button_qss("BTN_DANGER", padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=p)
         close.clicked.connect(self._finish)
         self._close_btn = close
         hb.addWidget(close)
@@ -497,6 +496,10 @@ class XEditView(QWidget):
             log_fn=self._log,
             title=self.tr("Step 5: Choose Proton Version"),
             show_launch_args=True,
+            wizard_id=getattr(self._ctx, "wizard_tool_id", ""),
+            wizard_label=getattr(self._ctx, "wizard_tool_label", ""),
+            wizard_label_args=getattr(
+                self._ctx, "wizard_tool_label_args", ()),
         ))
 
     def _on_proton_chosen(self, proton_name: str, prefix_mode: str):
@@ -663,7 +666,8 @@ class XEditView(QWidget):
                           f"{' '.join(extra_args)}")
                 safe_emit(self._run_started_sig)
                 run_tool_logged(proton_script, exe, env, log_fn=_wlog,
-                                extra_args=extra_args, label=name, game=game)
+                                extra_args=extra_args, label=name, game=game,
+                                owner=self)
 
                 shutdown_prefix_wineserver(proton_script, compat_data,
                                            log_fn=_wlog)
@@ -869,7 +873,8 @@ class XEditView(QWidget):
                               f"({i}/{total})")
                     run_tool_logged(proton_script, exe, env, log_fn=_wlog,
                                     extra_args=base_args + [plugin],
-                                    label=f"{name} [{plugin}]", game=game)
+                                    label=f"{name} [{plugin}]", game=game,
+                                    owner=self)
                     # Finalise this plugin's <name>.save.<ts> temp before the
                     # next launch reloads Data/ (QAC queues the rename to run on
                     # shutdown, but we relaunch into the same prefix).

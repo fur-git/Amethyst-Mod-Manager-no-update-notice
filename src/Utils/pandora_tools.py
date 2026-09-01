@@ -68,7 +68,7 @@ def install_net10(proton_script: Path, compat_data: Path, env: dict,
 
 def run_pandora(exe: Path, game: "BaseGame", proton_script: Path,
                 compat_data: Path, env: dict,
-                log_fn=_noop, on_started=None) -> int:
+                log_fn=_noop, on_started=None, owner=None) -> int:
     """Launch Pandora via Proton and wait for it to exit. Returns the exit
     code (stderr is logged). Blocking - call from a worker thread.
 
@@ -102,14 +102,16 @@ def run_pandora(exe: Path, game: "BaseGame", proton_script: Path,
     )
 
     # The output folder (<staging>/Pandora_output) is configured by rewriting
-    # Pandora's Settings.json inside the prefix - newer Pandora builds ignore
-    # the --output: CLI flag.
+    # Pandora's Settings.json - newer Pandora builds ignore the --output: CLI
+    # flag. Written to the prefix and beside the exe: 4.4 seeds from the
+    # prefix copy but thereafter reads the one in its own folder.
     _bootstrap_pandora_settings(
         getattr(game, "game_id", None),
         game_path,
         staging,
         compat_data,
         log_fn,
+        exe_path=exe,
     )
 
     pfx = Path(compat_data) / "pfx"
@@ -152,11 +154,11 @@ def run_pandora(exe: Path, game: "BaseGame", proton_script: Path,
                     "DOTNET_BUNDLE_EXTRACT_BASE_DIR": None,
                     "WINE_D3D_CONFIG": "renderer=gdi",
                 },
-                label="Pandora", game=game)
+                label="Pandora", game=game, owner=owner)
         else:
             rc = run_tool_logged(proton_script, exe, env, log_fn=log_fn,
                                  extra_args=[game_arg] if game_arg else None,
-                                 label="Pandora", game=game)
+                                 label="Pandora", game=game, owner=owner)
     finally:
         # In finally: a tool that crashed is exactly when Proton sidecars are
         # most likely to be left holding the prefix.

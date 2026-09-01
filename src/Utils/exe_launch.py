@@ -10,6 +10,7 @@ identical to the Tk app so settings are shared between both:
 - ~/.config/AmethystModManager/games/<game>/exe_launch_mode.json
       exe_name → "auto"|"steam"|"heroic"|"none"
       "__deploy_before_launch" → bool (default True)
+      "__launch_with_wayland" → bool (default False)
       "__proton_override_<exe>" → Proton dir name ('' = game default)
       "__launch_options_<exe>" → Steam-style launch options string
       "__hidden_auto_exes" → [exe names] hidden auto-detected framework exes
@@ -26,7 +27,9 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
+import threading
 import re
 from pathlib import Path
 
@@ -454,6 +457,17 @@ def save_deploy_before_launch(game, enabled: bool) -> None:
     _write_launch_mode_key(game, "__deploy_before_launch", bool(enabled))
 
 
+def load_launch_with_wayland(game) -> bool:
+    """Whether the game's Play entry should request a Wayland backend."""
+    return bool(_read_launch_mode_data(game).get("__launch_with_wayland", False))
+
+
+def save_launch_with_wayland(game, enabled: bool) -> None:
+    """Persist the off-by-default Wayland launch setting for manager Play."""
+    _write_launch_mode_key(
+        game, "__launch_with_wayland", True if enabled else None)
+
+
 def load_launch_toggle(game, key: str, default: bool = False) -> bool:
     """State of a handler-declared Launch settings checkbox (BaseGame.launch_toggles).
 
@@ -570,6 +584,14 @@ def save_exe_args(game, exe_name: str, args_str: str) -> None:
 
 _ENV_VAR_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
+_NATIVE_WAYLAND_ENV = {
+    "SDL_VIDEODRIVER": "wayland",
+    "QT_QPA_PLATFORM": "wayland",
+    "GDK_BACKEND": "wayland",
+}
+_WAYLAND_ENV_KEYS = (
+    "PROTON_ENABLE_WAYLAND", *_NATIVE_WAYLAND_ENV, "SDL_DYNAMIC_API")
+
 
 def split_preserving_backslash(s: str) -> list:
     """shlex.split but without treating ``\\`` as an escape character.
@@ -652,6 +674,77 @@ def parse_launch_options(opts: str, command: list,
                 suffix.append(token)
 
         return env_vars, list(command) + suffix
+
+
+def _is_native_unity_player(exe_path: "Path | None") -> bool:
+    """Whether *exe_path* has the normal Unity Linux player layout."""
+    if exe_path is None:
+        return False
+    exe_path = Path(exe_path)
+    if (exe_path.parent / "UnityPlayer.so").is_file():
+        return True
+    data_name = f"{exe_path.stem}_Data".casefold()
+    try:
+        return any(
+            child.is_dir() and child.name.casefold() == data_name
+            for child in exe_path.parent.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def apply_wayland_launch_setting(
+        game, env: dict, command: list[str], *, native: bool,
+        exe_path: "Path | None" = None, log_fn=_noop_log,
+        log_prefix: str = "Play",
+        enabled: "bool | None" = None) -> list[str]:
+    """Apply the saved Wayland request to a concrete launch environment.
+
+    Proton consumes ``PROTON_ENABLE_WAYLAND``. Native games commonly select
+    their backend through SDL, Qt or GTK; Unity Linux players additionally
+    require their documented ``-force-wayland`` argument.
+    """
+    command = list(command)
+    if enabled is None:
+        enabled = load_launch_with_wayland(game)
+    if not enabled:
+        return command
+
+    env["PROTON_ENABLE_WAYLAND"] = "1"
+    custom_message = None
+    if native:
+        env.update(_NATIVE_WAYLAND_ENV)
+        customize_env = getattr(game, "customize_native_wayland_env", None)
+        if callable(customize_env):
+            result = customize_env(env, command)
+            if isinstance(result, str):
+                custom_message = result
+        if (_is_native_unity_player(exe_path)
+                and "-force-wayland" not in command):
+            command.append("-force-wayland")
+    log_fn(f"{log_prefix}: {custom_message or 'Launch with Wayland enabled.'}")
+    return command
+
+
+def forward_wayland_env_through_flatpak_spawn(
+        command: list[str], env: dict) -> list[str]:
+    """Carry an explicit native Wayland request across a host portal."""
+    command = list(command)
+    if (len(command) < 2
+            or Path(command[0]).name != "flatpak-spawn"
+            or command[1] != "--host"):
+        return command
+    existing = {
+        token[len("--env="):].split("=", 1)[0]
+        for token in command
+        if token.startswith("--env=") and "=" in token[len("--env="):]
+    }
+    forwarded = [
+        f"--env={key}={env[key]}"
+        for key in _WAYLAND_ENV_KEYS
+        if key in env and key not in existing
+    ]
+    return [*command[:2], *forwarded, *command[2:]]
 
 
 # ---------------------------------------------------------------------------
@@ -743,8 +836,8 @@ def _without_amethyst_steam_handoff(options: str, game) -> str | None:
 
     Return the options remaining after the handoff, ``"%command%"`` when
     there are no additional options, or ``None`` when this is not Amethyst's
-    handoff. Tokens after the handoff's ``--`` marker are user wrappers and
-    must survive when the manager launches the game directly.
+    handoff. User environment, wrappers, and suffix arguments surrounding the
+    handoff must survive when the manager launches the game directly.
     """
     if not options or "%command%" not in options:
         return None
@@ -883,6 +976,8 @@ def _prepare_native_game_launch(game, exe_path: Path, env: dict,
         log_fn(f"Play: {reason}.")
         launch_report.mark_failed(launch_report.actionable(reason))
         return None
+    command = apply_wayland_launch_setting(
+        game, env, command, native=True, exe_path=exe_path, log_fn=log_fn)
 
     if (is_steam_install and steam_id
             and getattr(game, "native_steam_client_required", False)):
@@ -1723,6 +1818,8 @@ PREFIX_MODE_GAME = "game"          # reuse the game's own prefix
 _LAUNCH_ENV_FILE = "launch_env.json"
 _LAUNCH_ARGS_FILE = "launch_args.json"
 _ENV_VAR_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+_WIZARD_ALWAYS_USE_PREFIX = "__wizard_always_use_"
+_WIZARD_DISCRETE_GPU_PREFIX = "__wizard_discrete_gpu_"
 
 
 def shared_prefix_dir(proton_dir_name: str) -> Path:
@@ -1759,6 +1856,68 @@ def save_winetricks_style(game, exe_name: str, enabled: bool) -> None:
     """Persist the winetricks-style launch choice (off = remove key)."""
     _write_launch_mode_key(game, f"__winetricks_style_{exe_name}",
                            True if enabled else None)
+
+
+def load_wizard_always_use_settings(game, wizard_id: str) -> bool:
+    if not wizard_id:
+        return False
+    return bool(_read_launch_mode_data(game).get(
+        f"{_WIZARD_ALWAYS_USE_PREFIX}{wizard_id}"))
+
+
+def save_wizard_always_use_settings(
+        game, wizard_id: str, enabled: bool, *, label: str = "",
+        label_args=()) -> None:
+    if not wizard_id:
+        return
+    value = None
+    if enabled:
+        value = {
+            "label": str(label or wizard_id),
+            "label_args": [str(arg) for arg in (label_args or ())],
+        }
+    _write_launch_mode_key(
+        game, f"{_WIZARD_ALWAYS_USE_PREFIX}{wizard_id}", value)
+
+
+def list_wizard_always_use_settings(game) -> list[dict]:
+    entries = []
+    for key, value in _read_launch_mode_data(game).items():
+        if not key.startswith(_WIZARD_ALWAYS_USE_PREFIX) or not value:
+            continue
+        wizard_id = key[len(_WIZARD_ALWAYS_USE_PREFIX):]
+        if not wizard_id:
+            continue
+        if isinstance(value, dict):
+            label = str(value.get("label") or wizard_id)
+            raw_args = value.get("label_args")
+            label_args = tuple(str(arg) for arg in raw_args) \
+                if isinstance(raw_args, list) else ()
+        else:
+            label = wizard_id
+            label_args = ()
+        entries.append({
+            "wizard_id": wizard_id,
+            "label": label,
+            "label_args": label_args,
+        })
+    return entries
+
+
+def load_wizard_prefer_discrete_gpu(game, wizard_id: str) -> bool:
+    if not wizard_id:
+        return False
+    return bool(_read_launch_mode_data(game).get(
+        f"{_WIZARD_DISCRETE_GPU_PREFIX}{wizard_id}"))
+
+
+def save_wizard_prefer_discrete_gpu(
+        game, wizard_id: str, enabled: bool) -> None:
+    if not wizard_id:
+        return
+    _write_launch_mode_key(
+        game, f"{_WIZARD_DISCRETE_GPU_PREFIX}{wizard_id}",
+        True if enabled else None)
 
 
 def load_tool_launch_env(exe: Path | None) -> str:
@@ -1853,6 +2012,139 @@ def parse_env_overrides(text: str) -> dict:
             k, v = token.split("=", 1)
             out[k] = v
     return out
+
+
+# --------------------------------------------------------------------------
+# Live wizard-tool registry
+#
+# Every wizard wraps its tool launch in `finally: shutdown_prefix_wineserver`,
+# and that cleanup is correct - but it is unreachable when a tool finishes its
+# work and then fails to exit. PGPatcher does exactly that: it writes its last
+# file, logs "took N seconds to complete", then busy-spins its main thread
+# forever. A spinning process holds its stdout pipe open, so the reader loop in
+# run_tool_logged never sees EOF, never returns, and the `finally` never runs.
+# The tool then outlives the app itself - it belongs to wineserver, not to us,
+# so killing the Python process just reparents it to init.
+#
+# So every launch registers here, and the app-exit / wizard-close paths reap
+# what the tool would not release on its own.
+# --------------------------------------------------------------------------
+
+_live_tools: "dict[int, dict]" = {}
+_live_tools_lock = threading.Lock()
+_live_tools_seq = 0
+
+
+def _register_live_tool(proc, label: str, proton_script, compat_data,
+                        owner=None) -> int:
+    """Record a running tool process; returns a token for _forget_live_tool."""
+    global _live_tools_seq
+    with _live_tools_lock:
+        _live_tools_seq += 1
+        token = _live_tools_seq
+        _live_tools[token] = {
+            "proc": proc, "label": label, "owner": owner,
+            "proton_script": proton_script, "compat_data": compat_data,
+        }
+    return token
+
+
+def _forget_live_tool(token: int) -> None:
+    """Drop a registry entry - the tool exited on its own, as most do."""
+    with _live_tools_lock:
+        _live_tools.pop(token, None)
+
+
+def live_tool_labels(owner=None) -> "list[str]":
+    """Labels of tools still running (optionally only *owner*'s).
+
+    Lets a caller ask "is anything still up?" before deciding to prompt.
+    """
+    with _live_tools_lock:
+        entries = list(_live_tools.values())
+    return [e["label"] for e in entries
+            if (owner is None or e["owner"] is owner)
+            and e["proc"].poll() is None]
+
+
+def _kill_process_group(proc, sig) -> bool:
+    """Signal the tool's whole process group. False if it was already gone."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        # No process group (already reaped) - fall back to the direct child.
+        try:
+            proc.send_signal(sig)
+            return True
+        except Exception:
+            return False
+
+
+def reap_live_tools(owner=None, log_fn=None, timeout: float = 4.0) -> int:
+    """Terminate registered tools that are still running; returns how many.
+
+    Escalates deliberately, because the Popen we hold is only the *launcher*
+    (the Proton script). SIGTERM to the group gives a well-behaved tool the
+    chance to exit; the wineserver kill is what actually reaches an .exe
+    spinning inside the prefix; SIGKILL is the backstop for the launcher
+    itself. Killing the tool closes its pipe, which unblocks run_tool_logged
+    and lets each wizard's own `finally` cleanup finally run.
+
+    With *owner* set, only that owner's tools are touched - one wizard tab
+    closing must not kill a tool another tab is still using.
+    """
+    def _log(msg):
+        if log_fn is not None:
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+
+    with _live_tools_lock:
+        entries = [(tok, dict(e)) for tok, e in _live_tools.items()
+                   if owner is None or e["owner"] is owner]
+
+    reaped = 0
+    for token, entry in entries:
+        proc = entry["proc"]
+        label = entry["label"]
+        if proc.poll() is not None:
+            _forget_live_tool(token)
+            continue
+
+        _log(f"{label}: still running at shutdown - terminating")
+        _kill_process_group(proc, signal.SIGTERM)
+        try:
+            proc.wait(timeout=timeout / 2)
+        except Exception:
+            pass
+
+        if proc.poll() is None:
+            # The launcher is blocked on an .exe that will not exit. The
+            # prefix's wineserver owns that .exe, so this is what reaches it.
+            script, compat = entry["proton_script"], entry["compat_data"]
+            if script is not None and compat is not None:
+                _log(f"{label}: unresponsive - shutting down its wineserver")
+                shutdown_prefix_wineserver(Path(script), Path(compat),
+                                           log_fn=None)
+            try:
+                proc.wait(timeout=timeout / 2)
+            except Exception:
+                pass
+
+        if proc.poll() is None:
+            _log(f"{label}: forcing SIGKILL")
+            _kill_process_group(proc, signal.SIGKILL)
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
+        _forget_live_tool(token)
+        reaped += 1
+
+    return reaped
 
 
 def shutdown_prefix_wineserver(proton_script: Path, compat_data: Path,
@@ -2086,8 +2378,7 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
     extra = parse_env_overrides(load_tool_launch_env(exe))
     if extra:
         env.update(extra)
-        log_fn("applying saved env vars: "
-               + " ".join(f"{k}={v}" for k, v in extra.items()))
+        log_fn("applying saved env var names: " + ", ".join(sorted(extra)))
     # Marker consumed by run_tool_logged: launch this tool winetricks-style
     # (plain wine, no proton session - see run_tool_winetricks_style). Set
     # here so every wizard honours the Proton-step checkbox without each
@@ -2105,7 +2396,7 @@ def wrap_tool_command(game, command: list[str], env: dict,
     from Utils.vfs import manifest_path, wrap_command
     if not manifest_path(game).is_file():
         return command
-    wrapped = wrap_command(game, command, env=env)
+    wrapped = wrap_command(game, command, env=env, log_fn=log_fn)
     log_fn(f"{label}: using the deployed profile VFS game view.")
     return wrapped
 
@@ -2121,6 +2412,7 @@ def run_tool_logged(
     label: str | None = None,
     winedebug: str = "+err,+warn,fixme-all",
     game=None,
+    owner=None,
 ) -> int:
     """Launch *exe* through Proton and stream its output to *log_fn*.
 
@@ -2135,6 +2427,11 @@ def run_tool_logged(
     Blocks until the process exits (call from a worker thread) and returns the
     exit code. *proton_script* and *env* come from ``resolve_tool_prefix``;
     *extra_args* are appended after the exe (e.g. xEdit's data-path flag).
+
+    The launch is registered in the live-tool registry for as long as it runs,
+    so ``reap_live_tools`` can kill a tool that finishes its work and then
+    refuses to exit (see the registry comment above). Pass *owner* - normally
+    the wizard view - to let that wizard reap only its own tools.
     """
     from Utils.steam_finder import proton_run_command
 
@@ -2158,7 +2455,7 @@ def run_tool_logged(
                 proton_script, exe, Path(prefix), log_fn=log_fn,
                 extra_args=extra_args,
                 extra_env={key: env.get(key) for key in gpu_env_keys},
-                cwd=cwd, label=label, game=game)
+                cwd=cwd, label=label, game=game, owner=owner)
         log_fn(f"{label}: winetricks-style launch requested but no prefix "
                "path in env - falling back to Proton.")
 
@@ -2209,20 +2506,34 @@ def run_tool_logged(
             stderr=subprocess.STDOUT,
             bufsize=1,
             universal_newlines=True,
+            # Own session/process group, so reap_live_tools can signal the
+            # whole tool tree without that signal also reaching Amethyst.
+            start_new_session=True,
         )
     except OSError as exc:
         log_fn(f"{label}: failed to launch - {exc}")
         raise
 
-    # A patcher can run for an hour with no input; without this the Deck
-    # autosuspends mid-build and Wine rarely survives the resume.
-    with inhibit_sleep(f"{label} is running", lambda m: log_fn(f"{label}: {m}")):
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line:
-                log_fn(f"{label}: {line}")
-        rc = proc.wait()
+    # Registered for the whole blocking read below: this loop is exactly where
+    # a tool that never exits strands us, so the reaper has to be able to find
+    # the process while we are stuck here.
+    token = _register_live_tool(
+        proc, label, proton_script,
+        env.get("STEAM_COMPAT_DATA_PATH") or env.get("WINEPREFIX"),
+        owner=owner)
+    try:
+        # A patcher can run for an hour with no input; without this the Deck
+        # autosuspends mid-build and Wine rarely survives the resume.
+        with inhibit_sleep(f"{label} is running",
+                           lambda m: log_fn(f"{label}: {m}")):
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line:
+                    log_fn(f"{label}: {line}")
+            rc = proc.wait()
+    finally:
+        _forget_live_tool(token)
     if rc != 0:
         log_fn(f"{label}: exited with code {rc}")
     return rc
@@ -2239,6 +2550,7 @@ def run_tool_winetricks_style(
     cwd: "Path | None" = None,
     label: str | None = None,
     game=None,
+    owner=None,
 ) -> int:
     """Launch *exe* exactly the way winetricks' "Run an arbitrary executable"
     does: plain ``wine start.exe`` against WINEPREFIX, no ``proton`` script.
@@ -2292,8 +2604,8 @@ WINEPREFIX + Proton's bin on PATH, ``wine start.exe <exe>``), with only two
     saved = parse_env_overrides(load_tool_launch_env(exe))
     if saved:
         env.update(saved)
-        log_fn(f"{label}: applying saved env vars: "
-               + " ".join(f"{k}={v}" for k, v in saved.items()))
+        log_fn(f"{label}: applying saved env var names: "
+               + ", ".join(sorted(saved)))
     for k, v in (extra_env or {}).items():
         if v is None:
             env.pop(k, None)
@@ -2329,13 +2641,20 @@ WINEPREFIX + Proton's bin on PATH, ``wine start.exe <exe>``), with only two
         rep.mark_spawned()
     game_process.attach_process(proc)
 
-    with inhibit_sleep(f"{label} is running", lambda m: log_fn(f"{label}: {m}")):
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line:
-                log_fn(f"{label}: {line}")
-        rc = proc.wait()
+    # Same stranding risk as the Proton path - see the live-tool registry.
+    token = _register_live_tool(proc, label, proton_script, compat_data,
+                                owner=owner)
+    try:
+        with inhibit_sleep(f"{label} is running",
+                           lambda m: log_fn(f"{label}: {m}")):
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line:
+                    log_fn(f"{label}: {line}")
+            rc = proc.wait()
+    finally:
+        _forget_live_tool(token)
     launch_report.mark_exit(rep, started, rc, label)
     if rc != 0:
         log_fn(f"{label}: exited with code {rc}")
@@ -2379,13 +2698,10 @@ def launch_winetricks_in_prefix(wineprefix: Path, log_fn=_noop_log) -> None:
     env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
 
     log_fn(f"Prefix tools: launching winetricks GUI against {wineprefix.parent.name} …")
-    try:
-        subprocess.Popen(
-            [str(wt), "--gui"], env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        log_fn(f"Prefix tools error: {e}")
+    from Utils.process_watch import spawn_process_logged
+    spawn_process_logged(
+        [str(wt), "--gui"], env=env,
+        label="Prefix tools winetricks", log_fn=log_fn)
 
 
 def launch_wine_tool_in_prefix(proton_script: Path, prefix_dir: Path, env: dict,
@@ -2406,13 +2722,9 @@ def launch_wine_tool_in_prefix(proton_script: Path, prefix_dir: Path, env: dict,
     cmd = proton_run_command(proton_script, "runinprefix", tool, env=env)
     cmd = _host_forward(cmd, env, lambda m: log_fn(f"Prefix tools: {m}"))
     log_fn(f"Prefix tools: launching {tool} …")
-    try:
-        subprocess.Popen(cmd, env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception as e:
-        log_fn(f"Prefix tools error: {e}")
-        return False
+    from Utils.process_watch import spawn_process_logged
+    return spawn_process_logged(
+        cmd, env=env, label=f"Prefix tools {tool}", log_fn=log_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -2423,6 +2735,13 @@ def launch_game(game, log_fn=_noop_log) -> None:
     """Launch the game itself: native command / Steam / Heroic / Proton,
     honouring the saved launch mode. Call from a worker thread."""
     from Utils.xdg import host_env
+
+    # Launcher Settings belongs to the Play entry, not necessarily to the
+    # executable that ultimately starts.  A VFS profile may replace a stock
+    # launcher with a script extender (FalloutNVLauncher.exe ->
+    # nvse_loader.exe), while the settings dialog remains keyed by the normal
+    # resolved game entry.
+    settings_key = game_exe_key(game)
 
     # A mount-namespace VFS must sit outside Proton/the store launcher so all
     # descendants inherit the virtual game tree. Store URL routes cannot
@@ -2463,6 +2782,8 @@ def launch_game(game, log_fn=_noop_log) -> None:
                 log_fn(f"Play: {reason}")
                 launch_report.mark_failed(launch_report.actionable(reason))
                 return
+            command = forward_wayland_env_through_flatpak_spawn(
+                command, launch_env)
             log_fn(f"Play: VFS native cmd: {' '.join(command)}")
             spawn_process_watched(
                 command,
@@ -2472,7 +2793,8 @@ def launch_game(game, log_fn=_noop_log) -> None:
                 log_fn=log_fn,
             )
             return
-        launch_exe_via_proton(exe_path, game, log_fn)
+        launch_exe_via_proton(
+            exe_path, game, log_fn, launch_settings_key=settings_key)
         return
 
     native_cmd = getattr(game, "get_launch_command", lambda: None)()
@@ -2481,7 +2803,6 @@ def launch_game(game, log_fn=_noop_log) -> None:
         # IS the game, and those fields are the only way to pass e.g. openmw's
         # --skip-menu or a gamemoderun wrapper. Same key the dialog saves under.
         env = host_env()
-        settings_key = game_exe_key(game)
         try:
             extra_args = shlex.split(load_exe_args(game, settings_key))
         except ValueError as exc:
@@ -2500,6 +2821,10 @@ def launch_game(game, log_fn=_noop_log) -> None:
                 launch_report.mark_failed(launch_report.actionable(
                     "the launch options produced no command to run."))
                 return
+        cmd = apply_wayland_launch_setting(
+            game, env, cmd, native=True, exe_path=resolve_game_exe(game),
+            log_fn=log_fn)
+        cmd = forward_wayland_env_through_flatpak_spawn(cmd, env)
         # A wrapper from Launch Options (gamemoderun, mangohud) that isn't
         # installed would otherwise fail as a bare Popen error.
         if os.sep not in cmd[0] and shutil.which(cmd[0]) is None:
@@ -2528,7 +2853,27 @@ def launch_game(game, log_fn=_noop_log) -> None:
         launch_report.mark_failed(launch_report.actionable(reason))
         return
 
-    mode = load_launch_mode(game, game_exe_key(game))
+    mode = load_launch_mode(game, settings_key)
+    # The direct route consumes its settings below; only inspect them here
+    # when a launcher hand-off would otherwise bypass the manager entirely.
+    manager_launch_options = (
+        load_launch_options(game, settings_key) if mode != "none" else ""
+    )
+    launch_with_wayland = load_launch_with_wayland(game)
+    effective_mode = mode
+    if manager_launch_options and mode != "none":
+        # steam://, heroic:// and the other launcher hand-offs talk to a
+        # normally already-running client.  Environment variables or wrappers
+        # placed around that short-lived IPC process do not reach the game;
+        # only options saved in the launcher's own configuration do.
+        effective_mode = "none"
+        log_fn("Play: manager Launch Options are set - launching the game "
+               "directly so the manager-controlled launch environment is "
+               "applied.")
+    elif launch_with_wayland and mode != "none":
+        log_fn("Play: Launch with Wayland is enabled, but launcher routing "
+               "takes precedence. Configure Wayland in the selected launcher "
+               "or choose launch mode None to have the manager apply it.")
     steam_id = effective_steam_id(game)
     heroic_app_names = heroic_app_names_for_launch(game)
     is_steam = game_is_steam_install(game)
@@ -2570,14 +2915,14 @@ def launch_game(game, log_fn=_noop_log) -> None:
            f"heroic={','.join(heroic_app_names) if heroic_app_names else 'none'}, "
            f"pkg={pkg}")
 
-    if mode == "steam":
+    if effective_mode == "steam":
         if steam_id:
             launch_via_steam(steam_id, log_fn, extra_args=default_args or None)
         else:
             log_fn("Play: launch mode is Steam but game has no Steam ID.")
         return
 
-    if mode == "heroic":
+    if effective_mode == "heroic":
         if heroic_app_names:
             _note_launcher_args("Heroic")
             launch_via_heroic(
@@ -2587,7 +2932,7 @@ def launch_game(game, log_fn=_noop_log) -> None:
             log_fn("Play: launch mode is Heroic but game has no Heroic app name.")
         return
 
-    if mode == "lutris":
+    if effective_mode == "lutris":
         slugs = lutris_slugs_for_launch(game)
         if slugs:
             _note_launcher_args("Lutris")
@@ -2597,7 +2942,7 @@ def launch_game(game, log_fn=_noop_log) -> None:
             log_fn("Play: launch mode is Lutris but the game was not found in Lutris.")
         return
 
-    if mode == "faugus":
+    if effective_mode == "faugus":
         gameids = faugus_gameids_for_launch(game)
         if gameids:
             _note_launcher_args("Faugus")
@@ -2606,7 +2951,7 @@ def launch_game(game, log_fn=_noop_log) -> None:
             log_fn("Play: launch mode is Faugus but the game was not found in Faugus.")
         return
 
-    if mode != "none":  # "auto"
+    if effective_mode != "none":  # "auto"
         if steam_id and (is_steam or is_shortcut):
             launch_via_steam(steam_id, log_fn, extra_args=default_args or None)
             return
@@ -2633,7 +2978,8 @@ def launch_game(game, log_fn=_noop_log) -> None:
         log_fn("Play: no Steam/Heroic/Lutris/Faugus route matched - launching "
                "the game executable directly.")
 
-    if mode == "none" and not _require_direct_steam_client(game, log_fn):
+    if effective_mode == "none" and not _require_direct_steam_client(
+            game, log_fn):
         return
 
     exe_path = resolve_game_exe(game)
@@ -2650,12 +2996,15 @@ def launch_game(game, log_fn=_noop_log) -> None:
         if prepared is None:
             return
         launch_env, command = prepared
+        command = forward_wayland_env_through_flatpak_spawn(
+            command, launch_env)
         spawn_process_watched(command, env=launch_env,
                               cwd=exe_path.parent,
                               label="Play (native)", log_fn=log_fn)
         return
 
-    launch_exe_via_proton(exe_path, game, log_fn)
+    launch_exe_via_proton(
+        exe_path, game, log_fn, launch_settings_key=settings_key)
 
 
 def is_framework_launch_exe(game, exe_name: str) -> bool:
@@ -2743,7 +3092,8 @@ def swapped_framework_steam_id(game, exe_path: Path) -> str:
     if game is None or not is_framework_launch_exe(game, exe_path.name):
         return ""
     try:
-        if not bool(getattr(game, "script_extender_swap", False)):
+        if (not bool(getattr(game, "supports_script_extender_swap", True))
+                or not bool(getattr(game, "script_extender_swap", False))):
             return ""
     except Exception:
         return ""
@@ -2926,7 +3276,9 @@ def steam_compat_mounts(game, exe_path: Path) -> dict:
     return {"STEAM_COMPAT_MOUNTS": ":".join(paths)} if paths else {}
 
 
-def launch_exe_via_proton(exe_path: Path, game, log_fn=_noop_log) -> None:
+def launch_exe_via_proton(
+        exe_path: Path, game, log_fn=_noop_log, *,
+        launch_settings_key: "str | None" = None) -> None:
     """Standard Proton launch path for .exe files. Call from a worker thread.
 
     Uses the game's prefix by default; a saved per-exe Proton override runs in
@@ -2940,6 +3292,11 @@ def launch_exe_via_proton(exe_path: Path, game, log_fn=_noop_log) -> None:
     status in Steam, and the Steam Linux Runtime container is used (fixes
     missing audio vs a raw `proton run`).
     """
+    # A normal Run entry owns settings under its own filename.  Manager Play
+    # can intentionally resolve to another executable, notably a VFS-only
+    # script extender, so its caller supplies the canonical Play-entry key.
+    manager_play_launch = launch_settings_key is not None
+    settings_key = launch_settings_key or exe_path.name
     framework_launch = is_framework_launch_exe(game, exe_path.name)
     vfs_game_launch = False
     if getattr(game, "vfs_launch_enabled", False):
@@ -3186,7 +3543,7 @@ def launch_exe_via_proton(exe_path: Path, game, log_fn=_noop_log) -> None:
         link_mygames(game, pfx, lambda m: log_fn(f"Run EXE: {m}"))
 
     try:
-        extra_args = shlex.split(load_exe_args(game, exe_path.name))
+        extra_args = shlex.split(load_exe_args(game, settings_key))
     except ValueError as e:
         log_fn(f"Run EXE: invalid arguments - {e}")
         return
@@ -3208,7 +3565,7 @@ def launch_exe_via_proton(exe_path: Path, game, log_fn=_noop_log) -> None:
         # created/updated through Proton. Env vars from Launch Options are
         # applied; wrappers/%command% are not - there is no wrapped command.
         extra_env, _ = parse_launch_options(
-            load_launch_options(game, exe_path.name), [])
+            load_launch_options(game, settings_key), [])
         pfx_root = prefix_path if lutris_is_prefix else compat_data
         if (lutris_env_extra is None
                 and not (pfx_root / "pfx" / "user.reg").is_file()
@@ -3270,12 +3627,18 @@ def launch_exe_via_proton(exe_path: Path, game, log_fn=_noop_log) -> None:
     # command gets wrapped in flatpak-spawn --host, proton_run_command
     # explicitly forwards launch/runtime values via --env= flags, so env must
     # be final here.
-    launch_opts = load_launch_options(game, exe_path.name)
-    if not launch_opts and launches_game:
+    launch_opts = load_launch_options(game, settings_key)
+    if launch_opts:
+        log_fn(f"Run EXE: applying manager Launch Options for {settings_key}.")
+    elif launches_game:
         launch_opts = _direct_steam_launch_options_for_game(game, log_fn)
     env_updates, _ = parse_launch_options(launch_opts, [])
     if env_updates:
         env.update(env_updates)
+    if manager_play_launch:
+        apply_wayland_launch_setting(
+            game, env, [], native=False, log_fn=log_fn,
+            log_prefix="Run EXE")
 
     if umu_bin is not None:
         from Utils.lutris_finder import umu_run_command

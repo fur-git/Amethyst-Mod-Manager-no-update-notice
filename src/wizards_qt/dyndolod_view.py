@@ -33,7 +33,9 @@ from PySide6.QtWidgets import (
     QStackedWidget,
 )
 
-from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
+from gui_qt.theme_qt import (
+    active_palette, _c, button_qss, close_button, ok_text, err_text,
+)
 from gui_qt.safe_emit import safe_emit
 from Utils.xedit_tools import tool_exe_path
 
@@ -124,10 +126,7 @@ class DynDOLODView(QWidget):
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(
-            button_qss("BTN_DANGER", padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=p)
         close.clicked.connect(self._finish)
         hb.addWidget(close)
         v.addWidget(bar)
@@ -478,6 +477,10 @@ class DynDOLODView(QWidget):
             log_fn=self._log,
             title=self.tr("Step 5: Choose Proton Version"),
             show_discrete_gpu=self._tool_id in ("texgen", "dyndolod"),
+            wizard_id=getattr(self._ctx, "wizard_tool_id", ""),
+            wizard_label=getattr(self._ctx, "wizard_tool_label", ""),
+            wizard_label_args=getattr(
+                self._ctx, "wizard_tool_label_args", ()),
         )
         lay.addWidget(self._proton_step)
 
@@ -579,7 +582,7 @@ class DynDOLODView(QWidget):
                 run_tool_logged(
                     proton_script, exe, env, log_fn=_wlog,
                     extra_args=[data_arg, output_arg, "-sse"], label=name,
-                    game=game)
+                    game=game, owner=self)
 
                 self._log(f"{name} Wizard: {exe.name} closed.")
                 safe_emit(self._run_status_sig, self.tr("{0} finished.").format(name), ok_text())

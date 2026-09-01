@@ -14,6 +14,7 @@ from pathlib import Path
 class ProfileVFSGameMixin:
     """Opt-in settings, deployment, and launch hooks for ``Utils.vfs``."""
 
+    supports_vfs_deploy = True
     supports_profile_vfs = True
     launch_passthrough_supported = True
     # Compatibility for launch-option integrations written before launcher-
@@ -118,7 +119,8 @@ class ProfileVFSGameMixin:
         )
 
     def _vfs_script_extender(self) -> str:
-        if (not getattr(self, "script_extender_swap", False)
+        if (not getattr(self, "supports_script_extender_swap", True)
+                or not getattr(self, "script_extender_swap", False)
                 or not self.vfs_prefers_script_extender):
             return ""
         try:
@@ -340,6 +342,7 @@ class ProfileVFSGameMixin:
                         sep_entries,
                         log_fn=log_fn,
                         filemap_path=filemap,
+                        game=self,
                     )
                 except Exception as cleanup_exc:
                     log_fn(

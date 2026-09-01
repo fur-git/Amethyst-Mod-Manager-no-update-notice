@@ -48,6 +48,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
     # Enderal's own launcher already bootstraps its extender and overrides this.
     vfs_prefers_script_extender = True
+    supports_script_extender_swap = True
 
     plugins_use_star_prefix = False
     plugins_include_vanilla = True
@@ -1397,17 +1398,14 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         Vanilla archives are already in the engine's default SArchiveList; we
         only append archives that a mod actually deploys into Data/.
         """
-        try:
-            filemap = self.get_effective_filemap_path()
-        except Exception:
-            return []
-        if not filemap.is_file():
+        from Utils.filegraph_deploy import current, legacy_rows
+        if current() is None:
             return []
         names: list[str] = []
         seen: set[str] = set()
         try:
-            for line in filemap.read_text(encoding="utf-8").splitlines():
-                rel = line.split("\t", 1)[0].strip()
+            for rel, _owner in legacy_rows():
+                rel = rel.strip()
                 if not rel or "/" in rel or "\\" in rel:
                     continue  # only top-level Data/ entries are loadable archives
                 low = rel.lower()
@@ -1508,6 +1506,9 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         _log = log_fn
         if self._game_path is None:
             return
+        if not self.supports_script_extender_swap:
+            _log("  Launcher swap is not used for this game - skipping.")
+            return
         if self.vfs_launch_enabled:
             _log("  VFS launch: launcher swap is virtual - game files unchanged.")
             return
@@ -1566,7 +1567,8 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
         if not data_dir.is_dir():
             raise RuntimeError(f"Data directory not found: {data_dir}")
-        if not filemap.is_file():
+        from Utils.filegraph_deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -1682,6 +1684,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         cleanup_custom_deploy_dirs(
             _profile_dir, _entries, log_fn=_log,
             filemap_path=self.get_effective_filemap_path(),
+            game=self,
         )
 
         custom_rules = self.custom_routing_rules
@@ -1712,6 +1715,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
                 log_fn=_log,
                 restore_whitelist=self.restore_whitelist_matcher(
                     rel_prefix="data/"),
+                game=self, profile_dir=self._active_profile_dir,
             )
             _log(f"  Restored {restored} file(s). Data_Core/ removed.")
         elif not vfs_deploy:

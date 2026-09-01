@@ -28,7 +28,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Optional
 
-from Utils.extract_budget import get_uncompressed_size
+from Utils.extract_budget import ArchiveProbe, probe_archive
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, Optional[str]], None]
@@ -45,6 +45,49 @@ BAIN_DEFERRED = "__BAIN_DEFERRED__"
 # (parallel batch installs, collection install consumers) would otherwise
 # race, silently dropping entries.
 _commit_lock = threading.Lock()
+
+
+class UnsafeInstallPath(ValueError):
+    pass
+
+
+def _normalise_relative_install_path(value, *, label: str,
+                                     allow_empty: bool = True) -> str:
+    raw = os.fspath(value)
+    if not isinstance(raw, str):
+        raw = os.fsdecode(raw)
+    if "\x00" in raw:
+        raise UnsafeInstallPath(f"{label} contains a NUL byte")
+
+    normalised = raw.replace("\\", "/")
+    if normalised.startswith("/") or re.match(r"^[A-Za-z]:", normalised):
+        raise UnsafeInstallPath(f"{label} is absolute: {raw!r}")
+
+    trailing = normalised.endswith("/")
+    parts: list[str] = []
+    for part in normalised.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise UnsafeInstallPath(
+                f"{label} escapes its managed root: {raw!r}")
+        parts.append(part)
+
+    if not parts:
+        if allow_empty:
+            return ""
+        raise UnsafeInstallPath(f"{label} is empty: {raw!r}")
+    result = "/".join(parts)
+    return result + "/" if trailing else result
+
+
+def _require_path_within(root: Path, candidate: Path, *, label: str) -> Path:
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise UnsafeInstallPath(
+            f"{label} escapes its managed root: {candidate}") from exc
+    return candidate
 
 
 # ---- case-insensitive copy core (moved from gui/install_mod.py, shared) ------
@@ -208,7 +251,7 @@ def _merge_case_variant_dirs(file_list, game, log_fn):
         from Utils.ui_config import load_normalize_folder_case
         if not load_normalize_folder_case():
             return file_list
-        from Utils.filemap import canonicalize_dir_casing
+        from Utils.filegraph_paths import canonicalize_dir_casing
     except Exception:
         return file_list
 
@@ -263,12 +306,29 @@ def _copy_file_list(file_list, src_root: str, dest_root: Path, log_fn,
 
     file_list = _merge_case_variant_dirs(file_list, game, log_fn)
 
+    src_root_path = Path(src_root)
+    checked: list[tuple[str, str, bool]] = []
+    source_check_cache: dict = {}
+    for src_rel, dst_rel, is_folder in file_list:
+        safe_src = _normalise_relative_install_path(
+            src_rel, label="install source")
+        safe_dst = _normalise_relative_install_path(
+            dst_rel, label="install destination")
+        source_probe = _resolve_src_case(
+            src_root_path, safe_src, source_check_cache)
+        _require_path_within(
+            src_root_path, source_probe, label="install source")
+        destination_probe = dest_root.joinpath(
+            *safe_dst.rstrip("/").split("/")) if safe_dst else dest_root
+        _require_path_within(
+            dest_root, destination_probe, label="install destination")
+        checked.append((safe_src, safe_dst, is_folder))
+    file_list = checked
+
     folder_copied = 0
     file_entries: list = []
     _src_cache: dict = {}
     _dst_cache: dict = {}
-    src_root_path = Path(src_root)
-
     for src_rel, dst_rel, is_folder in file_list:
         if src_rel:
             # Always resolve the SOURCE case-insensitively. FOMOD XML paths are
@@ -281,11 +341,14 @@ def _copy_file_list(file_list, src_root: str, dest_root: Path, log_fn,
             src = _resolve_src_case(src_root_path, src_rel, _src_cache)
         else:
             src = src_root_path
+        _require_path_within(src_root_path, src, label="install source")
         dst = (_resolve_dst_case(dest_root, dst_rel, _dst_cache)
                if dst_rel else dest_root / dst_rel)
         if is_folder:
             if not dst_rel:
                 dst = dest_root
+            _require_path_within(
+                dest_root, dst, label="install destination")
             if src.is_dir():
                 folder_copied += _copytree_case_insensitive(src, dst)
                 _dst_cache.pop(dst.parent, None)
@@ -294,6 +357,8 @@ def _copy_file_list(file_list, src_root: str, dest_root: Path, log_fn,
                 dst = dest_root / src.name
             elif dst_rel.endswith("/") or dst_rel.endswith("\\"):
                 dst = _resolve_dst_case(dest_root, dst_rel.rstrip("/\\"), _dst_cache) / src.name
+            _require_path_within(
+                dest_root, dst, label="install destination")
             if src.is_file():
                 file_entries.append((src, dst))
 
@@ -678,12 +743,16 @@ def _free_bytes(path: str) -> int:
 
 
 def _choose_extract_parent(archive_path: str, staging_root: Path,
-                           log_fn: LogFn) -> "tuple[Path | None, int]":
-    """Pick a temp-dir PARENT that can hold the extraction. Default /tmp is a
-    RAM-backed tmpfs (Steam Deck: roughly half of RAM) - if the archive won't
-    fit there with headroom, extract NEXT TO the staging folder (real disk)
-    instead. This mirrors the Tk app's reroute logic - without it large mods
-    fail with 'No space left on device'.
+                           log_fn: LogFn,
+                           archive_probe: "ArchiveProbe | None" = None
+                           ) -> "tuple[Path | None, int]":
+    """Pick a temp-dir PARENT that can hold the extraction.
+
+    Prefer the staging filesystem: staging can then hardlink selected files out
+    of the temporary tree instead of copying every byte across filesystems, and
+    a RAM-backed ``/tmp`` does not retain the whole expanded archive. ``/tmp``
+    remains a guarded fallback when the staging-side temporary directory cannot
+    be created.
 
     Returns ``(parent, tmp_reserved_bytes)``: *parent* None = use /tmp, in
     which case *tmp_reserved_bytes* has been claimed from the shared /tmp
@@ -691,30 +760,33 @@ def _choose_extract_parent(archive_path: str, staging_root: Path,
     release it with :func:`_release_tmp_reservation` once the extract dir is
     deleted."""
     global _tmp_space_reserved
-    # Real metadata size where available (`7z l` probe / zip headers), 15×
-    # fallback otherwise - a compressed-size multiple alone undershoots extreme
-    # texture packs (a 120 MB .7z that unpacks to 3.6 GB is 30×).
-    need = get_uncompressed_size(archive_path)
+    # Reuse the caller's metadata probe so memory gating, placement and FOMOD
+    # preflight do not independently list the same archive.
+    probe = archive_probe or probe_archive(archive_path)
+    need = probe.uncompressed_size
     headroom = 512 * 1024 * 1024
-    tmp = tempfile.gettempdir()
-    with _tmp_space_lock:
-        if need + headroom + _tmp_space_reserved < _free_bytes(tmp):
-            _tmp_space_reserved += need
-            return None, need   # /tmp has room - claimed
-    # /tmp too small (a RAM-backed tmpfs) → use the staging filesystem (real disk).
     disk_parent = staging_root.parent if staging_root else None
     if disk_parent is not None:
         try:
             disk_parent.mkdir(parents=True, exist_ok=True)
             if need + headroom < _free_bytes(str(disk_parent)):
-                log_fn(f"Extracting to disk ({disk_parent}) - /tmp too small for "
-                       f"~{need // (1024 * 1024)} MB.")
+                log_fn(f"Extracting beside staging ({disk_parent}) so installed "
+                       "files can be hardlinked.")
                 return disk_parent, 0
             log_fn(f"Warning: extract target {disk_parent} may also be low on "
                    "space.")
             return disk_parent, 0
         except OSError:
             pass
+
+    # Staging-side temp creation failed. Keep the original shared reservation
+    # and headroom checks before allowing the RAM-backed fallback.
+    tmp = tempfile.gettempdir()
+    with _tmp_space_lock:
+        if need + headroom + _tmp_space_reserved < _free_bytes(tmp):
+            _tmp_space_reserved += need
+            log_fn("Staging-side temporary folder unavailable; using guarded /tmp.")
+            return None, need
     return None, 0
 
 
@@ -731,7 +803,8 @@ def _log_extract_location(extract_dir: Path, log_fn: LogFn) -> None:
 
 def _extract_with_disk_retry(archive_path: str, staging_root: Path,
                              log_fn: LogFn, cancel: "threading.Event | None" = None,
-                             progress_cb=None
+                             progress_cb=None,
+                             archive_probe: "ArchiveProbe | None" = None,
                              ) -> "tuple[bool, Path, int, list[str]]":
     """Extract *archive_path* into a fresh temp dir under a parent with room
     (:func:`_choose_extract_parent`), retrying ONCE next to the staging folder
@@ -743,8 +816,8 @@ def _extract_with_disk_retry(archive_path: str, staging_root: Path,
 
     Returns ``(extracted, extract_dir, tmp_reserved, errors)``; the caller
     owns the directory and the /tmp reservation."""
-    parent, tmp_reserved = _choose_extract_parent(archive_path, staging_root,
-                                                  log_fn)
+    parent, tmp_reserved = _choose_extract_parent(
+        archive_path, staging_root, log_fn, archive_probe=archive_probe)
     extract_dir = Path(tempfile.mkdtemp(prefix="mm_install_",
                                         dir=str(parent) if parent else None))
     _log_extract_location(extract_dir, log_fn)
@@ -805,12 +878,20 @@ def _debackslash_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
         return 0
     if not offenders:
         return 0
+    plans: list[tuple[Path, Path]] = []
+    for entry in offenders:
+        rel = _normalise_relative_install_path(
+            str(entry.relative_to(root)), label="archive member",
+            allow_empty=False)
+        target = root.joinpath(*rel.rstrip("/").split("/"))
+        plans.append((entry, _require_path_within(
+            root, target, label="archive member")))
+
     moved = 0
-    for entry in sorted(offenders, key=lambda p: len(str(p)), reverse=True):
+    for entry, target in sorted(
+            plans, key=lambda pair: len(str(pair[0])), reverse=True):
         if not entry.exists():
             continue
-        rel = str(entry.relative_to(root)).replace("\\", "/")
-        target = root / rel
         if target == entry:
             continue
         try:
@@ -836,6 +917,13 @@ def _debackslash_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
     if moved and log_fn is not None:
         log_fn(f"Normalised {moved} Windows backslash path(s) from archive.")
     return moved
+
+
+def _validate_zip_member_paths(archive_path: str) -> None:
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        for member in archive.infolist():
+            _normalise_relative_install_path(
+                member.filename, label="archive member", allow_empty=False)
 
 
 def _fix_perms_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
@@ -893,10 +981,10 @@ def _fix_nonutf8_names_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
     the file becomes addressable and the mod works). Deepest-first so a renamed
     parent dir doesn't invalidate child paths. Returns entries renamed.
     Idempotent; cheap when all names are already UTF-8 (the common case).
-    Thin wrapper over the neutral filemap.repair_nonutf8_names so the extract
+    Thin wrapper over the neutral path repair so the extract
     path and the Refresh (heal-on-disk) path share one implementation.
     """
-    from Utils.filemap import repair_nonutf8_names
+    from Utils.filegraph_paths import repair_nonutf8_names
     return repair_nonutf8_names(extract_dir, log_fn=log_fn)
 
 
@@ -926,6 +1014,14 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
         if error_sink is not None:
             error_sink.append(str(err))
 
+    try:
+        if zipfile.is_zipfile(archive_path):
+            _validate_zip_member_paths(archive_path)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        _note(exc)
+        log_fn(f"Unsafe archive path rejected ({exc}).")
+        return False
+
     # tar.* and plain .tar → tarfile directly.
     if ext in (".tar", ".gz", ".bz2", ".xz", ".tgz") or \
             archive_path.lower().endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
@@ -949,7 +1045,12 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
         # Native extractors (7z/bsdtar) and Python zipfile reproduce Windows
         # backslash member names as literal flat filenames; repair them into a
         # real tree so staging can resolve the paths (fixes "nothing staged").
-        _debackslash_extracted_tree(dest_dir, log_fn)
+        try:
+            _debackslash_extracted_tree(dest_dir, log_fn)
+        except UnsafeInstallPath as exc:
+            _note(exc)
+            log_fn(f"Unsafe archive path rejected ({exc}).")
+            return False
         # Repair non-UTF-8 (legacy code page) names so the mod isn't skipped by
         # the index (rebuild_mod_index drops any mod with a non-UTF-8 filename).
         _fix_nonutf8_names_extracted_tree(dest_dir, log_fn)
@@ -1261,7 +1362,9 @@ class PreparedInstall:
 def prepare_archive(archive_path: str, game, profile_dir: Path, *,
                     log_fn: LogFn, progress_fn: Optional[ProgressFn] = None,
                     preferred_name: str = "", prebuilt_meta=None,
-                    on_need_prefix=None, cancel=None) -> PreparedInstall | None:
+                    on_need_prefix=None, cancel=None,
+                    archive_probe: "ArchiveProbe | None" = None
+                    ) -> PreparedInstall | None:
     """Extract *archive_path* to a kept temp dir and detect FOMOD. The caller
     either runs the wizard (is_fomod) then `finish_install(prepared, selections)`,
     or just calls `finish_install(prepared, None)` for a plain/default install.
@@ -1325,11 +1428,12 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
         # so the (0, 0) indeterminate bar above stays for them.
         _p(pct, 100, "Extracting")
 
-    # Pick a temp parent big enough - /tmp is a RAM-backed tmpfs on the Deck, so
-    # a large mod must extract to the staging disk instead (Tk parity).
+    # Extract beside staging where possible so the staging pass can hardlink.
+    # Reuse metadata already gathered by a batch/collection memory gate.
     extracted, extract_dir, tmp_reserved, extract_errors = \
         _extract_with_disk_retry(str(archive), Path(staging_root), log_fn,
-                                 cancel=cancel, progress_cb=_extract_progress)
+                                 cancel=cancel, progress_cb=_extract_progress,
+                                 archive_probe=archive_probe)
     if not extracted:
         if cancel is not None and cancel.is_set():
             log_fn("Install: extraction cancelled - removing temp files.")
@@ -1521,7 +1625,7 @@ def wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
     already correctly structured and must not be touched (a loose root file
     alongside it is part of a multi-destination mod).
     """
-    from Utils.filemap import _EXCLUDE_NAMES
+    from Utils.filegraph_paths import EXCLUDE_NAMES
     if not mod_dir.is_dir():
         return False
     children = list(mod_dir.iterdir())
@@ -1549,7 +1653,7 @@ def wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
     sub = mod_dir / mod_dir.name
     sub.mkdir(exist_ok=True)
     for child in children:
-        if child.is_file() and child.name.lower() in _EXCLUDE_NAMES:
+        if child.is_file() and child.name.lower() in EXCLUDE_NAMES:
             continue
         shutil.move(str(child), str(sub / child.name))
     return True
@@ -1887,8 +1991,8 @@ def _collection_plugin_context(game, profile_dir: "Path | None"
                                ) -> "tuple[set[str], set[str], set[str]]":
     """Build the (installed_files, active_files, loose_files) sets a collection
     FOMOD needs to evaluate its conditions - a tkinter-free port of the set-up
-    block in ``gui/install_mod.py`` (~1747-1794). Reads plugins.txt/loadorder.txt/
-    filemap.txt next to the profile, then seeds vanilla/DLC plugins (loaded
+    block in ``gui/install_mod.py`` (~1747-1794). Reads plugins.txt/loadorder.txt
+    and a pinned Filegraph snapshot, then seeds vanilla/DLC plugins (loaded
     implicitly by the engine, so never in plugins.txt)."""
     installed_files: set[str] = set()
     active_files: set[str] = set()
@@ -1911,15 +2015,26 @@ def _collection_plugin_context(game, profile_dir: "Path | None"
                 installed_files.add(name.lower())
         except Exception:
             pass
-        # <fileDependency> nodes can reference arbitrary asset paths; MO2 checks
-        # the whole virtual tree, so mirror the filemap's relative paths.
+        # <fileDependency> nodes can reference arbitrary asset paths; mirror
+        # the resolved loose virtual tree from one catalog generation.
         try:
-            with open(profile_dir / "filemap.txt", "r", encoding="utf-8") as fmf:
-                for line in fmf:
-                    rel = line.split("\t", 1)[0].strip()
-                    if rel:
-                        loose_files.add(rel.replace("\\", "/").lower())
-        except OSError:
+            from Utils.filegraph_service import FileGraphService
+            library = FileGraphService.open_library(game, profile_dir)
+            status = library.ensure_ready(profile_dir)
+            profile = library.open_profile(profile_dir)
+            snapshot = profile.snapshot()
+            if (snapshot.generation == 0
+                    or snapshot.inventory_generation != status.inventory_generation):
+                profile.reconcile(operation_hint={"kind": "wizard_gate"})
+                snapshot = profile.snapshot()
+            for entry in snapshot.deployment_plan().entries:
+                if (entry.provider_kind != "archive_member"
+                        and not entry.legacy_root and entry.legacy_rel):
+                    loose_files.add(entry.legacy_rel.replace(
+                        "\\", "/").lower())
+        except Exception:
+            # The installer can still evaluate plugin-only conditions; the
+            # required catalog error is surfaced by the surrounding workflow.
             pass
     if game is not None:
         try:
@@ -1941,44 +2056,8 @@ def _archive_lists_fomod_config(archive_path: str) -> bool:
     return False and the normal extract-then-detect path decides. A listed but
     unparseable ModuleConfig.xml means the mod defers and installs verbatim in
     the deferred phase instead of verbatim immediately - same outcome, later."""
-    target = "fomod/moduleconfig.xml"
-
-    def _hit(name: str) -> bool:
-        # Backslash-zip members (Windows Compress-Archive) use literal "\".
-        n = name.replace("\\", "/").lower()
-        return n == target or n.endswith("/" + target)
-
-    if archive_path.lower().endswith(".zip"):
-        try:
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                return any(_hit(n) for n in zf.namelist())
-        except Exception:
-            return False
-    _7z = (shutil.which("7zzs") or shutil.which("7zz")
-           or shutil.which("7z") or shutil.which("7za"))
-    if _7z:
-        try:
-            res = subprocess.run(
-                [_7z, "l", "-slt", archive_path],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, timeout=30)
-            if res.returncode != 0:
-                return False
-            for line in res.stdout.splitlines():
-                if line.startswith("Path = ") and _hit(line[7:].strip()):
-                    return True
-        except Exception:
-            pass
-        return False
-    if archive_path.lower().endswith(".7z"):
-        # No 7z binary (extraction falls back to bsdtar/py7zr) - list via py7zr.
-        try:
-            import py7zr
-            with py7zr.SevenZipFile(archive_path, "r") as z:
-                return any(_hit(n) for n in z.getnames())
-        except Exception:
-            return False
-    return False
+    return probe_archive(
+        archive_path, inspect_members=True).has_fomod_config
 
 
 def install_collection_archive(
@@ -1987,6 +2066,8 @@ def install_collection_archive(
         preferred_name: str = "",
         prebuilt_meta=None,
         fomod_auto_selections: "dict | None" = None,
+        fomod_expected_installed_files: "set[str] | None" = None,
+        fomod_expected_active_files: "set[str] | None" = None,
         bain_auto_selections: "dict | None" = None,
         overwrite_existing: "bool | None" = None,
         skip_index_update: bool = True,
@@ -1995,7 +2076,8 @@ def install_collection_archive(
         resolve_fomod=None,
         resolve_bain=None,
         on_installed=None,
-        cancel=None) -> "str | None":
+        cancel=None,
+        archive_probe: "ArchiveProbe | None" = None) -> "str | None":
     """Install ONE collection mod from a downloaded archive - the tkinter-free
     equivalent of ``gui/install_mod.py:install_mod_from_archive`` for the paths a
     collection install exercises (FOMOD with author selections or deferred, BAIN,
@@ -2031,8 +2113,12 @@ def install_collection_archive(
     # deferred phase (double extraction of every interactive FOMOD; minutes of
     # 7z time on big texture packs). Listing misses fall through to the normal
     # extract-then-detect defer below.
+    if defer_interactive_fomod and fomod_auto_selections is None:
+        if archive_probe is None or not archive_probe.members_inspected:
+            archive_probe = probe_archive(str(archive), inspect_members=True)
     if (defer_interactive_fomod and fomod_auto_selections is None
-            and _archive_lists_fomod_config(str(archive))):
+            and archive_probe is not None
+            and archive_probe.has_fomod_config):
         log_fn("FOMOD installer detected (archive listing) - deferring until "
                "dependencies are installed.")
         return FOMOD_DEFERRED
@@ -2040,7 +2126,8 @@ def install_collection_archive(
     # Extract + FOMOD-detect via the shared prepare step (kept temp dir).
     prepared = prepare_archive(
         str(archive), game, profile_dir, log_fn=log_fn, progress_fn=progress_fn,
-        preferred_name=preferred_name, prebuilt_meta=prebuilt_meta, cancel=cancel)
+        preferred_name=preferred_name, prebuilt_meta=prebuilt_meta, cancel=cancel,
+        archive_probe=archive_probe)
     if prepared is None:
         return None
 
@@ -2081,6 +2168,25 @@ def install_collection_archive(
             stage_src_root = str(fomod_base)
             installed_files, active_files, loose_files = _collection_plugin_context(
                 game, profile_dir)
+            if fomod_auto_selections is not None:
+                plugin_exts = {
+                    ext.lower() for ext in
+                    (getattr(game, "plugin_extensions", None)
+                     or (".esp", ".esm", ".esl"))
+                }
+                provided_plugins = {
+                    name.lower()
+                    for _, _, names in os.walk(fomod_base)
+                    for name in names
+                    if Path(name).suffix.lower() in plugin_exts
+                }
+                expected_installed = (
+                    fomod_expected_installed_files or set()) - provided_plugins
+                expected_active = (
+                    fomod_expected_active_files or set()) - provided_plugins
+                installed_files.update(expected_installed)
+                active_files.difference_update(expected_installed)
+                active_files.update(expected_active)
             try:
                 from Utils.fomod_installer import (
                     resolve_files, check_module_dependencies)
@@ -2099,6 +2205,7 @@ def install_collection_archive(
             # the wizard (it crashes on an empty step list) and no need to defer;
             # install defaults inline.
             has_steps = bool(getattr(config, "steps", None))
+            authoritative_fomod_preset = fomod_auto_selections is not None
 
             if fomod_auto_selections is None and defer_interactive_fomod and has_steps:
                 log_fn("FOMOD installer detected - deferring until dependencies "
@@ -2147,7 +2254,8 @@ def install_collection_archive(
                     else:
                         file_list = resolve_files(
                             config, final_selections, installed_files,
-                            active_files, loose_files)
+                            active_files, loose_files,
+                            authoritative_selections=authoritative_fomod_preset)
                     is_fomod_install = True
                     log_fn(f"FOMOD complete - {len(file_list or [])} file(s) to install.")
                     try:
@@ -2156,9 +2264,19 @@ def install_collection_archive(
                             collect_selected_dep_plugins)
                         _sel = final_selections or {}
                         fomod_pending_deps = ";".join(
-                            collect_unselected_dep_plugins(config, _sel))
+                            collect_unselected_dep_plugins(
+                                config, _sel,
+                                authoritative_selections=authoritative_fomod_preset,
+                                installed_files=installed_files,
+                                active_files=active_files,
+                                loose_files=loose_files))
                         fomod_active_deps = ";".join(
-                            collect_selected_dep_plugins(config, _sel))
+                            collect_selected_dep_plugins(
+                                config, _sel,
+                                authoritative_selections=authoritative_fomod_preset,
+                                installed_files=installed_files,
+                                active_files=active_files,
+                                loose_files=loose_files))
                     except Exception as exc:
                         log_fn(f"FOMOD dep scan skipped ({exc}).")
                 except Exception as exc:
@@ -2658,11 +2776,11 @@ def _resolve_nexus_meta_for_naming(archive: Path, game, log_fn: LogFn):
     are swallowed: naming from the archive name is always an acceptable fallback.
     """
     try:
-        api = _build_nexus_api()
-        if api is None:
-            return None
         domains = _nexus_domains_for(game)
         if not domains:
+            return None
+        api = _build_nexus_api()
+        if api is None:
             return None
         from Nexus.nexus_meta import resolve_nexus_meta_for_archive_domains
         return resolve_nexus_meta_for_archive_domains(
@@ -2868,7 +2986,7 @@ def _write_install_meta(dest_root: Path, archive: Path, game, log_fn: LogFn,
                 # Pass a live API so resolve_nexus_meta_for_archive can do the
                 # MD5 reverse lookup (its Strategy 2 is skipped when api=None) -
                 # this is what the Tk installer did and the Qt port dropped.
-                api = _build_nexus_api()
+                api = _build_nexus_api() if domains else None
                 meta = resolve_nexus_meta_for_archive_domains(
                     archive, domains, api=api, log_fn=log_fn)
             except Exception:
@@ -2945,11 +3063,11 @@ def _check_nexus_flags_after_install(game, mod_names, log_fn: LogFn,
         names = {mod_names} if isinstance(mod_names, str) else set(mod_names)
         if not names:
             return
-        api = _build_nexus_api()
-        if api is None:
-            return
         fallback_domain = _nexus_domain_for(game)
         if not fallback_domain:
+            return
+        api = _build_nexus_api()
+        if api is None:
             return
         try:
             from Utils.mod_copy import resolve_target_staging
@@ -3029,50 +3147,12 @@ def _check_nexus_flags_after_install(game, mod_names, log_fn: LogFn,
 def _update_indexes(game, profile_dir: Path, mod_name: str, dest_root: Path,
                     log_fn: LogFn) -> None:
     try:
-        from Utils.filemap import rescan_mods_in_index
-        from Utils.deploy import load_per_mod_strip_prefixes
-        # The index MUST live where build_filemap reads it - next to the
-        # effective filemap (= staging.parent / game root), NOT the profile dir.
-        # Writing it to the profile dir leaves a fresh install invisible to the
-        # filemap rebuild → no conflicts detected (the bug this fixes).
-        try:
-            index_dir = game.get_effective_filemap_path().parent
-        except Exception:
-            index_dir = profile_dir
-        index_path = index_dir / "modindex.bin"
-        staging_root = Path(dest_root).parent
-        # Reuse rescan_mods_in_index (shares logic with rebuild_mod_index, the
-        # Refresh path) so the single-mod entry is written with EXACTLY the same
-        # strip-prefix / extension / per-mod / root-folder rules a full Refresh
-        # applies. The canonical game attributes are mod_folder_strip_prefixes /
-        # mod_install_extensions - the older strip_prefixes / install_extensions
-        # names don't exist on the game classes (getattr → None), which wrote an
-        # UNSTRIPPED entry (e.g. Bethesda "Data/…" kept), inconsistent with a
-        # Refresh → deploy double-nested paths / wrong conflicts until Refresh.
-        # A root-flagged mod (e.g. SKSE) must NOT be stripped - read the flag
-        # from the just-written meta.ini (the modlist isn't updated yet here).
-        root_mods = None
-        try:
-            from Nexus.nexus_meta import read_meta
-            if read_meta(Path(dest_root) / "meta.ini").root_folder:
-                root_mods = {mod_name}
-        except Exception:
-            root_mods = None
-        rescan_mods_in_index(
-            index_path, staging_root, [mod_name],
-            strip_prefixes=set(getattr(game, "mod_folder_strip_prefixes", None) or ()) or None,
-            per_mod_strip_prefixes=load_per_mod_strip_prefixes(profile_dir),
-            allowed_extensions=set(getattr(game, "mod_install_extensions", None) or ()) or None,
-            normalize_folder_case=getattr(game, "normalize_folder_case", True),
-            root_folder_mods=root_mods,
-            log_fn=log_fn,
-        )
-        archive_exts = frozenset(getattr(game, "archive_extensions", frozenset()) or frozenset())
-        if archive_exts:
-            from Utils.bsa_filemap import update_bsa_index
-            update_bsa_index(index_dir / "bsa_index.bin", mod_name, dest_root, archive_exts)
+        from Utils.filegraph_service import FileGraphService
+        library = FileGraphService.open_library(game, profile_dir, log_fn=log_fn)
+        session = library.open_profile(profile_dir)
+        library.replace_mod_manifest(session.adapter.build_manifest(mod_name))
     except Exception as exc:
-        log_fn(f"index update skipped ({exc}) - next rebuild will rescan.")
+        log_fn(f"catalog update skipped ({exc}) - explicit Refresh will repair it.")
 
 
 def _add_to_modlist(profile_dir: Path, mod_name: str, log_fn: LogFn,

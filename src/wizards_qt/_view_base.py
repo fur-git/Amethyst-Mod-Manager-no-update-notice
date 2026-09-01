@@ -32,8 +32,9 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import (active_palette, _c, button_qss, ok_text, err_text,
-                             warn_text)
+from gui_qt.theme_qt import (
+    active_palette, _c, button_qss, close_button, ok_text, err_text, warn_text,
+)
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -172,6 +173,10 @@ class WizardViewBase(QWidget):
         self._auto_fetch_on_archive = None
         self._dl_status: QLabel | None = None
         self._dl_next_btn: QPushButton | None = None
+        # Set when a header is built; stays None for embedded views (the host
+        # owns the close button). _tool_running vetoes the tab-bar ✕.
+        self._close_btn: QPushButton | None = None
+        self._tool_running = False
 
         self._locate_status_sig.connect(self._guard(
             lambda t, c: self._set_status(self._locate_status, t, c)))
@@ -202,11 +207,12 @@ class WizardViewBase(QWidget):
             head.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
             hb.addWidget(head)
             hb.addStretch(1)
-            close = QPushButton(self.tr("✕ Close"))
-            close.setCursor(Qt.PointingHandCursor)
-            close.setStyleSheet(button_qss("BTN_DANGER", pal=p, padding="5px 12px"))
+            close = close_button(self.tr("✕ Close"), pal=p)
             close.clicked.connect(self._finish)
             hb.addWidget(close)
+            # Kept so subclasses can lock the header ✕ while a tool they
+            # launched is still running (see _lock_close).
+            self._close_btn = close
             v.addWidget(bar)
 
         self._stack = QStackedWidget()
@@ -216,11 +222,31 @@ class WizardViewBase(QWidget):
     def _guard(self, fn):
         return lambda *a: None if self._closing else fn(*a)
 
+    def _lock_close(self, running: bool, tooltip: str = ""):
+        """Block/allow closing while a launched tool is still running.
+
+        Disables the header ✕ and vetoes the tab-bar ✕ via tab_close_blocked,
+        so a wizard whose post-run step would disturb a live tool (restoring
+        the modlist, deleting the tool's own files) cannot be closed mid-run.
+        Call with running=False on every exit path, including failures, or the
+        wizard becomes unclosable.
+        """
+        self._tool_running = running
+        if self._close_btn is not None:
+            self._close_btn.setEnabled(not running)
+            self._close_btn.setToolTip(tooltip if running else "")
+
+    def tab_close_blocked(self) -> bool:
+        """Veto hook for the tab bar's ✕ (see detachable_tabs)."""
+        return self._tool_running
+
     def _finish(self):
         # ✕, Done, and any auto-close all land here. Idempotent; in-flight
         # daemon workers finish harmlessly (late signals dropped by guards,
         # late emits dropped by safe_emit).
-        if self._closing:
+        # _tool_running blocks programmatic closes too - the ✕ is already
+        # disabled, but closing mid-run is what the lock exists to prevent.
+        if self._closing or self._tool_running:
             return
         self._closing = True
         self._auto_fetch_cancel.set()
@@ -616,6 +642,7 @@ class WizardViewBase(QWidget):
                       *, allow_game_prefix: bool = True,
                       isolated_prefix_dir_fn=None,
                       default_prefix_mode: str | None = None,
+                      show_discrete_gpu: bool = False,
                       title: str | None = None,
                       missing_text: str = ""):
         """(Re)build the Proton step on entry - the exe may only exist after
@@ -638,15 +665,22 @@ class WizardViewBase(QWidget):
             lay.addWidget(err)
             return
         from wizards_qt.proton_step import ProtonStepWidget
-        lay.addWidget(ProtonStepWidget(
+        step = ProtonStepWidget(
             self._game, exe, exe_name, display_name,
             on_continue=on_chosen,
             log_fn=self._log,
             allow_game_prefix=allow_game_prefix,
             isolated_prefix_dir_fn=isolated_prefix_dir_fn,
             default_prefix_mode=default_prefix_mode,
+            show_discrete_gpu=show_discrete_gpu,
             title=title,
-        ))
+            wizard_id=getattr(self._ctx, "wizard_tool_id", ""),
+            wizard_label=getattr(self._ctx, "wizard_tool_label", ""),
+            wizard_label_args=getattr(
+                self._ctx, "wizard_tool_label_args", ()),
+        )
+        lay.addWidget(step)
+        return step
 
     # ---- deploy through the app machinery -------------------------------------------
     def _run_ctx_deploy(self, status_lbl: QLabel, on_ok, on_fail=None):

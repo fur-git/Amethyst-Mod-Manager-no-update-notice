@@ -158,6 +158,7 @@ class SelectorButton(QToolButton):
                  on_select: "Callable[[str], None] | None" = None,
                  prefix="", suffix="", min_width=170, icon=None, icon_px=18,
                  item_icons=None, icon_provider=None, scroll_after=None,
+                 face_icon=None, face_icon_px=None, display_fn=None,
                  parent=None):
         """*items*   - list of selectable labels.
         *current*   - initially selected label (defaults to items[0]).
@@ -181,6 +182,19 @@ class SelectorButton(QToolButton):
         *scroll_after* - past this many items the list becomes one scrollable
                       block that tall, keeping the pinned actions in view
                       instead of pushing them down the screen. None = never.
+        *face_icon* - fallback QIcon for icon-only mode when the current item
+                      has no *item_icons* entry (the profile selector's icons
+                      are group badges, so an ungrouped profile has none).
+                      Unlike *icon* it doesn't force icon-only mode.
+        *face_icon_px* - draw size for that face; defaults to *icon_px*. Keeps
+                      small menu-row icons while the collapsed face is drawn
+                      at the toolbar's icon size.
+        *display_fn* - called with a label to get the text to DRAW for it; the
+                      labels themselves stay canonical, so *on_select* and
+                      :meth:`current` still hand back the real value. Used by
+                      the profile selector to show the default profile's
+                      translated name while "default" (its folder name) is what
+                      travels back into paths. Identity when None.
         """
         super().__init__(parent)
         self._items: list[str] = list(items or [])
@@ -189,9 +203,12 @@ class SelectorButton(QToolButton):
         self._prefix = prefix
         self._suffix = suffix or ""
         self._icon = icon
+        self._face_icon = face_icon
         self._item_icons: dict = dict(item_icons or {})
         self._icon_provider = icon_provider
+        self._display_fn = display_fn
         self._item_icon_px = icon_px
+        self._face_icon_px = face_icon_px or icon_px
         self._scroll_after = scroll_after
         self._item_list: _ItemList | None = None
         # Narrow-bar compaction (see set_label_width / set_icon_only) and the
@@ -328,7 +345,7 @@ class SelectorButton(QToolButton):
     def full_text(self) -> str:
         """The unelided button label (prefix + current item + suffix)."""
         return self.tr("{0}{1}{2}").format(
-            self._prefix, self._current or "-", self._suffix)
+            self._prefix, self._display(self._current) or "-", self._suffix)
 
     def natural_width(self) -> int:
         """Layout width with the full label - its minimum width floors it."""
@@ -340,10 +357,14 @@ class SelectorButton(QToolButton):
         """Layout width in the present state (full / elided / icon-only)."""
         return max(self.minimumWidth(), self.sizeHint().width())
 
+    def _face_for_current(self):
+        """Icon for icon-only mode: the item's own, else the face_icon."""
+        return self._item_icons.get(self._current) or self._face_icon
+
     def icon_width(self) -> int:
         """Layout width in icon-only mode; 0 when the current item has no icon
         to fall back on (collapsing it would leave a blank button)."""
-        if self._icon is not None or self._item_icons.get(self._current) is None:
+        if self._icon is not None or self._face_for_current() is None:
             return 0
         if self._icon_w is None:
             self._text_chrome()     # cache the text metrics while we still can
@@ -373,7 +394,7 @@ class SelectorButton(QToolButton):
     def set_icon_only(self, on: bool) -> None:
         """Show the current item's icon INSTEAD of its label. Ignored when that
         item has no icon."""
-        on = bool(on) and self._item_icons.get(self._current) is not None
+        on = bool(on) and self._face_for_current() is not None
         if on == self._icon_only:
             return
         if on:
@@ -402,10 +423,10 @@ class SelectorButton(QToolButton):
         if self._icon is not None:
             return              # fixed-icon selector - its face never changes
         full = self.full_text()
-        face = self._item_icons.get(self._current)
+        face = self._face_for_current()
         if self._icon_only and face is not None:
             self.setIcon(face)
-            self.setIconSize(QSize(self._item_icon_px, self._item_icon_px))
+            self.setIconSize(QSize(self._face_icon_px, self._face_icon_px))
             self.setToolButtonStyle(Qt.ToolButtonIconOnly)
             # Same QSS hook the action buttons use for their icon-only mode:
             # drops the label padding, keeps the arrow section.
@@ -435,7 +456,7 @@ class SelectorButton(QToolButton):
         if fm.horizontalAdvance(full) <= room:
             text = full
         else:
-            name = self._current or "-"
+            name = self._display(self._current) or "-"
             text = (name if fm.horizontalAdvance(name) <= room
                     else fm.elidedText(name, Qt.ElideRight, room))
         self.setText(text)
@@ -519,11 +540,22 @@ class SelectorButton(QToolButton):
         self._add_actions(self._menu, self._actions)
         self.face_changed.emit()
 
+    def _display(self, label: str) -> str:
+        """The text to DRAW for *label* (see *display_fn*). Never used as a
+        key - lookups and callbacks keep the canonical label."""
+        if self._display_fn is None:
+            return label
+        try:
+            return self._display_fn(label)
+        except Exception:
+            return label
+
     def _item_text(self, label: str) -> str:
         """Row text for *label* - the highlighted (deployed) item says so."""
+        shown = self._display(label)
         if self._highlighted is not None and label == self._highlighted:
-            return self.tr("{0}   ✓ deployed").format(label)
-        return label
+            return self.tr("{0}   ✓ deployed").format(shown)
+        return shown
 
     def _add_item_list(self):
         """Add the selectable items as one scrollable list capped at

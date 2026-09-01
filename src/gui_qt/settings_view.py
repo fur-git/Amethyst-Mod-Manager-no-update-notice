@@ -33,7 +33,7 @@ per-section footer that `_finish_section` flushes at the bottom of the group.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QRectF, QSize
+from PySide6.QtCore import Qt, Signal, QRect, QRectF, QSize
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame,
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QApplication, QTabWidget, QAbstractButton, QSizePolicy,
 )
 
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c, _QT_DEFAULT_THEME
 from gui_qt.help_marker import tip_text, make_help_marker, help_mark_qss
 from gui_qt.wheel_guard import no_wheel
 from gui_qt.flow_layout import FlowLayout, enable_height_for_width
@@ -156,6 +156,9 @@ class SettingsView(OverlayBase):
     # Stable width for the language selector within the common settings grid.
     COMBO_W = 180
 
+    # Width of one theme-gallery tile holder (preview square + wrapped name).
+    THEME_TILE_W = 108
+
     def __init__(self, window, on_closed=None):
         super().__init__(window, on_done=on_closed)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -218,9 +221,7 @@ class SettingsView(OverlayBase):
         title.setObjectName("SettingsTitle")
         row.addWidget(title)
         row.addStretch(1)
-        close = QPushButton(self.tr("Close"))
-        close.setObjectName("FormButton")
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("Close"), pal=self._pal)
         close.clicked.connect(self._finish)
         row.addWidget(close)
         outer.addWidget(bar)
@@ -539,9 +540,18 @@ class SettingsView(OverlayBase):
 
         self._build_ui_scale(g)
 
-        # Theme is live; only Language / UI Scale still need a restart.
-        # Indented to the control column so it reads as a note about the
-        # controls above rather than a row label of its own.
+        # Applies live. As a side bar the buttons are icon-only, with their
+        # labels as tooltips.
+        self._combo(
+            g, self.tr("Toolbar position"),
+            [(self.tr("Top"), "top"),
+             (self.tr("Left side"), "left"),
+             (self.tr("Right side"), "right")],
+            uc.load_header_position(), self._save_header_position)
+
+        # Theme and toolbar position are live; only Language / UI Scale still
+        # need a restart. Indented to the control column so it reads as a note
+        # about the controls above rather than a row label of its own.
         note = QLabel(self.tr(
             "Language and UI scale changes take effect after restart."))
         note.setObjectName("RestartNote")
@@ -578,6 +588,19 @@ class SettingsView(OverlayBase):
             g, self.tr("Sync language files"), self._on_sync_languages)
         self._finish_section(g)
 
+    def _save_header_position(self, value: str):
+        """Persist the toolbar position, then move the bar there immediately."""
+        uc.save_header_position(value)
+        win = self._window
+        if win is not None and hasattr(win, "_apply_header_position"):
+            try:
+                win._apply_header_position()
+            except Exception:
+                # Half-rebuilt bar is worth a log line; the saved value still
+                # takes effect on the next start.
+                import traceback
+                traceback.print_exc()
+
     def _apply_support_buttons(self):
         """Ask the window to re-apply Ko-Fi / Endorse button visibility live."""
         win = self._window
@@ -612,7 +635,7 @@ class SettingsView(OverlayBase):
             try:
                 current = uc.get_appearance_mode()
             except Exception:
-                current = "dark"
+                current = _QT_DEFAULT_THEME
         gallery = getattr(self, "_theme_gallery", None)
         if gallery is None:
             return
@@ -632,14 +655,33 @@ class SettingsView(OverlayBase):
             ordered_ids = ["dark"]
             names.setdefault("dark", "Dark")
         selected = (current if current in palettes else
-                    "dark" if "dark" in palettes else ordered_ids[0])
+                    _QT_DEFAULT_THEME if _QT_DEFAULT_THEME in palettes
+                    else ordered_ids[0])
 
         self._theme_buttons: dict[str, _ThemePreviewButton] = {}
+
+        # FlowLayout sizes its rows from sizeHint(), which ignores word
+        # wrapping - a name that wraps to two lines (e.g. "Catppuccin Mocha")
+        # would otherwise overflow its row and paint over the tile below.
+        # Measure the tallest wrapped name once and reserve that height on
+        # every holder, so rows never overlap and the grid stays aligned.
+        text_w = self.THEME_TILE_W - 4          # holder margins (2 + 2)
+        metrics = self.fontMetrics()
+        label_h = max(
+            metrics.boundingRect(
+                QRect(0, 0, text_w, 0),
+                int(Qt.TextWordWrap | Qt.AlignHCenter),
+                names.get(t, t.replace("_", " ").title())).height()
+            for t in ordered_ids)
+        # A long custom-theme name must not stretch every tile in the gallery;
+        # cap the reserved band at two lines and let the rest elide.
+        label_h = min(label_h, metrics.height() * 2)
+
         for tid in ordered_ids:
             display = names.get(tid, tid.replace("_", " ").title())
             holder = QWidget()
             holder.setObjectName("ThemeOption")
-            holder.setFixedWidth(108)
+            holder.setFixedWidth(self.THEME_TILE_W)
             holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
             layout = QVBoxLayout(holder)
             layout.setContentsMargins(2, 2, 2, 2)
@@ -657,6 +699,7 @@ class SettingsView(OverlayBase):
             label.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
             label.setWordWrap(True)
             label.setToolTip(display)
+            label.setFixedHeight(label_h)
             layout.addWidget(label)
             self._theme_buttons[tid] = tile
             gallery.addWidget(holder)
@@ -1103,6 +1146,12 @@ class SettingsView(OverlayBase):
             uc.load_download_cache_path, uc.save_download_cache_path,
             help=self.tr("Where downloaded mod archives are stored. "
                  "Blank = default ({0}).").format(base / 'download_cache'))
+        self._path_row(
+            g, self.tr("Custom Proton Build"),
+            uc.load_custom_proton_path, uc.save_custom_proton_path,
+            help=self.tr("Additional Proton build not found automatically. "
+                         "Select the build folder containing the top-level "
+                         "'proton' launcher, not files/bin/wine. Blank disables it."))
         self._path_row(
             g, self.tr("Heroic Config Location"),
             uc.load_heroic_config_path, uc.save_heroic_config_path,

@@ -29,7 +29,9 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 
-from gui_qt.theme_qt import active_palette, apply_theme, _c
+from gui_qt.theme_qt import (
+    active_palette, apply_theme, close_button, _c, _QT_DEFAULT_THEME,
+)
 from gui_qt.theme_preview import ThemePreviewPanel
 from gui_qt.color_picker_overlay import ColorPickerOverlay
 from gui_qt.confirm_overlay import ConfirmOverlay
@@ -283,7 +285,7 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ThemeEditorView", "Label and list text throughout the app, plus success/warning/error text."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "The highlight colour: links, dropdown arrows and accented controls."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Lines and frames around panels, lists and inputs."),
-    QT_TRANSLATE_NOOP("ThemeEditorView", "Danger / cancel / remove buttons (delete, remove profile, ✕ close)."),
+    QT_TRANSLATE_NOOP("ThemeEditorView", "Danger buttons (delete, remove profile and other destructive actions)."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Success / confirm buttons (Install, Done, Play)."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Warning buttons (Reinstall, download / update actions)."),
     QT_TRANSLATE_NOOP("ThemeEditorView", "Info / neutral action buttons (Select, Groups, Plugin Rules)."),
@@ -350,10 +352,10 @@ class ThemeEditorView(QWidget):
         outer.addWidget(split, 1)
 
         # Seed from the current active theme.
-        start_id = uc.get_appearance_mode() or "dark"
+        start_id = uc.get_appearance_mode() or _QT_DEFAULT_THEME
         if start_id not in self._palettes:
-            start_id = "dark" if "dark" in self._palettes else next(
-                iter(self._palettes), "dark")
+            start_id = (_QT_DEFAULT_THEME if _QT_DEFAULT_THEME in self._palettes
+                        else next(iter(self._palettes), _QT_DEFAULT_THEME))
         self._load_theme(start_id)
 
     # ---- styling ----------------------------------------------------------
@@ -423,9 +425,7 @@ class ThemeEditorView(QWidget):
         self._delete_btn.clicked.connect(self._delete)
         h.addWidget(self._delete_btn)
 
-        close = QPushButton(self.tr("✕ Close"))
-        close.setObjectName("FormButton")
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("✕ Close"), pal=self._pal)
         close.clicked.connect(self._close_tab)
         h.addWidget(close)
 
@@ -686,18 +686,18 @@ class ThemeEditorView(QWidget):
 
     def _do_delete(self, tid):
         ct.delete_custom_theme(tid)
-        # If the deleted theme was active, fall back to dark.
+        # If the deleted theme was active, fall back to the default theme.
         try:
             if uc.get_appearance_mode() == tid:
-                uc.save_appearance_mode("dark")
+                uc.save_appearance_mode(_QT_DEFAULT_THEME)
         except Exception:
             pass
         self._palettes = load_palettes()
         self._names = load_display_names()
         self._refresh_open_theme_selectors()
-        self._refresh_start_combo("dark")
-        self._load_theme("dark" if "dark" in self._palettes
-                         else next(iter(self._palettes), "dark"))
+        self._refresh_start_combo(_QT_DEFAULT_THEME)
+        self._load_theme(_QT_DEFAULT_THEME if _QT_DEFAULT_THEME in self._palettes
+                         else next(iter(self._palettes), _QT_DEFAULT_THEME))
 
     # ---- lifecycle --------------------------------------------------------
     def _close_tab(self):

@@ -61,6 +61,7 @@ _CREDENTIAL_HEADERS = ("APIKEY", "Authorization")
 V3_BASE = "https://api.nexusmods.com/v3"
 APP_NAME = "amethyst"
 APP_VERSION = __version__
+_SUPPORTED_COLLECTION_SCHEMA_ID = 1
 
 # How long to wait after a 429 before retrying (seconds)
 _RATE_LIMIT_BACKOFF = 2.0
@@ -218,6 +219,7 @@ class NexusModFile:
     version: str
     category_name: str       # "MAIN", "UPDATE", "OPTIONAL", "OLD_VERSION", "MISCELLANEOUS"
     file_name: str            # actual archive filename
+    category_id: int = 0
     size_in_bytes: int | None = None
     size_kb: int = 0
     mod_version: str = ""
@@ -447,6 +449,10 @@ class NexusCollectionMod:
     md5: str = ""           # collection.json mods[].source.md5 - used to verify cached archives
     domain_name: str = ""   # collection.json mods[].domainName - overrides collection-level domain
                             # (e.g. Skyrim mods inside an Enderal collection)
+    update_policy: str = "exact"
+    resolved_file_id: int = 0
+    resolved_nexus_file_name: str = ""
+    resolved_file_category: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1531,7 @@ class NexusAPI:
                                 version=entry.get("version", "") or "",
                                 category_name=cat_name,
                                 file_name=entry.get("uri", "") or "",
+                                category_id=int(entry.get("categoryId") or 0),
                                 size_in_bytes=sz or None,
                                 size_kb=(sz // 1024) if sz else 0,
                                 mod_version="",
@@ -1545,6 +1552,7 @@ class NexusAPI:
                 version=f.get("version", ""),
                 category_name=f.get("category_name", ""),
                 file_name=f.get("file_name", ""),
+                category_id=int(f.get("category_id") or 0),
                 size_in_bytes=f.get("size_in_bytes"),
                 size_kb=f.get("size_kb", 0),
                 mod_version=f.get("mod_version", ""),
@@ -1561,6 +1569,12 @@ class NexusAPI:
             file_updates=data.get("file_updates", []),
         )
 
+    def get_mod_file_updates(self, game_domain: str, mod_id: int) -> list[dict]:
+        """Return the REST file-update chain for one Nexus mod."""
+        data = self._get(f"/games/{game_domain}/mods/{mod_id}/files")
+        updates = data.get("file_updates", [])
+        return updates if isinstance(updates, list) else []
+
     def get_file_info(self, game_domain: str, mod_id: int,
                       file_id: int) -> NexusModFile:
         """Get details about a specific file."""
@@ -1572,6 +1586,7 @@ class NexusAPI:
             version=f.get("version", ""),
             category_name=f.get("category_name", ""),
             file_name=f.get("file_name", ""),
+            category_id=int(f.get("category_id") or 0),
             size_in_bytes=f.get("size_in_bytes"),
             size_kb=f.get("size_kb", 0),
             mod_version=f.get("mod_version", ""),
@@ -2138,6 +2153,7 @@ class NexusAPI:
                             version=entry.get("version", "") or "",
                             category_name=cat_name,
                             file_name=entry.get("uri", "") or "",
+                            category_id=int(entry.get("categoryId") or 0),
                             size_in_bytes=sz or None,
                             size_kb=(sz // 1024) if sz else 0,
                             mod_version="",
@@ -2668,11 +2684,15 @@ class NexusAPI:
         return """
     query Collections(
         $gameDomain: String!
+        $schemaId: Int!
         $count: Int
         $offset: Int
     ) {
         collectionsV2(
-            filter: { gameDomain: [{ value: $gameDomain }] }
+            filter: {
+                gameDomain: [{ value: $gameDomain }]
+                schemaId: [{ value: $schemaId, op: EQUALS }]
+            }
             count: $count
             offset: $offset
             sort: [%s]
@@ -2728,7 +2748,12 @@ class NexusAPI:
         *sort* is one of COLLECTION_SORTS (downloads / endorsements / rating /
         recent); unknown values fall back to the most-downloaded default.
         """
-        variables = {"gameDomain": game_domain, "count": count, "offset": offset}
+        variables = {
+            "gameDomain": game_domain,
+            "schemaId": _SUPPORTED_COLLECTION_SCHEMA_ID,
+            "count": count,
+            "offset": offset,
+        }
         query = self._collections_query(self._collection_sort_clause(sort))
         try:
             resp = self._post_graphql(query, variables,
@@ -2755,6 +2780,7 @@ class NexusAPI:
         return """
     query CollectionsSearch(
         $gameDomain: String!
+        $schemaId: Int!
         $query: String!
         $count: Int
         $offset: Int
@@ -2762,6 +2788,7 @@ class NexusAPI:
         collectionsV2(
             filter: {
                 gameDomain: [{ value: $gameDomain }]
+                schemaId: [{ value: $schemaId, op: EQUALS }]
                 name: { value: $query, op: WILDCARD }
             }
             count: $count
@@ -2803,6 +2830,7 @@ class NexusAPI:
         """
         variables = {
             "gameDomain": game_domain,
+            "schemaId": _SUPPORTED_COLLECTION_SCHEMA_ID,
             "query": query,
             "count": count,
             "offset": offset,
@@ -2840,6 +2868,7 @@ class NexusAPI:
             }
             latestPublishedRevision {
                 revisionNumber
+                collectionSchemaId
                 modCount totalSize assetsSizeBytes
                 downloadLink
                 modFiles {
@@ -2859,6 +2888,7 @@ class NexusAPI:
     query CollectionRevision($slug: String!, $domain: String!, $revision: Int!) {
         collectionRevision(slug: $slug, domainName: $domain, revision: $revision) {
             revisionNumber
+            collectionSchemaId
             modCount totalSize assetsSizeBytes
             downloadLink
             modFiles {
@@ -2894,8 +2924,8 @@ class NexusAPI:
         where ``revisions`` is a list of dicts with ``revisionNumber`` and
         ``revisionStatus`` (only populated on the initial/latest fetch, not on
         specific-revision fetches), and ``card`` carries collection-level display
-        fields (``tile_image_url``, ``total_downloads``, ``endorsements``) for
-        re-hydrating a NexusCollection.
+        fields for re-hydrating a NexusCollection. Unsupported revision schemas
+        return no install data and are identified in ``card``.
         """
         try:
             self._refresh_oauth_if_needed()
@@ -2952,6 +2982,21 @@ class NexusAPI:
                 rev = rev_data.get("data", {}).get("collectionRevision") or {}
             else:
                 rev = latest_rev
+
+            schema_id_value = rev.get("collectionSchemaId")
+            if schema_id_value is not None:
+                try:
+                    schema_id = int(schema_id_value)
+                except (TypeError, ValueError):
+                    schema_id = 0
+                card["collection_schema_id"] = schema_id
+                if schema_id != _SUPPORTED_COLLECTION_SCHEMA_ID:
+                    card["unsupported_collection_schema"] = True
+                    app_log(
+                        f"get_collection_detail: unsupported collection schema "
+                        f"{schema_id} for slug={slug!r} rev={revision_number}"
+                    )
+                    return (col_name, 0, 0, [], "", revisions, card)
 
             total_size = int(rev.get("totalSize") or 0) + int(rev.get("assetsSizeBytes") or 0)
             mod_count = int(rev.get("modCount") or 0)

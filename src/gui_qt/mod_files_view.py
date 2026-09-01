@@ -20,6 +20,8 @@ import Utils.mod_files as mflogic
 from gui_qt.mod_files_model import (
     ModFilesModel, _Node, COL_NAME, COL_TOPLEVEL, COL_ROOT, COL_DISABLE,
 )
+from gui_qt.audio_preview import AUDIO_EXTS, AudioControls
+from gui_qt.video_preview import VIDEO_EXTS
 
 
 class ModFilesView(QWidget):
@@ -35,7 +37,7 @@ class ModFilesView(QWidget):
         # Host-provided context (set via configure()).
         self.game = None
         self.profile_dir: Path | None = None
-        self.index_path: Path | None = None
+        self._snapshot = None
         self._mod_name: str | None = None
         self._stripped: set[str] = set()      # lower strip entries for this mod
         self._search = ""
@@ -47,10 +49,12 @@ class ModFilesView(QWidget):
         self._build()
 
     # -- context ------------------------------------------------------------
-    def configure(self, game, profile_dir, index_path):
+    def configure(self, game, profile_dir):
+        if game is not self.game or profile_dir != self.profile_dir:
+            self._audio_controls.clear_audio()
         self.game = game
         self.profile_dir = profile_dir
-        self.index_path = index_path
+        self._snapshot = None
         # The Root column is meaningless when the normal deploy already targets
         # the game root (no Data subfolder) - hide it for those games.
         hide_root = True
@@ -62,12 +66,17 @@ class ModFilesView(QWidget):
                 hide_root = True
         self._tree.setColumnHidden(COL_ROOT, hide_root)
 
+    def set_snapshot(self, snapshot):
+        self._snapshot = snapshot
+        if self._mod_name is not None:
+            self._request_repopulate()
+
     # -- construction -------------------------------------------------------
     def _build(self):
-        # Lean: just a mod-label header + the tree. The tool footer
+        # The tool footer
         # (Pack/Unpack + search + Filters/Expand), and the filter side panel,
         # are owned by the app so they sit in the shared column footer and the
-        # window-left filter slot (matching the modlist). See app.py.
+        # window-left filter slot (matching the modlist).
         self._filter_state: dict = {}
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -126,6 +135,9 @@ class ModFilesView(QWidget):
         self._tree.viewport().installEventFilter(self)
         v.addWidget(self._tree, 1)
 
+        self._audio_controls = AudioControls(self)
+        v.addWidget(self._audio_controls)
+
     def _header_min(self, col: int, floor: int) -> int:
         """Width that fits this column's header caption in full.
 
@@ -181,6 +193,8 @@ class ModFilesView(QWidget):
 
     # -- population ---------------------------------------------------------
     def show_mod(self, mod_name: str | None):
+        if mod_name != self._mod_name:
+            self._audio_controls.clear_audio()
         self._mod_name = mod_name
         self.mod_changed.emit(mod_name)
         if mod_name is None:
@@ -229,20 +243,24 @@ class ModFilesView(QWidget):
         # Preserve expand state by path.
         expanded = self._expanded_paths()
 
-        from Utils.filemap import read_mod_index
-        full_index = None
-        if self.index_path is not None and self.index_path.is_file():
-            try:
-                full_index = read_mod_index(self.index_path)
-            except Exception:
-                full_index = None
-
-        # Scan the displayed mod LIVE so the tree always matches the real
-        # on-disk structure (a stale flat index otherwise builds wrong paths,
-        # orphaning strip-prefix entries on toggle - the "can't untick, it
-        # disappears" bug). Only one mod is scanned, so it's cheap.
-        files = mflogic.load_mod_files(self.game, mod_name, self.index_path,
-                                       full_index, prefer_live=True)
+        if self._snapshot is not None:
+            records = self._snapshot.mod_files(mod_name)
+            files = {
+                record.source_rel.decode("utf-8", "surrogateescape").lower():
+                record.source
+                for record in records
+            }
+            conflict_status = {
+                record.source_rel.decode("utf-8", "surrogateescape").lower():
+                record.conflict_status
+                for record in records
+            }
+        else:
+            # Before initial catalog publication, show the selected mod's real
+            # files without consulting any legacy index. Conflict tinting stays
+            # disabled until a snapshot arrives.
+            files = mflogic.load_mod_files(self.game, mod_name)
+            conflict_status = {}
         # Extension counts (pre-filter) for the filter panel.
         self._ext_counts = {}
         for rel_key in files:
@@ -265,23 +283,8 @@ class ModFilesView(QWidget):
 
         excluded = mflogic.read_exclusions(self.profile_dir, mod_name)
         root_tags = mflogic.read_root_tags(self.profile_dir, mod_name)
-        conflicts = mflogic.build_conflict_cache(
-            self.index_path, self.profile_dir, full_index,
-            # Archive-aware: a loose file contesting another mod's BSA copy
-            # tints like any other conflict (see data_view for the shared gate).
-            bsa_index_path=mflogic.bsa_conflict_index_path(
-                self.game, self.index_path),
-            root_ctx=mflogic.conflict_root_context(self.game, self.profile_dir),
-            # BG3: two paks with different names but one module UUID contest by
-            # identity - the loser never reaches filemap.txt, so without this it
-            # would show as unconflicted here.
-            pak_ctx=mflogic.pak_uuid_context(self.game, self.index_path))
-
         def conflict_of(rel_key: str) -> int:
-            # status() picks the file's own namespace, so a root-tagged file is
-            # judged only against other root-bound files.
-            key = mflogic.rel_key_after_strip(rel_key, self._stripped)
-            return conflicts.status(mod_name, key.lower())
+            return conflict_status.get(rel_key.lower(), 0)
 
         def keep(rel_key: str, rel_str: str) -> bool:
             if not self._ext_ok(rel_key):
@@ -509,9 +512,7 @@ class ModFilesView(QWidget):
             self._maybe_open_file(node)
 
     def _maybe_open_file(self, node: _Node):
-        """Single-click a file → open a panel-scoped preview when we know how to
-        show it: an image/.dds preview, or a BSA/BA2 content tree. Delegates to
-        the host-supplied callback."""
+        """Single-click a file to preview supported content."""
         if node.rel_str is None:
             return
         ext = Path(node.rel_str).suffix.lower()
@@ -542,6 +543,20 @@ class ModFilesView(QWidget):
             if cb is not None:
                 cb(target, node.rel_str)
             return
+        if ext in AUDIO_EXTS:
+            target = self._disk_path_for(node)
+            if target is None or not target.is_file():
+                return
+            self._audio_controls.set_audio(target, node.rel_str)
+            return
+        if ext in VIDEO_EXTS:
+            target = self._disk_path_for(node)
+            if target is None or not target.is_file():
+                return
+            cb = getattr(self, "on_open_video", None)
+            if cb is not None:
+                cb(target, node.rel_str)
+            return
         from Utils.text_files import TEXT_EXTENSIONS
         if ext in TEXT_EXTENSIONS:
             target = self._disk_path_for(node)
@@ -556,7 +571,7 @@ class ModFilesView(QWidget):
         if self.game is None or self._mod_name is None or node.rel_str is None:
             return None
         try:
-            from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
+            from Utils.filegraph_constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
             if self._mod_name == OVERWRITE_NAME and hasattr(
                     self.game, "get_effective_overwrite_path"):
                 base = Path(self.game.get_effective_overwrite_path())
@@ -583,7 +598,7 @@ class ModFilesView(QWidget):
     def _toggle_root(self, node: _Node):
         if node.synthetic or node.meta:
             return
-        from Utils.filemap import ROOT_FOLDER_NAME
+        from Utils.filegraph_constants import ROOT_FOLDER_NAME
         if self._mod_name == ROOT_FOLDER_NAME:
             return   # [Root_Folder] already deploys to the game root
         if node.is_dir:

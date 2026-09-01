@@ -72,6 +72,11 @@ class QtWizardContext:
     a long-running external tool that reads the DEPLOYED Data folder: while
     held, Deploy/Restore/Play are disabled and refuse to start. Keyed so
     concurrent tools nest; ALWAYS release on the GUI thread in a finally.
+    show_mod_files(mod_name) selects that mod and opens the Mod Files tab - for
+    report-style wizards whose rows link to the mod they are talking about, so
+    the user lands on the footer buttons (Pack BSA, Unpack) that act on it.
+    Call it on the GUI thread. wizard_tool_id/label/label_args carry the stable
+    descriptor identity used by remembered Proton settings.
     """
     profile_name: str = "default"
     run_deploy: Callable | None = None
@@ -83,6 +88,11 @@ class QtWizardContext:
     nexus_api: Callable | None = None
     open_log_tab: Callable | None = None
     set_tool_lock: Callable | None = None
+    show_mod_files: Callable | None = None
+    filegraph_snapshot: Callable | None = None
+    wizard_tool_id: str = ""
+    wizard_tool_label: str = ""
+    wizard_tool_label_args: tuple = ()
 
 
 # Deliberately dropped from the Qt app (not even shown greyed out).
@@ -185,6 +195,8 @@ REGISTRY: dict[str, QtWizardSpec] = {
     "wizards.dyndolod.TexGenWizard": QtWizardSpec(_dyndolod_tool("texgen")),
     "wizards.dyndolod.DynDOLODWizard": QtWizardSpec(_dyndolod_tool("dyndolod")),
     "wizards.dyndolod.xLODGenWizard": QtWizardSpec(_dyndolod_tool("xlodgen")),
+    "wizards.acmos.ACMOSWizard":
+        QtWizardSpec(_simple("wizards_qt.acmos_view", "ACMOSView")),
 
     # -- phase 6: plugins-panel tools --
     "wizards.mewgenics_gpak.MewgenicsGpakWizard":
@@ -196,8 +208,22 @@ REGISTRY: dict[str, QtWizardSpec] = {
     "wizards.fallout_downgrade.FalloutDowngradeWizard":
         QtWizardSpec(_simple("wizards_qt.fallout_downgrade_view", "FalloutDowngradeView")),
     "wizards.fallout_4_downgrader.Fallout4DowngraderWizard":
-        QtWizardSpec(_simple("wizards_qt.fallout_4_downgrader_view",
-                             "Fallout4DowngraderView")),
+        QtWizardSpec(_param("wizards_qt.mulderload_downgrader_view",
+                            "MulderLoadDowngraderView",
+                            game_label="Fallout 4", slug="fallout4",
+                            game_exe="fallout-4-steam-downgrader.exe",
+                            ck_exe="fallout-4-creation-kit-steam-downgrader.exe")),
+    "wizards.skyrim_se_downgrader.SkyrimSEDowngraderWizard":
+        QtWizardSpec(_param(
+            "wizards_qt.mulderload_downgrader_view",
+            "MulderLoadDowngraderView",
+            game_label="Skyrim Special Edition", slug="skyrimse",
+            game_exe=(
+                "the-elder-scrolls-5-skyrim-special-edition-"
+                "steam-downgrader.exe"),
+            ck_exe=(
+                "the-elder-scrolls-5-skyrim-special-edition-creation-kit-"
+                "steam-downgrader.exe"))),
     "wizards.wrye_bash.WryeBashWizard":
         QtWizardSpec(_simple("wizards_qt.wrye_bash_view", "WryeBashView")),
     "wizards.bethini.BethINIWizard":
@@ -253,6 +279,9 @@ REGISTRY: dict[str, QtWizardSpec] = {
         QtWizardSpec(_simple("wizards_qt.skygen_view", "SkyGenView"), panel="modlist"),
     "wizards.plugin_audit.PluginAuditWizard":
         QtWizardSpec(_simple("wizards_qt.plugin_audit_view", "PluginAuditView"), panel="modlist"),
+    "wizards.bsa_pack_candidates.BsaPackCandidatesWizard":
+        QtWizardSpec(_simple("wizards_qt.bsa_pack_candidates_view",
+                             "BsaPackCandidatesView"), panel="modlist"),
 
     # -- full-UI tools (tree + 3D viewport needs the whole window) --
     "wizards.nif_viewer.NifViewerWizard":

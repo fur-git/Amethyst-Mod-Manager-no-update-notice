@@ -134,6 +134,7 @@ class CollectionDetailView(QWidget):
         self._pending_initial_rev = revision_number
         self._revisions_list: list[dict] = []
         self._detail_token = 0                     # guards stale revision fetches
+        self._unsupported_collection_schema = False
 
         self.setObjectName("CollectionDetailView")
         self._detail_ready.connect(self._on_detail_ready)
@@ -190,6 +191,7 @@ class CollectionDetailView(QWidget):
                 file_name=src.get("logicalFilename") or mod_name,
                 size_bytes=file_size, optional=bool(m.get("optional", False)),
                 source_type="nexus", version=m.get("version") or "",
+                update_policy=(src.get("updatePolicy") or "exact").lower(),
                 category_id=int(cat.get("id") or 0),
                 category_name=(cat.get("name") or "").strip(),
                 domain_name=(m.get("domainName") or "").strip()))
@@ -395,6 +397,7 @@ class CollectionDetailView(QWidget):
     def _start_detail_fetch(self):
         self._detail_token += 1
         token = self._detail_token
+        self._install_btn.setEnabled(False)
         slug = getattr(self._collection, "slug", "") or ""
         domain = self._domain
         # First fetch (no revisions list yet) is always "latest" so the dropdown
@@ -426,6 +429,29 @@ class CollectionDetailView(QWidget):
             self._title_lbl.setText(name)
             self._collection.name = name
             self.title_resolved.emit(name)
+        if isinstance(card, dict) and card.get("unsupported_collection_schema"):
+            self._unsupported_collection_schema = True
+            schema_id = int(card.get("collection_schema_id") or 0)
+            if schema_id == 2:
+                message = self.tr(
+                    "This is a Wabbajack list and cannot be installed by "
+                    "Amethyst. Install it with Wabbajack instead.")
+            else:
+                message = self.tr(
+                    "This collection uses an unsupported format and cannot "
+                    "be installed by Amethyst.")
+            self._mods = []
+            self._total_size = 0
+            self._table.setRowCount(0)
+            self._size_lbl.setText(message)
+            self._opt_empty.setText(self.tr("No installable collection data."))
+            self._install_btn.setText(self.tr("Unsupported collection"))
+            self._install_btn.setToolTip(message)
+            self._install_btn.setEnabled(False)
+            return
+        self._unsupported_collection_schema = False
+        self._install_btn.setEnabled(True)
+        self._install_btn.setToolTip("")
         # Enrich the (possibly bare NXM/"Open Current") collection with the
         # display fields we just fetched, so an append records a full card
         # (image + stats) into installed_collections/<slug>.json.
@@ -555,6 +581,10 @@ class CollectionDetailView(QWidget):
         Priority: Resume (paused) > Update (revision differs) > Install."""
         btn = getattr(self, "_install_btn", None)
         if btn is None:
+            return
+        if self._unsupported_collection_schema:
+            btn.setText(self.tr("Unsupported collection"))
+            btn.setEnabled(False)
             return
         from Utils.ui_config import load_download_only
         try:
@@ -808,13 +838,16 @@ class CollectionDetailView(QWidget):
         e.g. hyphens collapsed to spaces - so it's only a fallback). We apply it
         whenever the current name is ambiguous: empty, or shared by >1 file in
         this collection. Unique, non-empty GraphQL names are left untouched."""
-        info: "dict[int, tuple[bool, str]]" = {}   # file_id → (optional, name)
+        info: "dict[int, tuple[bool, str, str]]" = {}
         for cm in (manifest or {}).get("mods", []):
             src = cm.get("source") or {}
             fid = src.get("fileId")
             if fid is not None:
                 cj_name = (cm.get("name") or src.get("logicalFilename") or "")
-                info[int(fid)] = (bool(cm.get("optional", False)), cj_name)
+                policy = (src.get("updatePolicy") or "exact").lower()
+                if policy not in ("exact", "prefer", "latest"):
+                    policy = "exact"
+                info[int(fid)] = (bool(cm.get("optional", False)), cj_name, policy)
         if not info:
             return False
         # An ambiguous display name is one that is empty (GraphQL couldn't
@@ -828,7 +861,7 @@ class CollectionDetailView(QWidget):
         changed = False
         for m in self._mods:
             if m.file_id and m.file_id in info:
-                opt, cj_name = info[m.file_id]
+                opt, cj_name, policy = info[m.file_id]
                 if bool(getattr(m, "optional", False)) != opt:
                     m.optional = opt
                     changed = True
@@ -836,6 +869,9 @@ class CollectionDetailView(QWidget):
                 ambiguous = (not cur) or name_counts.get(cur, 1) > 1
                 if cj_name and ambiguous and cur != cj_name:
                     m.mod_name = cj_name
+                    changed = True
+                if getattr(m, "update_policy", "exact") != policy:
+                    m.update_policy = policy
                     changed = True
         return changed
 

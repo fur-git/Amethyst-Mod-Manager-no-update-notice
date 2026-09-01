@@ -9,8 +9,13 @@
 from __future__ import annotations
 
 import os
+import time as _startup_time
 from pathlib import Path
 
+from Utils import perftrace as _perftrace
+
+_MODULE_STARTUP_TIMING = _perftrace.startup_timeline()
+_startup_import_started = _startup_time.perf_counter()
 from PySide6.QtCore import Qt, QSize, Signal, QTimer, QT_TRANSLATE_NOOP
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
@@ -18,26 +23,59 @@ from PySide6.QtWidgets import (
     QLabel, QVBoxLayout, QHBoxLayout, QPlainTextEdit, QTextBrowser,
     QFrame, QLineEdit, QPushButton, QMenu, QStackedWidget, QSizePolicy,
 )
+if _MODULE_STARTUP_TIMING is not None:
+    _MODULE_STARTUP_TIMING.record(
+        "Import PySide6/Qt", phase_started=_startup_import_started,
+        category="imports")
 
+_startup_import_started = _startup_time.perf_counter()
 from gui_qt.theme_qt import (
     apply_theme, active_palette, bind_theme, _c, contrast_text,
 )
 from gui_qt.icons import icon, hamburger_icon
+if _MODULE_STARTUP_TIMING is not None:
+    _MODULE_STARTUP_TIMING.record(
+        "Import theme and icon support", phase_started=_startup_import_started,
+        category="imports")
+
+_startup_import_started = _startup_time.perf_counter()
 from gui_qt.modlist_model import ModListModel, COL_SIZE
 from gui_qt.modlist_view import ModListView
+if _MODULE_STARTUP_TIMING is not None:
+    _MODULE_STARTUP_TIMING.record(
+        "Import mod-list model and view", phase_started=_startup_import_started,
+        category="imports")
+
+_startup_import_started = _startup_time.perf_counter()
 from gui_qt.selector_button import SelectorButton, SplitPressHighlighter
+from gui_qt.i18n import (profile_display, is_reserved_profile_name,
+                         DEFAULT_PROFILE)
 from gui_qt.flow_layout import FlowLayout
 from gui_qt.game_state import GameState
 from gui_qt.detachable_tabs import DetachableTabWidget
 from gui_qt.notification_center import NotificationHistory, NotificationButton
 from gui_qt import glue
+if _MODULE_STARTUP_TIMING is not None:
+    _MODULE_STARTUP_TIMING.record(
+        "Import remaining core UI modules", phase_started=_startup_import_started,
+        category="imports")
+
+_startup_import_started = _startup_time.perf_counter()
 from Utils.proton_tools import DOTNET_VERSIONS
+if _MODULE_STARTUP_TIMING is not None:
+    _MODULE_STARTUP_TIMING.record(
+        "Import startup backend utilities", phase_started=_startup_import_started,
+        category="imports")
 # Diagnostic prints here run on worker threads and use flush=True. Under
 # Flatpak/AppImage stdout often has no reader, so a full pipe buffer makes
 # print() raise BrokenPipeError, which killed the worker (e.g. the play/deploy
 # build). safe_print swallows stream errors; the text is mirrored to the GUI
 # log anyway. Shadowing the builtin makes every print(...) below crash-proof.
 from Utils.app_log import safe_print as print  # noqa: A004
+
+# Qt's "no maximum" sentinel. PySide6 doesn't export QWIDGETSIZE_MAX, so undoing
+# a setFixedSize/setFixedWidth means writing the value out.
+_QWIDGETSIZE_MAX = (1 << 24) - 1
 
 
 def _tr_wizard(text: str, args: tuple = ()) -> str:
@@ -148,6 +186,7 @@ _QUICK_CONFIGURE_TR = (
     QT_TRANSLATE_NOOP("MainWindow", "Swap launcher with script extender on deploy"),
     QT_TRANSLATE_NOOP("MainWindow", "Apply the 4GB patch automatically on deploy"),
     QT_TRANSLATE_NOOP("MainWindow", "Auto deploy (on enable/disable/reorder)"),
+    QT_TRANSLATE_NOOP("MainWindow", "Prefer AppImage"),
     QT_TRANSLATE_NOOP("MainWindow", "Automatic archive invalidation (prefer loose files over BSAs)"),
     QT_TRANSLATE_NOOP("MainWindow", "Create case-alias symlinks on deploy (Faster load times)"),
     QT_TRANSLATE_NOOP("MainWindow", "Use profile-specific INI files"),
@@ -246,13 +285,6 @@ class MainWindow(QMainWindow):
     # Carries (generation, ConflictData) from a worker thread to the UI thread
     # (queued connection - thread-safe). See _rebuild_conflicts_async.
     _conflicts_ready = Signal(int, object)
-    # (generation, bsa_codes, bsa_overrides, bsa_overridden_by, loose_codes) -
-    # BSA-only recompute after a plugin toggle/reorder (no filemap rebuild).
-    # loose_codes is the re-merged loose map, or None if it couldn't be built.
-    _bsa_conflicts_ready = Signal(int, object, object, object, object)
-    # (generation) - filemap-only rebuild finished (disable fast path: the
-    # conflict scan was provably redundant). See _rebuild_filemap_light_async.
-    _filemap_light_done = Signal(int)
     # (generation, list[FrameworkStatus]) from the framework-detect worker -
     # detect_frameworks reads filemap.txt + the mod index, too slow for the UI
     # thread on a big modlist. See _refresh_framework_banner.
@@ -294,6 +326,9 @@ class MainWindow(QMainWindow):
     _nif_archive_ready = Signal(int, object, object)  # gen, bytes|None, context
     # Nexus validate() worker → UI thread (username or None).
     _nexus_validated = Signal(object)          # (username str | None)
+    # Saved-login initialization worker → UI thread (result dict). Importing
+    # OAuth/keyring support probes DBus and must not hold up the first paint.
+    _nexus_api_initialized = Signal(object)
     # LOOT Sort Plugins worker → UI thread (SortResult | None on error).
     _sort_plugins_ready = Signal(object)
     # LOOT record-overlap worker → UI thread: (target plugin name,
@@ -431,22 +466,39 @@ class MainWindow(QMainWindow):
         "_tf_filters_btn":      ("_text_files_filter_panel", "_tf_search"),
     }
 
-    def __init__(self, app, splash=None):
+    def __init__(self, app, splash=None, startup_timing=None):
+        phase_started = _startup_time.perf_counter()
         super().__init__()
+        self._startup_timing = startup_timing
+        self._startup_wait_for_conflicts = False
+        self._startup_event_loop_seen = False
+        if startup_timing is not None:
+            startup_timing.record(
+                "Create top-level Qt window", phase_started=phase_started,
+                category="UI")
         self._app = app
         # Startup splash: held open past show() and dismissed on the first
         # completed conflict rebuild (the last of the heavy first-load work).
         # A watchdog closes it anyway if that signal never arrives.
         self._splash = splash
         self._splash_dismissed = False
+        # Timestamp set when the populated plugin view queues the zero-delay
+        # reveal.  Qt may still have native layout/paint/GL work ahead of that
+        # timer, so measuring only _dismiss_splash() itself hides the time the
+        # callback spends waiting in the event queue.
+        self._splash_reveal_queued_at = None
         self._gl_warmup = None            # 1px QOpenGLWidget, see _start_gl_warmup
         self._gl_probing = False
+        phase_started = _startup_time.perf_counter()
         self._pal = active_palette()
         self._gs = GameState()
-        self._gs.load()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Initialize window palette and game state",
+                phase_started=phase_started, category="UI")
+        self._gs.load(timing=startup_timing)
+        phase_started = _startup_time.perf_counter()
         self._conflicts_ready.connect(self._on_conflicts_ready)
-        self._bsa_conflicts_ready.connect(self._on_bsa_conflicts_ready)
-        self._filemap_light_done.connect(self._on_filemap_light_done)
         self._framework_statuses_ready.connect(self._on_framework_statuses)
         self._nif_archive_ready.connect(self._on_nif_archive_ready)
         from gui_qt.worker import LatestWorker
@@ -457,6 +509,10 @@ class MainWindow(QMainWindow):
         # Deploy/restore state + notification host.
         self._deploy_running = False
         self._deploy_rerun_pending = False
+        self._restore_timing_origin = None
+        self._restore_timing_previous = None
+        self._restore_refresh_pending = False
+        self._restore_refresh_conflicts_done = False
         # Auto-deploy guard: a deploy triggers _reload_modlist → conflict rebuild
         # → _on_conflicts_ready; without this flag that would re-fire auto-deploy
         # in an infinite loop (Tk parity: gui.py _auto_deploy_in_progress).
@@ -539,6 +595,11 @@ class MainWindow(QMainWindow):
         # and the mod it is anchored on (so the menu entry reads as a toggle).
         self._modlist_conflict_filter: set = set()
         self._modlist_conflict_filter_anchor: str = ""
+        if startup_timing is not None:
+            startup_timing.record(
+                "Initialize window state and signals",
+                phase_started=phase_started, category="UI")
+        phase_started = _startup_time.perf_counter()
         try:
             from version import __version__ as _mm_version
         except Exception:
@@ -592,20 +653,48 @@ class MainWindow(QMainWindow):
                               ag.center().y() - want_h // 2)
             except Exception:
                 pass
+        if startup_timing is not None:
+            startup_timing.record(
+                "Restore window geometry", phase_started=phase_started,
+                category="UI")
 
         # Header+body+footer go in a vertical splitter with the log text area
         # so the log is drag-resizable; the log control bar stays fixed below.
+        # The toolbar is a row above the body by default; as a side bar it is a
+        # fixed-width icon column beside it, so the layout flips to horizontal.
+        header_pos = self._header_position()
         main_content = QWidget()
-        mc = QVBoxLayout(main_content)
+        mc = (QHBoxLayout(main_content) if header_pos in ("left", "right")
+              else QVBoxLayout(main_content))
         mc.setContentsMargins(0, 0, 0, 0)
         mc.setSpacing(0)
-        mc.addWidget(self._build_header_row())
-        mc.addWidget(self._build_body_row(), 1)
+        phase_started = _startup_time.perf_counter()
+        header_row = self._build_header_row()
+        if header_pos != "right":
+            mc.addWidget(header_row)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build header controls", phase_started=phase_started,
+                category="UI")
+        phase_started = _startup_time.perf_counter()
+        body_row = self._build_body_row(startup_timing=startup_timing)
+        mc.addWidget(body_row, 1)
+        if header_pos == "right":
+            mc.addWidget(header_row)
+        # Kept for _apply_header_position, which re-lays out this container.
+        self._main_content = main_content
+        self._body_row = body_row
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build mod and plugin panels", phase_started=phase_started,
+                category="UI")
         # (The tool footers now live inside each panel - see _build_body_row /
         # _build_modlist_area - not in a separate window-wide row.)
 
         # The main content is the permanent first tab; overlay-style views (Add
         # Game, Nexus browser, …) open as further tabs that can be detached.
+        assembly_started = _startup_time.perf_counter()
+        detail_started = assembly_started
         self._tabs = DetachableTabWidget()
         self._tabs.add_permanent(main_content, self.tr("Mods"))
         # Let the tab bar's right-click "Pin to…" menu move any tab between the
@@ -625,7 +714,12 @@ class MainWindow(QMainWindow):
             self._tab_notif_button, Qt.TopRightCorner)
         self._tabs.currentChanged.connect(self._sync_tab_notification_button)
         self._sync_tab_notification_button()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build top-level tab container",
+                phase_started=detail_started, category="UI")
 
+        detail_started = _startup_time.perf_counter()
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setObjectName("LogView")
@@ -640,7 +734,12 @@ class MainWindow(QMainWindow):
         self._vsplit.setCollapsible(1, True)     # log collapses to 0; handle stays
         self._vsplit.setHandleWidth(4)
         self._vsplit.splitterMoved.connect(lambda *_: self._sync_log_controls())
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build log view and vertical splitter",
+                phase_started=detail_started, category="UI")
 
+        detail_started = _startup_time.perf_counter()
         central = QWidget()
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -648,7 +747,15 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._vsplit, 1)
         outer.addWidget(self._build_log_bar())   # fixed control bar
         self.setCentralWidget(central)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build central layout and log controls",
+                phase_started=detail_started, category="UI")
+            startup_timing.record(
+                "Assemble tabs, layout, and log panel",
+                phase_started=assembly_started, category="aggregate")
 
+        phase_started = _startup_time.perf_counter()
         from gui_qt.file_pickers import build_pickers
         wired = glue.register_all(
             app, log=self._append_log, parent_window=self,
@@ -661,21 +768,38 @@ class MainWindow(QMainWindow):
             file_pickers=build_pickers(self),
         )
         print("[gui_qt] glue wired:", ", ".join(wired))
+        if startup_timing is not None:
+            startup_timing.record(
+                "Register UI/backend integrations",
+                phase_started=phase_started, category="UI")
 
         # Environment banner at the very top of the session log - a pasted log
         # then carries the same facts the Settings > System Information section
         # shows, without walking the reporter through collecting them.
+        phase_started = _startup_time.perf_counter()
         self._log_system_info()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Collect and render system information",
+                phase_started=phase_started, category="diagnostics")
 
         # Start with the log collapsed (deferred until the layout has real size).
-        QTimer.singleShot(0, lambda: (self._vsplit.setSizes(
-            [self._vsplit.height(), 0]), self._sync_log_controls()))
+        self._queue_startup_deferred(
+            "Finalize initial log splitter",
+            lambda: (self._vsplit.setSizes(
+                [self._vsplit.height(), 0]), self._sync_log_controls()))
 
         # Populate selectors from discovered games and load the active modlist.
+        phase_started = _startup_time.perf_counter()
         self._populate_selectors()
-        self._reload_modlist()
-        self._reload_plugins()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Populate game/profile selectors",
+                phase_started=phase_started, category="UI")
+        self._reload_modlist(startup_timing=startup_timing)
+        self._reload_plugins(startup_stage="initial")
         self._update_deployed_profile_highlight()
+        phase_started = _startup_time.perf_counter()
 
         # Global keyboard shortcuts (F2/F5/Ctrl+D/… - Tk parity) + last-panel
         # tracking so shortcuts route to the modlist or plugins panel.
@@ -683,8 +807,14 @@ class MainWindow(QMainWindow):
         register_shortcuts(self)
 
         # Connect to Nexus (if logged in) so the footer can show the username +
-        # rate limits; validate runs on a worker so startup isn't blocked.
+        # rate limits; validate runs on a worker so startup isn't blocked.  The
+        # saved-session worker itself is held until the populated window is
+        # revealed: importing OAuth/keyring/HTTP modules off-thread can still
+        # contend for the GIL with Qt's first layout and paint callbacks.
         self._nexus_api = None
+        self._nexus_api_init_running = False
+        self._nexus_api_init_deferred = True
+        self._nexus_api_initialized.connect(self._on_nexus_api_initialized)
         self._nexus_validated.connect(self._on_nexus_validated)
         # Live OAuth login client while a browser login is in flight (kept so the
         # "Paste login code" fallback can feed its session). None when idle.
@@ -752,7 +882,6 @@ class MainWindow(QMainWindow):
         self._custom_exe_picked.connect(self._on_custom_exe_picked)
         self._col_fomod.connect(self._on_col_fomod_ui)
         self._col_bain.connect(self._on_col_bain_ui)
-        QTimer.singleShot(0, self._ensure_nexus_api)
         # NXM protocol handling: the IPC callback fires on a worker thread, so
         # it emits _nxm_received to hop onto the UI thread. Process a --nxm URL
         # passed on our own command line once the window has finished building.
@@ -782,7 +911,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(3000, self._start_gh_sync)
         # Sweep leftover "<Data>.mm_trash-*" dirs from restores whose deferred
         # background delete was interrupted (crash / app close mid-delete).
-        QTimer.singleShot(0, self._sweep_deploy_trash_startup)
+        self._queue_startup_deferred(
+            "Queue deploy-trash cleanup", self._sweep_deploy_trash_startup)
         # App self-update check (Tk parity: after(2000, …)). AppImage/flatpak
         # compare against GitHub releases, everything else against the AUR.
         self._update_overlay = None
@@ -798,13 +928,16 @@ class MainWindow(QMainWindow):
         from Utils.game_helpers import _GAMES
         configured = sum(1 for g in _GAMES.values() if g.is_configured())
         if not load_onboarding_complete() and configured == 0:
-            QTimer.singleShot(0, self._open_onboarding_tab)
+            self._queue_startup_deferred(
+                "Open first-run onboarding", self._open_onboarding_tab)
 
         # Warn if any game handler failed to load. A broken handler used to make
         # its game silently vanish from the list, which users mistook for the
         # game (and its mods) being deleted - mods actually live untouched in
         # ~/.config and Profiles/. Deferred so the log panel is live first.
-        QTimer.singleShot(0, self._warn_handler_load_failures)
+        self._queue_startup_deferred(
+            "Report game-handler load failures",
+            self._warn_handler_load_failures)
 
         # Flatpak self-heal: bundle installs (release zip / Warehouse) don't
         # pull the Compat.i386 extension the manifest declares, leaving
@@ -826,6 +959,14 @@ class MainWindow(QMainWindow):
         # short grace period so it can never hang on screen.
         if self._splash is not None:
             QTimer.singleShot(4000, self._dismiss_splash)
+        elif self._nexus_api_init_deferred:
+            # A failed/disabled splash has no reveal callback to launch this.
+            self._queue_startup_deferred(
+                "Start saved Nexus-login worker", self._start_nexus_api_init)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Register shortcuts and deferred services",
+                phase_started=phase_started, category="services")
 
     def refresh_theme(self, palette: dict) -> None:
         self._pal = palette
@@ -850,6 +991,58 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_log_view"):
             self._render_log()
 
+    def _startup_event_loop_started(self):
+        """Record the first callback serviced by Qt's event loop."""
+        self._startup_event_loop_seen = True
+        timing = getattr(self, "_startup_timing", None)
+        if timing is not None and timing.active:
+            timing.record(
+                "Reach first Qt event-loop turn",
+                phase_started=getattr(
+                    self, "_startup_event_loop_wait_started", None),
+                category="aggregate")
+
+    def _queue_startup_deferred(
+            self, label: str, callback, *, wait_label: str | None = None) -> None:
+        """Queue and time a callback, optionally including its event-queue wait."""
+        queued_at = _startup_time.perf_counter()
+
+        def _run():
+            started = _startup_time.perf_counter()
+            try:
+                return callback()
+            finally:
+                timing = getattr(self, "_startup_timing", None)
+                if timing is not None and timing.active:
+                    if wait_label is not None:
+                        timing.record(
+                            wait_label,
+                            phase_started=queued_at,
+                            phase_finished=started,
+                            category="UI wait")
+                    timing.record(
+                        label, phase_started=started,
+                        category="deferred UI")
+
+        QTimer.singleShot(0, _run)
+
+    def _finish_startup_timing(self, ready_label: str):
+        """Emit the one-per-launch timing report to stdout and the app log."""
+        timing = getattr(self, "_startup_timing", None)
+        if timing is None or not timing.active:
+            return
+        callback_started = _startup_time.perf_counter()
+        timing.record("Settle final startup UI events",
+                      phase_started=callback_started, category="UI")
+        lines = timing.finish(ready_label)
+        if not lines:
+            return
+        print("\n".join(lines), flush=True)
+        for line in lines:
+            self._append_log(line)
+        if _perftrace.startup_timeline() is timing:
+            _perftrace.set_startup_timeline(None)
+
     def _dismiss_splash(self):
         """Reveal the finished window and close the startup splash, exactly once.
 
@@ -858,6 +1051,9 @@ class MainWindow(QMainWindow):
         splash closes on top of it."""
         if self._splash_dismissed:
             return
+        phase_started = _startup_time.perf_counter()
+        reveal_queued_at = self._splash_reveal_queued_at
+        self._splash_reveal_queued_at = None
         self._splash_dismissed = True
         self.setWindowOpacity(1.0)
         s, self._splash = self._splash, None
@@ -868,6 +1064,23 @@ class MainWindow(QMainWindow):
                 pass
         self.raise_()
         self.activateWindow()
+        timing = getattr(self, "_startup_timing", None)
+        if timing is not None and timing.active:
+            if reveal_queued_at is not None:
+                timing.record(
+                    "Wait for queued window reveal",
+                    phase_started=reveal_queued_at,
+                    phase_finished=phase_started,
+                    category="UI wait")
+            timing.record("Reveal window and dismiss splash",
+                          phase_started=phase_started, category="UI")
+        if getattr(self, "_nexus_api_init_deferred", False):
+            # Start on the following turn so OAuth/keyring imports cannot
+            # compete with the native events that make the window visible.
+            self._queue_startup_deferred(
+                "Start saved Nexus-login worker after reveal",
+                self._start_nexus_api_init,
+                wait_label="Settle first visible window events")
 
     def _start_gl_warmup(self):
         """Probe the OpenGL path on a worker thread and, if the answer lands
@@ -908,6 +1121,7 @@ class MainWindow(QMainWindow):
         prime_platform()      # GUI thread: the worker must not ask Qt itself
         self._gl_probing = True
         self._gl_probe_done.connect(self._on_gl_probe_done)
+        probe_started = _startup_time.perf_counter()
 
         def _run():
             from gui_qt.safe_emit import safe_emit
@@ -916,6 +1130,13 @@ class MainWindow(QMainWindow):
                 ok = gl_status()[0]
             except Exception:
                 ok = False
+            timing = getattr(self, "_startup_timing", None)
+            if timing is not None and timing.active:
+                timing.record(
+                    ("Probe OpenGL support (available)" if ok
+                     else "Probe OpenGL support (unavailable)"),
+                    phase_started=probe_started,
+                    lane="OpenGL probe", category="optional warmup")
             safe_emit(self._gl_probe_done, ok)
 
         import threading
@@ -938,12 +1159,14 @@ class MainWindow(QMainWindow):
     def _on_gl_probe_done(self, ok: bool):
         """UI thread: the GL probe answered. Warm composition up only while it
         is still free to do so - see _start_gl_warmup."""
-        self._gl_probing = False
-        if not ok or self._gl_warmup is not None:
-            return
-        if self.isVisible() and self.windowOpacity() > 0.01:
-            return                    # on screen already: the flash would show
+        phase_started = _startup_time.perf_counter()
+        result = "Skip hidden OpenGL composition warmup"
         try:
+            self._gl_probing = False
+            if not ok or self._gl_warmup is not None:
+                return
+            if self.isVisible() and self.windowOpacity() > 0.01:
+                return                # on screen already: the flash would show
             from PySide6.QtOpenGLWidgets import QOpenGLWidget
             warm = QOpenGLWidget(self)
             warm.setFixedSize(1, 1)
@@ -952,8 +1175,15 @@ class MainWindow(QMainWindow):
             warm.lower()
             warm.show()
             self._gl_warmup = warm
+            result = "Create hidden OpenGL composition surface"
         except Exception:
             pass
+        finally:
+            timing = getattr(self, "_startup_timing", None)
+            if timing is not None and timing.active:
+                timing.record(
+                    result, phase_started=phase_started,
+                    category="optional warmup")
 
     def _warn_handler_load_failures(self):
         """If any game handler failed to load during discovery, log each one and
@@ -1084,33 +1314,48 @@ class MainWindow(QMainWindow):
             button.setVisible(tabs.is_full_tab_active())
 
     # ---------------------------------------------------------- body row
-    def _build_body_row(self) -> QWidget:
+    def _build_body_row(self, startup_timing=None) -> QWidget:
         # Each side is a self-contained column: the modlist column owns its tool
         # footer (buttons + search), and the plugins column owns the Play bar on
         # top plus the plugins tool footer at the bottom. The footers live INSIDE
         # the panels (not a separate window-wide row) so they move/resize with
         # their panel. The splitter divides the two columns.
+        phase_started = _startup_time.perf_counter()
         right_col = QWidget()
         rc = QVBoxLayout(right_col)
         rc.setContentsMargins(0, 0, 0, 0)
         rc.setSpacing(0)
         play = self._play_bar()
         self._play_bar_widget = play
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build play controls", phase_started=phase_started,
+                category="UI")
         # Build the plugins panel FIRST - it creates the sub-tab views (incl.
         # _text_files_view) that the footers below reference.
-        plugins_body = self._build_plugins()
+        plugins_body = self._build_plugins(startup_timing=startup_timing)
         # The plugins column footer is a stack: it swaps to the active sub-tab's
         # tools (Plugins tools ↔ Mod Files Pack/Unpack + search).
         # _CurrentPageStack (not a plain QStackedWidget): sizes to the visible
         # footer only, so the Downloads footer wrapping its buttons to a second
         # row at min width doesn't add a blank row to the Plugins/etc. footers.
         self._plugin_footer_stack = _CurrentPageStack()
-        for _page in (self._plugins_footer(), self._mod_files_footer(),
-                      self._data_footer(), self._downloads_footer(),
-                      self._text_files_footer(), self._overrides_footer(),
-                      self._saves_footer()):
+        for _footer_name, _footer_builder in (
+                ("Plugins", self._plugins_footer),
+                ("Mod Files", self._mod_files_footer),
+                ("Data", self._data_footer),
+                ("Downloads", self._downloads_footer),
+                ("Text Files", self._text_files_footer),
+                ("Overrides", self._overrides_footer),
+                ("Saves", self._saves_footer)):
+            phase_started = _startup_time.perf_counter()
+            _page = _footer_builder()
             self._enable_height_for_width(_page)
             self._plugin_footer_stack.addWidget(_page)
+            if startup_timing is not None:
+                startup_timing.record(
+                    f"Build {_footer_name} footer",
+                    phase_started=phase_started, category="UI")
         # The stack must also report height via heightForWidth so its parent
         # (plugins_panel's QVBoxLayout) fits it to the visible page's wrapped
         # height at the actual width, not the inflated min-width sizeHint.
@@ -1122,6 +1367,7 @@ class MainWindow(QMainWindow):
         # lives in a stack so a panel-scoped tab (Change Version) can take it
         # over entirely - including the Play bar's row, giving scoped tabs the
         # full column height. Page 0 = Play bar + plugins panel + footer.
+        phase_started = _startup_time.perf_counter()
         plugins_panel = QWidget()
         pp = QVBoxLayout(plugins_panel)
         pp.setContentsMargins(0, 0, 0, 0)
@@ -1131,24 +1377,28 @@ class MainWindow(QMainWindow):
         pp.addWidget(self._plugin_footer_stack)
         # Inline userlist edit bars (hidden until opened from the plugins
         # context menu - Tk parity: rows 5/6 at the bottom of the plugins tab).
-        from gui_qt.userlist_bars import UserlistBar, GroupBar
-        self._ul_bar = UserlistBar(self._userlist_path,
-                                   self._on_userlist_bar_saved)
-        self._grp_bar = GroupBar(self._userlist_path,
-                                 self._on_userlist_bar_saved)
-        pp.addWidget(self._ul_bar)
-        pp.addWidget(self._grp_bar)
+        # Construct them on first use: their private styles and child controls
+        # otherwise cost every launch even though both start hidden.
+        self._plugins_panel_layout = pp
+        self._ul_bar = None
+        self._grp_bar = None
         self._plugins_panel_stack = QStackedWidget()
         self._plugins_panel_stack.addWidget(plugins_panel)               # page 0
         rc.addWidget(self._plugins_panel_stack, 1)
         self._right_col = right_col
+        if startup_timing is not None:
+            startup_timing.record(
+                "Assemble plugin panel containers",
+                phase_started=phase_started, category="UI")
 
         # The modlist column lives in a stack so a panel-scoped tab (e.g. an
         # image preview) can take over JUST the modlist region while the plugins
         # panel (with the Mod Files tree) stays live. Page 0 = the real modlist.
         self._modlist_panel_stack = QStackedWidget()
-        self._modlist_panel_stack.addWidget(self._build_modlist_area())
+        self._modlist_panel_stack.addWidget(
+            self._build_modlist_area(startup_timing=startup_timing))
 
+        phase_started = _startup_time.perf_counter()
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self._modlist_panel_stack)
         split.addWidget(right_col)
@@ -1172,6 +1422,10 @@ class MainWindow(QMainWindow):
             lambda *_: self._schedule_window_state_save())
         self._body_split = split
         self._wire_cross_panel()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Assemble body splitter and cross-panel wiring",
+                phase_started=phase_started, category="UI")
         return split
 
     def _wire_cross_panel(self):
@@ -1180,6 +1434,15 @@ class MainWindow(QMainWindow):
         owning mod (Tk parity)."""
         self._conflict_data = None
         self._conflict_maps_current = False
+        # Generation currently installed in *all* conflict-dependent Qt
+        # consumers (model/view partner maps, filters, Plugins and Data).  The
+        # native/Python projection cache is independent of what the widgets are
+        # showing: after A -> B -> A it can quite legitimately return an empty
+        # delta for A while the widgets still contain B.  Only apply a delta
+        # when this exact UI baseline is present; otherwise install the complete
+        # cached projection for the target profile.
+        self._conflict_ui_profile_id = None
+        self._conflict_ui_generation = 0
         mv, pv = self._modlist_view, self._plugin_view
         mv.selectionModel().selectionChanged.connect(
             lambda *_: self._on_mod_selection_changed())
@@ -1198,6 +1461,8 @@ class MainWindow(QMainWindow):
             names = mv.selected_mod_names()
             # Change Version tab (if visible) follows the selection.
             self._follow_selection_change_version()
+            # FOMOD Choices tab (if visible) likewise.
+            self._follow_selection_fomod_choices()
             if self._req_tab_active():
                 # View Requirements mode: conflict highlights are disabled -
                 # the panel retargets to the selection (multiple mods pool
@@ -1214,7 +1479,7 @@ class MainWindow(QMainWindow):
             # Tk quirk: the [Overwrite] band lights GREEN when it wins over the
             # selection (so the user sees Overwrite is active), even though a
             # normal winning mod would be red. Flip it from lower→higher.
-            from Utils.filemap import OVERWRITE_NAME
+            from Utils.filegraph_constants import OVERWRITE_NAME
             if OVERWRITE_NAME in lower:
                 lower = lower - {OVERWRITE_NAME}
                 higher = higher | {OVERWRITE_NAME}
@@ -1227,7 +1492,8 @@ class MainWindow(QMainWindow):
             bsa_higher, bsa_lower = mv.bsa_conflict_partners(names)
             pv.set_highlight_from_mods(
                 names, bsa_higher, bsa_lower, owner,
-                bsa_index_path=self._gs.bsa_index_path())
+                archive_plugin_stems=(
+                    cd.archive_plugin_stems if cd is not None else {}))
             # Picking a mod clears any plugin selection (mutual exclusivity).
             pv.clearSelection()
             # Feed the Mod Files tab the single selected mod (real mods only).
@@ -1333,6 +1599,22 @@ class MainWindow(QMainWindow):
         self._image_preview_widget = widget
         self._tabs.open_scoped_tab(
             widget, name, self._modlist_panel_stack, key="mf_image_preview")
+
+    def _open_video_preview_tab(self, path, rel_str):
+        """Open a video in a reused modlist-panel-scoped player tab."""
+        from pathlib import Path as _P
+        from gui_qt.video_preview import VideoPreview
+        name = rel_str.replace("\\", "/").rsplit("/", 1)[-1]
+        existing = getattr(self, "_video_preview_widget", None)
+        if existing is not None and self._tabs.has_key("mf_video_preview"):
+            existing.set_video(_P(path), name)
+            self._tabs.focus_key("mf_video_preview")
+            self._tabs.set_tab_title("mf_video_preview", name)
+            return
+        widget = VideoPreview(_P(path), name)
+        self._video_preview_widget = widget
+        self._tabs.open_scoped_tab(
+            widget, name, self._modlist_panel_stack, key="mf_video_preview")
 
     def _open_nif_preview_tab(self, path, rel_str):
         """Open a .nif in the 3D viewer as a modlist-panel-scoped tab (reused)."""
@@ -1489,6 +1771,8 @@ class MainWindow(QMainWindow):
                 data_dir=self._nif_game_data_dir(),
                 game=getattr(self._gs, "game", None),
                 keep_prefix=ASSET_PREFIXES,
+                snapshot=getattr(
+                    getattr(self, "_conflict_data", None), "snapshot", None),
             )
         except Exception:
             return None
@@ -1548,101 +1832,19 @@ class MainWindow(QMainWindow):
             widget, name, self._modlist_panel_stack, key="mf_bsa_preview")
 
     def _bsa_preview_conflicts(self, archive_path):
-        """Per-file conflict codes for the archive preview: {contained_path:
-        +1 (this mod's copy wins) / -1 (loses)} judged for the archive's
-        owning mod against every enabled mod's archives - the same winner map
-        the modlist icons and Show Conflicts tab use. Runs on the preview's
-        daemon thread. Returns {} for unowned paths (overwrite/), disabled
-        mods, or any failure - the preview just shows no tints then."""
+        """Per-member conflict codes from the pinned Filegraph generation."""
         try:
             from pathlib import Path as _P
-            g = self._gs.game
             staging = self._gs.staging_dir()
-            ml = self._gs.modlist_path()
-            if g is None or staging is None or ml is None or not ml.is_file():
+            data = getattr(self, "_conflict_data", None)
+            snapshot = getattr(data, "snapshot", None)
+            if staging is None or snapshot is None:
                 return {}
             rel = _P(archive_path).resolve().relative_to(staging.resolve())
             mod_name = rel.parts[0]
-
-            from Utils.bsa_filemap import read_bsa_index, compute_bsa_winner_map
-            from Utils.modlist import read_modlist
-            from Utils.ue_pak_reader import UE_ARCHIVE_EXTENSIONS
-            index = read_bsa_index(staging.parent / "bsa_index.bin") or {}
-            enabled = [e for e in read_modlist(ml)
-                       if not e.is_separator and e.enabled]
-            if mod_name not in {e.name for e in enabled}:
-                return {}
-            prio = [e.name for e in reversed(enabled)]
-            exts = frozenset(
-                getattr(g, "archive_extensions", frozenset()) or frozenset())
-            if getattr(g, "archive_plugin_ordering", True):
-                from Utils.plugins import read_loadorder
-                pdir = self._gs.profile_dir()
-                plugin_order = (read_loadorder(pdir / "loadorder.txt")
-                                if pdir is not None else None)
-                plugin_exts = frozenset(
-                    getattr(g, "plugin_extensions", []) or [])
-            else:
-                plugin_order = None
-                plugin_exts = None
-            is_ue = bool(exts & UE_ARCHIVE_EXTENSIONS)
-            winner, losers = compute_bsa_winner_map(
-                index, prio, plugin_order or None, plugin_exts or None,
-                staging.parent / "modindex.bin", is_ue)
-            codes = {}
-            for fp, lose_list in losers.items():
-                if winner.get(fp) == mod_name:
-                    codes[fp] = 1
-                elif mod_name in lose_list:
-                    codes[fp] = -1
-            if not is_ue:
-                my_bsa_paths = {
-                    fp
-                    for _bsa, _mt, paths in index.get(mod_name, [])
-                    for fp in paths
-                }
-                if my_bsa_paths:
-                    # Prefer filemap.txt (resolved deploy map) so Mod Files ▸
-                    # Disable exclusions count - modindex.bin still lists
-                    # excluded files. Same preference as build_bsa_conflicts.
-                    loose_resolved = False
-                    try:
-                        fm_text = (staging.parent / "filemap.txt").read_text(
-                            encoding="utf-8")
-                    except OSError:
-                        fm_text = None
-                    if fm_text is not None:
-                        loose_resolved = True
-                        prio_set = set(prio)
-                        for line in fm_text.splitlines():
-                            if "\t" not in line:
-                                continue
-                            rel_str, mod = line.split("\t", 1)
-                            if mod == mod_name or mod not in prio_set:
-                                continue
-                            rel_key = rel_str.replace("\\", "/").lower()
-                            if rel_key in my_bsa_paths:
-                                # Any loose file at a BSA path beats the BSA
-                                # (engine loads BSAs first, then loose on top).
-                                codes[rel_key] = -1
-                    if not loose_resolved:
-                        from Utils.filemap import read_mod_index
-                        loose_index = read_mod_index(
-                            staging.parent / "modindex.bin") or {}
-                        for cand in prio:
-                            if cand == mod_name:
-                                continue
-                            entry = loose_index.get(cand)
-                            if not entry:
-                                continue
-                            normal, _root = entry
-                            for rel_key in normal:
-                                if rel_key in my_bsa_paths:
-                                    # A higher-priority loose file wins outright; a
-                                    # lower-priority one still beats the BSA (engine
-                                    # loads BSAs first, then loose on top).
-                                    codes[rel_key] = -1
-            return codes
+            source_rel = "/".join(rel.parts[1:]).encode(
+                "utf-8", "surrogateescape")
+            return snapshot.archive_member_conflicts(mod_name, source_rel)
         except Exception:
             return {}
 
@@ -1774,6 +1976,37 @@ class MainWindow(QMainWindow):
         finally:
             self._xpanel_busy = False
 
+    def _wizard_show_mod_files(self, mod_name: str) -> None:
+        """Open *mod_name* in the Mod Files tab - a wizard's "jump to this mod".
+
+        Selects the modlist row first so every cross-panel highlight agrees with
+        what Mod Files shows, then swaps the right column to Mod Files, whose
+        footer carries the Pack BSA / Unpack buttons. The row may be hidden
+        behind a modlist-scoped wizard tab; the selection still applies and is
+        visible once that tab closes.
+        """
+        if not mod_name:
+            return
+        try:
+            from PySide6.QtCore import QItemSelectionModel
+            from PySide6.QtWidgets import QAbstractItemView
+            from gui_qt.modlist_model import COL_NAME
+            m = self._modlist_model
+            row = next((i for i in range(m.rowCount())
+                        if m.entry(i).name == mod_name), None)
+            if row is not None:
+                idx = m.index(row, COL_NAME)
+                self._modlist_view.setCurrentIndex(idx)
+                self._modlist_view.selectionModel().select(
+                    idx, QItemSelectionModel.ClearAndSelect
+                    | QItemSelectionModel.Rows)
+                self._modlist_view.scrollTo(
+                    idx, QAbstractItemView.PositionAtCenter)
+            self._select_plugin_tab(1)
+            self._mod_files_view.show_mod(mod_name)
+        except Exception as exc:
+            self._append_log(f"[wizard] show mod files failed: {exc}")
+
     # ---------------------------------------------------------- panel footers
     @staticmethod
     def _enable_height_for_width(w: QWidget) -> None:
@@ -1829,7 +2062,7 @@ class MainWindow(QMainWindow):
             self._modlist_footer_btns.append(b)
         v.addLayout(btns)
 
-        # Search row: an enabled/total count label (blue outline) to the left of
+        # Search row: an enabled/total count label (accent outline) to the left of
         # a full-width search box. The count label replaces the old Enabled /
         # Disabled stat pill row.
         search_row = QHBoxLayout()
@@ -1847,8 +2080,7 @@ class MainWindow(QMainWindow):
         self._modlist_count = count
         search_row.addWidget(count)
 
-        # Filters button - blue, to the left of the search icon (mirrors the
-        # plugins footer). Toggles the modlist filter side-panel.
+        # Filters is neutral at rest and accented while the list is narrowed.
         self._modlist_filters_btn = self._filters_button()
         self._modlist_filters_btn.clicked.connect(self._toggle_modlist_filters)
         self._modlist_footer_btns.append(self._modlist_filters_btn)
@@ -1877,7 +2109,7 @@ class MainWindow(QMainWindow):
         return bar
 
     def _plugins_footer(self) -> QWidget:
-        """Colored tool buttons + search, under the plugins."""
+        """Plugin tools + search, under the plugins."""
         bar = QWidget()
         bar.setObjectName("HeaderBar")
         v = QVBoxLayout(bar)
@@ -1887,13 +2119,16 @@ class MainWindow(QMainWindow):
         btns = FlowLayout(spacing=4)
         _made = {}
         self._plugin_footer_btns: list = []
-        for label, disp, key in [
-            ("Sort Plugins", self.tr("Sort Plugins"), "BTN_SUCCESS"),
-            ("Refresh Plugins", self.tr("Refresh Plugins"), "BTN_INFO"),
-            ("Groups", self.tr("Groups"), "BTN_INFO"),
-            ("Plugin Rules", self.tr("Plugin Rules"), "BTN_INFO"),
+        for label, disp in [
+            ("Sort Plugins", self.tr("Sort Plugins")),
+            ("Refresh Plugins", self.tr("Refresh Plugins")),
+            ("Groups", self.tr("Groups")),
+            ("Plugin Rules", self.tr("Plugin Rules")),
         ]:
-            b = self._color_button(disp, _c(self._pal, key), compact=True)
+            b = (self._color_button(
+                    disp, _c(self._pal, "ACCENT"), compact=True)
+                 if label == "Sort Plugins"
+                 else self._text_button(disp, compact=True))
             b.setFixedHeight(self._FOOT_BTN_H)
             btns.addWidget(b)
             _made[label] = b
@@ -1911,7 +2146,7 @@ class MainWindow(QMainWindow):
         self._plugin_rules_btn.clicked.connect(self._open_plugin_rules_tab)
         self._plugin_filters_btn.clicked.connect(self._toggle_plugin_filters)
 
-        # Search row: a total / non-ESL count label (blue outline) to the left
+        # Search row: a total / non-ESL count label (accent outline) to the left
         # of a full-width search box, mirroring the modlist footer.
         search_row = QHBoxLayout()
         search_row.setContentsMargins(0, 0, 0, 0)
@@ -1951,13 +2186,13 @@ class MainWindow(QMainWindow):
         v.setSpacing(6)
 
         btns = FlowLayout(spacing=4)
-        self._mf_pack_btn = self._color_button(
-            self.tr("Pack BSA"), _c(self._pal, "BTN_SUCCESS"), compact=True)
+        self._mf_pack_btn = self._text_button(
+            self.tr("Pack BSA"), compact=True)
         self._mf_pack_btn.setFixedHeight(self._FOOT_BTN_H)
         self._mf_pack_btn.setEnabled(False)
         self._mf_pack_btn.clicked.connect(self._on_pack_bsa)
-        self._mf_unpack_btn = self._color_button(
-            self.tr("Unpack BSA"), _c(self._pal, "BTN_DANGER"), compact=True)
+        self._mf_unpack_btn = self._text_button(
+            self.tr("Unpack BSA"), compact=True)
         self._mf_unpack_btn.setFixedHeight(self._FOOT_BTN_H)
         self._mf_unpack_btn.setEnabled(False)
         self._mf_unpack_btn.clicked.connect(self._on_unpack_bsa)
@@ -2065,22 +2300,22 @@ class MainWindow(QMainWindow):
         refresh.setFixedHeight(self._FOOT_BTN_H)
         refresh.clicked.connect(lambda: self._saves_view.mark_dirty())
         btns.addWidget(refresh)
-        self._saves_open_btn = self._color_button(
-            self.tr("Open folder"), _c(self._pal, "BTN_PURPLE"), compact=True)
+        self._saves_open_btn = self._text_button(
+            self.tr("Open folder"), compact=True)
         self._saves_open_btn.setFixedHeight(self._FOOT_BTN_H)
         self._saves_open_btn.setEnabled(False)
         self._saves_open_btn.clicked.connect(lambda: self._saves_view.open_folder())
         btns.addWidget(self._saves_open_btn)
         # Export packs the save folder into a zip; Import puts one back (after
         # moving the current contents aside).
-        self._saves_export_btn = self._color_button(
-            self.tr("Export"), _c(self._pal, "BTN_SUCCESS"), compact=True)
+        self._saves_export_btn = self._text_button(
+            self.tr("Export"), compact=True)
         self._saves_export_btn.setFixedHeight(self._FOOT_BTN_H)
         self._saves_export_btn.setEnabled(False)
         self._saves_export_btn.clicked.connect(lambda: self._saves_view.start_export())
         btns.addWidget(self._saves_export_btn)
-        self._saves_import_btn = self._color_button(
-            self.tr("Import"), _c(self._pal, "BTN_WARN_ORANGE"), compact=True)
+        self._saves_import_btn = self._text_button(
+            self.tr("Import"), compact=True)
         self._saves_import_btn.setFixedHeight(self._FOOT_BTN_H)
         self._saves_import_btn.setEnabled(False)
         self._saves_import_btn.clicked.connect(lambda: self._saves_view.start_import())
@@ -2141,13 +2376,13 @@ class MainWindow(QMainWindow):
 
         btns = FlowLayout(spacing=4)
         self._dl_install_btn = self._color_button(
-            self.tr("Install Selected"), _c(self._pal, "BTN_SUCCESS"), compact=True)
+            self.tr("Install Selected"), _c(self._pal, "ACCENT"), compact=True)
         self._dl_install_btn.setFixedHeight(self._FOOT_BTN_H)
         self._dl_install_btn.setEnabled(False)
         self._dl_install_btn.clicked.connect(
             lambda: self._downloads_view.install_selected())
-        self._dl_move_btn = self._color_button(
-            self.tr("Move Selected"), _c(self._pal, "BTN_INFO"), compact=True)
+        self._dl_move_btn = self._text_button(
+            self.tr("Move Selected"), compact=True)
         self._dl_move_btn.setFixedHeight(self._FOOT_BTN_H)
         self._dl_move_btn.setEnabled(False)
         self._dl_move_btn.clicked.connect(self._on_downloads_move)
@@ -2156,8 +2391,8 @@ class MainWindow(QMainWindow):
         self._dl_remove_btn.setFixedHeight(self._FOOT_BTN_H)
         self._dl_remove_btn.setEnabled(False)
         self._dl_remove_btn.clicked.connect(self._on_downloads_remove)
-        self._dl_locations_btn = self._color_button(
-            self.tr("Locations"), _c(self._pal, "BTN_INFO"), compact=True)
+        self._dl_locations_btn = self._text_button(
+            self.tr("Locations"), compact=True)
         self._dl_locations_btn.setFixedHeight(self._FOOT_BTN_H)
         self._dl_locations_btn.clicked.connect(self._on_downloads_locations)
         self._dl_filters_btn = self._filters_button()
@@ -2314,7 +2549,8 @@ class MainWindow(QMainWindow):
         self._tf_content_input.setClearButtonEnabled(True)
         self._tf_content_input.returnPressed.connect(self._run_tf_content_search)
         cbl.addWidget(self._tf_content_input, 1)
-        go = self._color_button(self.tr("Search"), _c(self._pal, "BTN_SUCCESS"), compact=True)
+        go = self._color_button(
+            self.tr("Search"), _c(self._pal, "ACCENT"), compact=True)
         go.setFixedHeight(self._FOOT_BTN_H)
         go.clicked.connect(self._run_tf_content_search)
         cbl.addWidget(go)
@@ -2326,8 +2562,8 @@ class MainWindow(QMainWindow):
         v.addWidget(self._tf_content_bar)
 
         btns = FlowLayout(spacing=4)
-        self._tf_content_btn = self._color_button(
-            self.tr("Search Content"), _c(self._pal, "BTN_INFO"), compact=True)
+        self._tf_content_btn = self._text_button(
+            self.tr("Search Content"), compact=True)
         self._tf_content_btn.setFixedHeight(self._FOOT_BTN_H)
         self._tf_content_btn.clicked.connect(self._on_text_files_content_search)
         self._tf_filters_btn = self._filters_button()
@@ -2410,13 +2646,23 @@ class MainWindow(QMainWindow):
         else:
             self._tf_content_status.setText("")
             self._tf_content_btn.setText(self.tr("Search Content"))
+        self._tf_content_btn.setProperty("active", bool(keyword))
+        self._tf_content_btn.style().unpolish(self._tf_content_btn)
+        self._tf_content_btn.style().polish(self._tf_content_btn)
 
     def _left_header(self) -> QWidget:
-        # Single row: game/profile selectors, then the mod-action buttons.
+        # Single row: game/profile selectors, then the mod-action buttons. As a
+        # side bar the same widgets stack in a column and stay icon-only, so the
+        # staged compaction is skipped and the tooltips carry the labels.
+        vertical = self._header_vertical()
         header = _HeaderBar(self._sync_header_compact)
         header.setObjectName("HeaderBar")
-        h = QHBoxLayout(header)
-        h.setContentsMargins(8, 6, 8, 6)
+        header.setProperty("vertical", vertical)
+        h = QVBoxLayout(header) if vertical else QHBoxLayout(header)
+        if vertical:
+            h.setContentsMargins(6, 8, 6, 8)
+        else:
+            h.setContentsMargins(8, 6, 8, 6)
         h.setSpacing(6)
 
         # Game selector - no label; the game names make it self-evident. Items
@@ -2433,6 +2679,9 @@ class MainWindow(QMainWindow):
             # rest of the pinned entries stay on screen instead of being pushed
             # off the bottom by a long library.
             scroll_after=7,
+            # Side bar: a game with no logo (or none configured) would
+            # otherwise collapse to a blank square.
+            face_icon=(icon("Logo.png", self._ICON_PX) if vertical else None),
         )
         self._game_selector.setFixedHeight(self._BTN_H)
         h.addWidget(self._game_selector)
@@ -2448,6 +2697,16 @@ class MainWindow(QMainWindow):
             icon_px=16,
             actions=self._profile_actions(),
             on_select=self._on_profile_changed,
+            # Side bar: the per-item icons are Profile Group badges, so an
+            # ungrouped profile has none. Untinted - profile.png is full-colour
+            # artwork, not a mono glyph; recolouring flattens it to a disc.
+            face_icon=(icon("profile.png", self._ICON_PX) if vertical
+                       else None),
+            face_icon_px=self._ICON_PX,
+            # "default" is the profile's FOLDER NAME - it stays canonical in
+            # items/current/on_select (it gets joined into paths); only the
+            # drawn text is translated.
+            display_fn=profile_display,
         )
         self._profile_selector.setFixedHeight(self._BTN_H)
         # Rebuild the pinned actions on every open (like the Wizard menu): the
@@ -2458,12 +2717,19 @@ class MainWindow(QMainWindow):
             self._refresh_profile_actions)
         h.addWidget(self._profile_selector)
 
-        # A new game/profile name is a different width - re-run the width
-        # budget, since the bar itself isn't resized by it.
-        for sel in (self._game_selector, self._profile_selector):
-            sel.face_changed.connect(self._sync_header_compact)
+        if vertical:
+            # Locked icon-only. set_icon_only short-circuits when the current
+            # item has no icon, so the face_icon fallbacks above make it stick.
+            for sel in (self._game_selector, self._profile_selector):
+                sel.setMinimumWidth(0)
+                sel.set_icon_only(True)
+        else:
+            # A new game/profile name is a different width - re-run the width
+            # budget, since the bar itself isn't resized by it.
+            for sel in (self._game_selector, self._profile_selector):
+                sel.face_changed.connect(self._sync_header_compact)
 
-        h.addWidget(self._group_sep())
+        h.addWidget(self._group_sep(vertical=vertical))
 
         # Plain mod-action buttons. They drop to icon-only when the bar gets
         # too narrow for the labels (_sync_header_compact).
@@ -2580,6 +2846,18 @@ class MainWindow(QMainWindow):
             self._action_buttons.append(b)
             h.addWidget(b)
 
+        if vertical:
+            # Icon-only for good, not as a width-pressure stage. `compact` is
+            # the same QSS hook _set_header_compact uses: it drops the label
+            # padding while the split buttons keep their arrow section.
+            self._header_compact = True
+            for b in self._action_buttons:
+                b.setToolButtonStyle(Qt.ToolButtonIconOnly)
+                b.setProperty("compact", True)
+                b.style().unpolish(b); b.style().polish(b)
+                b.setMinimumWidth(0)
+                b.setFixedHeight(self._BTN_H)
+
         # Gate the Nexus / Thunderstore buttons on the current game's stores,
         # and the Proton button on it having a wine prefix. Done after the loop
         # so all three buttons exist; safe before the header is shown (the sync
@@ -2599,6 +2877,30 @@ class MainWindow(QMainWindow):
             "settings.png", tooltip=self.tr("Settings"), tint=_c(self._pal, "TEXT_MAIN"))
         self._settings_button.clicked.connect(self._open_settings_modal)
         h.addWidget(self._settings_button)
+
+        if vertical:
+            # Width comes from the widest button (the split ones, which reserve
+            # arrow room) rather than a constant, so a larger UI scale or font
+            # can't clip it. Hidden buttons still report a sizeHint, so the
+            # column doesn't change width from game to game.
+            header.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            header.ensurePolished()
+            width = max([b.sizeHint().width() for b in self._action_buttons]
+                        + [self._BTN_H])
+            header.setFixedWidth(width + h.contentsMargins().left()
+                                 + h.contentsMargins().right())
+            # Stretch every tile to that width so the dropdown-less buttons
+            # match the split ones. They were built with setFixedSize, which
+            # pins BOTH bounds - clearing the maximum too is what lets the
+            # column size them. (The separator spans it already.)
+            for i in range(h.count()):
+                w = h.itemAt(i).widget()
+                if w is None or w.objectName() == "GroupSep":
+                    continue
+                w.setMinimumWidth(0)
+                w.setMaximumWidth(_QWIDGETSIZE_MAX)
+                w.setFixedHeight(self._BTN_H)
+                w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self._left_header_widget = header
         return header
@@ -2643,6 +2945,91 @@ class MainWindow(QMainWindow):
         if tooltip:
             b.setToolTip(tooltip)
         return b
+
+    # ---- toolbar placement --------------------------------------------------
+    def _header_position(self) -> str:
+        """Where the toolbar sits: "top" (default), "left" or "right"."""
+        # Cached: this gates per-resize work (_sync_header_compact).
+        # _apply_header_position refreshes it when the setting changes.
+        pos = getattr(self, "_header_pos", None)
+        if pos is None:
+            try:
+                from Utils.ui_config import load_header_position
+                pos = load_header_position()
+            except Exception:
+                pos = "top"
+            self._header_pos = pos
+        return pos
+
+    def _header_vertical(self) -> bool:
+        """Whether the toolbar is a side bar (and so permanently icon-only)."""
+        return self._header_position() in ("left", "right")
+
+    def _apply_header_position(self) -> None:
+        """Move the toolbar to the newly saved position without a restart."""
+        # Only the bar is rebuilt; the body (mod list, plugin panel and their
+        # models) is re-parented into the new layout untouched.
+        main = getattr(self, "_main_content", None)
+        body = getattr(self, "_body_row", None)
+        old = getattr(self, "_left_header_widget", None)
+        if main is None or body is None or old is None:
+            return
+        try:
+            from Utils.ui_config import load_header_position
+            new_pos = load_header_position()
+        except Exception:
+            return
+        if new_pos == getattr(self, "_header_pos", None):
+            return
+        self._header_pos = new_pos
+
+        old_notif = getattr(self, "_notif_button", None)
+
+        # Detach both children before the layout goes, or they go with it.
+        old_layout = main.layout()
+        if old_layout is not None:
+            old_layout.removeWidget(old)
+            old_layout.removeWidget(body)
+            old.setParent(None)
+            body.setParent(None)
+            # setLayout() only works once the old layout is gone, and
+            # deleteLater() is too late - reparent it away now.
+            QWidget().setLayout(old_layout)
+        old.deleteLater()
+
+        # Widths measured for the previous orientation no longer apply.
+        self._action_btn_widths = False
+        self._header_compact = False
+
+        vertical = new_pos in ("left", "right")
+        mc = QHBoxLayout(main) if vertical else QVBoxLayout(main)
+        mc.setContentsMargins(0, 0, 0, 0)
+        mc.setSpacing(0)
+        header = self._build_header_row()
+        if new_pos == "right":
+            mc.addWidget(body, 1)
+            mc.addWidget(header)
+        else:
+            mc.addWidget(header)
+            mc.addWidget(body, 1)
+
+        # The tab-row bell mirrors the header one and outlives this rebuild;
+        # re-point it or it keeps painting from the discarded button.
+        if old_notif is not None and self._notif_button is not old_notif:
+            self._notif_button.adopt_mirrors(old_notif)
+
+        # The bar is a fresh set of widgets: re-seed the selectors from the live
+        # GameState (else it reads "Add game" / a stale profile) and re-apply
+        # the per-game button gating.
+        self._populate_selectors()
+        self._sync_thunderstore_button()
+        # New buttons default to enabled - re-assert any lock, or the user could
+        # start a second deploy on top of a running one.
+        busy = (self._deploy_running or self._install_running
+                or self._col_install_running or self._tool_busy)
+        self._set_deploy_buttons_enabled(not busy)
+        if not vertical:
+            self._sync_header_compact()
 
     # ---- narrow top bar: staged compaction ----------------------------------
     # The bar gives up width in stages, least destructive first: the profile
@@ -2700,6 +3087,9 @@ class MainWindow(QMainWindow):
         """Claw back the width the top bar is missing, one stage at a time:
         elide the profile label, then drop the game name to its logo, and only
         then collapse the action buttons to icon-only."""
+        # A side bar has no stages - it is icon-only at a fixed width already.
+        if self._header_vertical():
+            return
         hdr = getattr(self, "_left_header_widget", None)
         if (hdr is None or not getattr(self, "_action_buttons", None)
                 or getattr(self, "_measuring_buttons", False)
@@ -3618,61 +4008,157 @@ class MainWindow(QMainWindow):
         # handlers synced on a previous run but their images never fetched).
         self._download_custom_game_images(page)
 
-    def _ensure_nexus_api(self):
-        """Build the shared NexusAPI from saved OAuth tokens (idempotent) and
-        kick off a background validate() to learn the username. Returns the API
-        or None (not logged in / connection failed). Reused by the footer and
-        the Nexus browser tab so there's a single instance whose passively
-        captured rate limits the footer can read."""
-        if getattr(self, "_nexus_api", None) is not None:
-            return self._nexus_api
-        from Nexus.nexus_oauth import load_oauth_tokens, clear_oauth_tokens, OAuthRefreshError
+    @staticmethod
+    def _load_saved_nexus_api() -> dict:
+        """Worker-safe saved-login load; never touches Qt widgets."""
+        result = {"api": None, "error": "", "revoked": False}
+        # OAuth's module import probes DBus/keyring and imports its HTTP/crypto
+        # stack. A v2 "cleared" authority record is definitive (it deliberately
+        # overrides any stale legacy keyring value), so logged-out users can
+        # avoid that work entirely until they actually start a login flow.
+        try:
+            import json
+            from Utils.config_paths import get_config_dir
+            storage = get_config_dir() / "nexus_oauth_storage_v2.bin"
+            if storage.is_file():
+                state = json.loads(storage.read_text(encoding="utf-8"))
+                if (isinstance(state, dict)
+                        and state.get("version") == 2
+                        and state.get("mode") == "cleared"):
+                    return result
+        except (OSError, TypeError, ValueError):
+            pass
+
+        from Nexus.nexus_oauth import (
+            OAuthRefreshError, clear_oauth_tokens, load_oauth_tokens)
         from Nexus.nexus_api import NexusAPI
         tokens = load_oauth_tokens()
         if tokens is None:
-            return None
+            return result
         try:
-            self._nexus_api = NexusAPI.from_oauth(tokens)
+            result["api"] = NexusAPI.from_oauth(tokens)
         except OAuthRefreshError as exc:
-            self._append_log(f"[nexus] api init failed: {exc}")
+            result["error"] = str(exc)
+            result["revoked"] = bool(exc.token_revoked)
             # A dead (rotated-out / revoked) refresh token wedges every future
-            # launch - clear it so the next attempt starts from a clean login.
-            # A transient network failure leaves the token in place to retry.
+            # launch. Clearing storage is blocking keyring/file work too, so it
+            # belongs on this worker with the load/refresh operation.
             if exc.token_revoked:
-                clear_oauth_tokens()
-                self._append_log("[nexus] cleared expired login - please log in again")
-                self._notify(
-                    self.tr("Your Nexus session expired - please log in again "
-                            "(Nexus ▸ Login to Nexus)."),
-                    "warning",
-                )
-            return None
+                try:
+                    clear_oauth_tokens()
+                except Exception as clear_exc:
+                    result["error"] += f"; could not clear login: {clear_exc}"
         except Exception as exc:
-            self._append_log(f"[nexus] api init failed: {exc}")
-            return None
-        # Validate off-thread (one rate-limited call; result cached 5 min).
+            result["error"] = str(exc)
+        return result
+
+    def _start_nexus_api_init(self):
+        """Restore the optional saved Nexus session without blocking paint."""
+        self._nexus_api_init_deferred = False
+        if (getattr(self, "_nexus_api", None) is not None
+                or getattr(self, "_nexus_api_init_running", False)):
+            return
+        self._nexus_api_init_running = True
         import threading
 
         def _worker():
-            name = None
+            started = _startup_time.perf_counter()
             try:
-                user = self._nexus_api.validate()
-                name = user.name
+                result = self._load_saved_nexus_api()
+            except Exception as exc:
+                result = {"api": None, "error": str(exc), "revoked": False}
+            timing = getattr(self, "_startup_timing", None)
+            if timing is not None and timing.active:
+                timing.record(
+                    "Restore optional saved Nexus session",
+                    phase_started=started, lane="Nexus login",
+                    category="services")
+            from gui_qt.safe_emit import safe_emit
+            safe_emit(self._nexus_api_initialized, result)
+
+        threading.Thread(
+            target=_worker, daemon=True, name="nexus-login-init").start()
+
+    def _apply_nexus_api_result(self, result: dict):
+        error = str((result or {}).get("error") or "")
+        revoked = bool((result or {}).get("revoked"))
+        if error:
+            self._append_log(f"[nexus] api init failed: {error}")
+        if revoked:
+            self._append_log(
+                "[nexus] cleared expired login - please log in again")
+            self._notify(
+                self.tr("Your Nexus session expired - please log in again "
+                        "(Nexus ▸ Login to Nexus)."),
+                "warning",
+            )
+        api = (result or {}).get("api")
+        if api is None:
+            return None
+        # A user-triggered synchronous load may have won the race while the
+        # startup worker was finishing. Keep the already-shared instance.
+        if self._nexus_api is None:
+            self._nexus_api = api
+            self._start_nexus_validation(api)
+        return self._nexus_api
+
+    def _on_nexus_api_initialized(self, result):
+        """UI thread: adopt the saved session built by the startup worker."""
+        self._nexus_api_init_running = False
+        self._apply_nexus_api_result(result or {})
+        # A browser may have launched this instance with an nxm:// URL while
+        # the saved-login worker was still restoring credentials. Resume those
+        # links now rather than incorrectly reporting that the user is logged out.
+        pending, self._nxm_install_queue = self._nxm_install_queue, []
+        for url in pending:
+            self._process_nxm_link(url)
+
+    def _ensure_nexus_api(self):
+        """Synchronously build the shared API for an explicit user action.
+
+        Normal startup uses :meth:`_start_nexus_api_init`; this fallback keeps
+        existing callers simple after that short worker has completed.
+        """
+        if getattr(self, "_nexus_api", None) is not None:
+            return self._nexus_api
+        if getattr(self, "_nexus_api_init_running", False):
+            return None
+        self._nexus_api_init_deferred = False
+        return self._apply_nexus_api_result(self._load_saved_nexus_api())
+
+    def _start_nexus_validation(self, api):
+        """Validate a restored login on a worker and report through Qt."""
+        import threading
+
+        def _worker():
+            result = {"name": None, "error": ""}
+            try:
+                user = api.validate()
+                result["name"] = user.name
                 # Record premium status so the collection-install premium gate
                 # has a last-known fallback if its own validate() errors (GH#278).
                 try:
                     from Utils.ui_config import save_nexus_last_premium
-                    save_nexus_last_premium(bool(getattr(user, "is_premium", False)))
+                    save_nexus_last_premium(
+                        bool(getattr(user, "is_premium", False)))
                 except Exception:
                     pass
             except Exception as exc:
-                self._append_log(f"[nexus] validate failed: {exc}")
-            self._nexus_validated.emit(name)
-        threading.Thread(target=_worker, daemon=True).start()
-        return self._nexus_api
+                result["error"] = str(exc)
+            self._nexus_validated.emit(result)
 
-    def _on_nexus_validated(self, name):
-        """Worker reported the validated username (or None) - update the footer."""
+        threading.Thread(
+            target=_worker, daemon=True, name="nexus-validate").start()
+
+    def _on_nexus_validated(self, result):
+        """Worker reported the validated username (or an error)."""
+        if isinstance(result, dict):
+            name = result.get("name")
+            error = result.get("error")
+        else:  # compatibility with a queued signal from pre-refactor code
+            name, error = result, ""
+        if error:
+            self._append_log(f"[nexus] validate failed: {error}")
         if name:
             self._append_log(f"[nexus] logged in as {name}")
         if hasattr(self, "_nexus_footer"):
@@ -4394,9 +4880,15 @@ class MainWindow(QMainWindow):
         self-heal re-binds our sockets if another instance or a /tmp cleaner
         removed them - otherwise every later 'Download with Mod Manager' click
         would open a new window instead of reaching us."""
+        timing = getattr(self, "_startup_timing", None)
+        phase_started = _startup_time.perf_counter()
         from PySide6.QtCore import QTimer
         from Nexus.nxm_handler import NxmIPC
         from gui_qt.safe_emit import safe_emit
+        if timing is not None and timing.active:
+            timing.record(
+                "Import link IPC support", phase_started=phase_started,
+                category="services")
 
         def _on_nxm(url: str):
             # One socket carries both schemes (the IPC payload is just a URL
@@ -4407,7 +4899,12 @@ class MainWindow(QMainWindow):
             else:
                 safe_emit(self._nxm_received, url)
 
+        phase_started = _startup_time.perf_counter()
         NxmIPC.start_server(_on_nxm)
+        if timing is not None and timing.active:
+            timing.record(
+                "Bind link IPC sockets", phase_started=phase_started,
+                category="services")
 
         def _heal():
             # Worker thread: ensure_bound probes sockets (blocking I/O) and is
@@ -4417,10 +4914,15 @@ class MainWindow(QMainWindow):
                 target=NxmIPC.ensure_bound, daemon=True, name="nxm-ipc-heal"
             ).start()
 
+        phase_started = _startup_time.perf_counter()
         self._nxm_ipc_timer = QTimer(self)
         self._nxm_ipc_timer.setInterval(30_000)
         self._nxm_ipc_timer.timeout.connect(_heal)
         self._nxm_ipc_timer.start()
+        if timing is not None and timing.active:
+            timing.record(
+                "Arm link IPC self-heal timer", phase_started=phase_started,
+                category="services")
 
     def _receive_nxm(self, nxm_url: str):
         """UI thread: handle an NXM link (from --nxm at startup or delivered via
@@ -4482,6 +4984,16 @@ class MainWindow(QMainWindow):
         """Handle an nxm:// link - download a mod or open a collection."""
         from Nexus.nxm_handler import parse_nxm_url, nxm_log
         nxm_log(f"Processing NXM link: {nxm_url}")
+        # Normal launches defer optional saved-session restoration until after
+        # first paint. A browser link cannot wait for that visual milestone:
+        # start the worker now and retain the URL until credentials are ready.
+        if getattr(self, "_nexus_api_init_deferred", False):
+            self._start_nexus_api_init()
+        if getattr(self, "_nexus_api_init_running", False):
+            if nxm_url not in self._nxm_install_queue:
+                self._nxm_install_queue.append(nxm_url)
+            nxm_log("NXM link waiting for saved Nexus login initialization")
+            return
         api = self._ensure_nexus_api()
         if api is None:
             self._notify(self.tr("Log in first: Nexus ▸ Login to Nexus ▸ Login via SSO."),
@@ -8033,6 +8545,44 @@ class MainWindow(QMainWindow):
             return    # not a Nexus mod - keep showing the current one
         view.retarget(e.name, meta)
 
+    def _follow_selection_fomod_choices(self):
+        """FOMOD Choices tab follows the modlist selection: while the tab is
+        visible, selecting a single mod that has saved choices retargets it.
+        Debounced so keyboard-scrolling the list doesn't read a sidecar per
+        row."""
+        view = self._tabs.content_for_key("fomod_choices")
+        if view is None or not view.isVisible():
+            return
+        t = getattr(self, "_fomod_follow_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._retarget_fomod_choices_to_selection)
+            self._fomod_follow_timer = t
+        t.start(300)
+
+    def _retarget_fomod_choices_to_selection(self):
+        view = self._tabs.content_for_key("fomod_choices")
+        if view is None or not view.isVisible():
+            return
+        rows = self._modlist_view.selectionModel().selectedRows()
+        if len(rows) != 1:
+            return
+        e = self._modlist_model.entry(rows[0].row())
+        if e.is_separator or e.name == getattr(view, "current_mod_name", lambda: None)():
+            return
+        game = self._gs.game
+        profile_dir = self._gs.profile_dir()
+        game_name = getattr(game, "name", "") or ""
+        # A mod with no FOMOD sidecar leaves the tab on the last one that had
+        # choices, rather than blanking it while scrolling past plain mods.
+        from Utils.fomod_choices import has_choices
+        if not has_choices(e.name, profile_dir, game_name):
+            return
+        view.set_mod(e.name, profile_dir, game_name)
+        self._tabs.set_tab_title(
+            "fomod_choices", self.tr("FOMOD: {0}").format(e.name))
+
     # ---- Bundle options (plugins-panel-scoped overlay) --------------------
 
     def _open_bundle_tab(self, mod_name: str):
@@ -8492,43 +9042,15 @@ class MainWindow(QMainWindow):
             self._notify(self.tr("No mod staging folder for this profile."), "warning")
             return
         cd = getattr(self, "_conflict_data", None)
-        beaten = set()
-        if cd is not None:
-            beaten = (set(cd.overrides.get(mod_name, set()))
-                      | set(cd.bsa_overrides.get(mod_name, set())))
-        strip_prefixes = (getattr(game, "mod_folder_strip_prefixes", set())
-                          | getattr(game, "mod_folder_strip_prefixes_post", set()))
-        # UE pak mounting is not plugin-driven - archive winners follow the
-        # engine's (_P boost, basename) mount order instead (empty plugin
-        # order + archive_name_ordering below select that path).
-        if getattr(game, "archive_plugin_ordering", True):
-            # Load order, NOT the panel's display order (a column sort must not
-            # change which BSA wins).
-            plugin_order = [r.name for r in self._plugin_model.natural_rows()
-                            if getattr(r, "enabled", False)]
-        else:
-            plugin_order = []
-        plugin_exts = frozenset(x.lower() for x in
-                                (getattr(game, "plugin_extensions", []) or ()))
-        from Utils.ue_pak_reader import UE_ARCHIVE_EXTENSIONS
-        from Utils.mod_files import conflict_root_context
-        archive_exts = frozenset(
-            getattr(game, "archive_extensions", frozenset()) or frozenset())
-        ctx = {
-            "staging_root": staging,
-            "profile_dir": self._gs.profile_dir(),
-            "filemap_path": staging.parent / "filemap.txt",
-            "modindex_path": staging.parent / "modindex.bin",
-            "bsa_index_path": staging.parent / "bsa_index.bin",
-            "strip_prefixes": strip_prefixes,
-            "beaten_mods": beaten,
-            "archive_exts": archive_exts,
-            "plugin_order": plugin_order,
-            "plugin_exts": plugin_exts,
-            # UE paks resolve by (_P boost, basename) mount order.
-            "archive_name_ordering": bool(archive_exts & UE_ARCHIVE_EXTENSIONS),
-            "root_ctx": conflict_root_context(game, self._gs.profile_dir()),
-        }
+        if cd is None or getattr(cd, "snapshot", None) is None:
+            self._notify(self.tr("Conflict data is still building."), "warning")
+            return
+        try:
+            from Utils.game_helpers import game_data_subpath
+            data_prefix = game_data_subpath(game) or ""
+        except Exception:
+            data_prefix = ""
+        ctx = {"snapshot": cd.snapshot, "data_prefix": data_prefix}
         # Reuse one tab: rebuild it for the new mod if already open.
         if self._tabs.has_key("show_conflicts"):
             self._tabs.close_tab("show_conflicts")
@@ -8538,6 +9060,33 @@ class MainWindow(QMainWindow):
             on_close=lambda: self._tabs.close_tab("show_conflicts"),
             log_fn=self._append_log)
         self._tabs.open_tab(view, self.tr("Conflicts: {0}").format(mod_name), key="show_conflicts")
+
+    # ---- View FOMOD Choices (full detachable tab) ---------------------------
+    def _open_fomod_choices_tab(self, mod_name: str):
+        """Open the saved-FOMOD-selections view for *mod_name* as a full tab.
+        The sidecars are read on a worker thread inside the view."""
+        game = self._gs.game
+        if game is None or not game.is_configured():
+            self._notify(self.tr("No configured game selected."), "warning")
+            return
+        profile_dir = self._gs.profile_dir()
+        game_name = getattr(game, "name", "") or ""
+        # Reuse one tab: retarget it in place (keeps the tab, its position and
+        # any detached window) rather than closing and rebuilding.
+        existing = self._tabs.content_for_key("fomod_choices")
+        if existing is not None and hasattr(existing, "set_mod"):
+            existing.set_mod(mod_name, profile_dir, game_name)
+            self._tabs.set_tab_title(
+                "fomod_choices", self.tr("FOMOD: {0}").format(mod_name))
+            self._tabs.focus_key("fomod_choices")
+            return
+        from gui_qt.fomod_choices_view import FomodChoicesView
+        view = FomodChoicesView(
+            mod_name, profile_dir, game_name,
+            on_close=lambda: self._tabs.close_tab("fomod_choices"),
+            log_fn=self._append_log)
+        self._tabs.open_tab(
+            view, self.tr("FOMOD: {0}").format(mod_name), key="fomod_choices")
 
     # ---- Filter Conflicts (narrow the modlist to one mod's conflict set) -----
     def _filter_conflicts(self, mod_name: str):
@@ -9881,6 +10430,13 @@ class MainWindow(QMainWindow):
         if not game_name:
             return
         existing = _profiles_for_game(game_name)
+        # The default profile's folder name is reserved, as is its translation -
+        # either would create a second row drawing as "Default".
+        if is_reserved_profile_name(name):
+            self._notify(self.tr("Profile '{0}' already exists.").format(
+                profile_display(DEFAULT_PROFILE)), "error")
+            self._new_profile_bar.open_for()
+            return
         if name in existing:
             self._notify(self.tr("Profile '{0}' already exists.").format(name), "error")
             # Re-open so the user can pick another name (fields reset).
@@ -10466,11 +11022,12 @@ class MainWindow(QMainWindow):
 
         toggles = list(getattr(game, "launch_toggles", []) or [])
 
-        def _done(mode, deploy, args, options, toggle_states):
+        def _done(mode, deploy, args, options, wayland, toggle_states):
             if mode is None:
                 return
             exe_launch.save_launch_mode(game, exe_key, mode)
             exe_launch.save_deploy_before_launch(game, deploy)
+            exe_launch.save_launch_with_wayland(game, wayland)
             # Same keys the direct-launch path reads, so these apply to every
             # launch we make ourselves (Steam's own options are the fallback).
             exe_launch.save_exe_args(game, exe_key, args)
@@ -10482,6 +11039,7 @@ class MainWindow(QMainWindow):
                 for k, v in (toggle_states or {}).items())
             self._append_log(f"[play] launch settings saved (via={mode}, "
                              f"deploy-before-launch={'on' if deploy else 'off'}"
+                             f", wayland={'on' if wayland else 'off'}"
                              f"{', args' if args else ''}"
                              f"{', options' if options else ''}{extra})")
 
@@ -10492,6 +11050,7 @@ class MainWindow(QMainWindow):
             deploy=exe_launch.load_deploy_before_launch(game),
             args=exe_launch.load_exe_args(game, exe_key),
             options=exe_launch.load_launch_options(game, exe_key),
+            wayland=exe_launch.load_launch_with_wayland(game),
             on_done=_done,
             toggles=toggles,
             toggle_values={
@@ -10636,7 +11195,7 @@ class MainWindow(QMainWindow):
         if self._staged_finish_queue:
             QTimer.singleShot(0, self._run_staged_finish)
 
-    def _prompt_mewgenics_deploy(self, game):
+    def _prompt_mewgenics_deploy(self, game, timing_origin=None):
         """Ask whether to generate a Steam launch command or repack the gpak,
         then act on the choice (Tk parity: gui/mewgenics_dialogs.py)."""
         from gui_qt.mewgenics_deploy_overlay import (
@@ -10660,11 +11219,72 @@ class MainWindow(QMainWindow):
                     self.window(), launch_string, modpaths_file)
                 return
             # result == "repack" -> run the normal deploy pipeline
-            self._start_deploy(game, profile)
+            self._start_deploy(
+                game, profile, timing_origin=timing_origin)
 
         MewgenicsDeployChoiceOverlay(self.window(), _on_choice)
 
-    def _start_deploy(self, game, profile, silent: bool = False):
+    def _deploy_timing_mark(self, label: str, *, finish: bool = False) -> None:
+        """Emit one opt-in deploy milestone to the source terminal and log."""
+        from Utils import perftrace
+        if not perftrace.is_enabled():
+            if finish:
+                self._deploy_timing_origin = None
+                self._deploy_timing_previous = None
+            return
+        import time
+        origin = getattr(self, "_deploy_timing_origin", None)
+        if origin is None:
+            return
+        now = time.perf_counter()
+        previous = getattr(self, "_deploy_timing_previous", origin)
+        message = (
+            f"[DEPLOY-TIMING] +{now - origin:8.3f}s "
+            f"(UI step {now - previous:7.3f}s) {label}"
+        )
+        self._deploy_timing_previous = now
+        from Utils.app_log import safe_print
+        safe_print(message, flush=True)
+        self._append_log(message)
+        if finish:
+            self._deploy_timing_origin = None
+            self._deploy_timing_previous = None
+
+    def _restore_timing_mark(
+        self, label: str, *, work: str | None = None,
+        finish: bool = False, log_fn=None,
+    ) -> None:
+        """Emit an opt-in button-to-settled Restore milestone."""
+        from Utils import perftrace
+        if not perftrace.is_enabled():
+            if finish:
+                self._restore_timing_origin = None
+                self._restore_timing_previous = None
+            return
+        import time
+        origin = self._restore_timing_origin
+        if origin is None:
+            return
+        now = time.perf_counter()
+        previous = self._restore_timing_previous or origin
+        tagged_label = f"[{work}] {label}" if work else label
+        message = (
+            f"[RESTORE-TIMING] +{now - origin:8.3f}s "
+            f"(step {now - previous:7.3f}s) {tagged_label}"
+        )
+        self._restore_timing_previous = now
+        from Utils.app_log import safe_print
+        safe_print(message, flush=True)
+        if log_fn is None:
+            self._append_log(message)
+        else:
+            log_fn(message)
+        if finish:
+            self._restore_timing_origin = None
+            self._restore_timing_previous = None
+
+    def _start_deploy(self, game, profile, silent: bool = False,
+                      timing_origin=None):
         """Run the deploy worker for *game* / *profile* without re-prompting
         (used by the Mewgenics 'repack' choice, which has already decided)."""
         if self._deploy_running:
@@ -10695,11 +11315,16 @@ class MainWindow(QMainWindow):
             self._auto_deploy_in_progress = False
             if not any(getattr(cb, "_kind", None) == "deploy"
                        for cb in self._pending_after_staged):
-                def _later(g=game, p=profile, s=silent):
-                    self._start_deploy(g, p, silent=s)
+                def _later(g=game, p=profile, s=silent, t=timing_origin):
+                    self._start_deploy(g, p, silent=s, timing_origin=t)
                 _later._kind = "deploy"
                 self._pending_after_staged.append(_later)
             return
+        import time
+        self._deploy_timing_origin = (
+            time.perf_counter() if timing_origin is None else timing_origin)
+        self._deploy_timing_previous = self._deploy_timing_origin
+        self._deploy_timing_mark("deploy request accepted; worker starting")
         self._deploy_running = True
         self._op_silent = silent
         self._op_is_restore = False
@@ -10736,6 +11361,7 @@ class MainWindow(QMainWindow):
                     confirm_downgrade=self._make_confirm_downgrade_cb(
                         game, silent=silent),
                     do_backup=True,
+                    timing_origin=self._deploy_timing_origin,
                 )
             except Exception as exc:
                 self._op_log.emit(f"Deploy error: {exc}")
@@ -10759,6 +11385,8 @@ class MainWindow(QMainWindow):
         suppresses the progress popup + interim toast so rapid mod toggles
         don't flash the UI; log lines + the final success/warning toasts still
         surface (Tk parity: top_bar._run_deploy silent=)."""
+        import time
+        timing_origin = time.perf_counter()
         game = self._gs.game
         if game is None or not game.is_configured():
             self._auto_deploy_in_progress = False
@@ -10774,10 +11402,13 @@ class MainWindow(QMainWindow):
         # top_bar._on_deploy). Only prompt for an explicit user deploy -
         # auto-deploy (silent) falls straight through to the repack path.
         if not silent and hasattr(game, "get_modpaths_launch_string"):
-            self._prompt_mewgenics_deploy(game)
+            self._prompt_mewgenics_deploy(
+                game, timing_origin=timing_origin)
             return
 
-        self._start_deploy(game, self._gs.profile, silent=silent)
+        self._start_deploy(
+            game, self._gs.profile, silent=silent,
+            timing_origin=timing_origin)
 
     def _save_window_state(self):
         """Persist the window geometry (pos/size/maximized) and the modlist ║
@@ -10821,6 +11452,15 @@ class MainWindow(QMainWindow):
                 self._restore_all_on_close()
         except Exception as exc:
             print(f"[gui_qt] restore-on-close error: {exc}", flush=True)
+        # Wizard tools belong to their prefix's wineserver, not to us, so a
+        # tool still up at this point does NOT die with the app - it reparents
+        # to init and keeps its CPU. Reap before we go.
+        try:
+            from Utils.exe_launch import reap_live_tools
+            reap_live_tools(
+                log_fn=lambda m: print(f"[tool-reap] {m}", flush=True))
+        except Exception as exc:
+            print(f"[gui_qt] tool-reap error: {exc}", flush=True)
         super().closeEvent(event)
 
     def _restore_all_on_close(self):
@@ -10841,9 +11481,11 @@ class MainWindow(QMainWindow):
                 game_root = game.get_game_path()
                 last_deployed = game.get_last_deployed_profile()
                 original_profile_dir = getattr(game, "_active_profile_dir", None)
+                recovery_profile_dir = original_profile_dir
                 if last_deployed:
-                    game.set_active_profile_dir(
+                    recovery_profile_dir = (
                         game.get_profile_root() / "profiles" / last_deployed)
+                    game.set_active_profile_dir(recovery_profile_dir)
                     # Reload so the last-deployed profile's path overrides drive
                     # the restore (it may target a different game folder).
                     game.load_paths()
@@ -10857,6 +11499,12 @@ class MainWindow(QMainWindow):
                             game, root_folder_dir=root_folder_dir,
                             game_root=game_root, log_fn=log_fn,
                         )
+                    if recovery_profile_dir is not None:
+                        from Utils.deploy_pipeline import (
+                            finalize_filegraph_recovery,
+                        )
+                        finalize_filegraph_recovery(
+                            game, recovery_profile_dir, log_fn=log_fn)
                     game.clear_deploy_active()
                 finally:
                     if original_profile_dir is not None:
@@ -10897,6 +11545,10 @@ class MainWindow(QMainWindow):
             self._notify(self.tr("Restore queued - it will run after the "
                                  "current install finishes."), "info")
             return
+        import time
+        self._restore_timing_origin = time.perf_counter()
+        self._restore_timing_previous = self._restore_timing_origin
+        self._restore_timing_mark("restore request accepted; worker starting")
         self._deploy_running = True
         self._op_is_restore = True
         self._op_title = "Restoring"
@@ -10911,6 +11563,8 @@ class MainWindow(QMainWindow):
         def worker():
             ok = True
             try:
+                self._restore_timing_mark(
+                    "pipeline worker entered", log_fn=self._op_log.emit)
                 from Utils.deploy_pipeline import check_paths_mounted
                 err = check_paths_mounted(game)
                 if err:
@@ -10918,21 +11572,39 @@ class MainWindow(QMainWindow):
                     ok = False
                 else:
                     last = game.get_last_deployed_profile()
+                    recovery_profile_dir = (
+                        game.get_profile_root() / "profiles" / (last or profile)
+                    )
                     if last:
-                        game.set_active_profile_dir(
-                            game.get_profile_root() / "profiles" / last)
+                        game.set_active_profile_dir(recovery_profile_dir)
                         game.load_paths()
+                    self._restore_timing_mark(
+                        "preflight and deployed-profile load complete",
+                        work="FS I/O",
+                        log_fn=self._op_log.emit)
                     game_root = game.get_game_path()
                     if hasattr(game, "restore"):
                         game.restore(
                             log_fn=lambda m: self._op_log.emit(str(m)),
                             progress_fn=lambda d, t, p=None: self._op_progress.emit(d, t, p))
+                    self._restore_timing_mark(
+                        "game handler restore complete",
+                        work="FS I/O + CPU",
+                        log_fn=self._op_log.emit)
                     rf = game.get_effective_root_folder_path()
                     if rf.is_dir() and game_root:
                         restore_root_folder_for_game(
                             game, root_folder_dir=rf, game_root=game_root,
                             log_fn=lambda m: self._op_log.emit(str(m)),
                         )
+                    from Utils.deploy_pipeline import finalize_filegraph_recovery
+                    finalize_filegraph_recovery(
+                        game, recovery_profile_dir,
+                        log_fn=lambda m: self._op_log.emit(str(m)),
+                    )
+                    self._restore_timing_mark(
+                        "root-file restore complete", work="FS I/O",
+                        log_fn=self._op_log.emit)
             except Exception as exc:
                 ok = False
                 self._op_log.emit(f"Restore error: {exc}")
@@ -10946,6 +11618,9 @@ class MainWindow(QMainWindow):
                         game.clear_deploy_active()
                 except Exception:
                     pass
+                self._restore_timing_mark(
+                    "active profile restored; worker complete", work="FS I/O",
+                    log_fn=self._op_log.emit)
                 self._op_done.emit("restore", ok, [])
 
         threading.Thread(target=worker, daemon=True).start()
@@ -10988,6 +11663,10 @@ class MainWindow(QMainWindow):
             self._progress_popup.set_progress(done, total, phase, title=title)
 
     def _on_op_done(self, kind: str, success: bool, warnings):
+        if kind == "deploy":
+            self._deploy_timing_mark("worker result reached the Qt thread")
+        elif kind == "restore":
+            self._restore_timing_mark("worker result reached the Qt thread")
         self._deploy_running = False
         # Captured before the reset below: auto-deploy runs silently and must
         # not raise a modal in the middle of the user toggling mods.
@@ -10998,16 +11677,20 @@ class MainWindow(QMainWindow):
             self._set_deploy_buttons_enabled(True)
         if self._progress_popup is not None:
             self._schedule_op_clear(1200)
-        # Any deploy (manual OR auto) is followed by a modlist reload → conflict
+        # A deploy or explicit restore is followed by a modlist reload → conflict
         # rebuild → _on_conflicts_ready. With auto_deploy on, that rebuild would
-        # otherwise start a *fresh* auto-deploy every time (an endless loop, and
-        # an extra deploy even after a manual Deploy press). Arm the guard so the
-        # rebuild caused by THIS deploy's reload is swallowed. (Tk parity: the
-        # gui.py entry path + top_bar._on_deploy_finished both set this flag.)
+        # otherwise start a fresh deploy. For deploy this loops; for restore it
+        # immediately undoes the requested restore. Arm the guard so either
+        # operation's own rebuild is swallowed.
         game = self._gs.game
-        if (kind == "deploy" and game is not None and game.is_configured()
+        if (kind in ("deploy", "restore")
+                and game is not None and game.is_configured()
                 and getattr(game, "auto_deploy", False)):
             self._auto_deploy_in_progress = True
+        self._deploy_refresh_pending = kind == "deploy"
+        self._deploy_refresh_conflicts_done = False
+        self._restore_refresh_pending = kind == "restore"
+        self._restore_refresh_conflicts_done = False
         # Refresh the modlist/conflicts + deployed-profile highlight after the op.
         self._reload_modlist()
         self._update_deployed_profile_highlight()
@@ -11015,6 +11698,12 @@ class MainWindow(QMainWindow):
         # Deploy/restore adds/removes framework launchers (script extenders)
         # in the game root - reflect that in the play-bar dropdown.
         self._refresh_play_selector()
+        if kind == "deploy":
+            self._deploy_timing_mark(
+                "completion handler finished; profile refresh running")
+        elif kind == "restore":
+            self._restore_timing_mark(
+                "completion handler finished; profile refresh running")
         game_name = self._gs.game.name if self._gs.game else self.tr("Game")
         if success:
             msg = (self.tr("{0} Deployed") if kind == "deploy"
@@ -11284,6 +11973,17 @@ class MainWindow(QMainWindow):
                 self._notify(
                     self.tr("Cannot change the deploy method while mods are "
                             "deployed. Restore first."), "warning")
+                self._revert_quick_configure(opt, action)
+                return
+        if opt["key"] == "prefer_appimage":
+            try:
+                deployed = game.is_configured() and game.get_deploy_active()
+            except Exception:
+                deployed = False
+            if deployed and bool(value) != bool(opt["value"]):
+                self._notify(self.tr(
+                    "Restore the game before changing the preferred OpenMW "
+                    "package."), "warning")
                 self._revert_quick_configure(opt, action)
                 return
         try:
@@ -11704,7 +12404,7 @@ class MainWindow(QMainWindow):
         game = self._gs.game
         if game is None:
             menu.addAction(self.tr("No game selected")).setEnabled(False)
-            self._add_prefix_manager_action(menu)
+            self._add_wizard_management_actions(menu)
             return
         from Utils.plugin_loader import get_all_wizard_tools
         from Utils.wizard_catalog import group_by_category
@@ -11717,7 +12417,7 @@ class MainWindow(QMainWindow):
             tools = []
         if not tools:
             menu.addAction(self.tr("No wizard tools for this game")).setEnabled(False)
-            self._add_prefix_manager_action(menu, tools)
+            self._add_wizard_management_actions(menu, tools)
             return
         # Favourites submenu at the top - quick launch for pinned tools.
         from Utils.ui_config import load_favourite_wizards
@@ -11752,13 +12452,10 @@ class MainWindow(QMainWindow):
                 else:
                     act.triggered.connect(
                         lambda _=False, t=tool: self._open_wizard_tool(t))
-        self._add_prefix_manager_action(menu, tools)
+        self._add_wizard_management_actions(menu, tools)
 
-    def _add_prefix_manager_action(self, menu, tools=None):
-        """Trailing 'Add Favourites…' + 'Manage Prefixes…' entries. The prefix
-        manager is always available (it lists every game's tool prefixes, like
-        the Tk wizard picker's button); 'Add Favourites…' is only shown when the
-        current game has tools to favourite."""
+    def _add_wizard_management_actions(self, menu, tools=None):
+        """Add the trailing wizard-management actions."""
         menu.addSeparator()
         if tools:
             fav = menu.addAction(self.tr("Add Favourites…"))
@@ -11766,6 +12463,12 @@ class MainWindow(QMainWindow):
                            "this menu for quick access."))
             fav.triggered.connect(
                 lambda _=False, t=list(tools): self._open_favourite_wizards(t))
+        settings = menu.addAction(self.tr("Wizard Settings…"))
+        settings.setToolTip(self.tr(
+            "Reset wizard tools that automatically reuse their saved Proton "
+            "settings."))
+        settings.triggered.connect(
+            lambda _=False: self._open_wizard_settings())
         act = menu.addAction(self.tr("Manage Prefixes…"))
         act.setToolTip(self.tr("Browse every wizard-tool Wine prefix and delete them "
                        "to reclaim disk space."))
@@ -11795,6 +12498,62 @@ class MainWindow(QMainWindow):
 
         FavouriteWizardsOverlay.show_over(
             self, items, load_favourite_wizards(), _done)
+
+    def _open_wizard_settings(self):
+        from Utils.exe_launch import (
+            list_wizard_always_use_settings,
+            save_wizard_always_use_settings,
+        )
+        from Utils.game_helpers import _GAMES
+        from Utils.plugin_loader import get_all_wizard_tools
+
+        entries = []
+        for game_name, game in sorted(
+                _GAMES.items(), key=lambda item: item[0].casefold()):
+            try:
+                if not game.is_configured():
+                    continue
+                saved = list_wizard_always_use_settings(game)
+            except Exception as exc:
+                self._append_log(
+                    f"Wizards: failed to read settings for {game_name}: {exc}")
+                continue
+            if not saved:
+                continue
+            try:
+                live_tools = {tool.id: tool
+                              for tool in get_all_wizard_tools(game)}
+            except Exception:
+                live_tools = {}
+            for record in saved:
+                wizard_id = record["wizard_id"]
+                tool = live_tools.get(wizard_id)
+                label = (_tr_wizard(tool.label, tool.label_args)
+                         if tool is not None else
+                         _tr_wizard(record["label"], record["label_args"]))
+                entries.append({
+                    "game_name": game_name,
+                    "wizard_id": wizard_id,
+                    "label": label,
+                })
+        entries.sort(key=lambda item: (
+            item["game_name"].casefold(), item["label"].casefold()))
+
+        def _reset(game_name: str, wizard_id: str) -> bool:
+            game = _GAMES.get(game_name)
+            if game is None:
+                return False
+            try:
+                save_wizard_always_use_settings(game, wizard_id, False)
+                return True
+            except Exception as exc:
+                self._append_log(
+                    f"Wizards: failed to reset {wizard_id} for "
+                    f"{game_name}: {exc}")
+                return False
+
+        from gui_qt.wizard_settings_overlay import WizardSettingsOverlay
+        WizardSettingsOverlay.show_over(self, entries, _reset)
 
     def _open_prefix_manager(self):
         """Open the prefix manager as a plugins-panel-scoped tab."""
@@ -11853,6 +12612,12 @@ class MainWindow(QMainWindow):
             nexus_api=self._ensure_nexus_api,
             open_log_tab=self._open_log_tab,
             set_tool_lock=self._set_tool_lock,
+            show_mod_files=self._wizard_show_mod_files,
+            filegraph_snapshot=lambda: getattr(
+                getattr(self, "_conflict_data", None), "snapshot", None),
+            wizard_tool_id=tool.id,
+            wizard_tool_label=tool.label,
+            wizard_tool_label_args=tool.label_args,
         )
         try:
             view = spec.view_factory(
@@ -11966,8 +12731,48 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._on_refresh_plugins)
 
     def _close_wizard_tab(self, key: str):
-        if self._tabs.has_key(key):
+        if not self._tabs.has_key(key):
+            return
+        view = self._tabs.content_for_key(key)
+        try:
+            from Utils.exe_launch import live_tool_labels
+            live = (sorted(set(live_tool_labels(owner=view)))
+                    if view is not None else [])
+        except Exception:
+            live = []
+        if not live:
             self._tabs.close_tab(key)
+            return
+
+        # A tool still up here is usually one that finished its work and never
+        # exited - it would otherwise keep a core busy until the app quits.
+        # Still ask: the user may have deliberately left xEdit or the CK open.
+        def _confirmed(ok):
+            if ok:
+                self._reap_wizard_tools(view)
+            self._tabs.close_tab(key)
+
+        from gui_qt.confirm_overlay import ConfirmOverlay
+        ConfirmOverlay.show_over(
+            self, self.tr("Tool still running"),
+            self.tr("This tab still has a tool running. Close the tool too?\n"
+                    "The tab closes either way; choosing Leave running keeps "
+                    "the tool alive until you quit Amethyst."),
+            _confirmed, confirm_label=self.tr("Close tool"),
+            cancel_label=self.tr("Leave running"), list_items=live)
+
+    def _reap_wizard_tools(self, view):
+        """Terminate the tools *view* launched, off the UI thread.
+
+        Reaping escalates as far as a wineserver kill and can take a couple of
+        seconds against a wedged tool, which must not freeze the UI - and
+        `_append_log` is thread-safe, so the worker can report directly.
+        """
+        import threading
+        from Utils.exe_launch import reap_live_tools
+        threading.Thread(
+            target=lambda: reap_live_tools(owner=view, log_fn=self._append_log),
+            daemon=True, name="tool-reap").start()
 
     def _close_wizard_tabs(self):
         """Close every open wizard tab (game switch - they're game-scoped).
@@ -12708,10 +13513,9 @@ class MainWindow(QMainWindow):
 
         def driver():
             from concurrent.futures import ThreadPoolExecutor
-            from Utils.mod_install import (prepare_archive, finish_install,
-                                           _archive_lists_fomod_config)
+            from Utils.mod_install import prepare_archive, finish_install
             from Utils.extract_budget import (ExtractionMemoryBudget,
-                                              get_uncompressed_size)
+                                              probe_archive)
             try:
                 from Utils.ui_config import load_collection_settings
                 workers = int(load_collection_settings().get(
@@ -12733,24 +13537,27 @@ class MainWindow(QMainWindow):
                 acquired = False
                 try:
                     self._op_log.emit(f"Installing: {name_for_log}")
+                    # One archive probe supplies FOMOD detection, the memory
+                    # reservation and extraction placement below.
+                    probe = probe_archive(path, inspect_members=True)
                     # Archive listing already shows fomod/ModuleConfig.xml →
                     # defer NOW, skipping an extract that would be thrown away
                     # and repeated in the deferred phase (collection parity).
-                    if _archive_lists_fomod_config(path):
+                    if probe.has_fomod_config:
                         self._op_log.emit(
                             f"FOMOD installer detected: {name_for_log} - "
                             "deferred to the end of the batch.")
                         with lock:
                             deferred.append(path)
                         return
-                    est = get_uncompressed_size(path)
+                    est = probe.uncompressed_size
                     budget.acquire(est)
                     acquired = True
                     prepared = prepare_archive(
                         path, self._install_game, self._install_profile_dir,
                         log_fn=lambda m: self._op_log.emit(str(m)),
                         prebuilt_meta=meta, preferred_name=forced,
-                        on_need_prefix=prefix_cb)
+                        on_need_prefix=prefix_cb, archive_probe=probe)
                     if prepared is None:
                         return
                     if (prepared.is_fomod() and prepared.fomod_has_steps()) \
@@ -12833,7 +13640,7 @@ class MainWindow(QMainWindow):
                 self._install_results[_path] = final
                 _chain(_next)
 
-            self._maybe_prompt_rename(name, _named)
+            self._maybe_prompt_rename(name, _named, defer_reload=True)
 
         _chain(0)
 
@@ -13146,24 +13953,33 @@ class MainWindow(QMainWindow):
                 self._apply_install_placement(
                     [final], place,
                     profile_dir=getattr(prepared, "profile_dir", None))
-            self._reload_modlist()
-            # Plugins reload comes from _on_conflicts_ready after the rebuild -
-            # an immediate reload prunes the fresh plugins.txt entry against the
-            # stale filemap (see _on_install_done).
-            if not getattr(self, "_reload_had_entries", False):
-                self._reload_plugins()
-            self._notify(self.tr("Installed {0}").format(final), "success")
+
+            def _finalize():
+                # Keep and Remove converge here, after the modlist has reached
+                # its final state. This is the single reload/conflict rebuild
+                # for the completed wizard install.
+                self._reload_modlist()
+                # Plugins reload comes from _on_conflicts_ready after the
+                # rebuild. Only load directly when no rebuild is coming.
+                if not getattr(self, "_reload_had_entries", False):
+                    self._reload_plugins()
+                self._notify(self.tr("Installed {0}").format(final), "success")
+                _drain_next()
+
             # Change Version tab stays open - refresh its highlights.
             if prev_name:
                 self._sync_change_version_after_install(final)
             # Change Version landed a different-named version → offer to remove
-            # the previous version (Tk parity with _finish_one_install).
+            # the previous version before rebuilding the filemap.
             if prev_name and final != prev_name:
-                self._maybe_prompt_remove_previous(prev_name, final)
-            _drain_next()
+                self._maybe_prompt_remove_previous(
+                    prev_name, final, on_done=_finalize,
+                    defer_reload=True)
+                return
+            _finalize()
 
         if name:
-            self._maybe_prompt_rename(name, _after_named)
+            self._maybe_prompt_rename(name, _after_named, defer_reload=True)
         else:
             archive_path = str(getattr(prepared, "archive", "") or "")
             self._pending_thunderstore_meta.pop(archive_path, None)
@@ -13209,7 +14025,8 @@ class MainWindow(QMainWindow):
         if name:
             # Optional post-install rename prompt (Tk parity). Modal, before the
             # next queued install - keeps one dialog at a time.
-            self._maybe_prompt_rename(name, self._finish_one_install)
+            self._maybe_prompt_rename(
+                name, self._finish_one_install, defer_reload=True)
         else:
             self._install_next()   # continue the queue
 
@@ -13229,7 +14046,27 @@ class MainWindow(QMainWindow):
             self._sync_change_version_after_install(name)
         if prev and name != prev:
             self._install_prev_name = None   # don't re-prompt for later items
-            self._maybe_prompt_remove_previous(prev, name)
+            # Preserve the existing Profile Group ordering contract: reconcile
+            # the newly-installed member mod before capturing the old entry's
+            # owner/slot for the prompt. This updates group metadata only; the
+            # UI reload and conflict rebuild remain deferred until the choice.
+            try:
+                from Utils.profile_groups import is_group, materialize_if_group
+                active = self._gs.profile_dir()
+                if active is not None and is_group(active):
+                    materialize_if_group(self._gs.game, active,
+                                         log_fn=self._append_log)
+            except Exception as exc:
+                print(f"[gui_qt] group reconcile before remove-previous "
+                      f"failed: {exc}", flush=True)
+            # The overlay is modeless. Pause the install queue here so its
+            # empty-queue completion cannot reload/rebuild before the user has
+            # chosen Keep or Remove. _on_install_done performs the one reload
+            # after either choice; Remove therefore defers its own reload.
+            self._maybe_prompt_remove_previous(
+                prev, name, on_done=self._install_next,
+                defer_reload=True)
+            return
         self._install_next()   # continue the queue
 
     def _prev_version_profile(self, old_name: str):
@@ -13251,16 +14088,30 @@ class MainWindow(QMainWindow):
                   flush=True)
         return pdir, old_name
 
-    def _maybe_prompt_remove_previous(self, old_name: str, new_name: str):
+    def _maybe_prompt_remove_previous(self, old_name: str, new_name: str,
+                                      on_done=None, defer_reload: bool = False):
         """Show the borderless 'Remove previous version?' overlay if both the old
         and new mods exist. Remove → the new mod inherits the old one's modlist
-        position + enabled state, then the old mod is removed."""
+        position + enabled state, then the old mod is removed. *on_done* is the
+        owning install flow's continuation and runs after either choice (or
+        immediately when there is nothing to prompt)."""
+        continued = False
+
+        def _continue():
+            nonlocal continued
+            if continued:
+                return
+            continued = True
+            if on_done is not None:
+                on_done()
+
         from Utils.mod_copy import resolve_target_staging
         game = self._gs.game
         old_dir, old_folder = self._prev_version_profile(old_name)
         new_dir = getattr(self, "_install_profile_dir", None) \
             or self._gs.profile_dir()
         if game is None or old_dir is None or new_dir is None:
+            _continue()
             return
         # In a group these are two DIFFERENT profiles' staging roots (the new
         # version was just installed into a member; the group only links to it).
@@ -13268,29 +14119,36 @@ class MainWindow(QMainWindow):
             old_staging = Path(resolve_target_staging(game, Path(old_dir)))
             new_staging = Path(resolve_target_staging(game, Path(new_dir)))
         except Exception:
+            _continue()
             return
         if not (old_staging / old_folder).is_dir() \
                 or not (new_staging / new_name).is_dir():
+            _continue()
             return
         from gui_qt.remove_previous_overlay import RemovePreviousOverlay
 
         def _done(result):
-            if result == "remove":
-                # Resolved NOW, not when the user answers: the install's
-                # group reconcile runs first and renames the group entry to
-                # the new version in place (same identity, newer version), so
-                # a late lookup of the old name would find nothing and fall
-                # back to the group - where the old row no longer exists and
-                # the new mod would be repositioned to the top.
-                self._remove_previous_version(
-                    old_name, new_name, profile_dir=old_dir,
-                    old_folder=old_folder)
+            try:
+                if result == "remove":
+                    # Resolved NOW, not when the user answers: the install's
+                    # group reconcile runs first and renames the group entry to
+                    # the new version in place (same identity, newer version),
+                    # so a late lookup of the old name would find nothing and
+                    # fall back to the group - where the old row no longer
+                    # exists and the new mod would move to the top.
+                    self._remove_previous_version(
+                        old_name, new_name, profile_dir=old_dir,
+                        old_folder=old_folder,
+                        reload_modlist=not defer_reload)
+            finally:
+                _continue()
 
         RemovePreviousOverlay.show_over(self, old_name, new_name, _done)
 
     def _remove_previous_version(self, old_name: str, new_name: str, *,
                                  profile_dir: Path | None = None,
-                                 old_folder: str | None = None):
+                                 old_folder: str | None = None,
+                                 reload_modlist: bool = True):
         """New mod inherits old's modlist slot + enabled state; old is removed.
         In a Profile Group the files live in a MEMBER profile
         (*profile_dir*/*old_folder*, captured when the prompt was raised), so
@@ -13355,16 +14213,21 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             print(f"[gui_qt] group reconcile after remove-previous failed: "
                   f"{exc}", flush=True)
-        self._reload_modlist()
-        self._rebuild_conflicts_async()
+        if reload_modlist:
+            # _reload_modlist sequences its own conflict rebuild after the meta
+            # pass; starting another one here duplicates the full scan.
+            self._reload_modlist()
         # The Change Version tab may still be open on the mod that was just
         # removed - swap it to the version that replaced it.
         self._sync_change_version_after_install(new_name)
 
-    def _maybe_prompt_rename(self, name: str, on_done):
+    def _maybe_prompt_rename(self, name: str, on_done,
+                             defer_reload: bool = False):
         """If 'Rename mod after install' is on, prompt for a new name and rename
         the mod (staging folder + index + modlist entry). Calls ``on_done`` with
-        the final name (unchanged if the user cancels or the rename fails)."""
+        the final name (unchanged if the user cancels or the rename fails).
+        Install flows defer the rename's reload because their completion path
+        reloads once after all follow-up decisions have resolved."""
         try:
             from Utils.ui_config import load_rename_mod_after_install
             if not load_rename_mod_after_install():
@@ -13378,8 +14241,9 @@ class MainWindow(QMainWindow):
             if new is None or not new.strip():
                 on_done(name)
                 return
-            renamed = self._rename_mod_on_disk(name, new.strip())
-            on_done(renamed or name)
+            self._rename_mod_on_disk(
+                name, new.strip(), reload_modlist=not defer_reload,
+                on_done=lambda renamed: on_done(renamed or name))
 
         from gui_qt.text_input_overlay import TextInputOverlay
         TextInputOverlay.show_over(
@@ -13399,19 +14263,27 @@ class MainWindow(QMainWindow):
                   flush=True)
             return []
 
-    def _rename_mod_on_disk(self, old_name: str, new_name: str) -> str | None:
+    def _rename_mod_on_disk(self, old_name: str, new_name: str, *,
+                            reload_modlist: bool = True,
+                            on_done=None) -> str | None:
         """Rename a mod: staging folder → new, modindex entry, modlist entry,
-        then reload. Returns the sanitised new name on success, else None.
+        then optionally reload. Returns the sanitised new name on success, else
+        None. ``on_done`` also covers the asynchronous collision overlay.
         Mirrors the Tk modlist_panel.rename_mod_by_name operation.
 
         If the target name is already taken, this shows the Mod-Already-Exists
         overlay (Replace All / Rename… / Cancel) rather than failing outright,
         and the rename completes asynchronously through that flow (so the return
         value is None - the folder is still under ``old_name`` at that point)."""
+        def _finish(result):
+            if on_done is not None:
+                on_done(result)
+            return result
+
         from Utils.mod_name_utils import sanitize_mod_folder_name
         new_name = sanitize_mod_folder_name(new_name)
         if not old_name or not new_name or old_name == new_name:
-            return None
+            return _finish(None)
         # In a group the staging entry is a symlink and the folder name comes
         # from the OWNING MEMBER - renaming the link would just be fought by
         # the next reconcile. Rename it in the member profile instead.
@@ -13424,12 +14296,12 @@ class MainWindow(QMainWindow):
                     "'{0}' belongs to the member profile '{1}' - switch to "
                     "that profile to rename it.").format(
                         old_name, owner[0] if owner else "?"), "warning")
-                return None
+                return _finish(None)
         except Exception:
             pass
         staging = self._gs.staging_dir()
         if staging is None:
-            return None
+            return _finish(None)
         new_folder = staging / new_name
         if new_folder.exists():
             # Collision → let the user Replace the existing mod, pick another
@@ -13438,20 +14310,30 @@ class MainWindow(QMainWindow):
 
             def _resolved(result):
                 if not result or result == "cancel":
+                    _finish(None)
                     return
                 if result == "replace":
-                    self._replace_then_rename(old_name, new_name)
+                    self._replace_then_rename(
+                        old_name, new_name, reload_modlist=reload_modlist,
+                        on_done=_finish)
                 elif result.startswith("rename:"):
-                    self._rename_mod_on_disk(old_name, result[len("rename:"):])
+                    self._rename_mod_on_disk(
+                        old_name, result[len("rename:"):],
+                        reload_modlist=reload_modlist, on_done=_finish)
+                else:
+                    _finish(None)
 
             # Suggestions come from the mod BEING renamed, not the occupant.
             ModExistsOverlay.show_over(
                 self, new_name, False, _resolved,
                 suggestions=self._mod_name_suggestions(old_name))
             return None
-        return self._do_rename_mod_on_disk(old_name, new_name)
+        return _finish(self._do_rename_mod_on_disk(
+            old_name, new_name, reload_modlist=reload_modlist))
 
-    def _replace_then_rename(self, old_name: str, new_name: str) -> None:
+    def _replace_then_rename(self, old_name: str, new_name: str, *,
+                             reload_modlist: bool = True,
+                             on_done=None) -> None:
         """Fully remove the existing mod occupying *new_name*, drop its modlist
         row, then rename *old_name* → *new_name* (used by the rename-collision
         Replace-All path)."""
@@ -13461,6 +14343,8 @@ class MainWindow(QMainWindow):
                         log_fn=self._append_log)
         except Exception as exc:
             self._notify(self.tr("Replace failed: {0}").format(exc), "warning")
+            if on_done is not None:
+                on_done(None)
             return
         # Drop the replaced mod's modlist row so it isn't left dangling. Edit
         # the file, not self._modlist_model - see _do_rename_mod_on_disk: for a
@@ -13477,9 +14361,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             print(f"[gui_qt] replace-then-rename modlist update failed: {exc}",
                   flush=True)
-        self._do_rename_mod_on_disk(old_name, new_name)
+        renamed = self._do_rename_mod_on_disk(
+            old_name, new_name, reload_modlist=reload_modlist)
+        if on_done is not None:
+            on_done(renamed)
 
-    def _do_rename_mod_on_disk(self, old_name: str, new_name: str) -> str | None:
+    def _do_rename_mod_on_disk(self, old_name: str, new_name: str, *,
+                               reload_modlist: bool = True) -> str | None:
         """Perform the actual rename (staging folder + index + state + modlist),
         assuming *new_name* is free. Returns the new name on success."""
         staging = self._gs.staging_dir()
@@ -13493,15 +14381,16 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self._notify(self.tr("Rename failed: {0}").format(exc), "warning")
             return None
-        # Keep the persistent mod index in sync (avoids a full rescan).
+        # Re-key the catalog row immediately; candidate rules are refreshed
+        # after the profile's name-keyed settings migrate below.
         try:
-            from Utils.filemap import rename_in_mod_index
-            from Utils.ui_config import load_normalize_folder_case
-            idx_path = staging.parent / "modindex.bin"
-            rename_in_mod_index(idx_path, old_name, new_name,
-                                normalize_folder_case=load_normalize_folder_case())
+            from Utils.filegraph_service import FileGraphService
+            _profile_dir = self._gs.profile_dir()
+            _library = FileGraphService.open_library(
+                self._gs.game, _profile_dir, log_fn=self._append_log)
+            _library.rename_mod(old_name, new_name)
         except Exception:
-            pass
+            _library = None
         # Re-key the name-keyed per-mod state (strip prefixes, disabled plugins,
         # excluded files, notes) - Tk parity: _migrate_mod_name_state.
         try:
@@ -13510,11 +14399,19 @@ class MainWindow(QMainWindow):
                               log_fn=self._append_log)
         except Exception as exc:
             print(f"[gui_qt] rename state migration failed: {exc}", flush=True)
+        try:
+            if _library is not None:
+                _session = _library.open_profile(self._gs.profile_dir())
+                _library.replace_mod_manifest(
+                    _session.adapter.build_manifest(new_name))
+        except Exception as exc:
+            self._append_log(f"Rename catalog refresh failed: {exc}")
         # Rename in the FILE, not via self._modlist_model: the rename-after-
         # install prompt resolves before _on_install_done's reload, so the row
         # isn't in the model yet - editing it was a silent no-op and save()
         # then clobbered the just-installed entry (mods "vanishing until
-        # Refresh"). The reload below catches the model up.
+        # Refresh"). The rename's reload, or the owning install completion
+        # reload when deferred, catches the model up.
         try:
             from Utils.modlist import read_modlist, write_modlist, modlist_lock
             ml_path = self._gs.modlist_path()
@@ -13531,7 +14428,8 @@ class MainWindow(QMainWindow):
                     write_modlist(ml_path, entries)
         except Exception as exc:
             print(f"[gui_qt] rename modlist update failed: {exc}", flush=True)
-        self._reload_modlist()
+        if reload_modlist:
+            self._reload_modlist()
         self._notify(self.tr("Renamed to '{0}'.").format(new_name), "info")
         return new_name
 
@@ -13745,13 +14643,14 @@ class MainWindow(QMainWindow):
         # gui.py _on_filemap_rebuilt refreshes the plugins tab after the rebuild.
         _ = wrote
 
-    def _build_modlist_area(self) -> QWidget:
+    def _build_modlist_area(self, startup_timing=None) -> QWidget:
         """Modlist column: the list + its tool footer (buttons + search) stacked
         vertically, with a collapsible filter side panel docked on the left (Tk
         parity - the filter panel pushes the column right, not an overlay)."""
         # The list + footer share one vertical column. A hidden 'new profile'
         # bar sits at the very top (row 0, Tk parity) and appears when the user
         # picks 'Add new profile…'.
+        phase_started = _startup_time.perf_counter()
         col = QWidget()
         cv = QVBoxLayout(col)
         cv.setContentsMargins(0, 0, 0, 0)
@@ -13763,42 +14662,84 @@ class MainWindow(QMainWindow):
         cv.addWidget(self._new_profile_bar)
         cv.addWidget(self._build_modlist(), 1)
         cv.addWidget(self._modlist_footer())
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build mod-list view and footer",
+                phase_started=phase_started, category="UI")
 
         area = QWidget()
         h = QHBoxLayout(area)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
-        self._modlist_filter_panel = self._build_modlist_filter_panel()
-        self._modlist_filter_panel.setVisible(False)
-        h.addWidget(self._modlist_filter_panel)
-        # The Mod Files filter panel shares this window-left slot so it opens in
-        # the same place as the modlist filters (just a different filter set).
-        self._mod_files_filter_panel = self._build_mod_files_filter_panel()
-        self._mod_files_filter_panel.setVisible(False)
-        h.addWidget(self._mod_files_filter_panel)
-        # The Data filter panel shares the same window-left slot.
-        self._data_filter_panel = self._build_data_filter_panel()
-        self._data_filter_panel.setVisible(False)
-        h.addWidget(self._data_filter_panel)
-        # The Downloads filter panel shares the slot too.
-        self._downloads_filter_panel = self._build_downloads_filter_panel()
-        self._downloads_filter_panel.setVisible(False)
-        h.addWidget(self._downloads_filter_panel)
-        # The Text Files filter panel shares the slot too.
-        self._text_files_filter_panel = self._build_text_files_filter_panel()
-        self._text_files_filter_panel.setVisible(False)
-        h.addWidget(self._text_files_filter_panel)
-        # The Saves filter panel shares the slot too.
-        self._saves_filter_panel = self._build_saves_filter_panel()
-        self._saves_filter_panel.setVisible(False)
-        h.addWidget(self._saves_filter_panel)
-        # The Plugins filter panel shares the slot too.
-        self._plugin_filter_panel = self._build_plugin_filter_panel()
-        self._plugin_filter_panel.setVisible(False)
-        h.addWidget(self._plugin_filter_panel)
+        phase_started = _startup_time.perf_counter()
+        # Every filter panel occupies this same window-left slot and starts
+        # hidden. Building all seven here creates dozens of checkboxes and
+        # scroll-area children that Qt then polishes/layouts even when the user
+        # never opens Filters. Keep their state independently and construct the
+        # requested panel on first use (footer button, header menu, or quick
+        # filter). _ensure_filter_panel inserts it immediately before *col*.
+        self._filter_panel_layout = h
+        self._filter_panel_builders = {
+            "_modlist_filter_panel": "_build_modlist_filter_panel",
+            "_mod_files_filter_panel": "_build_mod_files_filter_panel",
+            "_data_filter_panel": "_build_data_filter_panel",
+            "_downloads_filter_panel": "_build_downloads_filter_panel",
+            "_text_files_filter_panel": "_build_text_files_filter_panel",
+            "_saves_filter_panel": "_build_saves_filter_panel",
+            "_plugin_filter_panel": "_build_plugin_filter_panel",
+        }
+        for _attr in self._filter_panel_builders:
+            setattr(self, _attr, None)
+        self._modlist_filter_state: dict = {}
+        self._modlist_filter_data = None
+        self._plugin_filter_state: dict = {}
+        if startup_timing is not None:
+            startup_timing.record(
+                "Prepare lazy filter panels",
+                phase_started=phase_started, category="UI")
         h.addWidget(col, 1)
+        phase_started = _startup_time.perf_counter()
         self._install_tab_filter_menus()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Install tab-header filter menus",
+                phase_started=phase_started, category="UI")
         return area
+
+    def _ensure_filter_panel(self, attr: str):
+        """Build one shared-slot filter panel on first use and return it."""
+        panel = getattr(self, attr, None)
+        if panel is not None:
+            return panel
+        builder_name = getattr(self, "_filter_panel_builders", {}).get(attr)
+        layout = getattr(self, "_filter_panel_layout", None)
+        if not builder_name or layout is None:
+            return None
+        panel = getattr(self, builder_name)()
+        setattr(self, attr, panel)
+        panel.setVisible(False)
+        # The main modlist column is always the final item in this layout.
+        layout.insertWidget(max(0, layout.count() - 1), panel)
+
+        # Quick-filter menus can establish state before the full side panel is
+        # opened. Mirror those fixed checkbox values into the new widget
+        # without emitting a cascade for every checkbox.
+        state = (self._modlist_filter_state if attr == "_modlist_filter_panel"
+                 else self._plugin_filter_state
+                 if attr == "_plugin_filter_panel" else {})
+        for key, value in (state or {}).items():
+            if isinstance(value, int):
+                panel.set_check(key, value, emit=False)
+        if attr == "_modlist_filter_panel":
+            self._refresh_filter_game_specific()
+        return panel
+
+    def _hide_other_filter_panels(self, keep=None) -> None:
+        """Hide any already-created panel other than *keep*."""
+        for attr in getattr(self, "_filter_panel_builders", {}):
+            panel = getattr(self, attr, None)
+            if panel is not None and panel is not keep:
+                panel.setVisible(False)
 
     # -- header filter menus (the tabs' eye button) -------------------------
     def _install_tab_filter_menus(self):
@@ -13813,37 +14754,38 @@ class MainWindow(QMainWindow):
         mf, tf, sv, dv, dl = (self._mod_files_view, self._text_files_view,
                               self._saves_view, self._data_view,
                               self._downloads_view)
-        for view, panel, spec, dyn, sync in (
-            (mf, self._mod_files_filter_panel, ModFilesView.filter_spec(),
+        for view, panel_attr, spec, dyn, sync in (
+            (mf, "_mod_files_filter_panel", ModFilesView.filter_spec(),
              {"filetypes": mf.filetype_items},
              self._sync_mod_files_filter_list),
-            (tf, self._text_files_filter_panel, tf.filter_spec(),
+            (tf, "_text_files_filter_panel", tf.filter_spec(),
              {"filetypes": tf.filetype_items},
              self._sync_text_files_filter_list),
-            (sv, self._saves_filter_panel, SavesView.filter_spec(),
+            (sv, "_saves_filter_panel", SavesView.filter_spec(),
              {"filetypes": sv.filetype_items},
              self._sync_saves_filter_list),
-            (dv, self._data_filter_panel, DataView.filter_spec(),
+            (dv, "_data_filter_panel", DataView.filter_spec(),
              {"filetypes": dv.filetype_items},
              self._sync_data_filter_list),
-            (dl, self._downloads_filter_panel, dl.filter_spec(),
+            (dl, "_downloads_filter_panel", dl.filter_spec(),
              {"filetypes": dl.filetype_items, "locations": dl.location_items},
              self._sync_downloads_filter_list),
         ):
-            self._install_filter_menu_button(view._tree, panel, spec, dyn, sync)
+            self._install_filter_menu_button(
+                view._tree, panel_attr, spec, dyn, sync)
 
-    def _install_filter_menu_button(self, tree, panel, spec, dyn_fns, sync):
+    def _install_filter_menu_button(self, tree, panel_attr, spec, dyn_fns, sync):
         from gui_qt.filter_menu_button import FilterMenuButton, BTN_W
         # Paint the first column's label clear of the button; the button's
         # opaque background covers the strip that leaves bare.
         tree.header_left_pad = BTN_W
         btn = FilterMenuButton(tree)
         btn.sections_fn = lambda: self._filter_menu_sections(
-            panel, spec, dyn_fns, sync)
+            self._ensure_filter_panel(panel_attr), spec, dyn_fns, sync)
         btn.on_toggle = lambda key, on: self._on_filter_menu_toggle(
-            panel, key, on)
-        btn.on_clear = panel.clear_all
-        btn.any_active = panel.any_active
+            self._ensure_filter_panel(panel_attr), key, on)
+        btn.on_clear = lambda: self._ensure_filter_panel(panel_attr).clear_all()
+        btn.any_active = lambda: self._panel_filters_active(panel_attr)
         return btn
 
     def _filter_menu_sections(self, panel, spec, dyn_fns, sync):
@@ -13920,15 +14862,12 @@ class MainWindow(QMainWindow):
         return panel
 
     def _toggle_text_files_filters(self):
-        panel = self._text_files_filter_panel
+        panel = self._ensure_filter_panel("_text_files_filter_panel")
+        if panel is None:
+            return
         show = not panel.isVisible()
         if show:
-            self._modlist_filter_panel.setVisible(False)
-            self._mod_files_filter_panel.setVisible(False)
-            self._data_filter_panel.setVisible(False)
-            self._downloads_filter_panel.setVisible(False)
-            self._saves_filter_panel.setVisible(False)
-            self._plugin_filter_panel.setVisible(False)
+            self._hide_other_filter_panels(panel)
             panel.setVisible(True)
             self._sync_text_files_filter_list()
         else:
@@ -13946,19 +14885,15 @@ class MainWindow(QMainWindow):
         panel = FilterSidePanel(spec, title=self.tr("Filters"))
         panel.changed.connect(self._on_plugin_filter_changed)
         panel.close_requested.connect(self._toggle_plugin_filters)
-        self._plugin_filter_state: dict = {}
         return panel
 
     def _toggle_plugin_filters(self):
-        panel = self._plugin_filter_panel
+        panel = self._ensure_filter_panel("_plugin_filter_panel")
+        if panel is None:
+            return
         show = not panel.isVisible()
         if show:
-            self._modlist_filter_panel.setVisible(False)
-            self._mod_files_filter_panel.setVisible(False)
-            self._data_filter_panel.setVisible(False)
-            self._downloads_filter_panel.setVisible(False)
-            self._text_files_filter_panel.setVisible(False)
-            self._saves_filter_panel.setVisible(False)
+            self._hide_other_filter_panels(panel)
             panel.setVisible(True)
             self._apply_plugin_filters()
         else:
@@ -13981,7 +14916,7 @@ class MainWindow(QMainWindow):
         """Apply a plugin status filter chosen from the column menu by driving
         the Filters panel checkbox, so the panel and menu stay in sync and the
         normal filter pipeline (footer-button tint included) runs."""
-        panel = getattr(self, "_plugin_filter_panel", None)
+        panel = self._ensure_filter_panel("_plugin_filter_panel")
         if panel is not None:
             panel.set_check(key, state)   # emits changed -> _on_plugin_filter_changed
         else:   # panel not built yet - fall back to the state dict directly
@@ -14021,9 +14956,10 @@ class MainWindow(QMainWindow):
     def _sync_text_files_filter_list(self, *, force: bool = False):
         # force: the header filter menu needs the list even while the panel is
         # closed (it reads/drives the panel's checkboxes).
-        if not force and not self._text_files_filter_panel.isVisible():
+        panel = getattr(self, "_text_files_filter_panel", None)
+        if panel is None or (not force and not panel.isVisible()):
             return
-        self._text_files_filter_panel.set_dynamic_items(
+        panel.set_dynamic_items(
             "filetypes", self._text_files_view.filetype_items())
 
     def _build_saves_filter_panel(self):
@@ -14036,15 +14972,12 @@ class MainWindow(QMainWindow):
         return panel
 
     def _toggle_saves_filters(self):
-        panel = self._saves_filter_panel
+        panel = self._ensure_filter_panel("_saves_filter_panel")
+        if panel is None:
+            return
         show = not panel.isVisible()
         if show:
-            self._modlist_filter_panel.setVisible(False)
-            self._mod_files_filter_panel.setVisible(False)
-            self._data_filter_panel.setVisible(False)
-            self._downloads_filter_panel.setVisible(False)
-            self._text_files_filter_panel.setVisible(False)
-            self._plugin_filter_panel.setVisible(False)
+            self._hide_other_filter_panels(panel)
             panel.setVisible(True)
             self._sync_saves_filter_list()
         else:
@@ -14055,9 +14988,10 @@ class MainWindow(QMainWindow):
         self._sync_filters_btn("_saves_filters_btn")
 
     def _sync_saves_filter_list(self, *, force: bool = False):
-        if not force and not self._saves_filter_panel.isVisible():
+        panel = getattr(self, "_saves_filter_panel", None)
+        if panel is None or (not force and not panel.isVisible()):
             return
-        self._saves_filter_panel.set_dynamic_items(
+        panel.set_dynamic_items(
             "filetypes", self._saves_view.filetype_items())
 
     def _build_downloads_filter_panel(self):
@@ -14070,15 +15004,12 @@ class MainWindow(QMainWindow):
         return panel
 
     def _toggle_downloads_filters(self):
-        panel = self._downloads_filter_panel
+        panel = self._ensure_filter_panel("_downloads_filter_panel")
+        if panel is None:
+            return
         show = not panel.isVisible()
         if show:
-            self._modlist_filter_panel.setVisible(False)
-            self._mod_files_filter_panel.setVisible(False)
-            self._data_filter_panel.setVisible(False)
-            self._text_files_filter_panel.setVisible(False)
-            self._saves_filter_panel.setVisible(False)
-            self._plugin_filter_panel.setVisible(False)
+            self._hide_other_filter_panels(panel)
             panel.setVisible(True)
             self._sync_downloads_filter_list()
         else:
@@ -14089,11 +15020,12 @@ class MainWindow(QMainWindow):
         self._sync_filters_btn("_dl_filters_btn")
 
     def _sync_downloads_filter_list(self, *, force: bool = False):
-        if not force and not self._downloads_filter_panel.isVisible():
+        panel = getattr(self, "_downloads_filter_panel", None)
+        if panel is None or (not force and not panel.isVisible()):
             return
-        self._downloads_filter_panel.set_dynamic_items(
+        panel.set_dynamic_items(
             "filetypes", self._downloads_view.filetype_items())
-        self._downloads_filter_panel.set_dynamic_items(
+        panel.set_dynamic_items(
             "locations", self._downloads_view.location_items())
 
     def _build_data_filter_panel(self):
@@ -14108,15 +15040,12 @@ class MainWindow(QMainWindow):
     def _toggle_data_filters(self):
         """Open/close the Data filter panel in the window-left slot (does NOT hide
         the plugins column - the Data tree lives there)."""
-        panel = self._data_filter_panel
+        panel = self._ensure_filter_panel("_data_filter_panel")
+        if panel is None:
+            return
         show = not panel.isVisible()
         if show:
-            self._modlist_filter_panel.setVisible(False)
-            self._mod_files_filter_panel.setVisible(False)
-            self._downloads_filter_panel.setVisible(False)
-            self._text_files_filter_panel.setVisible(False)
-            self._saves_filter_panel.setVisible(False)
-            self._plugin_filter_panel.setVisible(False)
+            self._hide_other_filter_panels(panel)
             panel.setVisible(True)
             self._sync_data_filter_list()
         else:
@@ -14127,9 +15056,10 @@ class MainWindow(QMainWindow):
         self._sync_filters_btn("_data_filters_btn")
 
     def _sync_data_filter_list(self, *, force: bool = False):
-        if not force and not self._data_filter_panel.isVisible():
+        panel = getattr(self, "_data_filter_panel", None)
+        if panel is None or (not force and not panel.isVisible()):
             return
-        self._data_filter_panel.set_dynamic_items(
+        panel.set_dynamic_items(
             "filetypes", self._data_view.filetype_items())
 
     def _build_mod_files_filter_panel(self):
@@ -14141,23 +15071,18 @@ class MainWindow(QMainWindow):
         # Keep the panel's file-type list + Pack/Unpack enablement in sync.
         self._mod_files_view.filetypes_changed.connect(
             self._sync_mod_files_filter_list)
-        self._mod_files_view.mod_changed.connect(
-            lambda _n: self._update_mf_footer_buttons())
         return panel
 
     def _toggle_mod_files_filters(self):
         """Open/close the Mod Files filter panel in the window-left slot. Unlike
         the modlist filter, this does NOT hide the plugins column - the Mod Files
         tree lives there, so hiding it would hide what you're filtering."""
-        panel = self._mod_files_filter_panel
+        panel = self._ensure_filter_panel("_mod_files_filter_panel")
+        if panel is None:
+            return
         show = not panel.isVisible()
         if show:
-            self._modlist_filter_panel.setVisible(False)  # share the slot
-            self._data_filter_panel.setVisible(False)
-            self._downloads_filter_panel.setVisible(False)
-            self._text_files_filter_panel.setVisible(False)
-            self._saves_filter_panel.setVisible(False)
-            self._plugin_filter_panel.setVisible(False)
+            self._hide_other_filter_panels(panel)
             panel.setVisible(True)
             self._sync_mod_files_filter_list()
         else:
@@ -14168,9 +15093,10 @@ class MainWindow(QMainWindow):
         self._sync_filters_btn("_mf_filters_btn")
 
     def _sync_mod_files_filter_list(self, *, force: bool = False):
-        if not force and not self._mod_files_filter_panel.isVisible():
+        panel = getattr(self, "_mod_files_filter_panel", None)
+        if panel is None or (not force and not panel.isVisible()):
             return
-        self._mod_files_filter_panel.set_dynamic_items(
+        panel.set_dynamic_items(
             "filetypes", self._mod_files_view.filetype_items())
 
     def _update_mf_footer_buttons(self):
@@ -14297,7 +15223,6 @@ class MainWindow(QMainWindow):
 
         mv = self._mod_files_view
         profile_dir = getattr(mv, "profile_dir", None)
-        index_path = getattr(mv, "index_path", None)
         mod_name = plan.mod_name
         delete_loose = bool(opts.get("delete_loose"))
         split_textures = bool(opts.get("split_textures"))
@@ -14305,15 +15230,14 @@ class MainWindow(QMainWindow):
 
         excluded = ops.read_excluded_for_mod(profile_dir, mod_name)
         if skip_winners:
-            # compute_skip_winners answers in index-key space; the archive
-            # writers walk the mod folder, so translate back to raw paths or
+            # Filegraph answers in deploy-relative space; the archive writers
+            # walk the mod folder, so translate back to raw paths or
             # the winners silently pack on any mod with a Top Level strip.
             import Utils.mod_files as _mf
             from Utils.profile_state import read_mod_strip_prefixes
             game = getattr(mv, "game", None)
             winners = ops.compute_skip_winners(
-                index_path, profile_dir, mod_name,
-                root_ctx=_mf.conflict_root_context(game, profile_dir))
+                getattr(mv, "_snapshot", None), mod_name)
             excluded |= _mf.index_keys_to_raw(
                 self._bsa_mod_dir(), mod_name, winners,
                 getattr(game, "mod_folder_strip_prefixes", None),
@@ -14469,15 +15393,13 @@ class MainWindow(QMainWindow):
                 self.tr("Unpacked {0} file(s) from "
                 "{1} archive(s)").format(info['count'], len(info['archives'])), "success")
 
-        # Rebuild conflicts/index (Qt equivalent of the Tk filemap rebuild) and
-        # refresh the Mod Files tree so the new state shows.
-        self._rebuild_conflicts_async(rescan_index=True)
-        try:
-            if mod_name is not None:
-                mv.show_mod(mod_name)
-        except Exception:
-            pass
-        self._update_mf_footer_buttons()
+        # Packing/unpacking changes both the raw inventory and the profile's
+        # per-file exclusions.  Run the same complete reload path as the old
+        # post-filemap refresh so the mod-list flags and the open Mod Files tab
+        # are rebuilt from the new inventory.  The reload preserves the shown
+        # mod and uses its live-directory fallback until Filegraph publishes
+        # the refreshed snapshot.
+        self._reload_modlist(rescan_index=True, preserve_overlays=True)
 
     def _build_modlist_filter_panel(self):
         from gui_qt.filter_panel import FilterSidePanel
@@ -14503,8 +15425,6 @@ class MainWindow(QMainWindow):
         # `changed` that follows re-filters anyway.
         panel.cleared.connect(lambda: self._clear_conflict_filter(reapply=False))
         panel.close_requested.connect(self._toggle_modlist_filters)
-        self._modlist_filter_state: dict = {}
-        self._modlist_filter_data = None
         return panel
 
     def _toggle_modlist_filters(self):
@@ -14513,28 +15433,13 @@ class MainWindow(QMainWindow):
         Mirrors Tk: opening the modlist filter auto-hides the plugins panel so
         the filter takes its space; closing restores the plugins panel only if
         it was visible when we opened."""
-        panel = getattr(self, "_modlist_filter_panel", None)
+        panel = self._ensure_filter_panel("_modlist_filter_panel")
         if panel is None:
             return
         show = not panel.isVisible()
         right = getattr(self, "_right_col", None)
         if show:
-            # The Mod Files / Data filters share this slot - close them first.
-            mfp = getattr(self, "_mod_files_filter_panel", None)
-            if mfp is not None and mfp.isVisible():
-                self._toggle_mod_files_filters()
-            dfp = getattr(self, "_data_filter_panel", None)
-            if dfp is not None and dfp.isVisible():
-                self._toggle_data_filters()
-            dlfp = getattr(self, "_downloads_filter_panel", None)
-            if dlfp is not None and dlfp.isVisible():
-                self._toggle_downloads_filters()
-            tffp = getattr(self, "_text_files_filter_panel", None)
-            if tffp is not None and tffp.isVisible():
-                self._toggle_text_files_filters()
-            svfp = getattr(self, "_saves_filter_panel", None)
-            if svfp is not None and svfp.isVisible():
-                self._toggle_saves_filters()
+            self._hide_other_filter_panels(panel)
             self._filter_plugins_was_visible = bool(
                 right is not None and right.isVisible())
             panel.setVisible(True)
@@ -14615,6 +15520,13 @@ class MainWindow(QMainWindow):
         """Modlist search: hide rows whose mod name (or owning separator block)
         doesn't contain the query. Debounced to coalesce fast typing."""
         self._modlist_search_text = text
+        if ("!" in (text or "")
+                and getattr(self, "_modlist_filter_data", None) is None):
+            # Token searches share the panel's FilterData. Constructing the
+            # still-hidden panel here preserves that behavior without charging
+            # ordinary launches for it.
+            self._ensure_filter_panel("_modlist_filter_panel")
+            self._rebuild_filter_data()
         t = getattr(self, "_modlist_search_timer", None)
         if t is None:
             t = QTimer(self)
@@ -14705,7 +15617,7 @@ class MainWindow(QMainWindow):
         """Apply a quick filter chosen from the column menu by driving the
         Filters panel checkbox, so the panel and menu stay in sync and the
         normal filter pipeline (footer-button tint included) runs."""
-        panel = getattr(self, "_modlist_filter_panel", None)
+        panel = self._ensure_filter_panel("_modlist_filter_panel")
         if panel is not None:
             panel.set_check(key, state)   # emits changed -> _on_modlist_filter_changed
         else:   # panel not built yet - fall back to the state dict directly
@@ -14740,7 +15652,7 @@ class MainWindow(QMainWindow):
         self._sync_filters_btn("_modlist_filters_btn")
 
     def _sync_filters_btn(self, btn_attr: str):
-        """Light a Filters footer button purple while that panel is filtered.
+        """Accent a Filters footer button while that panel is filtered.
 
         "Filtered" covers both routes to a narrowed list: a checkbox set in the
         Filters side panel, and a non-empty search box - the button is the only
@@ -14766,35 +15678,27 @@ class MainWindow(QMainWindow):
         btn.style().polish(btn)
 
     def _rebuild_filter_data(self):
-        """(Re)build FilterData: the disk-derived parts (modindex read + BSA /
-        plugin folder walks) run on a worker; _on_filter_data_ready assembles
-        the FilterData and updates the panel on the UI thread. Runs after every
-        conflict rebuild, so the scans must not block the UI."""
-        panel = getattr(self, "_modlist_filter_panel", None)
-        if panel is None:
-            return
+        """Build filter facets from the accepted immutable graph generation."""
         import threading
-        staging = self._gs.staging_dir()
-        staging_parent = staging.parent if staging is not None else None
-        plugin_exts = getattr(self._gs.game, "plugin_extensions", None)
+        conflict_data = getattr(self, "_conflict_data", None)
+        snapshot = getattr(conflict_data, "snapshot", None)
         self._filter_data_gen += 1
         gen = self._filter_data_gen
 
         def worker():
             payload = None
-            if staging_parent is not None:
-                from gui_qt.modlist_filter import (
-                    build_index_data, build_mods_with_bsa, build_mods_with_plugins,
-                )
+            if snapshot is not None:
                 try:
-                    counts, mod_ft, pbr = build_index_data(staging_parent)
+                    facets = snapshot.inventory_facets()
                     payload = {
-                        "filetype_counts": counts,
-                        "mod_filetypes": mod_ft,
-                        "mods_with_pbr": pbr,
-                        "mods_with_bsa": build_mods_with_bsa(staging_parent),
-                        "mods_with_plugins": build_mods_with_plugins(
-                            staging_parent, plugin_exts),
+                        "filetype_counts": facets["filetype_counts"],
+                        "mod_filetypes": {
+                            name: set(values)
+                            for name, values in facets["mod_filetypes"].items()
+                        },
+                        "mods_with_pbr": set(facets["mods_with_pbr"]),
+                        "mods_with_bsa": set(facets["mods_with_archives"]),
+                        "mods_with_plugins": set(facets["mods_with_plugins"]),
                     }
                 except Exception as exc:
                     print(f"[gui_qt] filter data scan failed: {exc}", flush=True)
@@ -14803,14 +15707,32 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True,
                          name="filter-data").start()
 
+    def _refresh_filter_conflicts(self):
+        """Refresh the toggle-sensitive part of the current FilterData.
+
+        A mod toggle changes enabled state and conflict codes, but leaves the
+        mod index, archive/plugin membership, metadata, notes and Mod Files
+        settings untouched. Reusing those products avoids another staging scan
+        and another dynamic-filter-panel rebuild after every checkbox click.
+        """
+        data = getattr(self, "_modlist_filter_data", None)
+        if data is None:
+            self._rebuild_filter_data()
+            return
+        cd = getattr(self, "_conflict_data", None)
+        if cd is not None:
+            data.conflict_codes = self._loose_backend_codes(cd)
+            data.bsa_conflict_codes = self._bsa_backend_codes(cd)
+        self._apply_modlist_filters()
+        if self._modlist_token_search_active():
+            self._apply_modlist_search()
+
     def _on_filter_data_ready(self, gen: int, payload):
         """UI thread: merge the worker's disk-derived sets with the in-memory
         meta/conflict state into FilterData, repopulate the panel, reapply."""
         if gen != self._filter_data_gen:
             return   # superseded by a newer rebuild
         panel = getattr(self, "_modlist_filter_panel", None)
-        if panel is None:
-            return
         from gui_qt.modlist_filter import FilterData
         cd = getattr(self, "_conflict_data", None)
 
@@ -14839,23 +15761,29 @@ class MainWindow(QMainWindow):
             data.mods_with_plugins = payload["mods_with_plugins"]
         self._modlist_filter_data = data
 
-        # Repopulate dynamic lists.
-        cats = sorted({(c or "") for c in data.category_names.values()} | {""},
-                      key=lambda c: ("(Uncategorized)" if c == "" else c).lower())
-        panel.set_dynamic_items("categories", [
-            (c, "(Uncategorized)" if c == "" else c, None) for c in cats])
-        # Authors (Nexus uploader). Only offer names we actually know - an
-        # "(Unknown)" bucket for un-stamped mods would just match everything not
-        # yet looked up, which isn't a useful filter.
-        auths = sorted({a for a in data.author_names.values() if a},
-                       key=str.lower)
-        panel.set_dynamic_items("authors", [(a, a, None) for a in auths])
-        fts = sorted(data.filetype_counts.items(), key=lambda kv: kv[0])
-        panel.set_dynamic_items("filetypes", [
-            (ext, ext, count) for ext, count in fts])
+        if panel is not None:
+            # Repopulate dynamic lists only after the lazily-created panel
+            # exists. FilterData itself is still built unconditionally because
+            # token searches and visible mod flags consume it too.
+            cats = sorted(
+                {(c or "") for c in data.category_names.values()} | {""},
+                key=lambda c: (
+                    "(Uncategorized)" if c == "" else c).lower())
+            panel.set_dynamic_items("categories", [
+                (c, "(Uncategorized)" if c == "" else c, None) for c in cats])
+            # Authors (Nexus uploader). Only offer names we actually know - an
+            # "(Unknown)" bucket for un-stamped mods would just match everything
+            # not yet looked up, which isn't a useful filter.
+            auths = sorted({a for a in data.author_names.values() if a},
+                           key=str.lower)
+            panel.set_dynamic_items("authors", [(a, a, None) for a in auths])
+            fts = sorted(data.filetype_counts.items(), key=lambda kv: kv[0])
+            panel.set_dynamic_items("filetypes", [
+                (ext, ext, count) for ext, count in fts])
+            self._refresh_filter_game_specific()
 
-        # Relabel / re-enable game-specific filters, then reapply.
-        self._refresh_filter_game_specific()
+        # Reapply state/token filters even when their full panel has never been
+        # opened; quick menus and search tokens can operate independently.
         self._apply_modlist_filters()
         # Token searches (e.g. "!update") depend on the FilterData we just
         # (re)built - re-run so results reflect fresh conflict/update data.
@@ -15069,6 +15997,10 @@ class MainWindow(QMainWindow):
             panel.set_check_label("filter_has_bsa", self.tr("Mods with PAK archives"))
         else:
             panel.set_check_label("filter_has_bsa", self.tr("Mods with BSA archives"))
+        # A game with no archive format can never match: leaving the box enabled
+        # just blanks the list (include-filter, empty set) with no way to tell
+        # that from a broken scan.
+        panel.set_check_enabled("filter_has_bsa", bool(archive_exts))
         # PGPatcher (PBR) is Skyrim SE only.
         is_sse = bool(g and getattr(g, "nexus_game_domain", "")
                       == "skyrimspecialedition")
@@ -15077,7 +16009,7 @@ class MainWindow(QMainWindow):
     def _loose_backend_codes(self, cd) -> dict:
         """Map the display loose_codes back to backend CONFLICT_* codes the
         engine filters on (DISP 1/-1/2/3 → WINS/LOSES/PARTIAL/FULL)."""
-        from Utils.filemap import (
+        from Utils.filegraph_constants import (
             CONFLICT_WINS, CONFLICT_LOSES, CONFLICT_PARTIAL, CONFLICT_FULL)
         m = {1: CONFLICT_WINS, -1: CONFLICT_LOSES,
              2: CONFLICT_PARTIAL, 3: CONFLICT_FULL}
@@ -15086,7 +16018,7 @@ class MainWindow(QMainWindow):
     def _bsa_backend_codes(self, cd) -> dict:
         """BSA codes from ConflictData are 1/-1/2/3 (win/lose/mixed/full).
         Map to backend codes for the engine (mixed→PARTIAL)."""
-        from Utils.filemap import (
+        from Utils.filegraph_constants import (
             CONFLICT_WINS, CONFLICT_LOSES, CONFLICT_PARTIAL, CONFLICT_FULL)
         m = {1: CONFLICT_WINS, -1: CONFLICT_LOSES, 2: CONFLICT_PARTIAL,
              3: CONFLICT_FULL}
@@ -15109,7 +16041,8 @@ class MainWindow(QMainWindow):
         self._gs.reassert_active_profile()
 
     def _reload_modlist(self, rescan_index: bool = False,
-                        preserve_overlays: bool = False):
+                        preserve_overlays: bool = False,
+                        startup_timing=None):
         """Load the active game/profile's modlist + metadata into the model.
         rescan_index=True forces the conflict rebuild to rescan the index from
         disk (Refresh button).
@@ -15123,7 +16056,17 @@ class MainWindow(QMainWindow):
         from gui_qt.modlist_data import read_meta_for_entries
         from Utils.perftrace import span
 
+        startup_sync_started = (_startup_time.perf_counter()
+                                if startup_timing is not None else None)
         self._reassert_profile_paths()
+
+        # set_entries/configure below reset at least one conflict consumer even
+        # on a same-profile reload (notably the Data tab's generation cache).
+        # The next accepted result must therefore publish a complete projection.
+        # Ordinary enable/disable/move edits do not come through this method, so
+        # their hot incremental path remains available.
+        self._conflict_ui_profile_id = None
+        self._conflict_ui_generation = 0
 
         ml_path = self._gs.modlist_path()
         staging = self._gs.staging_dir()
@@ -15212,6 +16155,8 @@ class MainWindow(QMainWindow):
         self._modlist_view.on_reinstall = self._reinstall_mods
         # Show Conflicts: right-click item.
         self._modlist_view.on_show_conflicts = self._open_show_conflicts_tab
+        # View FOMOD Choices: right-click item on a mod with saved selections.
+        self._modlist_view.on_show_fomod_choices = self._open_fomod_choices_tab
         # Filter Conflicts: narrow the list to one mod's conflict set (and the
         # anchor getter the menu reads to label the entry as a toggle).
         self._modlist_view.on_filter_conflicts = self._filter_conflicts
@@ -15258,27 +16203,24 @@ class MainWindow(QMainWindow):
             self._apply_modlist_sizes()
         with span("reload_modlist.load_separator_state"):
             self._modlist_view.load_separator_state()
-        # Point the Mod Files tab at this game/profile (index next to filemap).
+        # Point the Mod Files tab at this game/profile.
         if hasattr(self, "_mod_files_view"):
-            idx = (staging.parent / "modindex.bin") if staging is not None else None
             self._mod_files_view.configure(
-                self._gs.game, self._gs.profile_dir(), idx)
+                self._gs.game, self._gs.profile_dir())
             # Re-show the previously selected mod on a same-context refresh (it
             # updates against the freshly-scanned files); blank otherwise. The
             # Overwrite / Root Folder boundary rows are synthetic (not in the raw
             # modlist) but always present, so they survive too.
-            from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
+            from Utils.filegraph_constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
             still_present = keep_mod_files is not None and (
                 keep_mod_files in (OVERWRITE_NAME, ROOT_FOLDER_NAME)
                 or any(e.name == keep_mod_files for e in entries))
             self._mod_files_view.show_mod(
                 keep_mod_files if still_present else None)
-        # Point the Data tab at this game/profile (filemap.txt + modindex.bin).
+        # Point the Data tab at this game/profile.
         if hasattr(self, "_data_view"):
-            fm = (staging.parent / "filemap.txt") if staging is not None else None
-            idx2 = (staging.parent / "modindex.bin") if staging is not None else None
             self._data_view.configure(
-                self._gs.game, self._gs.profile_dir(), fm, idx2)
+                self._gs.game, self._gs.profile_dir())
         # Point the Downloads tab at this game (game-name getter for cache dir).
         if hasattr(self, "_downloads_view"):
             self._downloads_view.configure(
@@ -15289,9 +16231,8 @@ class MainWindow(QMainWindow):
                 self._gs.profile_dir(), staging, ml_path)
         # Point the Text Files tab at this game/profile.
         if hasattr(self, "_text_files_view"):
-            fm3 = (staging.parent / "filemap.txt") if staging is not None else None
             self._text_files_view.configure(
-                self._gs.game, self._gs.profile_dir(), fm3, staging)
+                self._gs.game, self._gs.profile_dir())
         # Point the Saves tab at this game/profile (saves can be per-profile).
         if hasattr(self, "_saves_view"):
             self._saves_view.configure(self._gs.game, self._gs.profile or "")
@@ -15334,6 +16275,11 @@ class MainWindow(QMainWindow):
             tv._game = self._gs.game
             tv.refresh_installed()
 
+        if startup_timing is not None:
+            startup_timing.record(
+                f"Load and bind mod list ({len(entries)} entries)",
+                phase_started=startup_sync_started, category="mod data")
+
         # Meta read + conflict rebuild, SEQUENCED. Both cold-read the same
         # per-mod meta.ini files (the meta columns here, the filemap's
         # root-flag collect inside the conflict build); run concurrently they
@@ -15348,8 +16294,16 @@ class MainWindow(QMainWindow):
             pdir_meta = self._gs.profile_dir()
             is_bg3 = (getattr(self._gs.game, "game_id", "") == "baldurs_gate_3")
             meta_entries = list(entries)
+            startup_meta = startup_timing
+            if startup_meta is not None:
+                startup_meta_timings = getattr(
+                    self, "_startup_meta_timings", None)
+                if startup_meta_timings is None:
+                    startup_meta_timings = self._startup_meta_timings = {}
+                startup_meta_timings[meta_gen] = startup_meta
 
             def meta_worker():
+                worker_started = _startup_time.perf_counter()
                 try:
                     with span("modlist.meta_worker(read_meta)"):
                         payload = read_meta_for_entries(
@@ -15358,43 +16312,75 @@ class MainWindow(QMainWindow):
                 except Exception as exc:
                     print(f"[gui_qt] meta read failed: {exc}", flush=True)
                     payload = None   # still emit - the conflict rebuild chains
+                if startup_meta is not None:
+                    startup_meta.record(
+                        f"Read per-mod metadata ({len(meta_entries)} entries)",
+                        phase_started=worker_started, lane="metadata worker",
+                        category="mod data")
+                    # Preserve when the worker result became ready separately
+                    # from when Qt eventually dispatches its queued signal.
+                    # On a busy first event-loop turn that queue wait can be
+                    # substantially larger than the actual model update.
+                    startup_meta_timings[meta_gen] = (
+                        startup_meta, _startup_time.perf_counter())
                 self._modlist_meta_ready.emit(meta_gen, payload)
 
-            self._conflicts_after_meta = (meta_gen, rescan_index)
+            self._conflicts_after_meta = (
+                meta_gen, rescan_index, startup_timing)
+            if startup_timing is not None:
+                self._startup_wait_for_conflicts = True
             threading.Thread(target=meta_worker, daemon=True,
                              name="modlist-meta").start()
             meta_started = True
 
         if entries and not meta_started:
             # No meta worker (staging unresolved) → kick the rebuild directly.
-            self._rebuild_conflicts_async(rescan_index=rescan_index)
-        elif not entries and rescan_index:
-            # Empty modlist but an explicit rescan was requested (Refresh /
-            # install / toggle). The conflict rebuild is normally skipped when
-            # there are no mods (nothing to conflict), but the [Overwrite]
-            # pseudo-mod is INDEPENDENT of the real modlist: files can sit in
-            # overwrite/ (and in modindex.bin's [Overwrite] entry) with zero
-            # enabled mods. Skipping the rebuild here left a stale [Overwrite]
-            # index entry + stale filemap.txt that no Refresh could clear once
-            # the modlist was empty - the file kept showing in the Data tab and
-            # kept deploying (as a dangling symlink). Run the rebuild so the
-            # index and filemap are reconciled against the folder; it also
-            # writes an empty filemap when the last mod is removed.
-            # _on_conflicts_ready sets _switch_conflicts_done when the build
-            # lands, so the switch-marker bookkeeping below is still covered.
-            self._rebuild_conflicts_async(rescan_index=rescan_index)
-        elif not entries and getattr(self, "_switch_t0", None) is not None:
-            # Empty profile, no rescan (plain profile switch) → no conflict
-            # rebuild will follow, so the first plugin pass IS the final one;
-            # without this the switch marks would leak into the next unrelated
-            # plugin reload.
-            self._switch_conflicts_done = True
+            if startup_timing is not None:
+                self._startup_wait_for_conflicts = True
+            self._rebuild_conflicts_async(
+                rescan_index=rescan_index,
+                startup_timing=startup_timing)
+        elif not entries:
+            try:
+                has_frameworks = bool(self._gs.game.frameworks)
+            except Exception:
+                has_frameworks = False
+            if rescan_index or has_frameworks:
+                if startup_timing is not None:
+                    self._startup_wait_for_conflicts = True
+                self._rebuild_conflicts_async(
+                    rescan_index=rescan_index,
+                    startup_timing=startup_timing)
+            elif getattr(self, "_switch_t0", None) is not None:
+                # Empty framework-less profile, no rescan → no conflict
+                # rebuild will follow, so the first plugin pass IS the final
+                # one; without this the switch marks would leak into the next
+                # unrelated plugin reload.
+                self._switch_conflicts_done = True
 
     def _on_modlist_meta_ready(self, gen, payload):
         """UI thread: apply the worker-read per-mod meta (see _reload_modlist).
         *payload* is None when the read failed - the apply is skipped but the
         chained conflict rebuild below still runs (it must not be lost)."""
+        startup_info = getattr(
+            self, "_startup_meta_timings", {}).pop(gen, None)
+        if isinstance(startup_info, tuple):
+            startup_timing, result_ready_at = startup_info
+        else:
+            startup_timing, result_ready_at = startup_info, None
+        callback_started = (_startup_time.perf_counter()
+                            if startup_timing is not None else None)
+        if startup_timing is not None and result_ready_at is not None:
+            startup_timing.record(
+                "Wait to apply mod metadata on the UI thread",
+                phase_started=result_ready_at,
+                phase_finished=callback_started,
+                category="UI wait")
         if gen != self._modlist_meta_gen:
+            if startup_timing is not None:
+                startup_timing.record(
+                    "Discard superseded mod metadata result",
+                    phase_started=callback_started, category="mod data")
             return   # superseded - the game/profile switched mid-read
         self._mark_since_switch("switch→modlist_meta_applied")  # i18n: skip - perftrace marker label
         from Utils.perftrace import span
@@ -15404,8 +16390,14 @@ class MainWindow(QMainWindow):
         pend = getattr(self, "_conflicts_after_meta", None)
         if pend is not None and pend[0] == gen:
             self._conflicts_after_meta = None
-            self._rebuild_conflicts_async(rescan_index=pend[1])
+            self._rebuild_conflicts_async(
+                rescan_index=pend[1],
+                startup_timing=pend[2] if len(pend) > 2 else None)
         if payload is None:
+            if startup_timing is not None:
+                startup_timing.record(
+                    "Handle failed mod metadata read",
+                    phase_started=callback_started, category="mod data")
             return
         (versions, installed, flags, categories, updates,
          fomod, bain, missing_reqs, descriptions, authors) = payload
@@ -15445,6 +16437,10 @@ class MainWindow(QMainWindow):
         panel_active = panel is not None and panel.any_active()
         if panel_active or self._modlist_token_search_active():
             self._rebuild_filter_data()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Apply mod metadata to the UI",
+                phase_started=callback_started, category="mod data")
 
     def _apply_modlist_sizes(self):
         """Scan mod folder sizes and push them to the model. Called on reload
@@ -15500,7 +16496,7 @@ class MainWindow(QMainWindow):
         gen = self._boundary_counts_gen
 
         from gui_qt.worker import run_in_worker, NO_EMIT
-        from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
+        from Utils.filegraph_constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
 
         def scan():
             from gui_qt.modlist_data import count_files_in
@@ -15665,7 +16661,7 @@ class MainWindow(QMainWindow):
         lbl.setToolTip(self.tr("{0} plugins ({1} ESL, {2} non-ESL)").format(
             s["total"], s["esl"], s["non_esl"]))
 
-    def _reload_plugins(self):
+    def _reload_plugins(self, timing=None, startup_stage=None):
         """Load the active game/profile's plugins into the Plugins tab.
 
         The disk work (per-plugin header reads for the ESL/master flags,
@@ -15674,13 +16670,55 @@ class MainWindow(QMainWindow):
         UI applies the rows. A generation counter drops results from a
         superseded reload (game/profile switched mid-read)."""
         import threading
+        startup_timing = (getattr(self, "_startup_timing", None)
+                          if startup_stage else None)
+        if startup_timing is not None and not startup_timing.active:
+            startup_timing = None
+        startup_queued = (_startup_time.perf_counter()
+                          if startup_timing is not None else None)
         self._reassert_profile_paths()
         self._plugins_gen += 1
         gen = self._plugins_gen
+        plugin_timings = getattr(self, "_plugin_conflict_timings", None)
+        if plugin_timings is None:
+            plugin_timings = self._plugin_conflict_timings = {}
+        if timing is not None:
+            plugin_timings[gen] = timing
+        if startup_timing is not None:
+            startup_plugins = getattr(self, "_startup_plugin_timings", None)
+            if startup_plugins is None:
+                startup_plugins = self._startup_plugin_timings = {}
+            startup_plugins[gen] = (startup_timing, startup_stage)
         game, profile = self._gs.game, self._gs.profile
         ul_path = self._userlist_path()
+        graph_snapshot = None
+        conflict_data = getattr(self, "_conflict_data", None)
+        profile_dir = self._gs.profile_dir()
+        if (getattr(self, "_conflict_maps_current", False)
+                and conflict_data is not None
+                and profile_dir is not None
+                and getattr(conflict_data, "profile_id", None)
+                == str(profile_dir.resolve(strict=False))):
+            graph_snapshot = getattr(conflict_data, "snapshot", None)
+        # This initial startup pass is followed by an authoritative
+        # post-conflict reload whenever a conflict build is queued. Without a
+        # snapshot, BOS/SkyPatcher discovery falls back to a full staging-tree
+        # walk (~1s on the traced profile); defer just those decorative flags
+        # to the guaranteed post-conflict pass, which reads them from the
+        # published snapshot in milliseconds.
+        include_bos_sp = not (
+            startup_stage == "initial"
+            and bool(getattr(self, "_startup_wait_for_conflicts", False)))
 
         def worker():
+            startup_worker_started = _startup_time.perf_counter()
+            startup_lane = f"plugins {startup_stage}"
+            if startup_timing is not None:
+                startup_timing.record(
+                    f"Queue {startup_stage} plugin worker",
+                    phase_started=startup_queued,
+                    phase_finished=startup_worker_started,
+                    lane=startup_lane, category="plugins")
             from gui_qt.plugin_state import (
                 load_plugins, resolve_plugin_paths_for_game)
             from Utils.userlist import read_userlist_state
@@ -15690,10 +16728,21 @@ class MainWindow(QMainWindow):
             # arrival (dropped in _on_plugins_loaded), so stop working on it.
             stale = lambda: gen != self._plugins_gen
             report = {}
+            phase_started = timing.now() if timing is not None else None
+            if timing is not None:
+                timing.mark("Plugins reload worker entered",
+                            phase_started=phase_started, lane="worker")
             try:
+                phase_started = timing.now() if timing is not None else None
                 with span("plugins.load_plugins(worker)"):
                     rows = load_plugins(game, profile, cancelled=stale,
-                                        report=report)
+                                        report=report,
+                                        snapshot=graph_snapshot,
+                                        include_bos_sp=include_bos_sp)
+                if timing is not None:
+                    timing.mark(
+                        f"plugin rows discovered and parsed ({len(rows or [])} rows)",
+                        phase_started=phase_started, lane="worker")
             except Exception as exc:
                 print(f"[gui_qt] plugin load failed: {exc}", flush=True)
                 rows = []
@@ -15702,18 +16751,55 @@ class MainWindow(QMainWindow):
                        f"(superseded by gen={self._plugins_gen})")
                 print(f"[plugin-diag] {msg}", flush=True)
                 self._append_log(f"[rescan-diag] {msg}")
+                plugin_timings.pop(gen, None)
+                getattr(self, "_startup_plugin_timings", {}).pop(gen, None)
+                if startup_timing is not None:
+                    startup_timing.record(
+                        f"Cancel {startup_stage} plugin load",
+                        phase_started=startup_worker_started,
+                        lane=startup_lane, category="plugins")
+                if timing is not None:
+                    timing.finish("Plugins reload superseded during discovery",
+                                  lane="worker")
                 return
+            phase_started = timing.now() if timing is not None else None
             with span("plugins.resolve_paths(worker)"):
-                paths = (resolve_plugin_paths_for_game(game)
+                paths = (resolve_plugin_paths_for_game(
+                    game, snapshot=graph_snapshot)
                          if game is not None else {})
+            if timing is not None:
+                timing.mark(
+                    f"plugin winner paths resolved ({len(paths)} paths)",
+                    phase_started=phase_started, lane="worker")
+            phase_started = timing.now() if timing is not None else None
             try:
                 state = read_userlist_state(ul_path)
             except Exception:
                 state = None
+            if timing is not None:
+                timing.mark("plugin userlist state read",
+                            phase_started=phase_started, lane="worker")
+            if startup_timing is not None:
+                deferred_note = (
+                    ", BOS/SkyPatcher flags deferred"
+                    if not include_bos_sp else "")
+                startup_timing.record(
+                    f"Load {startup_stage} plugins ({len(rows)} rows"
+                    f"{deferred_note})",
+                    phase_started=startup_worker_started,
+                    lane=startup_lane, category="plugins")
+                startup_plugins[gen] = (
+                    startup_timing, startup_stage,
+                    _startup_time.perf_counter())
             self._plugins_loaded.emit(gen, rows, paths, state, report)
+            if timing is not None:
+                timing.mark("Plugins result emitted to Qt", lane="worker")
 
-        threading.Thread(target=worker, daemon=True,
-                         name="plugins-reload").start()
+        thread = threading.Thread(target=worker, daemon=True,
+                                  name="plugins-reload")
+        thread.start()
+        if timing is not None:
+            timing.mark(f"Plugins reload thread started (generation {gen})")
 
     def _clear_plugin_panel(self):
         """Blank the plugin panel while a reload that will repopulate it is in
@@ -15733,12 +16819,37 @@ class MainWindow(QMainWindow):
 
     def _on_plugins_loaded(self, gen, rows, paths, state, report=None):
         """UI thread: apply a finished plugin reload (see _reload_plugins)."""
+        startup_info = getattr(
+            self, "_startup_plugin_timings", {}).pop(gen, None)
+        startup_timing = startup_info[0] if startup_info is not None else None
+        startup_stage = startup_info[1] if startup_info is not None else None
+        startup_result_ready_at = (
+            startup_info[2]
+            if startup_info is not None and len(startup_info) > 2 else None)
+        startup_apply_started = (_startup_time.perf_counter()
+                                 if startup_timing is not None else None)
+        if startup_timing is not None and startup_result_ready_at is not None:
+            startup_timing.record(
+                f"Wait to apply {startup_stage} plugins on the UI thread",
+                phase_started=startup_result_ready_at,
+                phase_finished=startup_apply_started,
+                category="UI wait")
+        timing = getattr(self, "_plugin_conflict_timings", {}).pop(gen, None)
         if gen != self._plugins_gen:
             msg = (f"plugins_loaded gen={gen} SUPERSEDED "
                    f"(current={self._plugins_gen}) - {len(rows)} row(s) DROPPED")
             print(f"[plugin-diag] {msg}", flush=True)
             self._append_log(f"[rescan-diag] {msg}")
+            if startup_timing is not None:
+                startup_timing.record(
+                    f"Discard superseded {startup_stage} plugin result",
+                    phase_started=startup_apply_started,
+                    category="plugins")
+            if timing is not None:
+                timing.finish("Plugins result superseded on Qt thread")
             return   # superseded - a newer reload is in flight
+        if timing is not None:
+            timing.mark("Plugins result reached the Qt thread")
         # Final link in the chain: how many plugin rows actually reached the
         # panel. If this is 0 while the index/filemap looked fine above, the
         # failure is in plugin discovery, not the filemap. GUI-visible so a
@@ -15747,9 +16858,14 @@ class MainWindow(QMainWindow):
                          f"{len(rows)} row(s) to the panel")
         import time as _time
         _apply_t0 = _time.perf_counter()
+        phase_started = timing.now() if timing is not None else None
         self._plugin_model.set_rows(rows, game=self._gs.game,
                                     profile=self._gs.profile,
                                     profile_dir=self._gs.profile_dir())
+        if timing is not None:
+            timing.mark(f"Plugins table model populated ({len(rows)} rows)",
+                        phase_started=phase_started)
+        phase_started = timing.now() if timing is not None else None
         # Context menu reads these off the view (ESL path resolution + refresh).
         self._plugin_view.game = self._gs.game
         self._plugin_view.profile_dir = self._gs.profile_dir()
@@ -15769,19 +16885,32 @@ class MainWindow(QMainWindow):
         # Resolved plugin paths (name.lower → on-disk path) power the master-
         # highlight on plugin selection; clear any stale master ticks.
         self._plugin_paths = paths
+        self._plugin_view.resolved_paths = paths
         self._plugin_view.set_master_highlight(set())
+        if timing is not None:
+            timing.mark("Plugins view bindings, search, and markers updated",
+                        phase_started=phase_started)
         # Row indices/flags changed - re-apply any active plugin filter.
+        phase_started = timing.now() if timing is not None else None
         if getattr(self, "_plugin_filter_panel", None) is not None:
             self._apply_plugin_filters()
         self._refresh_plugin_stats()
         self._refresh_framework_banner()
         self._apply_plugins_supported()
+        if timing is not None:
+            timing.mark("Plugins filters, stats, and framework support updated",
+                        phase_started=phase_started)
         # Rerun-FOMOD flag: an option's fileDependency plugin may have just become
         # enabled/disabled - recompute the overlay against the fresh load order.
+        phase_started = timing.now() if timing is not None else None
         self._refresh_rerun_fomod_flags()
+        if timing is not None:
+            timing.mark("rerun-FOMOD flags refreshed",
+                        phase_started=phase_started)
         # Userlist state → PF_USERLIST/PF_UL_CYCLE bits were already applied by
         # load_plugins; push the membership sets (context-menu predicates), the
         # group map (flags tooltip), and the userlist action callbacks.
+        phase_started = timing.now() if timing is not None else None
         if state is None:
             from Utils.userlist import read_userlist_state
             state = read_userlist_state(self._userlist_path())
@@ -15800,13 +16929,24 @@ class MainWindow(QMainWindow):
             "_plugin_filter_panel")
         self._plugin_view.on_clear_filters = lambda: self._clear_panel_filters(
             "_plugin_filter_panel")
+        if timing is not None:
+            timing.mark("Plugins userlist state and actions applied",
+                        phase_started=phase_started)
         print(f"[gui_qt] plugins: {len(rows)} entries")
         from Utils import perftrace
         perftrace.mark("on_plugins_loaded(apply)",
                        _time.perf_counter() - _apply_t0)
+        startup_final = bool(
+            startup_timing is not None
+            and (startup_stage == "post-conflict"
+                 or (startup_stage == "initial"
+                     and not self._startup_wait_for_conflicts)))
         # ESL-eligibility (filters) computes AFTER the rows are visible - a
         # cold libloot scan is seconds of GIL-hogging record parsing.
-        self._start_esl_scan(gen, rows, paths)
+        esl_started = self._start_esl_scan(
+            gen, rows, paths, timing=timing,
+            startup_timing=startup_timing,
+            startup_final=startup_final)
         # Profile-switch milestones: the FIRST plugin pass runs against the old
         # filemap (fast feedback); the FINAL pass follows the conflict rebuild
         # and is the moment the switch is fully rendered.
@@ -15820,8 +16960,25 @@ class MainWindow(QMainWindow):
         # populated. Dismiss the startup splash here (dropped one event-loop
         # turn later so this final dataChanged pass actually paints first).
         if not self._splash_dismissed and self._splash is not None:
-            from PySide6.QtCore import QTimer
+            if self._splash_reveal_queued_at is None:
+                self._splash_reveal_queued_at = _startup_time.perf_counter()
             QTimer.singleShot(0, self._dismiss_splash)
+        if (getattr(self, "_deploy_refresh_pending", False)
+                and getattr(self, "_deploy_refresh_conflicts_done", False)):
+            self._deploy_timing_mark(
+                "post-deploy Plugins update applied; UI refresh settled",
+                finish=True,
+            )
+            self._deploy_refresh_pending = False
+            self._deploy_refresh_conflicts_done = False
+        if (getattr(self, "_restore_refresh_pending", False)
+                and getattr(self, "_restore_refresh_conflicts_done", False)):
+            self._restore_timing_mark(
+                "post-restore Plugins update applied; UI refresh settled",
+                finish=True,
+            )
+            self._restore_refresh_pending = False
+            self._restore_refresh_conflicts_done = False
         # Explicit Refresh Modlist: the automatic phantom-prune caps at
         # _PRUNE_MAX entries (a mass miss usually means a broken resolution),
         # so a listed-but-nowhere-on-disk load order above the cap - e.g.
@@ -15836,6 +16993,23 @@ class MainWindow(QMainWindow):
             phantoms = report.get("mass_prune") or []
             if phantoms:
                 self._offer_phantom_cleanup(list(phantoms))
+        if startup_timing is not None:
+            startup_timing.record(
+                f"Apply {startup_stage} plugins to the UI ({len(rows)} rows)",
+                phase_started=startup_apply_started,
+                category="plugins")
+            if startup_final and not esl_started:
+                QTimer.singleShot(
+                    0, lambda: self._finish_startup_timing(
+                        "Mod list and plugins ready"))
+        if timing is not None:
+            timing.mark(
+                "Plugins UI update complete; deferred ESL scan running"
+                if esl_started else "Plugins UI update complete")
+            if not esl_started:
+                QTimer.singleShot(
+                    0, lambda current=timing: current.finish(
+                        "conflict update fully settled"))
 
     def _offer_phantom_cleanup(self, names: list[str]):
         """Confirm-then-prune for a mass phantom load order (see the Refresh
@@ -15869,7 +17043,9 @@ class MainWindow(QMainWindow):
                     "touched.").format(len(names)),
             _confirmed, confirm_label=self.tr("Remove"), list_items=names)
 
-    def _start_esl_scan(self, gen, rows, resolved):
+    def _start_esl_scan(self, gen, rows, resolved, timing=None,
+                        startup_timing=None,
+                        startup_final: bool = False) -> bool:
         """Compute the ESL-safe/unsafe filter bits on a worker AFTER the plugin
         rows are applied. A cold libloot eligibility scan is seconds of
         full-record parsing that does not release the GIL - inside
@@ -15878,29 +17054,97 @@ class MainWindow(QMainWindow):
         loads resolve instantly."""
         game = self._gs.game
         if game is None or not getattr(game, "supports_esl_flag", False):
-            return
+            return False
         names = [r.name for r in rows]
         if not names:
-            return
+            return False
         import threading
+        if timing is not None:
+            esl_timings = getattr(self, "_esl_conflict_timings", None)
+            if esl_timings is None:
+                esl_timings = self._esl_conflict_timings = {}
+            esl_timings[gen] = timing
+        if startup_timing is not None:
+            startup_esl = getattr(self, "_startup_esl_timings", None)
+            if startup_esl is None:
+                startup_esl = self._startup_esl_timings = {}
+            startup_esl[gen] = (startup_timing, startup_final)
 
         def worker():
+            startup_worker_started = _startup_time.perf_counter()
             from gui_qt.plugin_state import compute_esl_eligibility
             from Utils.perftrace import span
             data_dir = (game.get_vanilla_plugins_path()
                         if hasattr(game, "get_vanilla_plugins_path") else None)
-            with span("plugins.esl_eligibility(deferred)"):
-                kinds = compute_esl_eligibility(names, resolved, data_dir, game)
+            phase_started = timing.now() if timing is not None else None
+            try:
+                with span("plugins.esl_eligibility(deferred)"):
+                    kinds = compute_esl_eligibility(
+                        names, resolved, data_dir, game)
+            except Exception as exc:
+                print(f"[gui_qt] deferred ESL scan failed: {exc}", flush=True)
+                getattr(self, "_esl_conflict_timings", {}).pop(gen, None)
+                if startup_timing is not None:
+                    startup_timing.record(
+                        f"Deferred ESL eligibility scan failed: {exc}",
+                        phase_started=startup_worker_started,
+                        lane="ESL worker", category="plugins")
+                if timing is not None:
+                    timing.finish(f"deferred ESL scan failed: {exc}",
+                                  lane="worker")
+                if startup_final:
+                    self._esl_elig_ready.emit(gen, {})
+                else:
+                    getattr(self, "_startup_esl_timings", {}).pop(gen, None)
+                return
+            if timing is not None:
+                timing.mark(
+                    f"deferred ESL eligibility computed ({len(kinds or {})} results)",
+                    phase_started=phase_started, lane="worker")
+            if startup_timing is not None:
+                startup_timing.record(
+                    f"Compute deferred ESL eligibility ({len(kinds or {})} results)",
+                    phase_started=startup_worker_started,
+                    lane="ESL worker", category="plugins")
             self._esl_elig_ready.emit(gen, kinds)
+            if timing is not None:
+                timing.mark("deferred ESL result emitted to Qt", lane="worker")
 
         threading.Thread(target=worker, daemon=True, name="esl-elig").start()
+        return True
 
     def _on_esl_elig_ready(self, gen, kinds):
         """UI thread: merge the deferred ESL-eligibility bits into the plugin
         rows (see _start_esl_scan) and reapply any active plugin filter that
         keys off them."""
+        startup_info = getattr(
+            self, "_startup_esl_timings", {}).pop(gen, None)
+        startup_timing = startup_info[0] if startup_info is not None else None
+        startup_final = bool(startup_info[1]) if startup_info is not None else False
+        startup_apply_started = (_startup_time.perf_counter()
+                                 if startup_timing is not None else None)
+        timing = getattr(self, "_esl_conflict_timings", {}).pop(gen, None)
         if gen != self._plugins_gen or not kinds:
+            if startup_timing is not None:
+                startup_timing.record(
+                    ("Discard superseded deferred ESL result"
+                     if gen != self._plugins_gen
+                     else "Finish deferred ESL scan (no UI changes)"),
+                    phase_started=startup_apply_started,
+                    category="plugins")
+                if startup_final:
+                    QTimer.singleShot(
+                        0, lambda: self._finish_startup_timing(
+                            "Mod list, plugins, and deferred ESL data ready"))
+            if timing is not None:
+                timing.finish(
+                    "deferred ESL update superseded"
+                    if gen != self._plugins_gen
+                    else "conflict update fully settled (no ESL changes)")
             return   # superseded - a newer plugin reload is in flight/applied
+        if timing is not None:
+            timing.mark("deferred ESL result reached the Qt thread")
+        phase_started = timing.now() if timing is not None else None
         from gui_qt.plugin_state import PF_ESL_SAFE, PF_ESL_UNSAFE
         from gui_qt.plugin_model import COL_FLAGS, PFlagsRole
         m = self._plugin_model
@@ -15914,6 +17158,17 @@ class MainWindow(QMainWindow):
                 r.flags = nf
                 changed = True
         if not changed:
+            if startup_timing is not None:
+                startup_timing.record(
+                    "Apply deferred ESL result (unchanged)",
+                    phase_started=startup_apply_started,
+                    category="plugins")
+                if startup_final:
+                    QTimer.singleShot(
+                        0, lambda: self._finish_startup_timing(
+                            "Mod list, plugins, and deferred ESL data ready"))
+            if timing is not None:
+                timing.finish("conflict update fully settled (ESL unchanged)")
             return
         m.dataChanged.emit(m.index(0, COL_FLAGS),
                            m.index(len(m._rows) - 1, COL_FLAGS),
@@ -15922,6 +17177,21 @@ class MainWindow(QMainWindow):
         # The ESL-safe/unsafe filters read these bits - reapply if active.
         if getattr(self, "_plugin_filter_panel", None) is not None:
             self._apply_plugin_filters()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Apply deferred ESL flags and filters",
+                phase_started=startup_apply_started,
+                category="plugins")
+            if startup_final:
+                QTimer.singleShot(
+                    0, lambda: self._finish_startup_timing(
+                        "Mod list, plugins, and deferred ESL data ready"))
+        if timing is not None:
+            timing.mark("deferred ESL flags and filters applied",
+                        phase_started=phase_started)
+            QTimer.singleShot(
+                0, lambda current=timing: current.finish(
+                    "conflict update fully settled"))
 
     # ---- LOOT userlist (groups / rules / cycle / flag) ---------------------
     def _userlist_path(self):
@@ -15961,6 +17231,21 @@ class MainWindow(QMainWindow):
         """An inline bar (Add to userlist / Add to group) wrote userlist.yaml."""
         self._notify(message, "success")
         self._refresh_userlist_flags()
+
+    def _ensure_userlist_bar(self, *, group: bool):
+        """Build one normally-hidden userlist editor when it is first opened."""
+        attr = "_grp_bar" if group else "_ul_bar"
+        bar = getattr(self, attr, None)
+        if bar is not None:
+            return bar
+        from gui_qt.userlist_bars import GroupBar, UserlistBar
+        cls = GroupBar if group else UserlistBar
+        bar = cls(self._userlist_path, self._on_userlist_bar_saved)
+        setattr(self, attr, bar)
+        # Play, tab body and footer occupy rows 0..2. Inserting at these stable
+        # positions keeps Userlist above Group regardless of which is used first.
+        self._plugins_panel_layout.insertWidget(4 if group else 3, bar)
+        return bar
 
     def _close_userlist_ui(self):
         """Close the userlist-scoped tabs + hide the inline bars - they hold
@@ -16123,14 +17408,15 @@ class MainWindow(QMainWindow):
             pos = row
         after_plugin = rows[pos - 1].name if pos > 0 else ""
         before_plugin = rows[pos + 1].name if pos + 1 < len(rows) else ""
-        self._ul_bar.open_for(plugin_name, after_plugin, before_plugin)
+        self._ensure_userlist_bar(group=False).open_for(
+            plugin_name, after_plugin, before_plugin)
 
     def _on_group_add(self, plugin_names: list):
         """'Add to group…' - open the inline group-assignment bar."""
         if self._userlist_path() is None:
             self._notify(self.tr("No active profile - cannot assign group."), "warning")
             return
-        self._grp_bar.open_for(plugin_names)
+        self._ensure_userlist_bar(group=True).open_for(plugin_names)
 
     def _on_userlist_remove(self, plugin_names: list):
         """'Remove from userlist' - drop the plugins' entries and refresh."""
@@ -16205,6 +17491,9 @@ class MainWindow(QMainWindow):
             userlist_path = None
 
         include_vanilla = bool(getattr(game, "plugins_include_vanilla", False))
+        from Utils.filegraph_service import plugin_source_paths
+        plugin_winner_paths = plugin_source_paths(
+            getattr(self._conflict_data, "snapshot", None), game)
         # Snapshot what the apply step needs (no model access mid-flight).
         self._sort_ctx = {
             "rows": rows, "locked_indices": locked_indices,
@@ -16226,6 +17515,7 @@ class MainWindow(QMainWindow):
             game_data_dir=(game.get_vanilla_plugins_path()
                            if hasattr(game, "get_vanilla_plugins_path") else None),
             userlist_path=userlist_path,
+            plugin_winner_paths=plugin_winner_paths,
         )
 
         self._sort_running = True
@@ -16360,6 +17650,9 @@ class MainWindow(QMainWindow):
 
         # Snapshot everything the worker needs - no model access mid-flight.
         plugin_names = [r.name for r in rows]
+        from Utils.filegraph_service import plugin_source_paths
+        plugin_winner_paths = plugin_source_paths(
+            getattr(self._conflict_data, "snapshot", None), game)
         kw = dict(
             target_plugin=plugin_name,
             plugin_names=plugin_names,
@@ -16369,6 +17662,7 @@ class MainWindow(QMainWindow):
             game_type_attr=getattr(game, "loot_game_type", ""),
             game_data_dir=(game.get_vanilla_plugins_path()
                            if hasattr(game, "get_vanilla_plugins_path") else None),
+            plugin_winner_paths=plugin_winner_paths,
         )
 
         self._overlap_running = True
@@ -16504,34 +17798,18 @@ class MainWindow(QMainWindow):
         stack.setVisible(self._plugins_supported() or not on_plugins_tab)
 
     def _refresh_framework_banner(self):
-        """Re-detect modding frameworks and update the Plugins-tab banner. Called
-        on game/profile change + after each filemap rebuild (same as Tk).
-
-        The detect reads filemap.txt (+ mod index) - ~200 ms on a 100k-file
-        modlist - so it runs on a worker thread and lands via
-        _framework_statuses_ready. A generation counter drops results that a
-        game/profile switch (or a newer refresh) has superseded."""
+        """Apply framework state from the accepted filegraph generation."""
         if not hasattr(self, "_framework_banner"):
             return
         self._framework_gen += 1
-        gen = self._framework_gen
-        # Snapshot inputs on the UI thread - GameState can be swapped under a
-        # worker (see the profile-desync incident).
-        game = self._gs.game
-        staging = self._gs.staging_dir()
-        filemap_path = (staging.parent / "filemap.txt") if staging is not None else None
-        modlist_path = self._gs.modlist_path()
-
-        from gui_qt.worker import run_in_worker
-
-        def detect():
-            from Utils.framework_detect import detect_frameworks
-            return gen, detect_frameworks(game, filemap_path, modlist_path,
-                                          rf_toggle_enabled=True)
-
-        run_in_worker(detect, self._framework_statuses_ready,
-                      name="framework-detect", unpack=True,
-                      error_result=(gen, []))
+        data = getattr(self, "_conflict_data", None)
+        profile_dir = self._gs.profile_dir()
+        profile_id = (str(profile_dir.resolve(strict=False))
+                      if profile_dir is not None else "")
+        statuses = (data.framework_statuses
+                    if data is not None and data.profile_id == profile_id else [])
+        self._framework_banner.set_statuses(statuses)
+        self._cache_framework_states(statuses)
 
     def _on_framework_statuses(self, gen: int, statuses):
         if gen != self._framework_gen or not hasattr(self, "_framework_banner"):
@@ -16548,89 +17826,29 @@ class MainWindow(QMainWindow):
             self._framework_states = value
             self._refresh_play_selector()
 
-    def _recompute_bsa_conflicts_async(self):
-        """A plugin toggle/reorder changed the plugin load order. BSAs load at
-        their plugin's position, so BSA conflict winners may have changed - but
-        the deployed file set (filemap.txt / modindex.bin), loose conflicts,
-        plugin ownership and framework states are all unaffected. So recompute
-        ONLY the BSA conflicts off-thread (re-reads the freshly-written
-        loadorder.txt) and repaint just the BSA icons on the modlist - instead
-        of the full _rebuild_conflicts_async, which rebuilds the filemap and
-        reloads both the modlist and the Plugins panel. Tk parity: plugin
-        toggle → recompute_bsa_conflicts (BSA-only), NOT a filemap rebuild."""
-        import threading
-        g = self._gs.game
-        if g is None or not self._gs.profile:
-            return
-        gen = getattr(self, "_bsa_conflict_gen", 0) + 1
-        self._bsa_conflict_gen = gen
-
-        def worker():
-            try:
-                (bsa_codes, bsa_over, bsa_overby,
-                 lob) = self._gs._build_bsa_conflicts(g, lambda _m: None)
-            except Exception as exc:
-                print(f"[gui_qt] BSA recompute failed: {exc}", flush=True)
-                return
-            # Plugin order decides BSA winners, hence whether a loose file
-            # still overrides one - so the loose icons can change too. Re-merge
-            # from the pristine base, not the already-merged copy (which would
-            # accumulate upgrades across toggles).
-            loose_codes = None
-            cd = getattr(self, "_conflict_data", None)
-            if cd is not None and cd.loose_codes_base is not None:
-                loose_codes = self._gs._merge_loose_beats_bsa(
-                    dict(cd.loose_codes_base), lob)
-            self._bsa_conflicts_ready.emit(
-                gen, bsa_codes, bsa_over, bsa_overby, loose_codes)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_bsa_conflicts_ready(self, gen, bsa_codes, bsa_over, bsa_overby,
-                                loose_codes=None):
-        if gen != getattr(self, "_bsa_conflict_gen", 0):
-            return   # superseded by a newer plugin toggle
-        # Keep the cached conflict data's BSA maps in sync so a later full
-        # rebuild path / highlight lookup sees the current winners.
-        if getattr(self, "_conflict_data", None) is not None:
-            self._conflict_data.bsa_codes = bsa_codes
-            self._conflict_data.bsa_overrides = bsa_over
-            self._conflict_data.bsa_overridden_by = bsa_overby
-            if loose_codes is not None:
-                self._conflict_data.loose_codes = loose_codes
-        if loose_codes is not None:
-            # A changed BSA winner can add/remove a loose-beats-BSA win, so
-            # repaint both icon sets together.
-            self._modlist_model.set_conflicts(loose_codes,
-                                              bsa_conflicts=bsa_codes)
-        else:
-            self._modlist_model.set_bsa_conflicts(bsa_codes)
-        # Cross-panel highlights follow the BSA override maps (loose maps unchanged).
-        loose_over = loose_overby = None
-        if getattr(self, "_conflict_data", None) is not None:
-            loose_over = self._conflict_data.overrides
-            loose_overby = self._conflict_data.overridden_by
-        self._modlist_view.set_conflict_maps(
-            loose_over or {}, loose_overby or {}, bsa_over, bsa_overby)
-
     def _on_modlist_saved(self, edit_ctx=None):
-        """modlist.txt was rewritten (every structural edit funnels here via
-        model.save()). edit_ctx classifies the edit (see model.save):
-          ("move", moved, crossed) - when the move provably can't have changed
-            the filemap, skip EVERYTHING (worker + plugins reload + auto-deploy
-            are all no-ops).
-          ("toggle", changes) - when a disable provably can't change any
-            conflict product, rebuild ONLY the filemap (the toggled mod's
-            entries must still leave it) and auto-deploy; skip the scan.
-          None/unknown → full rebuild."""
-        if edit_ctx is not None:
-            kind = edit_ctx[0]
-            if kind == "move" and self._move_skips_rebuild(edit_ctx[1:]):
-                return
-            if kind == "toggle" and self._toggle_skips_conflict_scan(edit_ctx[1]):
-                self._rebuild_filemap_light_async()
-                return
-        self._rebuild_conflicts_async()
+        """Reconcile every committed modlist edit with the native graph."""
+        from Utils.conflict_timing import timeline_from_edit_ctx
+        timing = timeline_from_edit_ctx(edit_ctx)
+        phase_started = timing.now() if timing is not None else None
+        if timing is not None and edit_ctx and edit_ctx[0] == "toggle":
+            # save() emits enabled_changed immediately after this callback.
+            # Defer graph work one event-loop turn so plugin/load-order sync is
+            # complete before the adapter reads it, and so both paths do not
+            # contend for the GIL while scanning the same profile files.
+            QTimer.singleShot(
+                0,
+                lambda current=edit_ctx: self._rebuild_conflicts_async(
+                    edit_ctx=current),
+            )
+            timing.mark(
+                "reconciliation deferred until plugin activation sync completes",
+                phase_started=phase_started)
+            return
+        self._rebuild_conflicts_async(edit_ctx=edit_ctx)
+        if timing is not None:
+            timing.mark("modlist callback queued reconciliation",
+                        phase_started=phase_started)
 
     def _move_skips_rebuild(self, move_ctx) -> bool:
         """True when a reorder left every moved mod on the same side of all
@@ -16711,82 +17929,48 @@ class MainWindow(QMainWindow):
             f"conflict scan skipped ({len(changes)} mod(s), filemap-only)")
         return True
 
-    def _rebuild_filemap_light_async(self):
-        """Disable fast path: rebuild ONLY the filemap (the incremental delta
-        removes the toggled mods' entries) - _toggle_skips_conflict_scan proved
-        every conflict product unchanged, so skip the scan, the panel reloads
-        and the conflict-map repaints. Shares the build lock + generation with
-        _rebuild_conflicts_async so full rebuilds serialize/supersede normally;
-        _conflict_maps_current deliberately stays armed (the maps still
-        describe reality - that is exactly what the predicate proved)."""
-        import threading
-        self._reassert_profile_paths()
-        gen = getattr(self, "_conflict_gen", 0) + 1
-        self._conflict_gen = gen
-        if not hasattr(self, "_conflict_build_lock"):
-            self._conflict_build_lock = threading.Lock()
-        g = self._gs.game
-        profile = self._gs.profile
-        if g is None or not profile:
-            return
-
-        def worker():
-            from Utils.perftrace import span
-            with self._conflict_build_lock:
-                if gen != self._conflict_gen:
-                    return   # superseded while waiting - the newer build covers us
-                from Utils.deploy_pipeline import _build_filemap_for_game
-
-                def _fm_log(m):
-                    m = str(m)
-                    try:
-                        m.encode("utf-8")
-                    except UnicodeEncodeError:
-                        m = m.encode("utf-8", "backslashreplace").decode(
-                            "utf-8", "replace")
-                    print(f"[filemap] {m}", flush=True)
-                    self._append_log(f"[filemap] {m}")
-
-                try:
-                    with span("build_filemap(light)"):
-                        _build_filemap_for_game(
-                            g, profile, log_fn=_fm_log, rescan_index=False)
-                except Exception as exc:
-                    print(f"[gui_qt] light filemap rebuild failed: {exc}",
-                          flush=True)
-            self._filemap_light_done.emit(gen)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_filemap_light_done(self, gen: int):
-        """UI thread: a filemap-only rebuild finished. Refresh only what the
-        deployed file SET touches - conflict maps, plugins panel, filter data
-        and framework banner are untouched by construction."""
-        if gen != self._conflict_gen:
-            return   # superseded by a full rebuild - its handler covers this
-        from Utils.perftrace import span
-        with span("on_filemap_light_done"):
-            if hasattr(self, "_data_view"):
-                self._data_view.mark_dirty()
-            if hasattr(self, "_text_files_view"):
-                self._text_files_view.mark_dirty()
-            self._refresh_modlist_stats()
-            # Active filters may key on the enabled state - reapply from the
-            # in-memory FilterData (no disk rescan needed).
-            self._apply_modlist_filters()
-        self._maybe_auto_deploy()
-
-    def _rebuild_conflicts_async(self, rescan_index: bool = False):
+    def _rebuild_conflicts_async(self, rescan_index: bool = False,
+                                 edit_ctx=None, startup_timing=None):
         """Build the filemap off-thread; the worker emits _conflicts_ready
         (queued → UI thread). A generation counter drops results from a
         superseded reload (user switched game before the build finished).
         rescan_index=True forces a full disk rescan (Refresh button)."""
         import threading
+        from Utils.conflict_timing import timeline_from_edit_ctx
+        timing = timeline_from_edit_ctx(edit_ctx)
+        startup_queued = (_startup_time.perf_counter()
+                          if startup_timing is not None else None)
+        setup_started = timing.now() if timing is not None else None
+        # Snapshot this before invalidating the maps below. Toggle-specific UI
+        # reuse is valid only when an accepted build described the pre-toggle
+        # index and no explicit/latched Refresh is about to replace that index.
+        toggle_reuse_ok = bool(
+            edit_ctx and edit_ctx[0] == "toggle"
+            and getattr(self, "_conflict_maps_current", False)
+            and not rescan_index
+            and not getattr(self, "_pending_rescan_index", False))
         # The maps the move fast-path tests are about to be superseded.
         self._conflict_maps_current = False
         self._reassert_profile_paths()
         gen = getattr(self, "_conflict_gen", 0) + 1
         self._conflict_gen = gen
+        if startup_timing is not None:
+            startup_conflicts = getattr(
+                self, "_startup_conflict_timings", None)
+            if startup_conflicts is None:
+                startup_conflicts = self._startup_conflict_timings = {}
+            startup_conflicts[gen] = startup_timing
+        # Keep the edit classification attached to the generation whose result
+        # will be applied. A toggle changes enabled/winner state, but it cannot
+        # change the installed library, index-derived flags, or the filter
+        # panel's disk-derived lists. The ready handler uses this to avoid
+        # repeating those structural refreshes on the Qt thread.
+        self._conflict_gen_edit_ctx = (gen, edit_ctx, toggle_reuse_ok)
+        if timing is not None:
+            timings = getattr(self, "_conflict_timings", None)
+            if timings is None:
+                timings = self._conflict_timings = {}
+            timings[gen] = timing
         # A requested full rescan must SURVIVE supersession. Previously
         # rescan_index lived only in this call's worker closure: if a Refresh's
         # rescan build (rescan_index=True) was superseded - e.g. by the enable
@@ -16814,7 +17998,28 @@ class MainWindow(QMainWindow):
             # (_append_log, thread-safe) so a normal user can see + send them
             # without relaunching with an env var. They fire once per conflict
             # build / supersession (not per-frame), so they're low-noise.
+            startup_worker_started = _startup_time.perf_counter()
+            if startup_timing is not None:
+                startup_timing.record(
+                    "Queue and start conflict worker",
+                    phase_started=startup_queued,
+                    phase_finished=startup_worker_started,
+                    lane="conflict worker", category="filegraph")
+            worker_started = timing.now() if timing is not None else None
+            if timing is not None:
+                timing.mark("conflict worker entered",
+                            phase_started=worker_started, lane="worker")
+            lock_started = timing.now() if timing is not None else None
+            startup_lock_started = _startup_time.perf_counter()
             with self._conflict_build_lock:
+                if startup_timing is not None:
+                    startup_timing.record(
+                        "Wait for conflict build lock",
+                        phase_started=startup_lock_started,
+                        lane="conflict worker", category="filegraph")
+                if timing is not None:
+                    timing.mark("conflict build lock acquired",
+                                phase_started=lock_started, lane="worker")
                 if gen != self._conflict_gen:
                     msg = (f"conflict build gen={gen} SUPERSEDED "
                            f"(current={self._conflict_gen}) - skipped before "
@@ -16822,6 +18027,17 @@ class MainWindow(QMainWindow):
                            f"latch pending={getattr(self, '_pending_rescan_index', False)}")
                     print(f"[plugin-diag] {msg}", flush=True)
                     self._append_log(f"[rescan-diag] {msg}")
+                    getattr(self, "_conflict_timings", {}).pop(gen, None)
+                    getattr(self, "_startup_conflict_timings", {}).pop(
+                        gen, None)
+                    if startup_timing is not None:
+                        startup_timing.record(
+                            "Conflict build superseded before work",
+                            phase_started=startup_worker_started,
+                            lane="conflict worker", category="filegraph")
+                    if timing is not None:
+                        timing.finish("conflict build superseded before work",
+                                      lane="worker")
                     return   # a newer build was queued while we waited - skip
                 # Honour a latched rescan request even if THIS build was queued
                 # as rescan_index=False (it superseded a pending Refresh). The
@@ -16855,93 +18071,75 @@ class MainWindow(QMainWindow):
                             "utf-8", "replace")
                     print(f"[filemap] {m}", flush=True)
                     self._append_log(f"[filemap] {m}")
-                with span(f"build_conflicts(rescan={do_rescan})"):
-                    data = self._gs.build_conflicts(
-                        log_fn=_fm_log,
-                        rescan_index=do_rescan)
-                # Decisive check: after the build, is every ENABLED modlist mod
-                # actually present in the index the filemap was built from? An
-                # enabled mod missing here is THE failure (no conflicts/plugins).
-                self._log_enabled_not_indexed(gen)
+                startup_build_started = _startup_time.perf_counter()
+                try:
+                    with span(f"build_conflicts(rescan={do_rescan})"):
+                        operation_hint = {"kind": "full", "mods": []}
+                        if edit_ctx:
+                            operation_hint["kind"] = str(edit_ctx[0])
+                            if edit_ctx[0] == "toggle" and len(edit_ctx) > 1:
+                                operation_hint["mods"] = [
+                                    name for name, _enabled in edit_ctx[1]
+                                ]
+                            elif edit_ctx[0] == "move" and len(edit_ctx) > 1:
+                                operation_hint["mods"] = list(edit_ctx[1])
+                        data = self._gs.build_conflicts(
+                            log_fn=_fm_log,
+                            rescan_index=do_rescan,
+                            operation_hint=operation_hint,
+                            timing=timing)
+                except BaseException as exc:
+                    getattr(self, "_conflict_timings", {}).pop(gen, None)
+                    getattr(self, "_startup_conflict_timings", {}).pop(
+                        gen, None)
+                    if startup_timing is not None:
+                        startup_timing.record(
+                            f"Filegraph/conflict build failed: {exc}",
+                            phase_started=startup_build_started,
+                            lane="conflict worker", category="filegraph")
+                    if timing is not None:
+                        timing.finish(f"conflict build failed: {exc}",
+                                      lane="worker")
+                    raise
+                if startup_timing is not None:
+                    startup_timing.record(
+                        "Build filegraph and calculate conflicts",
+                        phase_started=startup_build_started,
+                        lane="conflict worker", category="filegraph")
+            if timing is not None:
+                timing.mark("conflict result emitted to Qt",
+                            lane="worker")
             self._conflicts_ready.emit(gen, data)
 
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _log_enabled_not_indexed(self, gen: int) -> None:
-        """Diagnostic (off-thread): report any ENABLED modlist mod that is
-        absent from modindex.bin after a build. An enabled mod missing from the
-        index is the exact failure behind "no conflicts / no plugins / not in
-        Data tab" - it isolates whether the cause is a stale index (rescan race:
-        mod on disk + in modlist but not indexed) vs. a name/scan issue
-        (near-match key) vs. all-good. Reads the index once per build."""
-        try:
-            from Utils.modlist import read_modlist
-            from Utils.filemap import read_mod_index, OVERWRITE_NAME, ROOT_FOLDER_NAME
-            staging = self._gs.staging_dir()
-            ml = self._gs.modlist_path()
-            if staging is None or ml is None or not ml.is_file():
-                return
-            index_path = staging.parent / "modindex.bin"
-            index = read_mod_index(index_path) or {}
-            # Surface the RESOLVED index path + any RIVAL modindex.bin at the
-            # OTHER convention (shared <profile_root>/ vs profile-specific
-            # <profile_dir>/). Two files means the staging-path resolution
-            # flip-flopped (stale _active_profile_dir) and reads/writes are
-            # hitting different indexes - the "two modindex.bin" bug.
-            self._append_log(
-                f"[rescan-diag] gen={gen}: index path = {index_path} "
-                f"(exists={index_path.is_file()})")
-            try:
-                canon = index_path.resolve()
-                pd = self._gs.profile_dir()
-                stray = (pd / "modindex.bin") if pd is not None else None
-                if (stray is not None and stray.is_file()
-                        and stray.resolve() != canon):
-                    self._append_log(
-                        f"[rescan-diag] gen={gen}: WARNING - stray modindex.bin "
-                        f"at {stray} describes the same shared mods folder as the "
-                        f"canonical index ({index_path}); it is a legacy leftover "
-                        f"and should be removed (a Refresh sweep removes it).")
-            except Exception:
-                pass
-            enabled = [e.name for e in read_modlist(ml)
-                       if e.enabled and not e.is_separator
-                       and e.name not in (OVERWRITE_NAME, ROOT_FOLDER_NAME)]
-            missing = []
-            for name in enabled:
-                if name in index:
-                    continue
-                on_disk = (staging / name).is_dir()
-                near = [k for k in index if k.strip().casefold() == name.strip().casefold()]
-                missing.append((name, on_disk, near))
-            if not missing:
-                self._append_log(
-                    f"[rescan-diag] gen={gen}: OK - all {len(enabled)} enabled "
-                    f"mod(s) present in modindex.bin ({len(index)} indexed)")
-                return
-            self._append_log(
-                f"[rescan-diag] gen={gen}: {len(missing)} ENABLED mod(s) MISSING "
-                f"from modindex.bin (index has {len(index)} mod(s)):")
-            for name, on_disk, near in missing[:20]:
-                if near:
-                    reason = f"NAME MISMATCH - index has {near!r}"
-                elif on_disk:
-                    reason = ("folder EXISTS on disk but NOT indexed → STALE INDEX "
-                              "(rescan race / rescan skipped)")
-                else:
-                    reason = "folder not found on disk"
-                self._append_log(f"[rescan-diag]   {name!r}: {reason}")
-        except Exception as exc:
-            print(f"[plugin-diag] _log_enabled_not_indexed error: {exc}", flush=True)
+        thread = threading.Thread(target=worker, daemon=True,
+                                  name=f"conflicts-{gen}")
+        thread.start()
+        if timing is not None:
+            timing.mark(f"conflict worker thread started (generation {gen})",
+                        phase_started=setup_started)
 
     def _on_conflicts_ready(self, gen: int, data):
+        startup_timing = getattr(
+            self, "_startup_conflict_timings", {}).pop(gen, None)
+        startup_apply_started = (_startup_time.perf_counter()
+                                 if startup_timing is not None else None)
+        timing = getattr(self, "_conflict_timings", {}).pop(gen, None)
         if gen != self._conflict_gen:
             msg = (f"conflicts_ready gen={gen} SUPERSEDED "
                    f"(current={self._conflict_gen}) - result dropped, plugins "
                    f"NOT reloaded from this build")
             print(f"[plugin-diag] {msg}", flush=True)
             self._append_log(f"[rescan-diag] {msg}")
+            if startup_timing is not None:
+                startup_timing.record(
+                    "Discard superseded conflict result",
+                    phase_started=startup_apply_started,
+                    category="filegraph")
+            if timing is not None:
+                timing.finish("conflict result superseded on Qt thread")
             return
+        if timing is not None:
+            timing.mark("conflict result reached the Qt thread")
         # This build's result is accepted. If it performed the latched full
         # rescan, clear the latch now (a fresh, correct modindex.bin is on disk).
         # A rescan that was superseded mid-build never reaches here, so its
@@ -16955,48 +18153,139 @@ class MainWindow(QMainWindow):
         if getattr(self, "_switch_t0", None) is not None:
             self._mark_since_switch("switch→conflicts_applied")  # i18n: skip - perftrace marker label
             self._switch_conflicts_done = True
+        _edit = getattr(self, "_conflict_gen_edit_ctx", None)
+        toggle_only = bool(
+            _edit is not None and _edit[0] == gen and _edit[1]
+            and _edit[1][0] == "toggle" and _edit[2])
+        resolution_delta = getattr(data, "resolution_delta", None)
+        ui_base_matches = bool(
+            resolution_delta is not None
+            and getattr(self, "_conflict_ui_profile_id", None)
+                == getattr(data, "profile_id", None)
+            and getattr(self, "_conflict_ui_generation", 0)
+                == resolution_delta.base_generation
+        )
+        incremental_delta = bool(
+            getattr(data, "projection_is_incremental", False)
+            and resolution_delta is not None
+            and not resolution_delta.full_rebuild
+            and resolution_delta.base_generation > 0
+            and ui_base_matches
+        )
+        changed_conflict_mods = set()
+        changed_capability_mods = set()
+        if incremental_delta:
+            changed_conflict_mods.update(
+                resolution_delta.changed_summaries)
+            for edge in resolution_delta.changed_edges:
+                changed_conflict_mods.update((edge.loser, edge.winner))
+            changed_capability_mods.update(
+                resolution_delta.changed_capability_flags)
+        if timing is not None:
+            detail = (
+                f"incremental={incremental_delta}, "
+                f"changed_mods={len(changed_conflict_mods)}, "
+                f"changed_capabilities={len(changed_capability_mods)}, "
+                f"changed_edges={len(resolution_delta.changed_edges) if resolution_delta else 0}"
+            )
+            timing.mark(f"Qt conflict update classified ({detail})")
         with span("on_conflicts_ready"):
             self._conflict_data = data
             # These maps now describe the on-disk modlist - arm the move
             # fast-path (see _move_skips_rebuild). Only valid if no newer
             # rebuild was queued meanwhile; the gen check above ensures that.
             self._conflict_maps_current = True
-            with span("model.set_filemap_results"):
+            phase_started = timing.now() if timing is not None else None
+            with span("model.apply_conflict_delta" if incremental_delta
+                      else "model.set_filemap_results"):
                 # Conflicts + the filemap-derived flag overlays (info=pre-RTX,
                 # root=custom root rule) in one dataChanged pass.
-                self._modlist_model.set_filemap_results(
-                    data.loose_codes, data.bsa_codes,
-                    getattr(data, "prertx_mods", set()),
-                    getattr(data, "root_rule_mods", set()),
-                    uuid_conflicts=getattr(data, "uuid_codes", None))
+                if incremental_delta:
+                    self._modlist_model.apply_conflict_delta(
+                        data.loose_codes, bsa_conflicts=data.bsa_codes,
+                        uuid_conflicts=getattr(data, "uuid_codes", None),
+                        changed_mods=(changed_conflict_mods
+                                      | changed_capability_mods),
+                        prertx_mods=(
+                            getattr(data, "prertx_mods", set())
+                            if changed_capability_mods else None),
+                        root_rule_mods=(
+                            getattr(data, "root_rule_mods", set())
+                            if changed_capability_mods else None))
+                else:
+                    self._modlist_model.set_filemap_results(
+                        data.loose_codes, data.bsa_codes,
+                        getattr(data, "prertx_mods", set()),
+                        getattr(data, "root_rule_mods", set()),
+                        uuid_conflicts=getattr(data, "uuid_codes", None))
+            if timing is not None:
+                timing.mark("mod-list conflict icons/model rows updated",
+                            phase_started=phase_started)
             # Cross-panel highlighting needs the override + owner maps.
-            with span("view.set_conflict_maps"):
-                self._modlist_view.set_conflict_maps(
-                    data.overrides, data.overridden_by,
-                    data.bsa_overrides, data.bsa_overridden_by)
-            self._plugin_view.set_plugin_owner(data.plugin_owner)
+            phase_started = timing.now() if timing is not None else None
+            with span("view.apply_conflict_map_delta" if incremental_delta
+                      else "view.set_conflict_maps"):
+                if incremental_delta:
+                    self._modlist_view.apply_conflict_map_delta(
+                        data.overrides, data.overridden_by,
+                        data.bsa_overrides, data.bsa_overridden_by,
+                        changed_conflict_mods)
+                else:
+                    self._modlist_view.set_conflict_maps(
+                        data.overrides, data.overridden_by,
+                        data.bsa_overrides, data.bsa_overridden_by)
+            if timing is not None:
+                timing.mark("selection highlight partner maps updated",
+                            phase_started=phase_started)
+            phase_started = timing.now() if timing is not None else None
+            if incremental_delta:
+                self._plugin_view.apply_plugin_owner_delta(
+                    resolution_delta.changed_plugin_owners)
+            else:
+                self._plugin_view.set_plugin_owner(data.plugin_owner)
             # Rebuild the filter data + repopulate the filter panel's dynamic lists,
             # then reapply whatever filters are currently active.
-            with span("rebuild_filter_data"):
-                self._rebuild_filter_data()
+            if incremental_delta:
+                with span("refresh_filter_conflicts"):
+                    self._refresh_filter_conflicts()
+            else:
+                with span("rebuild_filter_data"):
+                    self._rebuild_filter_data()
+            if timing is not None:
+                timing.mark("plugin owners and mod filters updated",
+                            phase_started=phase_started)
             # The deployed filemap changed → the Data tab is stale (rebuilds lazily).
+            phase_started = timing.now() if timing is not None else None
             if hasattr(self, "_data_view"):
-                self._data_view.mark_dirty()
-            # A mod may have been added/removed → re-evaluate Install vs Reinstall.
-            if hasattr(self, "_downloads_view"):
-                self._downloads_view.mark_dirty()
-            # The deployed file set changed → the Text Files list is stale.
+                if incremental_delta:
+                    self._data_view.apply_resolution_delta(
+                        data.snapshot, resolution_delta)
+                else:
+                    self._data_view.set_snapshot(data.snapshot)
+            if hasattr(self, "_mod_files_view"):
+                self._mod_files_view.set_snapshot(data.snapshot)
             if hasattr(self, "_text_files_view"):
-                self._text_files_view.mark_dirty()
+                self._text_files_view.set_snapshot(data.snapshot)
+            if timing is not None:
+                timing.mark("Data/Mod Files/Text Files snapshots updated",
+                            phase_started=phase_started)
+            # A mod may have been added/removed → re-evaluate Install vs Reinstall.
+            phase_started = timing.now() if timing is not None else None
+            if not toggle_only and hasattr(self, "_downloads_view"):
+                self._downloads_view.mark_dirty()
             # A mod may have been removed/added → re-evaluate the Nexus browser's
             # Install/Reinstall buttons (remove goes through save()→conflict rebuild,
             # which is the only signal the Nexus tab gets for a removal).
-            nv = getattr(self, "_nexus_view", None)
-            if nv is not None:
-                nv.refresh_installed()
-            tv = getattr(self, "_thunderstore_view", None)
-            if tv is not None:
-                tv.refresh_installed()
+            if not toggle_only:
+                nv = getattr(self, "_nexus_view", None)
+                if nv is not None:
+                    nv.refresh_installed()
+                tv = getattr(self, "_thunderstore_view", None)
+                if tv is not None:
+                    tv.refresh_installed()
+            if timing is not None:
+                timing.mark("download/store install state updated",
+                            phase_started=phase_started)
             # The filemap (staged/deployed file set) changed → framework states may
             # have flipped (e.g. a framework mod toggled, deployed, or removed).
             # Precomputed on the conflict worker (detect_frameworks re-reads
@@ -17004,6 +18293,7 @@ class MainWindow(QMainWindow):
             # detect can't overwrite this fresher result. set_statuses is a
             # no-op when the rows are unchanged, so the repeated refreshes a
             # deploy/restore fires don't rebuild (and flicker) the banner.
+            phase_started = timing.now() if timing is not None else None
             if hasattr(self, "_framework_banner"):
                 self._framework_gen += 1
                 self._framework_banner.set_statuses(data.framework_statuses)
@@ -17014,15 +18304,48 @@ class MainWindow(QMainWindow):
                 self._refresh_modlist_stats()
             # A deploy/restore/install writes into overwrite/ (and Root_Folder)
             # without a modlist reload → re-count for the boundary rows' "(N)".
-            self._refresh_boundary_counts()
+            if not toggle_only:
+                self._refresh_boundary_counts()
+            if timing is not None:
+                timing.mark("framework banner, footer stats, and boundaries updated",
+                            phase_started=phase_started)
             # The filemap is now fresh → reload the Plugins tab so ESL/master flags
             # resolve against the winning (e.g. patcher-provided light) copies and
             # plugins still deployed by another enabled mod are recovered. Tk parity:
             # gui.py _on_filemap_rebuilt calls _refresh_plugins_tab() here, AFTER the
             # rebuild - reloading earlier (on the toggle) races the stale filemap.
             with span("reload_plugins"):
-                self._reload_plugins()
+                self._reload_plugins(
+                    timing=timing,
+                    startup_stage=("post-conflict"
+                                   if startup_timing is not None else None))
+            # All synchronous conflict consumers above now describe this
+            # immutable snapshot.  Record the baseline only after they have all
+            # accepted it, so a later native delta cannot be applied to a
+            # partially reset/profile-mismatched UI.
+            self._conflict_ui_profile_id = data.profile_id
+            self._conflict_ui_generation = data.snapshot.generation
+            if timing is not None:
+                timing.mark("post-conflict Plugins reload queued")
+        if getattr(self, "_deploy_refresh_pending", False):
+            self._deploy_refresh_conflicts_done = True
+            self._deploy_timing_mark(
+                "post-deploy conflicts/Data update applied; Plugins reload running")
+        if getattr(self, "_restore_refresh_pending", False):
+            self._restore_refresh_conflicts_done = True
+            self._restore_timing_mark(
+                "post-restore conflicts/Data update applied; Plugins reload running")
+        phase_started = timing.now() if timing is not None else None
         self._maybe_auto_deploy()
+        if timing is not None:
+            timing.mark("post-conflict auto-deploy check complete",
+                        phase_started=phase_started)
+        if startup_timing is not None:
+            self._startup_wait_for_conflicts = False
+            startup_timing.record(
+                "Apply conflicts and queue final plugin refresh",
+                phase_started=startup_apply_started,
+                category="filegraph")
 
     def _maybe_auto_deploy(self):
         """Auto deploy: if the game has auto_deploy enabled, deploy after every
@@ -17054,8 +18377,8 @@ class MainWindow(QMainWindow):
                 self._on_deploy(silent=True)
 
     # ----------------------------------------------------------------- right
-    def _build_plugins(self) -> QWidget:
-        return self._plugins_placeholder()
+    def _build_plugins(self, startup_timing=None) -> QWidget:
+        return self._plugins_placeholder(startup_timing=startup_timing)
 
     def _play_bar(self) -> QWidget:
         bar = QWidget()
@@ -17117,7 +18440,8 @@ class MainWindow(QMainWindow):
         h.addWidget(self._exe_settings_btn)
         return bar
 
-    def _plugins_placeholder(self) -> QWidget:
+    def _plugins_placeholder(self, startup_timing=None) -> QWidget:
+        phase_started = _startup_time.perf_counter()
         from PySide6.QtWidgets import QStackedWidget
         from gui_qt.plugin_model import PluginModel
         from gui_qt.plugin_view import PluginView
@@ -17134,9 +18458,14 @@ class MainWindow(QMainWindow):
                                   self.tr("Downloads"), self.tr("Overrides"),
                                   self.tr("Saves")]
         self._plugin_stack = QStackedWidget()
+        if startup_timing is not None:
+            startup_timing.record(
+                "Initialize plugin tab container",
+                phase_started=phase_started, category="UI")
 
         # Page 0: the real Plugins view, with a framework-status banner above the
         # columns (one colored row per framework the game declares).
+        phase_started = _startup_time.perf_counter()
         self._plugin_model = PluginModel()
         # A plugin reorder/toggle changes BSA load order (BSAs load at their
         # plugin's position), so recompute BSA conflicts when the order is saved.
@@ -17146,7 +18475,8 @@ class MainWindow(QMainWindow):
         # written loadorder.txt) instead of a full filemap rebuild + modlist/
         # plugins reload. Tk parity: recompute_bsa_conflicts.
         self._plugin_model.order_changed.connect(
-            self._recompute_bsa_conflicts_async)
+            lambda: self._rebuild_conflicts_async(
+                edit_ctx=("plugin_order",)))
         self._plugin_model.save_failed.connect(
             lambda msg: self._notify(msg, "error"))
         self._plugin_view = PluginView(self._plugin_model)
@@ -17162,26 +18492,57 @@ class MainWindow(QMainWindow):
         from gui_qt.framework_banner import FrameworkBanner
         self._framework_banner = FrameworkBanner()
         self._plugin_stack.addWidget(self._plugin_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build Plugins tab view", phase_started=phase_started,
+                category="UI")
         # Page 1: the real Mod Files view.
+        phase_started = _startup_time.perf_counter()
         from gui_qt.mod_files_view import ModFilesView
         self._mod_files_view = ModFilesView()
         self._mod_files_view.changed.connect(self._on_mod_files_changed)
         self._mod_files_view.on_open_image = self._open_image_preview_tab
+        self._mod_files_view.on_open_video = self._open_video_preview_tab
         self._mod_files_view.on_open_archive = self._open_bsa_preview_tab
         self._mod_files_view.on_open_nif = self._open_nif_preview_tab
         self._mod_files_view.on_open_text = self._open_text_editor_tab
+        # Footer Pack/Unpack state follows the selected mod regardless of
+        # whether the lazily-built Filters panel has ever been opened.
+        self._mod_files_view.mod_changed.connect(
+            lambda _n: self._update_mf_footer_buttons())
         self._plugin_stack.addWidget(self._mod_files_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build hidden Mod Files tab view",
+                phase_started=phase_started, category="UI")
         # Page 2: the real Text Files view.
+        phase_started = _startup_time.perf_counter()
         from gui_qt.text_files_view import TextFilesView
         self._text_files_view = TextFilesView()
         self._text_files_view.on_open_file = self._open_text_editor_tab
         self._plugin_stack.addWidget(self._text_files_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build hidden Text Files tab view",
+                phase_started=phase_started, category="UI")
         # Page 3: the real Data view.
+        phase_started = _startup_time.perf_counter()
         from gui_qt.data_view import DataView
         self._data_view = DataView()
         self._data_view.on_select_mod = self._on_data_select_mod
+        self._data_view.on_open_file_browser = lambda folder: \
+            self._open_folder_path(folder, self.tr("File location"))
+        self._data_view.on_open_text = self._open_text_editor_tab
+        self._data_view.on_open_nif = self._open_nif_preview_tab
+        self._data_view.on_open_video = self._open_video_preview_tab
+        self._data_view.on_open_archive = self._open_bsa_preview_tab
         self._plugin_stack.addWidget(self._data_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build hidden Data tab view", phase_started=phase_started,
+                category="UI")
         # Page 4: the real Downloads view.
+        phase_started = _startup_time.perf_counter()
         from gui_qt.downloads_view import DownloadsView
         self._downloads_view = DownloadsView()
         self._downloads_view.on_install = \
@@ -17189,9 +18550,14 @@ class MainWindow(QMainWindow):
         self._downloads_view.selection_changed.connect(
             self._update_downloads_footer)
         self._plugin_stack.addWidget(self._downloads_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build hidden Downloads tab view",
+                phase_started=phase_started, category="UI")
         # Page 5: the BG3 Overrides view (override paks - tab shown only for
         # games with has_override_pak_tab; the label is repositioned below so
         # it renders where the hidden Plugins tab sits).
+        phase_started = _startup_time.perf_counter()
         from gui_qt.override_view import OverridesView
         self._overrides_view = OverridesView()
         self._overrides_view.changed.connect(self._on_mod_files_changed)
@@ -17199,7 +18565,12 @@ class MainWindow(QMainWindow):
         # strip (same anchor-highlight path the Plugins/Data tabs use).
         self._overrides_view.on_select_mod = self._on_data_select_mod
         self._plugin_stack.addWidget(self._overrides_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build hidden Overrides tab view",
+                phase_started=phase_started, category="UI")
         # Page 6: the Saves view (Ludusavi-resolved save folders, read-only).
+        phase_started = _startup_time.perf_counter()
         from gui_qt.saves_view import SavesView
         self._saves_view = SavesView(log_fn=self._append_log)
         # Screenshot.jpg / mod_*.txt beside a save open the same way a mod's
@@ -17207,12 +18578,17 @@ class MainWindow(QMainWindow):
         self._saves_view.on_open_image = self._open_image_preview_tab
         self._saves_view.on_open_text = self._open_text_editor_tab
         self._plugin_stack.addWidget(self._saves_view)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Build hidden Saves tab view", phase_started=phase_started,
+                category="UI")
         self._TEXT_FILES_TAB_IDX = 2
         self._DATA_TAB_IDX = 3
         self._DOWNLOADS_TAB_IDX = 4
         self._OVERRIDES_TAB_IDX = 5
         self._SAVES_TAB_IDX = 6
 
+        phase_started = _startup_time.perf_counter()
         tabs = QHBoxLayout()
         tabs.setSpacing(2)
         # Centre the tab strip within the panel (stretch on both sides).
@@ -17240,6 +18616,10 @@ class MainWindow(QMainWindow):
         v.addLayout(tabs)
         v.addWidget(self._plugin_stack, 1)
         self._select_plugin_tab(0)
+        if startup_timing is not None:
+            startup_timing.record(
+                "Assemble plugin sub-tab strip",
+                phase_started=phase_started, category="UI")
         return frame
 
     def _select_plugin_tab(self, idx: int):
@@ -17391,41 +18771,29 @@ class MainWindow(QMainWindow):
         return b
 
     def _color_button(self, text: str, color: str,
-                      compact: bool = False,
-                      active_color: str | None = None) -> QPushButton:
-        """Solid colored button (plugin tools, matching the Tk app).
-
-        *active_color* adds an ``[active="true"]`` fill so the button can light
-        up in a second colour (the Filters footer buttons use it)."""
+                      compact: bool = False) -> QPushButton:
+        """Solid theme-coloured button for a prominent semantic action."""
         pad = "4px 10px" if compact else "6px 14px"
         fs = "12px" if compact else "14px"
         fg = contrast_text(color)   # black or white - whichever reads on the fill
+        disabled_bg = _c(self._pal, "BG_ROW")
+        disabled_fg = _c(self._pal, "TEXT_DIM")
+        disabled_border = _c(self._pal, "BORDER")
         b = QPushButton(text)
         b.setCursor(Qt.PointingHandCursor)
         sheet = (
             f"QPushButton{{background:{color}; color:{fg}; border:none;"
             f" padding:{pad}; border-radius:4px; font-size:{fs};"
             f" font-weight:600;}}"
-            f"QPushButton:hover{{background:{color};}}")
-        if active_color:
-            # The :hover rule above also matches while active, so the active
-            # fill needs its own hover rule to win (equal specificity, later).
-            afg = contrast_text(active_color)
-            sheet += (
-                f'QPushButton[active="true"]{{background:{active_color};'
-                f' color:{afg};}}'
-                f'QPushButton[active="true"]:hover{{background:{active_color};'
-                f' color:{afg};}}')
+            f"QPushButton:hover{{background:{color};}}"
+            f"QPushButton:disabled{{background:{disabled_bg}; color:{disabled_fg};"
+            f" border:1px solid {disabled_border};}}")
         b.setStyleSheet(sheet)
         return b
 
-    def _filters_button(self) -> QPushButton:
-        """A footer "Filters" button: blue at rest, theme purple (BTN_PURPLE)
-        while that panel has a filter set or its search box holds a query.
-        _sync_filters_btn flips the `active` property that swaps the fill."""
-        b = self._color_button(
-            self.tr("Filters"), _c(self._pal, "BTN_INFO"), compact=True,
-            active_color=_c(self._pal, "BTN_PURPLE"))
+    def _filters_button(self) -> QToolButton:
+        """Neutral footer button that uses the accent while filtering."""
+        b = self._text_button(self.tr("Filters"), compact=True)
         b.setFixedHeight(self._FOOT_BTN_H)
         b.setProperty("active", False)
         return b
@@ -17437,11 +18805,16 @@ class MainWindow(QMainWindow):
         for b in buttons:
             b.setMinimumWidth(w)
 
-    def _group_sep(self) -> QFrame:
+    def _group_sep(self, vertical: bool = False) -> QFrame:
+        """Divider between toolbar groups; *vertical* = the bar is a side bar."""
         s = QFrame()
-        s.setFrameShape(QFrame.VLine)
         s.setObjectName("GroupSep")
-        s.setFixedWidth(2)
+        if vertical:
+            s.setFrameShape(QFrame.HLine)
+            s.setFixedHeight(2)
+        else:
+            s.setFrameShape(QFrame.VLine)
+            s.setFixedWidth(2)
         return s
 
     # ------------------------------------------------------ log control bar
@@ -17608,12 +18981,17 @@ class MainWindow(QMainWindow):
         appended to on every ``_append_log`` call so the file stays in sync with
         the on-screen log."""
         self._log_file = None
+        self._log_file_error = None
+        self._log_file_error_reported = False
         try:
             from datetime import datetime
             from Utils.config_paths import get_logs_dir
-            ts = datetime.now().strftime("%m-%d-%y-%H%M%S")
-            self._log_file = get_logs_dir() / f"amethyst-{ts}.log"
-        except Exception:
+            ts = datetime.now().strftime("%m-%d-%y-%H%M%S-%f")
+            self._log_file = get_logs_dir() / f"amethyst-{ts}-{os.getpid()}.log"
+        except Exception as exc:
+            self._log_file_error = (
+                f"could not resolve/create the logs directory: "
+                f"{type(exc).__name__}: {exc}")
             self._log_file = None
 
     def _write_log_file(self, line: str, timestamp: str):
@@ -17622,12 +19000,24 @@ class MainWindow(QMainWindow):
         *timestamp* is the same value shown on-screen so file and panel agree."""
         log_file = getattr(self, "_log_file", None)
         if log_file is None:
-            return
+            return None
         try:
             with open(log_file, "a", encoding="utf-8", errors="replace") as f:
                 f.write(f"[{timestamp}]  {line}\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            self._log_file = None
+            self._log_file_error = f"could not write {log_file}: {exc}"
+            return self._log_file_error
+        return None
+
+    def _report_log_file_failure(self):
+        if getattr(self, "_log_file_error_reported", False):
+            return
+        error = getattr(self, "_log_file_error", None)
+        if not error:
+            return
+        self._log_file_error_reported = True
+        self._append_log(f"ERROR: persistent session log disabled: {error}")
 
     def _log_system_info(self):
         """Write the environment banner to the log (startup, once).
@@ -17654,6 +19044,9 @@ class MainWindow(QMainWindow):
             self._write_log_file(line, timestamp)
         self._log_banner_len = len(self._log_lines) - before
         self._render_log()
+        self._report_log_file_failure()
+        if getattr(self, "_log_file", None) is not None:
+            self._append_log(f"Session log file: {self._log_file}")
 
     def _append_log(self, message: str):
         """Backend log_fn target - append a line to the log text area.
@@ -17691,7 +19084,9 @@ class MainWindow(QMainWindow):
         self._log_lines.append((line, severity, timestamp))
         # Persist to the session log file (before the display filter, so the file
         # captures everything - Tk status_bar parity).
-        self._write_log_file(line, timestamp)
+        file_error = self._write_log_file(line, timestamp)
+        if file_error:
+            self._report_log_file_failure()
         if not self._line_visible(severity):
             return   # filtered out - retained but not shown
         html = self._log_line_html(line, severity, timestamp)
@@ -18084,7 +19479,8 @@ def _apply_app_identity(app) -> None:
     else:
         app.setDesktopFileName("io.github.Amethyst.ModManager")
 
-def run() -> int:
+def run(startup_timing=None) -> int:
+    phase_started = _startup_time.perf_counter()
     import sys
     from PySide6.QtWidgets import QApplication
     from Nexus.nxm_handler import (
@@ -18094,7 +19490,12 @@ def run() -> int:
     # (logs/nxm.log) is the only record of this launch - log it first thing.
     from Thunderstore.ror2mm_handler import (
         Ror2mmHandler, ror2mm_url_from_argv, strip_ror2mm_argv)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Import protocol handlers", phase_started=phase_started,
+            category="imports")
 
+    phase_started = _startup_time.perf_counter()
     nxm_url = nxm_url_from_argv()
     if nxm_url or "--nxm" in sys.argv:
         nxm_log(f"NXM launch: argv={sys.argv[1:]}")
@@ -18129,27 +19530,79 @@ def run() -> int:
     elif "--ror2mm" in sys.argv:
         nxm_log("--ror2mm flag present but no ror2mm:// URL in argv")
 
-    # Register as the nxm:// handler on every full launch (idempotent) so
-    # "Download with Manager" on Nexus routes here.
-    try:
-        NxmHandler.register()
-    except Exception:
-        import traceback
-        nxm_log(f"NxmHandler.register() crashed:\n{traceback.format_exc()}")
+    if startup_timing is not None:
+        startup_timing.record(
+            "Parse links and check for an existing instance",
+            phase_started=phase_started, category="services")
 
-    # Same for ror2mm:// so Thunderstore's "Install with Mod Manager" button
-    # routes here. Independent try/except: a failure in one scheme's XDG
-    # registration must not stop the other from being registered.
-    try:
-        Ror2mmHandler.register()
-    except Exception:
-        import traceback
-        nxm_log(f"Ror2mmHandler.register() crashed:\n{traceback.format_exc()}")
+    # Registration writes desktop files and invokes several XDG/GIO helper
+    # processes.  It is idempotent but can take seconds, and neither parsing a
+    # URL nor handing it to this instance depends on it.  Keep the two schemes
+    # serialized in one worker (both patch mimeapps.list) and start it only
+    # after the splash is visible, off the splash-critical path.
+    def _register_protocol_handlers():
+        registration_started = _startup_time.perf_counter()
+        nxm_current = False
+        try:
+            nxm_current = NxmHandler.registration_is_current()
+            if nxm_current:
+                nxm_log("nxm:// registration unchanged - skipping desktop refresh")
+            else:
+                NxmHandler.register()
+        except Exception:
+            import traceback
+            nxm_log(f"NXM registration check/update crashed:\n{traceback.format_exc()}")
+        if startup_timing is not None:
+            startup_timing.record(
+                ("Verify NXM protocol handler (unchanged)" if nxm_current
+                 else "Register NXM protocol handler"),
+                phase_started=registration_started,
+                lane="protocol worker", category="services")
+
+        registration_started = _startup_time.perf_counter()
+        ror2mm_current = False
+        try:
+            ror2mm_current = Ror2mmHandler.registration_is_current()
+            if ror2mm_current:
+                nxm_log(
+                    "ror2mm:// registration unchanged - skipping desktop refresh")
+            else:
+                Ror2mmHandler.register()
+        except Exception:
+            import traceback
+            nxm_log(
+                f"ror2mm registration check/update crashed:\n{traceback.format_exc()}")
+        if startup_timing is not None:
+            startup_timing.record(
+                ("Verify Thunderstore protocol handler (unchanged)"
+                 if ror2mm_current
+                 else "Register Thunderstore protocol handler"),
+                phase_started=registration_started,
+                lane="protocol worker", category="services")
 
     # Migrate/clean amethyst.ini BEFORE anything reads it (theme loader, GameState).
     # Wipes a pre-Qt ini (missing [meta] version=2) so everyone starts fresh.
-    from Utils.ui_config import ensure_ini_version, load_language, load_ui_scale
-    ensure_ini_version()
+    phase_started = _startup_time.perf_counter()
+    from Utils.ui_config import (
+        ensure_ini_version, load_language, load_ui_scale,
+        load_ui_scale_is_auto,
+    )
+    from Utils.app_log import app_log as _app_log, safe_print as _safe_print
+
+    def _startup_log(message):
+        _app_log(message)
+        _safe_print(f"[startup] {message}", file=sys.stderr)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Import UI configuration helpers", phase_started=phase_started,
+            category="imports")
+
+    phase_started = _startup_time.perf_counter()
+    ensure_ini_version(log_fn=_startup_log)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Validate/migrate application configuration",
+            phase_started=phase_started, category="configuration")
 
     # Apply the user's saved UI scale. Qt only reads QT_SCALE_FACTOR once, at
     # QApplication construction, so this must run before the QApplication below;
@@ -18164,22 +19617,57 @@ def run() -> int:
     # if QT_SCALE_FACTOR is present WITHOUT the marker, it's the user's - leave
     # it alone.
     import os as _os
+    phase_started = _startup_time.perf_counter()
+    _scale_auto = False
     try:
-        _scale = load_ui_scale()
+        _scale = load_ui_scale(timing=startup_timing)
+        _scale_auto = load_ui_scale_is_auto()
+    except Exception as exc:
+        _scale = None
+        _startup_log(f"Startup display: UI scale could not be loaded: "
+                     f"{type(exc).__name__}: {exc}")
+    if startup_timing is not None:
+        startup_timing.record(
+            "Load UI scale setting (aggregate)",
+            phase_started=phase_started, category="aggregate")
+
+    phase_started = _startup_time.perf_counter()
+    try:
+        if _scale is None:
+            raise ValueError("UI scale could not be loaded")
         _ours = _os.environ.get("_AMM_OWNS_SCALE") == "1"
         _user_set = "QT_SCALE_FACTOR" in _os.environ and not _ours
-        if not _user_set:
+        if _user_set:
+            _app_names = set((_os.environ.get("_AMM_ENV_KEYS") or "").split(","))
+            _source = ("saved Amethyst environment setting"
+                       if "QT_SCALE_FACTOR" in _app_names
+                       else "inherited environment")
+            _startup_log(
+                f"Startup display: QT_SCALE_FACTOR={_os.environ['QT_SCALE_FACTOR']} "
+                f"from {_source}; UI scale setting {_scale:g} did not override it.")
+        else:
             if abs(_scale - 1.0) > 0.01:
                 _os.environ["QT_SCALE_FACTOR"] = (
                     f"{_scale:.4f}".rstrip("0").rstrip("."))
                 _os.environ["_AMM_OWNS_SCALE"] = "1"
+                _source = "automatic detection" if _scale_auto else "saved UI setting"
+                _startup_log(f"Startup display: applying UI scale {_scale:g} "
+                             f"from {_source}.")
             else:
                 # 1.0 / auto→1.0: drop any scale we set on a previous launch so
                 # Qt's native per-monitor DPI handling takes over again.
                 _os.environ.pop("QT_SCALE_FACTOR", None)
                 _os.environ.pop("_AMM_OWNS_SCALE", None)
-    except Exception:
-        pass
+                _source = "automatic detection" if _scale_auto else "saved UI setting"
+                _startup_log(f"Startup display: {_source} resolved to 1; "
+                             "using Qt native per-monitor scaling.")
+    except Exception as exc:
+        _startup_log(f"Startup display: could not apply UI scale: "
+                     f"{type(exc).__name__}: {exc}")
+    if startup_timing is not None:
+        startup_timing.record(
+            "Apply UI scale environment",
+            phase_started=phase_started, category="configuration")
 
     # Share GL contexts so the nif viewport survives tab detach/re-pin
     # reparenting. Must be set before the QApplication exists.
@@ -18194,35 +19682,77 @@ def run() -> int:
     # hang is handled where it happens instead, by holding off viewport repaints
     # mid-resize (see _Viewport.resizeEvent). Users can still opt in by exporting
     # QT_XCB_GL_INTEGRATION themselves - Qt reads it without our help.
+    phase_started = _startup_time.perf_counter()
     app = QApplication(sys.argv)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Construct QApplication", phase_started=phase_started,
+            category="Qt")
     # Before anything installs an event filter: an exception escaping a Qt
     # callback leaves CPython's error indicator set and kills the next widget
     # Qt-side construction with a bogus "returned NULL without setting an
     # exception" SystemError somewhere else entirely.
+    phase_started = _startup_time.perf_counter()
     from gui_qt.qt_callback_guard import install as _install_callback_guard
     _install_callback_guard()
     _apply_app_identity(app)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Install Qt guards and application identity",
+            phase_started=phase_started, category="Qt")
     # Install UI translators before any widget is built (Qt only translates
     # tr() calls made after the translator is installed). Language comes from
     # amethyst.ini, which ensure_ini_version() has just finished migrating.
+    phase_started = _startup_time.perf_counter()
     from gui_qt.i18n import install_translators
     install_translators(app, load_language())
+    if startup_timing is not None:
+        startup_timing.record(
+            "Load translations", phase_started=phase_started,
+            category="UI")
+    phase_started = _startup_time.perf_counter()
     apply_theme(app)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Apply application theme", phase_started=phase_started,
+            category="UI")
 
     # Transparent, correctly-centred splash covering first load. Held open past
     # show() and dismissed by MainWindow on the first completed conflict rebuild
     # (with a watchdog fallback). Never let a splash failure block startup.
+    phase_started = _startup_time.perf_counter()
     _splash = None
     try:
         from gui_qt.splash import show_splash
         _splash = show_splash()
     except Exception:
         _splash = None
+    if startup_timing is not None:
+        startup_timing.record(
+            "Create startup splash", phase_started=phase_started,
+            category="UI")
 
-    win = MainWindow(app, splash=_splash)
+    import threading as _threading
+    phase_started = _startup_time.perf_counter()
+    _threading.Thread(
+        target=_register_protocol_handlers, daemon=True,
+        name="protocol-registration").start()
+    if startup_timing is not None:
+        startup_timing.record(
+            "Queue protocol registration worker",
+            phase_started=phase_started, category="services")
+
+    phase_started = _startup_time.perf_counter()
+    win = MainWindow(
+        app, splash=_splash, startup_timing=startup_timing)
+    if startup_timing is not None:
+        startup_timing.record(
+            "Construct main window (aggregate)",
+            phase_started=phase_started, category="aggregate")
     # Route stderr + uncaught tracebacks into the log panel now that the log
     # sink (set_app_log) is wired by MainWindow.__init__. Best-effort - a
     # failure here must never block startup.
+    phase_started = _startup_time.perf_counter()
     try:
         from Utils.stderr_capture import (
             install as _install_stderr_capture,
@@ -18235,6 +19765,10 @@ def run() -> int:
         _install_faulthandler()
     except Exception:
         pass
+    if startup_timing is not None:
+        startup_timing.record(
+            "Attach stderr and crash reporting to UI",
+            phase_started=phase_started, category="diagnostics")
     # Show the window immediately so its layout gets a real size (the deferred
     # singleShot(0) setup in __init__ reads live widget heights), but at zero
     # opacity so nothing is visibly rendered behind the splash while it loads.
@@ -18245,6 +19779,7 @@ def run() -> int:
     # thread, and only lands if it beats the window onto the screen; the inline
     # version of that probe aborted the process on GLX stacks that can't serve
     # the format (qFatal, uncatchable - it took the AppImage down under Xvfb).
+    phase_started = _startup_time.perf_counter()
     win._start_gl_warmup()
     if _splash is not None:
         win.setWindowOpacity(0.0)
@@ -18254,9 +19789,20 @@ def run() -> int:
             _splash.raise_()
         except Exception:
             pass
+    if startup_timing is not None:
+        startup_timing.record(
+            "Start GL warmup and show window",
+            phase_started=phase_started, category="UI")
     # Listen for NXM links handed off by future instances (after the window is
     # up so the received-link handler has a live UI to drive).
+    phase_started = _startup_time.perf_counter()
     win._start_nxm_ipc()
+    if startup_timing is not None:
+        startup_timing.record(
+            "Start link IPC listener", phase_started=phase_started,
+            category="services")
+        win._startup_event_loop_wait_started = _startup_time.perf_counter()
+        QTimer.singleShot(0, win._startup_event_loop_started)
     rc = app.exec()
 
     # A language change requests a clean self-restart so the whole UI rebuilds

@@ -28,7 +28,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QStackedWidget,
 )
 
-from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
+from gui_qt.theme_qt import (
+    active_palette, _c, button_qss, close_button, ok_text, err_text,
+)
 from gui_qt.safe_emit import safe_emit
 from Utils.pandora_tools import EXE_NAME, find_pandora_exe
 
@@ -96,10 +98,7 @@ class PandoraView(QWidget):
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(
-            button_qss("BTN_DANGER", padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=p)
         close.clicked.connect(self._on_close)
         hb.addWidget(close)
         v.addWidget(bar)
@@ -217,6 +216,10 @@ class PandoraView(QWidget):
             on_continue=self._on_proton_chosen,
             log_fn=self._log,
             title=self.tr("Step 2: Choose Proton Version"),
+            wizard_id=getattr(self._ctx, "wizard_tool_id", ""),
+            wizard_label=getattr(self._ctx, "wizard_tool_label", ""),
+            wizard_label_args=getattr(
+                self._ctx, "wizard_tool_label_args", ()),
         )
 
     def _on_proton_chosen(self, proton_name: str, prefix_mode: str):
@@ -320,7 +323,8 @@ class PandoraView(QWidget):
                 rc = run_pandora(
                     exe, game, proton_script, compat_data, env,
                     log_fn=lambda m: self._log(f"Pandora Wizard: {m}"),
-                    on_started=lambda *a: safe_emit(self._run_started_sig, *a))
+                    on_started=lambda *a: safe_emit(self._run_started_sig, *a),
+                    owner=self)
                 if rc != 0:
                     safe_emit(self._run_status_sig,
                         self.tr("Pandora exited with error (code {0}).\nSee the "

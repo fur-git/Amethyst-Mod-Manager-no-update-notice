@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from gui_qt.overlay_base import OverlayBase
 from gui_qt.safe_emit import safe_emit
 from gui_qt.theme_qt import (
-    _c, active_palette, button_qss, contrast_text, danger_close_button,
+    _c, active_palette, button_qss, contrast_text, close_button,
     err_text, ok_text,
 )
 from Utils.prefix_health import HealthStatus
@@ -102,7 +102,15 @@ def _install_lavfilters(game, log_fn) -> bool:
     return repair_lavfilters(game, log_fn=log_fn)
 
 
+def _install_dotnet(version: str):
+    def _install(game, log_fn) -> bool:
+        from Utils.proton_tools import install_dotnet
+        return install_dotnet(game, version, log_fn=log_fn)
+    return _install
+
+
 from Utils.protontricks import WINETRICKS_VERB_DEPS as _WINETRICKS_VERB_DEPS
+from Utils.proton_tools import DOTNET_VERSIONS as _DOTNET_VERSIONS
 
 def _install_winetricks_verb(verb: str):
     """Fix handler for a component that is just a winetricks verb."""
@@ -118,6 +126,7 @@ _FIX_INSTALLERS = {
     "d3dcompiler_47": _install_d3dcompiler,
     "lavfilters": _install_lavfilters,
     "game_registry": _fix_game_registry,
+    **{f"dotnet{_v}": _install_dotnet(_v) for _v in _DOTNET_VERSIONS},
     **{_v: _install_winetricks_verb(_v) for _v in _WINETRICKS_VERB_DEPS},
 }
 
@@ -244,7 +253,7 @@ class PrefixHealthOverlay(OverlayBase):
         bar.addWidget(self._fix_all)
 
         bar.addStretch(1)
-        self._close_btn = danger_close_button()
+        self._close_btn = close_button()
         self._close_btn.clicked.connect(lambda: self._finish(None))
         bar.addWidget(self._close_btn)
         v.addLayout(bar)
@@ -317,6 +326,9 @@ class PrefixHealthOverlay(OverlayBase):
 
     def _label_for(self, check) -> str:
         """Localised row label; falls back to the util's English one."""
+        for version in _DOTNET_VERSIONS:
+            if check.check_id == f"dotnet{version}":
+                return self.tr(".NET {0} Desktop Runtime").format(version)
         return {
             "prefix_exists": self.tr("Proton prefix"),
             "prefix_structure": self.tr("Prefix structure"),

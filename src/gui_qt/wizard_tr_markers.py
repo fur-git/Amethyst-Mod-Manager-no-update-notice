@@ -31,6 +31,7 @@ WIZARD_LABELS = (
     QT_TRANSLATE_NOOP("WizardTools", "Run BodySlide"),
     QT_TRANSLATE_NOOP("WizardTools", "Run Outfit Studio"),
     QT_TRANSLATE_NOOP("WizardTools", "Downgrade Fallout 4"),
+    QT_TRANSLATE_NOOP("WizardTools", "Downgrade Skyrim Special Edition"),
     QT_TRANSLATE_NOOP("WizardTools", "Install Script Extender (F4SE)"),
     QT_TRANSLATE_NOOP("WizardTools", "Run BethINI Pie"),
     QT_TRANSLATE_NOOP("WizardTools", "Install Script Extender (F4SEVR)"),
@@ -45,6 +46,7 @@ WIZARD_LABELS = (
     QT_TRANSLATE_NOOP("WizardTools", "Install Script Extender (SKSE)"),
     QT_TRANSLATE_NOOP("WizardTools", "SkyGen - Patch Generator"),
     QT_TRANSLATE_NOOP("WizardTools", "Plugin Audit & Cleanup"),
+    QT_TRANSLATE_NOOP("WizardTools", "BSA Pack Candidates"),
     QT_TRANSLATE_NOOP("WizardTools", "SSE Display Tweaks Config"),
     QT_TRANSLATE_NOOP("WizardTools", "Engine Fixes Config"),
     QT_TRANSLATE_NOOP("WizardTools", "Run Pandora"),
@@ -57,6 +59,7 @@ WIZARD_LABELS = (
     QT_TRANSLATE_NOOP("WizardTools", "Run TexGen"),
     QT_TRANSLATE_NOOP("WizardTools", "Run DynDOLOD"),
     QT_TRANSLATE_NOOP("WizardTools", "Run xLODGen"),
+    QT_TRANSLATE_NOOP("WizardTools", "Run ACMOS Road Generator"),
     QT_TRANSLATE_NOOP("WizardTools", "Run VRAMr"),
     QT_TRANSLATE_NOOP("WizardTools", "Run BENDr"),
     QT_TRANSLATE_NOOP("WizardTools", "Run ParallaxR"),
@@ -111,8 +114,12 @@ WIZARD_DESCRIPTIONS = (
         "Deploy mods and run Outfit Studio from the Data folder."),
     QT_TRANSLATE_NOOP(
         "WizardTools",
-        "Download the latest Fallout 4 Steam Downgrader and run it from the "
-        "game folder."),
+        "Download the latest Fallout 4 Steam Downgrader (game or Creation "
+        "Kit) and run it from the game folder."),
+    QT_TRANSLATE_NOOP(
+        "WizardTools",
+        "Download the latest Skyrim Special Edition Steam Downgrader (game "
+        "or Creation Kit) and run it from the game folder."),
     QT_TRANSLATE_NOOP("WizardTools", "Download and install F4SE into the game folder."),
     QT_TRANSLATE_NOOP(
         "WizardTools",
@@ -209,6 +216,10 @@ WIZARD_DESCRIPTIONS = (
         "Install xLODGen, deploy mods, and run xLODGenx64.exe."),
     QT_TRANSLATE_NOOP(
         "WizardTools",
+        "Install ACMOS Road Generator, choose a terrain LOD mod, and write "
+        "generated road textures to ACMOS_Output."),
+    QT_TRANSLATE_NOOP(
+        "WizardTools",
         "Install BethINI Pie and configure Skyrim SE INI settings."),
     QT_TRANSLATE_NOOP(
         "WizardTools",
@@ -230,6 +241,10 @@ WIZARD_DESCRIPTIONS = (
         "Scan load order for safe-to-disable plugins, then disable them or "
         "clean up orphaned SkyGen BOS/SkyPatcher INIs for plugins that must "
         "stay enabled."),
+    QT_TRANSLATE_NOOP(
+        "WizardTools",
+        "Rank mods by how many files they could pack into a BSA/BA2, and flag "
+        "the ones that would break if packed."),
     QT_TRANSLATE_NOOP(
         "WizardTools",
         "Download and install SKSEVR into the game folder."),
@@ -279,6 +294,7 @@ WIZARD_DESCRIPTIONS = (
 # Category headers -- the submenu titles (Utils/wizard_catalog.CATEGORY_ORDER).
 WIZARD_CATEGORIES = (
     QT_TRANSLATE_NOOP("WizardTools", "Setup and Installers"),
+    QT_TRANSLATE_NOOP("WizardTools", "Install Modlist"),
     QT_TRANSLATE_NOOP("WizardTools", "Body and Outfits"),
     QT_TRANSLATE_NOOP("WizardTools", "Animation and Physics"),
     QT_TRANSLATE_NOOP("WizardTools", "DynDOLOD"),
@@ -287,6 +303,7 @@ WIZARD_CATEGORIES = (
     QT_TRANSLATE_NOOP("WizardTools", "xEdit"),
     QT_TRANSLATE_NOOP("WizardTools", "Load Order and Config"),
     QT_TRANSLATE_NOOP("WizardTools", "INI Tweaks"),
+    QT_TRANSLATE_NOOP("WizardTools", "NIF Viewer"),
     QT_TRANSLATE_NOOP("WizardTools", "Other"),
 )
 

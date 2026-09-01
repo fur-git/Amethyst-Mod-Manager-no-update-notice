@@ -18,6 +18,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtCore import QCoreApplication, QT_TRANSLATE_NOOP
 
 from gui_qt.confirm_overlay import ConfirmOverlay
+from gui_qt.i18n import profile_display
 from gui_qt.modlist_model import COL_NAME
 from gui_qt.text_input_overlay import TextInputOverlay
 
@@ -145,7 +146,7 @@ def build_context_menu(view, index):
         #   Log         - both (files swept in on restore; Root Folder gets its
         #                 own .mm_overwrite_log.txt written by _move_runtime_files)
         #   Show Conflicts - Overwrite only (Root Folder has no conflict data)
-        from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
+        from Utils.filegraph_constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
         if multi_mods or multi_seps:
             return None
         has_game = getattr(view, "game", None) is not None
@@ -397,6 +398,8 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         lambda: _open_note_editor(view, [name]))
     if _nif_viewer_available(view) and _has_meshes(view, name):
         act(_mt("Open in NIF Viewer"), lambda: _open_nif_viewer(view, name))
+    if _has_fomod_choices(view, name):
+        act(_mt("View FOMOD Choices"), lambda: _show_fomod_choices(view, name))
     if _has_conflict(model, row):
         act(_mt("Show Conflicts"), lambda: _show_conflicts(view, name))
         act(_mt("Clear Conflict Filter") if _conflict_filter_on(view, name)
@@ -694,6 +697,28 @@ def _conflict_filter_on(view, name: str | None = None) -> bool:
     return anchor == name if name is not None else bool(anchor)
 
 
+def _has_fomod_choices(view, name: str) -> bool:
+    """True when this mod was installed through the FOMOD wizard and its
+    selections were saved, so there is something to show."""
+    if not name:
+        return False
+    try:
+        from Utils.fomod_choices import has_choices
+        game = getattr(view, "game", None)
+        return has_choices(name, getattr(view, "profile_dir", None),
+                           getattr(game, "name", "") or "")
+    except Exception:
+        return False
+
+
+def _show_fomod_choices(view, name):
+    """Open the FOMOD Choices tab for *name* (window installs the callback in
+    _reload_modlist). No-op if it isn't wired (e.g. headless)."""
+    cb = getattr(view, "on_show_fomod_choices", None)
+    if cb is not None and name:
+        cb(name)
+
+
 def _nif_viewer_available(view) -> bool:
     """True when the active game ships the NIF Viewer tool (the Bethesda
     titles). Asked of the tool registry so the two can't drift apart."""
@@ -715,7 +740,7 @@ def _has_meshes(view, name: str) -> bool:
         return False
     try:
         from Utils.mesh_catalog import mod_has_assets
-        return mod_has_assets(staging, name)
+        return mod_has_assets(staging, name, game=getattr(view, "game", None))
     except Exception:
         return False
 
@@ -925,6 +950,9 @@ def _move_to_separator(view, model, mod_rows, sep_name):
     # splicing a display-ordered block into the natural list flips the mods'
     # relative priorities (GH#380).
     moved = [e for e in model.natural_entries() if e.name in moved_names]
+    from Utils.conflict_timing import ConflictTimeline
+    timing = ConflictTimeline("move", [e.name for e in moved])
+    phase_started = timing.now()
     old_order = [e.name for e in model.natural_entries() if not e.is_separator]
     # Body = the NATURAL order minus the moved mods - the display may be a
     # sorted/inverted permutation and must never be persisted as the new order.
@@ -940,10 +968,14 @@ def _move_to_separator(view, model, mod_rows, sep_name):
     # no conflicting mod skips the conflict rebuild (see app._on_modlist_saved).
     new_order = [e.name for e in model.natural_entries() if not e.is_separator]
     ctx = model._move_ctx(old_order, new_order, [e.name for e in moved])
+    timing.mark("move-to-separator Qt model update complete",
+                phase_started=phase_started)
     try:
-        model.save(edit_ctx=None if ctx is None else ("move",) + ctx)
-    except Exception:
-        pass
+        save_ctx = (("move",) + ctx + (timing,) if ctx is not None
+                    else ("full", timing))
+        model.save(edit_ctx=save_ctx)
+    except Exception as exc:
+        timing.finish(f"move-to-separator save failed: {exc}")
 
 
 # ---- Copy / Move to profile ------------------------------------------------
@@ -983,8 +1015,9 @@ def _profile_submenu_items(view, names, mod_rows, others, move: bool):
         e = model.entry(r)
         if not e.is_separator:
             enabled_map[e.name] = e.enabled
+    # The label is display-only; the callback closes over the FOLDER name.
     return [
-        (prof, (lambda p=prof: _copy_to_profile(
+        (profile_display(prof), (lambda p=prof: _copy_to_profile(
             view, names, dict(enabled_map), p, move)))
         for prof in others
     ]
@@ -1290,6 +1323,9 @@ def _sort_selected_alphabetically(view, model, mod_rows):
     # permutation); at each selected slot drop in the next sorted entry.
     # set_entries re-appends boundaries.
     sel_ids = {id(e) for e in sel}
+    from Utils.conflict_timing import ConflictTimeline
+    timing = ConflictTimeline("move", [e.name for e in sel])
+    phase_started = timing.now()
     old_order = [e.name for e in model.natural_entries() if not e.is_separator]
     body: list = []
     it = iter(sorted_entries)
@@ -1302,10 +1338,14 @@ def _sort_selected_alphabetically(view, model, mod_rows):
     # a sort that flipped no conflicting pair skips the conflict rebuild.
     new_order = [e.name for e in model.natural_entries() if not e.is_separator]
     ctx = model._move_ctx(old_order, new_order, [e.name for e in sel])
+    timing.mark("sort-selection Qt model update complete",
+                phase_started=phase_started)
     try:
-        model.save(edit_ctx=None if ctx is None else ("move",) + ctx)
-    except Exception:
-        pass
+        save_ctx = (("move",) + ctx + (timing,) if ctx is not None
+                    else ("full", timing))
+        model.save(edit_ctx=save_ctx)
+    except Exception as exc:
+        timing.finish(f"sort-selection save failed: {exc}")
 
 
 def _create_empty_mod(view, model, row):
@@ -1372,7 +1412,7 @@ def _show_overwrite_log(view, boundary_name=None):
     game = getattr(view, "game", None)
     if game is None:
         return
-    from Utils.filemap import ROOT_FOLDER_NAME
+    from Utils.filegraph_constants import ROOT_FOLDER_NAME
     is_root = boundary_name == ROOT_FOLDER_NAME
     text = ""
     try:

@@ -7,6 +7,8 @@ No UI, no game-specific knowledge.
 from __future__ import annotations
 
 import collections
+import errno
+import fnmatch
 import os
 import re
 import shutil
@@ -41,6 +43,21 @@ _COMMON_SUBDIR = Path("steamapps") / "common"
 
 _STEAM_FLATPAK_ID = "com.valvesoftware.Steam"
 _STEAM_FLATPAK_DATA = _HOME / ".var" / "app" / _STEAM_FLATPAK_ID
+
+_discovery_warnings: set[str] = set()
+_discovery_warning_lock = threading.Lock()
+
+
+def _warn_discovery_once(key: str, message: str) -> None:
+    with _discovery_warning_lock:
+        if key in _discovery_warnings:
+            return
+        _discovery_warnings.add(key)
+    try:
+        from Utils.app_log import app_log
+        app_log(f"Steam discovery: {message}")
+    except Exception:
+        pass
 
 
 def _proton_script_in_steam_flatpak(proton_script: "Path") -> bool:
@@ -154,13 +171,20 @@ def steam_launch_options(app_id: str) -> str:
             continue
         try:
             user_dirs = [d for d in userdata.iterdir() if d.is_dir()]
-        except OSError:
+        except OSError as exc:
+            _warn_discovery_once(
+                f"userdata:{userdata}",
+                f"could not scan Steam userdata directory {userdata}: {exc}")
             continue
         for user_dir in user_dirs:
             cfg = user_dir / "config" / "localconfig.vdf"
             try:
                 mtime = cfg.stat().st_mtime
-            except OSError:
+            except OSError as exc:
+                if getattr(exc, "errno", None) not in (errno.ENOENT, errno.ENOTDIR):
+                    _warn_discovery_once(
+                        f"launch-options:{cfg}",
+                        f"could not inspect Steam launch options {cfg}: {exc}")
                 continue
             if mtime <= best[0]:
                 continue
@@ -199,7 +223,10 @@ def _parse_launch_options(localconfig: Path, app_id: str) -> str:
                 m = re.match(r'"([^"]*)"$', line)
                 if m:
                     pending = m.group(1).lower()
-    except OSError:
+    except OSError as exc:
+        _warn_discovery_once(
+            f"launch-options-read:{localconfig}",
+            f"could not read Steam launch options {localconfig}: {exc}")
         return ""
     return ""
 
@@ -264,13 +291,20 @@ def _newest_localconfig() -> "Path | None":
             continue
         try:
             user_dirs = [d for d in userdata.iterdir() if d.is_dir()]
-        except OSError:
+        except OSError as exc:
+            _warn_discovery_once(
+                f"userdata:{userdata}",
+                f"could not scan Steam userdata directory {userdata}: {exc}")
             continue
         for user_dir in user_dirs:
             cfg = user_dir / "config" / "localconfig.vdf"
             try:
                 mtime = cfg.stat().st_mtime
-            except OSError:
+            except OSError as exc:
+                if getattr(exc, "errno", None) not in (errno.ENOENT, errno.ENOTDIR):
+                    _warn_discovery_once(
+                        f"localconfig:{cfg}",
+                        f"could not inspect Steam user configuration {cfg}: {exc}")
                 continue
             if mtime > best[0]:
                 best = (mtime, cfg)
@@ -663,13 +697,43 @@ def _proton_sort_key(name: str) -> tuple[int, tuple[int, ...], str]:
     return (0 if is_ge else 1, tuple(-n for n in nums), lower)
 
 
+def resolve_custom_proton_script(value: "str | Path | None" = None) -> Path | None:
+    """Resolve a configured build directory or top-level ``proton`` script."""
+    if value is None:
+        try:
+            from Utils.ui_config import load_custom_proton_path
+            value = load_custom_proton_path()
+        except Exception:
+            value = ""
+    if not value:
+        return None
+    try:
+        path = Path(value).expanduser()
+        script = path if path.is_file() else path / "proton"
+        return script if script.is_file() and script.name == "proton" else None
+    except OSError:
+        return None
+
+
+def is_custom_proton_script(script: "str | Path") -> bool:
+    custom = resolve_custom_proton_script()
+    if custom is None:
+        return False
+    try:
+        return Path(script).resolve() == custom.resolve()
+    except OSError:
+        return Path(script) == custom
+
+
 def list_installed_proton() -> list[Path]:
     """Return all installed Proton launcher scripts, sorted by _proton_sort_key.
 
     Covers the Steam roots (compatibilitytools.d + steamapps/common) and the
     Proton builds Heroic's Wine Manager downloads (the only source on
-    Steam-less systems, GH#320). Deduplicates by resolved path so symlinked
-    Steam roots (e.g. ~/.steam/steam) don't produce duplicate entries.
+    Steam-less systems, GH#320), plus one user-configured build. Deduplicates
+    by resolved path so symlinked Steam roots (e.g. ~/.steam/steam) don't
+    produce duplicate entries. The custom build is listed last so registering
+    one does not change the default selection in existing Proton pickers.
     """
     seen: set[Path] = set()
     candidates: list[Path] = []
@@ -692,7 +756,10 @@ def list_installed_proton() -> list[Path]:
                         continue
                     seen.add(resolved)
                     candidates.append(proton_script)
-            except OSError:
+            except OSError as exc:
+                _warn_discovery_once(
+                    f"proton-dir:{search_dir}",
+                    f"could not scan Proton directory {search_dir}: {exc}")
                 continue
     # Heroic-managed Proton builds. A Heroic copy whose directory name matches
     # a Steam-provided tool is skipped - it's the same build, and the Steam
@@ -700,7 +767,9 @@ def list_installed_proton() -> list[Path]:
     try:
         from Utils.heroic_finder import list_heroic_proton_scripts
         heroic_scripts = list_heroic_proton_scripts()
-    except Exception:
+    except Exception as exc:
+        _warn_discovery_once(
+            "heroic-proton", f"Heroic Proton scan failed: {type(exc).__name__}: {exc}")
         heroic_scripts = []
     steam_names = {c.parent.name.lower() for c in candidates}
     for proton_script in heroic_scripts:
@@ -713,6 +782,26 @@ def list_installed_proton() -> list[Path]:
         seen.add(resolved)
         candidates.append(proton_script)
     candidates.sort(key=lambda p: _proton_sort_key(p.parent.name))
+
+    custom = resolve_custom_proton_script()
+    if custom is not None:
+        try:
+            custom_resolved = custom.resolve()
+        except OSError:
+            custom_resolved = custom
+        custom_name = _normalize_tool_name(custom.parent.name)
+        filtered: list[Path] = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            if (resolved != custom_resolved
+                    and _normalize_tool_name(candidate.parent.name)
+                    != custom_name):
+                filtered.append(candidate)
+        candidates = filtered
+        candidates.append(custom)
     return candidates
 
 
@@ -739,12 +828,16 @@ def find_any_installed_proton(preferred_name: str = "") -> Path | None:
             if _normalize_tool_name(candidate.parent.name) == preferred_norm:
                 return candidate
 
+    standard = [c for c in candidates if not is_custom_proton_script(c)]
     proton_like = [
-        c for c in candidates
+        c for c in standard
         if c.parent.name.lower().startswith(("proton", "ge-proton"))
     ]
     if not proton_like:
-        proton_like = candidates
+        proton_like = standard
+
+    if not proton_like:
+        return candidates[-1]
 
     proton_like.sort(key=lambda p: _proton_sort_key(p.parent.name))
     return proton_like[0]
@@ -837,7 +930,10 @@ def _stat_sig(path) -> "tuple[int, int] | None":
     """(st_mtime_ns, st_size) for a regular file, None if absent/unreadable."""
     try:
         st = os.stat(path)
-    except OSError:
+    except OSError as exc:
+        if getattr(exc, "errno", None) not in (errno.ENOENT, errno.ENOTDIR):
+            _warn_discovery_once(
+                f"stat:{path}", f"could not inspect {path}: {exc}")
         return None
     return (st.st_mtime_ns, st.st_size) if stat.S_ISREG(st.st_mode) else None
 
@@ -857,7 +953,10 @@ def _custom_vdf_path() -> str:
         custom = load_steam_libraries_vdf_path()
         _custom_vdf_cache = (ini_sig, custom)
         return custom
-    except Exception:
+    except Exception as exc:
+        _warn_discovery_once(
+            "custom-vdf-config",
+            f"could not load the custom VDF setting: {type(exc).__name__}: {exc}")
         return ""
 
 
@@ -916,6 +1015,63 @@ def find_steam_libraries() -> list[Path]:
     return libraries
 
 
+def steam_discovery_report() -> list[str]:
+    """One-shot diagnostic summary for a failed game auto-detection."""
+    if _in_flatpak_sandbox():
+        mode = "Flatpak sandbox"
+    elif os.environ.get("APPIMAGE") or os.environ.get("APPDIR"):
+        mode = "AppImage host"
+    else:
+        mode = "native host"
+    report = [f"Steam discovery report: execution={mode}."]
+    custom = _custom_vdf_path()
+    if custom:
+        custom_path = Path(custom)
+        report.append(
+            f"Steam discovery report: custom VDF={custom_path} "
+            f"({'readable' if os.access(custom_path, os.R_OK) else 'not readable'}).")
+    else:
+        report.append("Steam discovery report: custom VDF=not configured.")
+
+    roots = []
+    vdfs = []
+    errors = []
+    for root in _STEAM_CANDIDATES:
+        try:
+            if root.is_dir():
+                roots.append(root)
+        except OSError as exc:
+            errors.append(f"{root}: {exc}")
+        for name in _VDF_FILENAMES:
+            for candidate in (root / "steamapps" / name,
+                              root / "config" / name, root / name):
+                try:
+                    if candidate.is_file():
+                        vdfs.append(candidate)
+                except OSError as exc:
+                    errors.append(f"{candidate}: {exc}")
+    roots = list(dict.fromkeys(roots))
+    report.append("Steam discovery report: client roots="
+                  + (", ".join(str(path) for path in roots) if roots else "none") + ".")
+    report.append("Steam discovery report: VDF files="
+                  + (", ".join(str(path) for path in dict.fromkeys(vdfs))
+                     if vdfs else "none") + ".")
+    libraries = find_steam_libraries()
+    report.append("Steam discovery report: usable libraries="
+                  + (", ".join(str(path) for path in libraries)
+                     if libraries else "none") + ".")
+    try:
+        protons = [path.parent.name for path in list_installed_proton()]
+    except Exception as exc:
+        protons = []
+        errors.append(f"Proton inventory: {type(exc).__name__}: {exc}")
+    report.append("Steam discovery report: Proton tools="
+                  + (", ".join(protons) if protons else "none") + ".")
+    for error in errors[:8]:
+        report.append(f"Steam discovery report: probe error: {error}")
+    return report
+
+
 # Warn-once tracking so the same library path doesn't spam the log every time
 # find_steam_libraries() runs (it's called frequently by GUI refreshes).
 _vdf_warned_missing: set[str] = set()
@@ -972,7 +1128,9 @@ def parse_vdf_libraries(vdf_path: Path) -> list[Path]:
 
     try:
         text = vdf_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except OSError as exc:
+        _warn_discovery_once(
+            f"read-vdf:{vdf_path}", f"could not read {vdf_path}: {exc}")
         return libraries
 
     for match in pattern.finditer(text):
@@ -1492,16 +1650,36 @@ def scan_drives_for_exe(exe_names: list[str],
                         stop_event: "threading.Event | None" = None) -> Path | None:
     """Scan all mounted drives for any of *exe_names*, stopping at first match.
 
+    Returns the directory containing the executable, adjusted for any declared
+    relative subpath.
+    """
+    return _scan_drives(exe_names, stop_event, return_file=False)
+
+
+def scan_drives_for_file(file_patterns: list[str],
+                         stop_event: "threading.Event | None" = None,
+                         *, case_sensitive: bool = True) -> Path | None:
+    """Scan all mounted drives for a filename or glob and return the file."""
+    return _scan_drives(file_patterns, stop_event, return_file=True,
+                        case_sensitive=case_sensitive)
+
+
+def _scan_drives(file_names: list[str],
+                 stop_event: "threading.Event | None",
+                 return_file: bool,
+                 case_sensitive: bool = True) -> Path | None:
+    """Shared all-drive scanner for game executables and standalone files.
+
     Walks every real (non-pseudo) mount point from /proc/mounts, fanning
     subtree walks out across a thread pool - user trees (/home, /run/media,
     /media, /mnt) are split a level deeper and queued first, and each walk is
     breadth-first, since game dirs sit shallow. Per-session fuse mirrors
     (document portal, gvfs) are excluded so the scan never returns a
     /run/user/…/doc alias for a real path. Matching is on the bare filename
-    (case-sensitive, to match the Tk behaviour); *exe_names* entries with
+    (case-sensitive by default); *file_names* entries with
     sub-paths are matched on their final component, and the declared sub-path
     is then stripped from the result so the game root comes back (parity with
-    find_game_in_libraries). Returns the game root directory, or None.
+    find_game_in_libraries). Shell-style filename globs are supported.
 
     Pass *stop_event* to allow an external caller (e.g. a closing dialog) to
     abort the walk early.
@@ -1515,7 +1693,7 @@ def scan_drives_for_exe(exe_names: list[str],
     # strip is case-insensitive (Linux copies of Windows games vary in
     # casing); longest declared sub-path wins.
     name_parents: dict[str, list[tuple[str, ...]]] = {}
-    for e in exe_names:
+    for e in file_names:
         if not e:
             continue
         rel = Path(e.replace("\\", "/"))
@@ -1523,15 +1701,34 @@ def scan_drives_for_exe(exe_names: list[str],
         name_parents.setdefault(rel.name, []).append(parents)
     for subpaths in name_parents.values():
         subpaths.sort(key=len, reverse=True)
-    names = set(name_parents)
-    if not names:
+    patterns = tuple(name_parents)
+    if not patterns:
         return None
 
-    def _match_root(dirpath, matched: str) -> Path:
+    normalise = (lambda name: name) if case_sensitive else str.casefold
+    exact_names = {
+        normalise(name): name for name in patterns
+        if not any(char in name for char in "*?[")
+    }
+    glob_names = tuple(
+        (normalise(name), name) for name in patterns
+        if any(char in name for char in "*?[")
+    )
+
+    def _declared_match(name: str) -> str | None:
+        candidate = normalise(name)
+        if candidate in exact_names:
+            return exact_names[candidate]
+        return next((declared for pattern, declared in glob_names
+                     if fnmatch.fnmatchcase(candidate, pattern)), None)
+
+    def _match_result(dirpath, declared: str, matched: str) -> Path:
         """Strip the matched exe's declared sub-path off its directory."""
+        if return_file:
+            return Path(dirpath) / matched
         d = Path(dirpath)
         lower = tuple(p.lower() for p in d.parts)
-        for parents in name_parents[matched]:
+        for parents in name_parents[declared]:
             n = len(parents)
             if n and len(lower) > n and lower[-n:] == parents:
                 return Path(*d.parts[:-n])
@@ -1611,8 +1808,11 @@ def scan_drives_for_exe(exe_names: list[str],
                                 if (entry.name not in skip_dirs
                                         and entry.path not in all_mounts):
                                     queue.append(entry.path)
-                            elif entry.name in names:
-                                return _match_root(dirpath, entry.name)
+                            else:
+                                declared = _declared_match(entry.name)
+                                if declared is not None:
+                                    return _match_result(
+                                        dirpath, declared, entry.name)
                         except OSError:
                             continue
             except OSError:
@@ -1633,8 +1833,10 @@ def scan_drives_for_exe(exe_names: list[str],
                         if (entry.name not in skip_dirs
                                 and entry.path not in all_mounts):
                             subs.append(Path(entry.path))
-                    elif entry.name in names:
-                        return _match_root(d, entry.name), []
+                    else:
+                        declared = _declared_match(entry.name)
+                        if declared is not None:
+                            return _match_result(d, declared, entry.name), []
         except OSError:
             pass
         return None, subs

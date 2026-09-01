@@ -6,9 +6,12 @@ TkStyleHeader owns column resizing; column state persists via column_state.
 
 from __future__ import annotations
 
+from time import perf_counter
+
 # Crash-proof diagnostic prints (Flatpak stdout can raise BrokenPipeError and
 # kill worker threads). See Utils.app_log.safe_print.
 from Utils.app_log import safe_print as print  # noqa: A004
+from Utils import perftrace
 
 from PySide6.QtCore import Qt, QTimer, QRect, QPoint, QCoreApplication, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QAction
@@ -22,7 +25,7 @@ from gui_qt.modlist_model import (
     COL_CONFLICTS, COL_INSTALLED, COL_VERSION, COL_AUTHOR, COL_SIZE,
     HighlightRole,
 )
-from gui_qt.modlist_delegate import ModRowDelegate, SEP_H
+from gui_qt.modlist_delegate import ModRowDelegate, ROW_H, SEP_H
 from gui_qt import column_state
 from gui_qt.modlist_header import TkStyleHeader
 from gui_qt.theme_qt import bind_theme, _c
@@ -80,13 +83,15 @@ class ModListView(QTreeView):
         self.setItemDelegate(ModRowDelegate(self))
 
         self.setRootIsDecorated(False)        # flat list, not a tree
-        self.setUniformRowHeights(False)      # separators are taller
+        # Use Qt's large-list fast path while both delegate row sizes match.
+        self.setUniformRowHeights(ROW_H == SEP_H)
         self.setAlternatingRowColors(False)   # delegate paints zebra itself
         self.setMouseTracking(True)
         self.setExpandsOnDoubleClick(False)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._perf_resize_paint_pending = False
 
         # Custom drag-reorder (NOT Qt InternalMove): we drive the reorder by
         # hand so separators (spanned rows) drag correctly and autoscroll near
@@ -134,6 +139,15 @@ class ModListView(QTreeView):
         self._filter_hidden: set[int] = set()
         self._search_hidden: set[int] = set()
         self._searching: bool = False
+        # Conflict results normally arrive as a full snapshot first, but a
+        # restored Filegraph profile can legitimately publish an incremental
+        # delta as its first UI update.  Keep the four partner maps valid from
+        # construction so that path does not abort the rest of snapshot
+        # publication (Plugins, Filters, Data, and FOMOD dependency state).
+        self._overrides: dict[str, set[str]] = {}
+        self._overridden_by: dict[str, set[str]] = {}
+        self._bsa_overrides: dict[str, set[str]] = {}
+        self._bsa_overridden_by: dict[str, set[str]] = {}
         # Last hidden-row set actually applied via setRowHidden - lets
         # apply_collapse touch only the delta. Row indices go stale on any
         # structural change, so drop the cache there.
@@ -488,6 +502,9 @@ class ModListView(QTreeView):
         finally:
             self.setUpdatesEnabled(True)
         self._applied_hidden = hidden
+        marker = getattr(self, "_marker_strip", None)
+        if marker is not None:
+            marker.invalidate_geometry()
 
     def set_filter_hidden(self, rows: set[int]) -> None:
         """Set the rows the filter panel wants hidden, then reapply visibility.
@@ -709,11 +726,46 @@ class ModListView(QTreeView):
         self._position_column_menu_button()
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._fit_name_to_width()
-        self._position_column_menu_button()
-        if hasattr(self, "_marker_strip"):
-            self._reposition_marker_strip()
+        tracing = perftrace.is_enabled()
+        trace_started = perf_counter() if tracing else 0.0
+        viewport = self.viewport()
+        coalesce_paint = viewport.updatesEnabled()
+        if coalesce_paint:
+            viewport.setUpdatesEnabled(False)
+        try:
+            super().resizeEvent(event)
+            qt_finished = perf_counter() if tracing else 0.0
+            h = self.header()
+            widths_before = tuple(self.columnWidth(c)
+                                  for c in range(len(COLUMNS)))
+            # QTreeView otherwise queues another viewport update for the
+            # automatic section resize; the re-enable below already repaints it.
+            signals_were_blocked = h.blockSignals(True)
+            try:
+                self._fit_name_to_width()
+            finally:
+                h.blockSignals(signals_were_blocked)
+            if (widths_before != tuple(self.columnWidth(c)
+                                       for c in range(len(COLUMNS)))
+                    and hasattr(self, "_save_timer")):
+                self._schedule_save()
+            columns_finished = perf_counter() if tracing else 0.0
+            self._position_column_menu_button()
+            if hasattr(self, "_marker_strip"):
+                self._reposition_marker_strip()
+        finally:
+            if coalesce_paint:
+                if tracing:
+                    self._perf_resize_paint_pending = True
+                viewport.setUpdatesEnabled(True)
+        if tracing:
+            finished = perf_counter()
+            perftrace.mark("ui.resize.modlist.qt", qt_finished - trace_started)
+            perftrace.mark("ui.resize.modlist.columns",
+                           columns_finished - qt_finished)
+            perftrace.mark("ui.resize.modlist.overlays",
+                           finished - columns_finished)
+            perftrace.mark("ui.resize.modlist.total", finished - trace_started)
 
     def _fit_name_to_width(self):
         """Keep the table exactly filling the viewport on window resize.
@@ -762,6 +814,26 @@ class ModListView(QTreeView):
         # Re-apply any active highlight against the fresh maps.
         self._refresh_self_highlights()
 
+    def apply_conflict_map_delta(
+        self, overrides, overridden_by, bsa_overrides, bsa_overridden_by,
+        changed_mods,
+    ) -> None:
+        """Copy partner sets only for mods named by a resolution delta."""
+        names = set(changed_mods or ())
+        for current, source in (
+            (self._overrides, overrides),
+            (self._overridden_by, overridden_by),
+            (self._bsa_overrides, bsa_overrides),
+            (self._bsa_overridden_by, bsa_overridden_by),
+        ):
+            for name in names:
+                partners = (source or {}).get(name)
+                if partners:
+                    current[name] = set(partners)
+                else:
+                    current.pop(name, None)
+        self._refresh_self_highlights()
+
     def selectAll(self) -> None:
         """Ctrl+A → select every *visible*, non-separator mod row. Qt's default
         selects the whole model (hidden rows + separators too), which is wrong
@@ -804,6 +876,14 @@ class ModListView(QTreeView):
     def conflict_partners(self, names: set[str]) -> tuple[set[str], set[str]]:
         """For a set of mod names, return (higher, lower): the mods they beat
         (loose+BSA) and the mods that beat them, excluding the selection."""
+        # Conflict maps are replaced asynchronously after a toggle.  Filter
+        # both anchors and partners through the synchronous modlist state so a
+        # selected disabled mod cannot keep stale highlights during that gap.
+        # Overwrite is always active even though it is represented by a pinned
+        # separator rather than an enabled ModEntry.
+        from Utils.filegraph_constants import OVERWRITE_NAME
+        active = self.model().enabled_mod_names() | {OVERWRITE_NAME}
+        names = set(names) & active
         ov = getattr(self, "_overrides", {})
         ob = getattr(self, "_overridden_by", {})
         bov = getattr(self, "_bsa_overrides", {})
@@ -815,11 +895,15 @@ class ModListView(QTreeView):
             lower |= ob.get(n, set()) | bob.get(n, set())
         higher -= names
         lower -= names
+        higher &= active
+        lower &= active
         return higher, lower
 
     def bsa_conflict_partners(self, names: set[str]) -> tuple[set[str], set[str]]:
         """Like conflict_partners but BSA-only - used to colour plugins (Tk only
         tints plugins for BSA conflicts, never loose-file ones)."""
+        active = self.model().enabled_mod_names()
+        names = set(names) & active
         bov = getattr(self, "_bsa_overrides", {})
         bob = getattr(self, "_bsa_overridden_by", {})
         higher: set[str] = set()
@@ -829,6 +913,8 @@ class ModListView(QTreeView):
             lower |= bob.get(n, set())
         higher -= names
         lower -= names
+        higher &= active
+        lower &= active
         return higher, lower
 
     def _refresh_self_highlights(self):
@@ -1285,7 +1371,20 @@ class ModListView(QTreeView):
             self.viewport().update()
 
     def paintEvent(self, event):
+        tracing = perftrace.is_enabled()
+        paint_started = perf_counter() if tracing else 0.0
         super().paintEvent(event)
+        if tracing:
+            elapsed = perf_counter() - paint_started
+            kind = ("full" if event.rect().contains(self.viewport().rect())
+                    else "partial")
+            perftrace.mark("ui.paint.modlist.viewport", elapsed)
+            perftrace.mark(f"ui.paint.modlist.{kind}", elapsed)
+            if kind == "full":
+                source = ("after_resize" if self._perf_resize_paint_pending
+                          else "other")
+                self._perf_resize_paint_pending = False
+                perftrace.mark(f"ui.paint.modlist.full.{source}", elapsed)
         # Sticky separator band (hidden during a drag - it would cover the
         # drop zone while autoscrolling toward the top). An external archive
         # drag (Downloads tab) paints the same indicator.

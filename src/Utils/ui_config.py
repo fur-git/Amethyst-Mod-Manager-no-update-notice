@@ -11,6 +11,7 @@ import os
 import re as _re
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from Utils.atomic_write import write_atomic_text
@@ -173,7 +174,7 @@ def _get_portal_scale() -> float:
     return scale
 
 
-def _get_compositor_scale() -> float:
+def _get_compositor_scale(portal_scale: "float | None" = None) -> float:
     """Return the display compositor's global scale factor (>1.0 on HiDPI).
 
     Tries, in order:
@@ -184,7 +185,12 @@ def _get_compositor_scale() -> float:
 
     Returns 1.0 if nothing is detected or all sources fail.
     """
-    portal = _get_portal_scale()
+    # get_screen_info() already queries the portal separately so it can expose
+    # that subprocess cost in the startup trace.  Reuse that result instead of
+    # making the same two D-Bus calls for a second time.  Direct callers retain
+    # the original behaviour by leaving *portal_scale* unset.
+    portal = (_get_portal_scale() if portal_scale is None
+              else float(portal_scale))
     if portal > 1.0:
         return portal
 
@@ -353,18 +359,31 @@ def set_screen_probe(fn: "callable | None") -> None:
     _screen_probe = fn
 
 
-def get_screen_info() -> tuple[int, int, float]:
+def _record_display_probe(timing, label: str, started: float) -> None:
+    if timing is not None:
+        timing.record(label, phase_started=started,
+                      category="display probe")
+
+
+def get_screen_info(timing=None) -> tuple[int, int, float]:
     """Return (screen_width, screen_height, detected_scale) for the primary display."""
+    probe_started = time.perf_counter()
     if _screen_probe is not None:
         try:
             w, h, de_scale = _screen_probe()
         except Exception:
+            _record_display_probe(
+                timing, "Probe display through GUI toolkit", probe_started)
             return 0, 0, _DEFAULT_SCALE
+        _record_display_probe(
+            timing, "Probe display through GUI toolkit", probe_started)
     else:
         # No GUI toolkit attached: derive size from xrandr/wlr-randr and let the
         # portal/compositor path below supply the scale.
         w, h = _get_primary_monitor_size()
         de_scale = 1.0
+        _record_display_probe(
+            timing, "Probe primary display geometry", probe_started)
     if w <= 0 or h <= 0:
         return w, h, _DEFAULT_SCALE
 
@@ -376,7 +395,10 @@ def get_screen_info() -> tuple[int, int, float]:
     # we set would multiply on top of it, not replace it. So auto must stay
     # at 1.0. (The opposite of the Tk era: Tk ignores Xft.dpi, which is why
     # this module used to apply the scale itself.)
-    if _get_xft_dpi_scale() > 1.05:
+    probe_started = time.perf_counter()
+    xft_scale = _get_xft_dpi_scale()
+    _record_display_probe(timing, "Probe Xft DPI scaling", probe_started)
+    if xft_scale > 1.05:
         return w, h, 1.0
 
     # Wayland guard: we force xcb, so on Wayland we run under XWayland and
@@ -384,7 +406,27 @@ def get_screen_info() -> tuple[int, int, float]:
     # the system" mode) upscale the window themselves. Either way the scale
     # is applied outside the app - scaling again would double-scale.
     on_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
-    compositor = max(_get_portal_scale(), _get_compositor_scale())
+    # Before QApplication exists there is no toolkit screen probe, so
+    # de_scale is necessarily 1.0.  In that exact startup case every branch
+    # below already resolves to 1.0 on Wayland, regardless of what the portal
+    # or compositor reports.  Return the same answer immediately instead of
+    # waiting on kscreen-doctor/gsettings subprocesses (kscreen-doctor alone
+    # can consume its full three-second timeout during login/startup).
+    if on_wayland and _screen_probe is None:
+        probe_started = time.perf_counter()
+        _record_display_probe(
+            timing, "Skip redundant XWayland compositor probes",
+            probe_started)
+        return w, h, 1.0
+
+    probe_started = time.perf_counter()
+    portal_scale = _get_portal_scale()
+    _record_display_probe(timing, "Probe XDG portal scaling", probe_started)
+    probe_started = time.perf_counter()
+    compositor_scale = _get_compositor_scale(portal_scale=portal_scale)
+    _record_display_probe(timing, "Probe desktop compositor scaling",
+                          probe_started)
+    compositor = max(portal_scale, compositor_scale)
     if on_wayland and compositor > 1.0 and de_scale <= 1.05:
         return w, h, 1.0
 
@@ -405,7 +447,10 @@ def get_screen_info() -> tuple[int, int, float]:
     # When xrandr is unavailable (e.g. Flatpak sandbox without host xrandr),
     # Tk's winfo_screenheight on Wayland/XWayland typically reports the
     # logical (already-scaled) size, so dividing again would halve the scale.
+    probe_started = time.perf_counter()
     pm_w, pm_h = _get_primary_monitor_size()
+    _record_display_probe(
+        timing, "Confirm primary display geometry", probe_started)
     if pm_h > 0:
         w, h = pm_w, pm_h
         physical_h = h / de_scale if de_scale > 1.0 else h
@@ -424,7 +469,7 @@ def get_screen_info() -> tuple[int, int, float]:
     return w, h, scale
 
 
-def detect_hidpi_scale() -> float:
+def detect_hidpi_scale(timing=None) -> float:
     """Detect suggested UI scale (compositor-reported, else screen height).
 
     Returns 1.0 whenever the scale is already applied outside the app: a
@@ -434,11 +479,11 @@ def detect_hidpi_scale() -> float:
     heights ≤1600 → 1.0; above scales by h/1080, capped at _AUTO_MAX_SCALE
     (1.5x); manual selection can still go higher.
     """
-    _, _, scale = get_screen_info()
+    _, _, scale = get_screen_info(timing=timing)
     return scale
 
 
-def load_ui_scale() -> float:
+def load_ui_scale(timing=None) -> float:
     """Load ui_scale from INI. Returns the value, clamped to [0.5, 3.0].
 
     When config is missing or scale=auto, uses detect_hidpi_scale() for automatic
@@ -447,7 +492,7 @@ def load_ui_scale() -> float:
     global _ui_scale
     path = get_ui_config_path()
     if not path.is_file():
-        _ui_scale = detect_hidpi_scale()
+        _ui_scale = detect_hidpi_scale(timing=timing)
         _write_scale_ini(path, _INI_AUTO)
         _seed_first_run_defaults(path)
         return _ui_scale
@@ -456,13 +501,13 @@ def load_ui_scale() -> float:
         if parser.has_section(_INI_SECTION) and parser.has_option(_INI_SECTION, _INI_OPTION):
             raw = parser.get(_INI_SECTION, _INI_OPTION).strip().lower()
             if raw == _INI_AUTO:
-                _ui_scale = detect_hidpi_scale()
+                _ui_scale = detect_hidpi_scale(timing=timing)
             else:
                 _ui_scale = _clamp(float(raw))
         else:
-            _ui_scale = detect_hidpi_scale()
+            _ui_scale = detect_hidpi_scale(timing=timing)
     except (configparser.Error, ValueError):
-        _ui_scale = detect_hidpi_scale()
+        _ui_scale = detect_hidpi_scale(timing=timing)
     return _ui_scale
 
 
@@ -802,9 +847,9 @@ def _clamp(value: float) -> float:
 # ---------------------------------------------------------------------------
 _COLLECTIONS_SECTION = "collections"
 
-# Download order is no longer configurable - collection downloads always run
-# strictly smallest→largest (unknown-size mods last). Defaults are 8/8: more
-# concurrency past this gives little practical benefit on typical hardware.
+# Download order is no longer configurable. Up to two collection download lanes
+# take the largest remaining archives while the others run smallest-first.
+# Defaults are 8/8; more concurrency past this gives little practical benefit.
 _DEFAULT_MAX_CONCURRENT = 8
 _DEFAULT_MAX_EXTRACT_WORKERS = 8
 
@@ -1606,6 +1651,39 @@ def save_hide_endorse_button(value: bool) -> None:
     _write_ini(parser, path)
 
 
+_HEADER_POSITIONS = ("top", "left", "right")
+
+
+def load_header_position() -> str:
+    """Return where the main toolbar sits: "top" (default), "left" or "right"."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return "top"
+    try:
+        parser = _read_ini(path)
+        value = parser.get(
+            _FILEMAP_SECTION, "header_position", fallback="top").strip().lower()
+        return value if value in _HEADER_POSITIONS else "top"
+    except Exception:
+        return "top"
+
+
+def save_header_position(value: str) -> None:
+    """Persist the header_position setting to amethyst.ini."""
+    value = (value or "top").strip().lower()
+    if value not in _HEADER_POSITIONS:
+        value = "top"
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _FILEMAP_SECTION not in parser:
+        parser[_FILEMAP_SECTION] = {}
+    parser[_FILEMAP_SECTION]["header_position"] = value
+    _write_ini(parser, path)
+
+
 def load_rename_mod_after_install() -> bool:
     """Return the rename_mod_after_install setting (default False).
 
@@ -1739,6 +1817,57 @@ def save_nexus_page_size(value: int) -> None:
 # Custom launcher paths
 # ---------------------------------------------------------------------------
 _PATHS_SECTION = "paths"
+_CUSTOM_PROTON_SECTION = "custom_proton"
+
+
+def load_custom_proton_path() -> str:
+    """Return the user-configured Proton build directory, or '' if unset."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return ""
+    try:
+        parser = _read_ini(path)
+        return parser.get(_PATHS_SECTION, "custom_proton_path", fallback="").strip()
+    except Exception:
+        return ""
+
+
+def save_custom_proton_path(value: str) -> None:
+    """Persist an additional Proton build directory. Pass '' to clear."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _PATHS_SECTION not in parser:
+        parser[_PATHS_SECTION] = {}
+    parser[_PATHS_SECTION]["custom_proton_path"] = value.strip()
+    _write_ini(parser, path)
+
+
+def load_custom_proton_warning_ack() -> bool:
+    """Whether the unsupported custom-Proton warning was accepted."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return False
+    try:
+        return _read_ini(path).getboolean(
+            _CUSTOM_PROTON_SECTION, "warning_ack", fallback=False)
+    except Exception:
+        return False
+
+
+def save_custom_proton_warning_ack(value: bool) -> None:
+    """Persist the custom-Proton warning acknowledgement."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _CUSTOM_PROTON_SECTION not in parser:
+        parser[_CUSTOM_PROTON_SECTION] = {}
+    parser[_CUSTOM_PROTON_SECTION]["warning_ack"] = "1" if value else "0"
+    _write_ini(parser, path)
 
 
 def load_heroic_config_path() -> str:
@@ -1999,6 +2128,7 @@ _DISMISSIBLE_NOTICES: tuple[tuple[str, "str | None"], ...] = (
     (_FS_WARNINGS_SECTION, None),       # Windows-filesystem warning, per game
     (_FO3_DOWNGRADE_SECTION, None),     # Fallout 3 Anniversary downgrade prompt
     (_FLATPAK_SECTION, "suppress_i386_warning"),
+    (_CUSTOM_PROTON_SECTION, "warning_ack"),
 )
 
 # Values that mean "not dismissed" even though the key exists: boolean notices
@@ -2459,7 +2589,8 @@ def load_theme_colors() -> dict[str, str]:
 # the gui package; theme.py handles unknown IDs by falling back to dark.
 # ---------------------------------------------------------------------------
 _APPEARANCE_OPTION = "appearance_mode"
-_APPEARANCE_DEFAULT = "dark"
+_APPEARANCE_DEFAULT = "amethyst"
+_APPEARANCE_LEGACY_DEFAULT = "dark"
 # Theme ids are lowercase word chars/digits/dashes/underscores; user-authored
 # JSON themes add a single "custom:" namespace prefix (see Utils.custom_themes),
 # so a colon is permitted between the prefix and the slug.
@@ -2467,7 +2598,7 @@ _APPEARANCE_ID_RE = _re.compile(r"^[a-z0-9_][a-z0-9_:-]*$")
 
 
 def get_appearance_mode() -> str:
-    """Return the saved appearance-mode theme ID, defaulting to 'dark'."""
+    """Return the saved appearance-mode theme ID, defaulting to 'amethyst'."""
     path = get_ui_config_path()
     if not path.is_file():
         return _APPEARANCE_DEFAULT
@@ -2536,7 +2667,7 @@ def save_last_session(game: "str | None", profile: "str | None") -> None:
 # amethyst.ini schema version gate (migration wipe)
 # ---------------------------------------------------------------------------
 
-def ensure_ini_version() -> None:
+def ensure_ini_version(log_fn=None) -> None:
     """Ensure amethyst.ini matches the current schema version.
 
     If the file exists but its ``[meta] version`` is missing or != _APP_INI_VERSION
@@ -2544,11 +2675,30 @@ def ensure_ini_version() -> None:
     file exists stamping the current version. amethyst.ini only - other config
     (last_game.json, games/, profiles, caches) is left untouched.
 
+    Also pins appearance_mode=dark into any surviving ini that doesn't set it,
+    so the newer 'amethyst' default only reaches brand-new installs.
+
     Call this ONCE at the very start of startup, before anything reads the ini.
     Best-effort: any error falls back to wiping + rewriting so a corrupt/locked
     ini can never block startup.
     """
+    if log_fn is None:
+        try:
+            from Utils.app_log import app_log
+            log_fn = app_log
+        except Exception:
+            log_fn = lambda _message: None
+
+    target_log = log_fn
+
+    def log_fn(message):
+        try:
+            target_log(message)
+        except Exception:
+            pass
+
     path = get_ui_config_path()
+    log_fn(f"Startup configuration: path={path}, expected schema={_APP_INI_VERSION}.")
     try:
         needs_wipe = False
         if path.is_file():
@@ -2556,37 +2706,60 @@ def ensure_ini_version() -> None:
                 parser = _new_parser()
                 parser.read(path)
                 ver = parser.getint(_META_SECTION, "version", fallback=0)
-            except Exception:
+            except Exception as exc:
                 ver = -1   # unreadable → treat as outdated
+                log_fn(f"Startup configuration: could not parse existing INI; "
+                       f"resetting it ({type(exc).__name__}: {exc}).")
             if ver != _APP_INI_VERSION:
                 needs_wipe = True
+                if ver >= 0:
+                    log_fn(f"Startup configuration: schema {ver} does not match "
+                           f"{_APP_INI_VERSION}; resetting application UI settings.")
         if needs_wipe:
             try:
                 path.unlink()
-            except OSError:
-                pass
+                log_fn("Startup configuration: removed the incompatible INI.")
+            except OSError as exc:
+                log_fn(f"Startup configuration: could not remove incompatible INI: "
+                       f"{exc}.")
         if not path.is_file():
             # Fresh stamp (brand-new install or just-wiped).
             path.parent.mkdir(parents=True, exist_ok=True)
             parser = _new_parser()
             parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
             _write_ini(parser, path)
+            log_fn(f"Startup configuration: created schema {_APP_INI_VERSION} INI.")
         else:
             # File is current but make sure the version key is present/correct.
             parser = _new_parser()
             parser.read(path)
+            dirty = False
             if (not parser.has_section(_META_SECTION)
                     or parser.get(_META_SECTION, "version", fallback="")
                     != str(_APP_INI_VERSION)):
                 if _META_SECTION not in parser:
                     parser[_META_SECTION] = {}
                 parser[_META_SECTION]["version"] = str(_APP_INI_VERSION)
+                dirty = True
+            if not parser.has_option(_INI_SECTION, _APPEARANCE_OPTION):
+                if _INI_SECTION not in parser:
+                    parser[_INI_SECTION] = {}
+                parser[_INI_SECTION][_APPEARANCE_OPTION] = _APPEARANCE_LEGACY_DEFAULT
+                dirty = True
+            if dirty:
                 _write_ini(parser, path)
-    except Exception:
+                log_fn("Startup configuration: filled missing schema/default fields.")
+            else:
+                log_fn("Startup configuration: existing INI is current.")
+    except Exception as exc:
+        log_fn(f"Startup configuration: validation failed; attempting a clean "
+               f"rewrite ({type(exc).__name__}: {exc}).")
         # Last resort: try a clean rewrite; swallow anything so startup proceeds.
         try:
             parser = _new_parser()
             parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
             _write_ini(parser, path)
-        except Exception:
-            pass
+            log_fn("Startup configuration: clean rewrite succeeded.")
+        except Exception as rewrite_exc:
+            log_fn(f"Startup configuration: clean rewrite failed: "
+                   f"{type(rewrite_exc).__name__}: {rewrite_exc}")

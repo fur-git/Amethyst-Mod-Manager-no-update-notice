@@ -19,13 +19,15 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QCheckBox, QComboBox, QLineEdit,
 )
 
-from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
+from gui_qt.help_marker import help_mark_qss, make_help_marker, tip_text
+from gui_qt.theme_qt import (active_palette, _c, button_qss, ok_text,
+                             err_text, warn_text)
 from gui_qt.safe_emit import safe_emit
 from Utils.exe_launch import (
     PREFIX_MODE_GAME, PREFIX_MODE_ISOLATED, PREFIX_MODE_SHARED,
@@ -33,6 +35,8 @@ from Utils.exe_launch import (
     load_tool_launch_env, load_winetricks_style, save_prefix_mode,
     save_proton_override, save_tool_launch_args, save_tool_launch_env,
     save_winetricks_style, shared_prefix_dir,
+    load_wizard_always_use_settings, save_wizard_always_use_settings,
+    load_wizard_prefer_discrete_gpu, save_wizard_prefer_discrete_gpu,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +49,7 @@ class ProtonStepWidget(QWidget):
 
     # (ok, message) from the delete-prefix worker → UI thread.
     _delete_done = Signal(bool, str)
+    _custom_picked = Signal(object)
 
     def __init__(self, game: "BaseGame", exe: Path,
                  tool_exe_name: str, tool_display_name: str,
@@ -56,7 +61,10 @@ class ProtonStepWidget(QWidget):
                  default_prefix_mode: str | None = None,
                  show_launch_args: bool = False,
                  default_launch_args: str = "",
-                 show_discrete_gpu: bool = False):
+                 show_discrete_gpu: bool = False,
+                 wizard_id: str = "",
+                 wizard_label: str = "",
+                 wizard_label_args: tuple = ()):
         super().__init__()
         if title is None:
             title = self.tr("Choose Proton Version")
@@ -73,6 +81,11 @@ class ProtonStepWidget(QWidget):
         self._allow_game_prefix = allow_game_prefix
         self._show_launch_args = show_launch_args
         self._default_launch_args = default_launch_args
+        self._wizard_id = wizard_id
+        self._wizard_label = wizard_label
+        self._wizard_label_args = tuple(wizard_label_args or ())
+        self._remembered = load_wizard_always_use_settings(game, wizard_id)
+        self._auto_skip_pending = False
         self._args_entry = None
         self._prefer_discrete_gpu_cb: QCheckBox | None = None
         # Hosts whose exe sits somewhere a prefix shouldn't go (e.g. Creation
@@ -84,106 +97,129 @@ class ProtonStepWidget(QWidget):
         self._confirm_delete = False
 
         self._delete_done.connect(self._on_delete_done)
+        self._custom_picked.connect(self._on_custom_picked)
 
         p = active_palette()
+        self.setStyleSheet(help_mark_qss(p))
         v = QVBoxLayout(self)
         v.setContentsMargins(20, 16, 20, 16)
         v.setSpacing(6)
 
-        head = QLabel(title)
-        head.setAlignment(Qt.AlignHCenter)
-        head.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
-        v.addWidget(head)
+        def add_help_control(control, help_text: str):
+            control.setToolTip(tip_text(help_text))
+            holder = QWidget()
+            row = QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            row.addWidget(control)
+            row.addWidget(make_help_marker(help_text))
+            row.addStretch(1)
+            v.addWidget(holder)
+
+        def add_heading(text: str, help_text: str):
+            holder = QWidget()
+            row = QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            row.addStretch(1)
+            label = QLabel(text)
+            label.setStyleSheet(
+                f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
+            label.setToolTip(tip_text(help_text))
+            row.addWidget(label)
+            row.addWidget(make_help_marker(help_text))
+            row.addStretch(1)
+            v.addWidget(holder)
+
+        intro_help = (
+            self.tr("{0} runs in its own Wine prefix, stored next to "
+                    "its exe and separate from the game's prefix, so you can "
+                    "pick any Proton version without affecting the game.")
+            .format(tool_display_name)
+            + "\n\n" + deps_note
+        )
+        add_heading(title, intro_help)
 
         from Utils.steam_finder import list_installed_proton
         self._versions = [s.parent.name for s in list_installed_proton()]
-        if not self._versions:
-            err = QLabel(self.tr("No Proton versions were found.\n\n"
-                         "Install a Proton version in Steam (or with "
-                         "Heroic's Wine Manager), then reopen this wizard."))
-            err.setAlignment(Qt.AlignHCenter)
-            err.setWordWrap(True)
-            err.setStyleSheet(f"color:{err_text()};")
-            v.addWidget(err)
-            v.addStretch(1)
-            return
-
-        desc = QLabel(
-            self.tr("{0} runs in its own Wine prefix, stored next to "
-            "its exe and separate from the game's prefix, so you can pick any "
-            "Proton version without affecting the game.\n\n").format(
-                tool_display_name) + deps_note)
-        desc.setWordWrap(True)
-        desc.setAlignment(Qt.AlignHCenter)
-        desc.setStyleSheet(f"color:{_c(p,'TEXT_DIM')};")
-        v.addWidget(desc)
-        v.addSpacing(6)
+        self._no_versions_label = QLabel(self.tr(
+            "No Proton versions were found. Install one through Steam or "
+            "Heroic, or add a custom Proton build below."))
+        self._no_versions_label.setAlignment(Qt.AlignHCenter)
+        self._no_versions_label.setWordWrap(True)
+        self._no_versions_label.setStyleSheet(f"color:{err_text()};")
+        self._no_versions_label.setVisible(not self._versions)
+        v.addWidget(self._no_versions_label)
 
         dim = f"color:{_c(p,'TEXT_DIM')};"
         # ---- prefix mode checkboxes ----
-        mode = load_prefix_mode(game, tool_exe_name)
+        saved_mode = load_prefix_mode(game, tool_exe_name)
+        saved_proton = load_proton_override(game, tool_exe_name)
+        mode = saved_mode
         # Apply a tool-specific default only before this exe has any saved
         # Proton choice. After the first Continue, the user's selection wins.
         if (default_prefix_mode is not None
-                and load_proton_override(game, tool_exe_name) is None):
+                and saved_proton is None):
             mode = default_prefix_mode
         game_pfx_ok = self._game_prefix_available()
+        self._remember_warning = ""
+        if self._remembered:
+            if saved_mode == PREFIX_MODE_GAME:
+                if not (allow_game_prefix and game_pfx_ok):
+                    self._remember_warning = self.tr(
+                        "The saved game prefix is unavailable. Choose another "
+                        "prefix setting.")
+            elif not saved_proton:
+                self._remember_warning = self.tr(
+                    "The saved Proton selection is incomplete. Choose a "
+                    "Proton version.")
+            elif self._match_installed_version(saved_proton) is None:
+                self._remember_warning = self.tr(
+                    "The saved Proton version '{0}' is no longer installed. "
+                    "Choose another version.").format(saved_proton)
         if mode == PREFIX_MODE_GAME and not (allow_game_prefix and game_pfx_ok):
             mode = PREFIX_MODE_ISOLATED
+
+        if self._remember_warning:
+            warning = QLabel(self._remember_warning)
+            warning.setAlignment(Qt.AlignHCenter)
+            warning.setWordWrap(True)
+            warning.setStyleSheet(f"color:{warn_text()};")
+            v.addWidget(warning)
 
         self._shared_chk = QCheckBox(self.tr("Use shared prefix"))
         self._shared_chk.setChecked(mode == PREFIX_MODE_SHARED)
         self._shared_chk.toggled.connect(self._on_shared_toggle)
-        v.addWidget(self._shared_chk)
-        shared_note = QLabel(
-            self.tr("Reuse one prefix (per Proton version) shared by every wizard "
+        add_help_control(self._shared_chk, self.tr(
+            "Reuse one prefix (per Proton version) shared by every wizard "
             "tool, kept in the app config folder instead of next to the exe."))
-        shared_note.setWordWrap(True)
-        shared_note.setStyleSheet(dim)
-        shared_note.setContentsMargins(26, 0, 0, 6)
-        v.addWidget(shared_note)
 
         self._game_chk = None
         if allow_game_prefix and game_pfx_ok:
             self._game_chk = QCheckBox(self.tr("Use game prefix"))
             self._game_chk.setChecked(mode == PREFIX_MODE_GAME)
             self._game_chk.toggled.connect(self._on_game_pfx_toggle)
-            v.addWidget(self._game_chk)
-            game_note = QLabel(
-                self.tr("Run inside the game's own prefix. No new prefix is created "
+            add_help_control(self._game_chk, self.tr(
+                "Run inside the game's own prefix. No new prefix is created "
                 "and the Proton version follows the game's Steam setting."))
-            game_note.setWordWrap(True)
-            game_note.setStyleSheet(dim)
-            game_note.setContentsMargins(26, 0, 0, 0)
-            v.addWidget(game_note)
 
         # ---- winetricks-style launch ----
         self._winetricks_chk = QCheckBox(
             self.tr("Launch with plain Wine (winetricks-style)"))
         self._winetricks_chk.setChecked(
             load_winetricks_style(game, tool_exe_name))
-        v.addWidget(self._winetricks_chk)
-        wt_note = QLabel(
-            self.tr("Use Winetricks style launch"))
-        wt_note.setWordWrap(True)
-        wt_note.setStyleSheet(dim)
-        wt_note.setContentsMargins(26, 0, 0, 6)
-        v.addWidget(wt_note)
+        add_help_control(self._winetricks_chk, self.tr(
+            "Run this tool with plain Wine against the selected prefix instead "
+            "of starting a Proton session."))
 
         if show_discrete_gpu:
             self._prefer_discrete_gpu_cb = QCheckBox(
                 self.tr("Prefer discrete GPU (hybrid systems)"))
-            self._prefer_discrete_gpu_cb.setToolTip(self.tr(
-                "Expose the discrete GPU as adapter 0. May use more power."))
-            v.addWidget(self._prefer_discrete_gpu_cb)
-
-            gpu_note = QLabel(self.tr(
-                "Uses the discrete GPU for texconv; falls back to CPU if "
-                "unavailable."))
-            gpu_note.setWordWrap(True)
-            gpu_note.setStyleSheet(dim)
-            gpu_note.setContentsMargins(26, 0, 0, 6)
-            v.addWidget(gpu_note)
+            self._prefer_discrete_gpu_cb.setChecked(
+                load_wizard_prefer_discrete_gpu(game, wizard_id))
+            add_help_control(self._prefer_discrete_gpu_cb, self.tr(
+                "Expose the discrete GPU as adapter 0 for texconv. This may "
+                "use more power and falls back to the CPU if unavailable."))
 
         # ---- proton picker row + delete ----
         row = QWidget()
@@ -196,6 +232,13 @@ class ProtonStepWidget(QWidget):
         self._proton_combo.currentTextChanged.connect(
             lambda _t: self._update_prefix_delete_state())
         rh.addWidget(self._proton_combo)
+        self._custom_btn = QPushButton(self.tr("Add Custom Build"))
+        self._custom_btn.setCursor(Qt.PointingHandCursor)
+        self._custom_btn.setToolTip(tip_text(self.tr(
+            "Select a complete Proton build folder containing the top-level "
+            "'proton' launcher. Do not select files/bin/wine.")))
+        self._custom_btn.clicked.connect(self._browse_custom_proton)
+        rh.addWidget(self._custom_btn)
         self._delete_btn = QPushButton(self.tr("Delete Prefix"))
         self._delete_btn.setCursor(Qt.PointingHandCursor)
         self._delete_btn.clicked.connect(self._on_delete_prefix)
@@ -212,17 +255,9 @@ class ProtonStepWidget(QWidget):
         # ---- launch arguments ----
         if self._show_launch_args:
             v.addSpacing(8)
-            args_head = QLabel(self.tr("Launch Arguments (optional)"))
-            args_head.setAlignment(Qt.AlignHCenter)
-            args_head.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
-            v.addWidget(args_head)
-            args_note = QLabel(
-                self.tr("Extra command-line arguments appended when the tool "
+            add_heading(self.tr("Launch Arguments (optional)"), self.tr(
+                "Extra command-line arguments appended when the tool "
                 "launches. Saved next to the exe and reapplied on every run."))
-            args_note.setWordWrap(True)
-            args_note.setAlignment(Qt.AlignHCenter)
-            args_note.setStyleSheet(dim)
-            v.addWidget(args_note)
             self._args_entry = QLineEdit()
             if self._default_launch_args:
                 self._args_entry.setPlaceholderText(self._default_launch_args)
@@ -232,17 +267,9 @@ class ProtonStepWidget(QWidget):
 
         # ---- env vars ----
         v.addSpacing(8)
-        env_head = QLabel(self.tr("Environment Variables (optional)"))
-        env_head.setAlignment(Qt.AlignHCenter)
-        env_head.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
-        v.addWidget(env_head)
-        env_note = QLabel(
-            self.tr("Space-separated KEY=VALUE pairs applied when the tool launches. "
+        add_heading(self.tr("Environment Variables (optional)"), self.tr(
+            "Space-separated KEY=VALUE pairs applied when the tool launches. "
             "Saved next to the exe and reapplied on every run."))
-        env_note.setWordWrap(True)
-        env_note.setAlignment(Qt.AlignHCenter)
-        env_note.setStyleSheet(dim)
-        v.addWidget(env_note)
         self._env_entry = QLineEdit()
         self._env_entry.setPlaceholderText(
             self.tr("e.g. PROTON_USE_WINED3D=1 WINEDLLOVERRIDES=dinput8=n,b"))
@@ -250,15 +277,56 @@ class ProtonStepWidget(QWidget):
         v.addWidget(self._env_entry)
 
         v.addStretch(1)
-        cont = QPushButton(self.tr("Continue"))
-        cont.setCursor(Qt.PointingHandCursor)
-        cont.setStyleSheet(button_qss("BTN_INFO"))
-        cont.clicked.connect(self._on_chosen)
-        v.addWidget(cont, 0, Qt.AlignHCenter)
+        self._always_use_chk = QCheckBox(
+            self.tr("Always use these settings"))
+        self._always_use_chk.setChecked(self._remembered)
+        add_help_control(self._always_use_chk, self.tr(
+            "Skip this Proton step on future runs and reuse the saved values. "
+            "Reset it from Wizard > Wizard Settings."))
+        self._continue_btn = QPushButton(self.tr("Continue"))
+        self._continue_btn.setCursor(Qt.PointingHandCursor)
+        self._continue_btn.setStyleSheet(button_qss("BTN_INFO"))
+        self._continue_btn.clicked.connect(self._on_chosen)
+        v.addWidget(self._continue_btn, 0, Qt.AlignHCenter)
 
         self._update_proton_row_state()
+        from Utils.ui_config import load_custom_proton_warning_ack
+        self._auto_skip_pending = bool(
+            self._remembered and not self._remember_warning
+            and (self._current_prefix_mode() == PREFIX_MODE_GAME
+                 or not self._selected_is_custom()
+                 or load_custom_proton_warning_ack()))
+
+    def showEvent(self, event):  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        if not self._auto_skip_pending:
+            return
+        self._auto_skip_pending = False
+        self.setVisible(False)
+        QTimer.singleShot(0, self._auto_continue)
+
+    def _auto_continue(self):
+        try:
+            self._on_chosen()
+        except Exception as exc:
+            self.setVisible(True)
+            self._log(
+                f"{self._tool_display_name} Wizard: could not reuse saved "
+                f"settings: {exc}")
 
     # ---- defaults / state ---------------------------------------------------
+    def _match_installed_version(self, saved: str) -> str | None:
+        if not saved:
+            return None
+        low = saved.lower()
+        for version in self._versions:
+            if version.lower() == low:
+                return version
+        for version in self._versions:
+            if version.lower().startswith(low):
+                return version
+        return None
+
     def _initial_version(self) -> str:
         """Saved per-exe override, else the game's own Proton, else first."""
         from Utils.steam_finder import find_proton_for_game, game_steam_id
@@ -268,14 +336,58 @@ class ProtonStepWidget(QWidget):
             script = find_proton_for_game(steam_id) if steam_id else None
             if script is not None:
                 saved = script.parent.name
-        if saved in self._versions:
-            return saved
-        if saved:
-            low = saved.lower()
-            for vname in self._versions:
-                if vname.lower().startswith(low):
-                    return vname
-        return self._versions[0]
+        matched = self._match_installed_version(saved)
+        if matched is not None:
+            return matched
+        return self._versions[0] if self._versions else ""
+
+    def _reload_versions(self, selected: str = ""):
+        from Utils.steam_finder import list_installed_proton
+        current = selected or self._proton_combo.currentText()
+        self._versions = [s.parent.name for s in list_installed_proton()]
+        self._proton_combo.blockSignals(True)
+        self._proton_combo.clear()
+        self._proton_combo.addItems(self._versions)
+        matched = self._match_installed_version(current)
+        if matched is not None:
+            self._proton_combo.setCurrentText(matched)
+        self._proton_combo.blockSignals(False)
+        self._no_versions_label.setVisible(not self._versions)
+        self._update_proton_row_state()
+
+    def _browse_custom_proton(self):
+        from Utils.portal_filechooser import pick_folder
+        pick_folder(
+            self.tr("Select custom Proton build folder"),
+            lambda path: safe_emit(self._custom_picked, path))
+
+    def _on_custom_picked(self, path):
+        if not path:
+            return
+        from Utils.steam_finder import resolve_custom_proton_script
+        script = resolve_custom_proton_script(path)
+        if script is None:
+            self._set_prefix_status(
+                self.tr("The selected folder does not contain a top-level "
+                        "'proton' launcher."), err_text())
+            return
+        from Utils.ui_config import save_custom_proton_path
+        save_custom_proton_path(str(script.parent))
+        self._reload_versions(script.parent.name)
+        self._log(f"{self._tool_display_name} Wizard: registered custom "
+                  f"Proton build {script.parent}")
+        self._set_prefix_status(
+            self.tr("Custom Proton build added: {0}").format(
+                script.parent.name), ok_text())
+
+    def _selected_is_custom(self) -> bool:
+        name = self._proton_combo.currentText().strip()
+        if not name:
+            return False
+        from Utils.steam_finder import (
+            find_any_installed_proton, is_custom_proton_script)
+        script = find_any_installed_proton(name)
+        return script is not None and is_custom_proton_script(script)
 
     def _game_prefix_available(self) -> bool:
         try:
@@ -312,7 +424,9 @@ class ProtonStepWidget(QWidget):
     def _update_proton_row_state(self):
         """The game prefix has its own fixed Proton; grey the picker out then."""
         use_game = self._game_chk is not None and self._game_chk.isChecked()
-        self._proton_combo.setEnabled(not use_game)
+        self._proton_combo.setEnabled(not use_game and bool(self._versions))
+        self._custom_btn.setEnabled(not use_game)
+        self._continue_btn.setEnabled(use_game or bool(self._versions))
         if use_game:
             self._delete_btn.setEnabled(False)
             self._prefix_status.setText(
@@ -324,6 +438,42 @@ class ProtonStepWidget(QWidget):
             self._update_prefix_delete_state()
 
     def _on_chosen(self):
+        mode = self._current_prefix_mode()
+        name = self._proton_combo.currentText()
+        if mode != PREFIX_MODE_GAME and not name:
+            self._set_prefix_status(
+                self.tr("Select or add a Proton build before continuing."),
+                err_text())
+            return
+        if mode != PREFIX_MODE_GAME and self._selected_is_custom():
+            from Utils.ui_config import load_custom_proton_warning_ack
+            if not load_custom_proton_warning_ack():
+                from gui_qt.confirm_overlay import ConfirmOverlay
+                ConfirmOverlay.show_over(
+                    self,
+                    self.tr("Use custom Proton build?"),
+                    self.tr(
+                        "This Proton build was added manually and is outside "
+                        "Amethyst's supported configurations. Support cannot "
+                        "be provided for issues that occur while using it.\n\n"
+                        "Continue with {0}?").format(name),
+                    self._on_custom_warning_done,
+                    confirm_label=self.tr("Use Custom Build"),
+                    cancel_label=self.tr("Cancel"),
+                    danger=False,
+                )
+                return
+        self._save_and_continue()
+
+    def _on_custom_warning_done(self, accepted: bool):
+        if not accepted:
+            self.setVisible(True)
+            return
+        from Utils.ui_config import save_custom_proton_warning_ack
+        save_custom_proton_warning_ack(True)
+        self._save_and_continue()
+
+    def _save_and_continue(self):
         mode = self._current_prefix_mode()
         name = self._proton_combo.currentText()
         save_proton_override(self._game, self._tool_exe_name, name)
@@ -342,6 +492,15 @@ class ProtonStepWidget(QWidget):
                 save_tool_launch_args(self._exe, self._args_entry.text().strip())
             except Exception:
                 pass
+        if self._prefer_discrete_gpu_cb is not None:
+            save_wizard_prefer_discrete_gpu(
+                self._game, self._wizard_id,
+                self._prefer_discrete_gpu_cb.isChecked())
+        save_wizard_always_use_settings(
+            self._game, self._wizard_id,
+            self._always_use_chk.isChecked(),
+            label=self._wizard_label,
+            label_args=self._wizard_label_args)
         if mode == PREFIX_MODE_GAME:
             self._log(f"{self._tool_display_name} Wizard: using the game's own prefix.")
         elif mode == PREFIX_MODE_SHARED:

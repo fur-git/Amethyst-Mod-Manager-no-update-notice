@@ -43,8 +43,10 @@ def current_deploy_method(game) -> str | None:
     if game is None or not hasattr(game, "get_deploy_mode"):
         return None
     try:
-        if (getattr(game, "supports_profile_vfs", False)
-                and getattr(game, "vfs_enabled", False)):
+        if (getattr(game, "vfs_deploy_active", False)
+                or getattr(game, "vfs_launch_enabled", False)
+                or (getattr(game, "supports_profile_vfs", False)
+                    and getattr(game, "vfs_enabled", False))):
             return "vfs"
         return ("hardlink" if game.get_deploy_mode() == LinkMode.HARDLINK
                 else "symlink")
@@ -74,9 +76,10 @@ def build_quick_configure_options(game) -> list[dict[str, Any]]:
 
     # --- Deploy method (Symlink / Hardlink / optional VFS) ------------------
     if hasattr(game, "set_deploy_mode") and hasattr(game, "get_deploy_mode"):
-        rec = getattr(game, "default_deploy_mode", "symlink")
+        rec = getattr(game, "default_deploy_mode", None)
         supports_vfs = bool(
-            getattr(game, "supports_profile_vfs", False)
+            (getattr(game, "supports_vfs_deploy", False)
+             or getattr(game, "supports_profile_vfs", False))
             and hasattr(game, "set_vfs_enabled")
         )
         choices = [
@@ -86,7 +89,10 @@ def build_quick_configure_options(game) -> list[dict[str, Any]]:
              "Hardlink (Recommended)" if rec == "hardlink" else "Hardlink"),
         ]
         if supports_vfs:
-            choices.append(("vfs", "Virtual filesystem (VFS)"))
+            choices.append((
+                "vfs",
+                getattr(game, "vfs_deploy_label", "Virtual filesystem (VFS)"),
+            ))
 
         def apply_deploy_method(value: str) -> None:
             if value == "vfs":
@@ -105,7 +111,8 @@ def build_quick_configure_options(game) -> list[dict[str, Any]]:
         )
 
     # --- Boolean option toggles (mirror the Configure view gating) ----------
-    if hasattr(game, "set_script_extender_swap"):
+    if (hasattr(game, "set_script_extender_swap")
+            and getattr(game, "supports_script_extender_swap", True)):
         add_toggle(
             "script_extender_swap",
             "Swap launcher with script extender on deploy",
@@ -122,6 +129,12 @@ def build_quick_configure_options(game) -> list[dict[str, Any]]:
     val, apply = _toggle_attr(game, "auto_deploy", False)
     add_toggle("auto_deploy",
                "Auto deploy (on enable/disable/reorder)", val, apply)
+
+    if hasattr(game, "set_prefer_appimage"):
+        add_toggle(
+            "prefer_appimage", "Prefer AppImage",
+            getattr(game, "prefer_appimage", False),
+            lambda v: game.set_prefer_appimage(v), needs_reload=True)
 
     if hasattr(game, "archive_invalidation_enabled"):
         val, apply = _toggle_attr(game, "archive_invalidation", True)
