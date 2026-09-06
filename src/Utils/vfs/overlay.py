@@ -30,9 +30,9 @@ import threading
 from pathlib import Path, PureWindowsPath
 from typing import Iterable
 
-from Utils import perftrace
+from Utils.diagnostics import performance as perftrace
 from Utils.atomic_write import write_atomic_text
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     compute_rule_claims,
     deploy_custom_rules,
@@ -40,13 +40,13 @@ from Utils.deploy import (
     deploy_root_flagged_mods,
     deploy_root_folder,
 )
-from Utils.deploy_shared import (
+from Utils.deployment.shared import (
     RestoreIncompleteError,
     _do_link_ex,
     _resolve_nocase,
     _resolve_root_path,
 )
-from Utils.deploy_shared import (
+from Utils.deployment.shared import (
     OVERWRITE_LOG_NAME,
     _move_runtime_files,
     _write_deploy_snapshot,
@@ -495,7 +495,7 @@ def _mapped_separator_dirs(per_mod_deploy: dict[str, Path], game_root: Path,
 
 def _overwrite_entries() -> set[str]:
     """Paths supplied by [Overwrite], which is mounted as Data's upper layer."""
-    from Utils.filegraph_deploy import legacy_rows
+    from Utils.filegraph.deploy import legacy_rows
     return {
         rel.replace("\\", "/").lower()
         for rel, owner in legacy_rows()
@@ -971,6 +971,7 @@ def _capture_shadow_runtime(game, payload: dict, state: Path,
         state / DATA_SNAPSHOT_NAME,
         data_upper,
         log_fn=_log,
+        apply_global_ignore=False,
     )
     if not data_rel.parts:
         if moved_data:
@@ -985,6 +986,7 @@ def _capture_shadow_runtime(game, payload: dict, state: Path,
         root_destination,
         log_fn=_log,
         exclude_dirs=(data_rel.as_posix(),),
+        apply_global_ignore=False,
     )
     moved = moved_data + moved_root
     if moved:
@@ -1432,7 +1434,7 @@ def build_layers(
         prefix_rules and game.get_prefix_path() is None)
     routing_entries: list[tuple[str, str]] = []
     if needs_claim_partition or needs_prefix_probe:
-        from Utils.filegraph_deploy import legacy_rows
+        from Utils.filegraph.deploy import legacy_rows
         routing_entries = [
             (relative, mod_name)
             for relative, mod_name in legacy_rows()
@@ -1853,7 +1855,7 @@ def _forward_flatpak_host_environment(
     """Forward launch context through an existing host portal in place."""
     if not wrapper or Path(wrapper[0]).name != "flatpak-spawn":
         return
-    from Utils.flatpak_env import flatpak_forward_env_args
+    from Utils.flatpak.env import flatpak_forward_env_args
     index = 1
     while index < len(wrapper) and wrapper[index].startswith("-"):
         index += 1
@@ -2206,7 +2208,7 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
 
     def routed(route: str, wrapped: list[str], *, helpers: bool = False) -> list[str]:
         try:
-            from Utils.process_watch import format_command
+            from Utils.processes.watch import format_command
             location = "Flatpak host" if _inside_flatpak() else "native/AppImage"
             log_fn(
                 f"VFS launch: backend={backend}, route={route}, execution={location}.")

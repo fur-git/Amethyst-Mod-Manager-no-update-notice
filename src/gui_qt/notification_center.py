@@ -89,7 +89,7 @@ class _ProgressRow(QFrame):
             self._bar.setRange(0, bar_total)
             self._bar.setValue(bar_done)
             if entry.get("bytes_mode"):
-                from Utils.cache_tools import format_size
+                from Utils.downloads.cache import format_size
                 self._count.setText(self.tr("{0} / {1}").format(
                     format_size(min(done, total)), format_size(total)))
             else:
@@ -394,6 +394,10 @@ class NotificationButton(QToolButton):
     def open_menu(self, anchor: QWidget | None = None):
         """Open the live notification menu without blocking the caller."""
         if self._active_menu is not None:
+            return
+        window = (anchor or self).window()
+        if (window is None or not window.isVisible() or window.isMinimized()
+                or not window.isActiveWindow()):
             return
         if anchor is None or not anchor.isVisible():
             if self.isVisible():

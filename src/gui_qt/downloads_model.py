@@ -4,7 +4,8 @@
   0 check    - selection checkbox (archives only)
   1 name     - archive filename / section label
   2 size     - human size (archives only)
-  3 install  - Install / Reinstall button (painted by the delegate)
+  3 date     - downloaded date/time (archives only)
+  4 install  - Install / Reinstall button (painted by the delegate)
 
 Selection is tracked by Path in `checked` so it survives rescans/filtering
 (Tk parity). Installed detection (Install vs Reinstall) comes from an
@@ -13,32 +14,53 @@ InstalledIndex set on the model.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QT_TRANSLATE_NOOP)
 
-from Utils.downloads_core import DownloadEntry, InstalledIndex
+from Utils.downloads.core import DownloadEntry, InstalledIndex
+from Utils.downloads.locations import archive_path_key
 
 COL_CHECK = 0
 COL_NAME = 1
 COL_SIZE = 2
-COL_INSTALL = 3
+COL_DOWNLOADED = 3
+COL_INSTALL = 4
 # Translated at display time in headerData; register literals for lupdate.
 COLUMNS = ["",
            QT_TRANSLATE_NOOP("DownloadsModel", "Name"),
            QT_TRANSLATE_NOOP("DownloadsModel", "Size"),
+           QT_TRANSLATE_NOOP("DownloadsModel", "Downloaded"),
            ""]
+
+_SORT_KEYS = {"name", "size", "downloaded"}
 
 EntryRole = Qt.UserRole + 1
 InstalledRole = Qt.UserRole + 2   # bool: archive already installed
+HiddenRole = Qt.UserRole + 3
+
+
+def _downloaded_text(mtime: float) -> str:
+    try:
+        downloaded = datetime.fromtimestamp(mtime)
+    except (OSError, OverflowError, ValueError):
+        return ""
+    if downloaded.date() == datetime.now().date():
+        return downloaded.strftime("%H:%M")
+    return downloaded.strftime("%m/%d/%y")
 
 
 class DownloadsModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._natural: list[DownloadEntry] = []
         self._rows: list[DownloadEntry] = []
         self._installed = InstalledIndex()
+        self._hidden_entries: frozenset[Path] = frozenset()
+        self._sort_key: str | None = None
+        self._sort_ascending = True
         self.checked: set[Path] = set()       # selected archive paths
         # Shift-click range selection (Tk parity): the anchor row + whether the
         # anchor's action was select(True)/deselect(False).
@@ -46,16 +68,65 @@ class DownloadsModel(QAbstractTableModel):
         self._range_select = True
 
     # ---- population -------------------------------------------------------
-    def set_rows(self, rows: list[DownloadEntry], installed: InstalledIndex):
+    def set_rows(self, rows: list[DownloadEntry], installed: InstalledIndex,
+                 hidden_paths: frozenset[str] = frozenset()):
         self.beginResetModel()
-        self._rows = rows
+        self._natural = rows
+        self._rows = self._derive_rows()
         self._installed = installed
+        self._hidden_entries = (
+            frozenset(
+                e.path for e in rows
+                if e.path is not None
+                and archive_path_key(e.path) in hidden_paths)
+            if hidden_paths else frozenset()
+        )
         # Drop checks for archives no longer present.
         present = {e.path for e in rows if not e.is_section_header and e.path}
         self.checked &= present
         if self._anchor_path is not None and self._anchor_path not in present:
             self._anchor_path = None
         self.endResetModel()
+
+    # ---- column sorting --------------------------------------------------
+    def set_sort(self, key: str | None, ascending: bool = True):
+        key = key if key in _SORT_KEYS else None
+        ascending = bool(ascending)
+        if (key, ascending) == (self._sort_key, self._sort_ascending):
+            return
+        self.beginResetModel()
+        self._sort_key = key
+        self._sort_ascending = ascending
+        self._rows = self._derive_rows()
+        self.endResetModel()
+
+    def sort_state(self) -> tuple[str | None, bool]:
+        return self._sort_key, self._sort_ascending
+
+    def _derive_rows(self) -> list[DownloadEntry]:
+        if self._sort_key is None:
+            return list(self._natural)
+
+        def sort_key(e: DownloadEntry):
+            if self._sort_key == "name":
+                return e.path.name.casefold() if e.path else ""
+            if self._sort_key == "size":
+                return e.size
+            return e.mtime
+
+        rows: list[DownloadEntry] = []
+        i = 0
+        while i < len(self._natural):
+            if self._natural[i].is_section_header:
+                rows.append(self._natural[i])
+                i += 1
+            start = i
+            while i < len(self._natural) and not self._natural[i].is_section_header:
+                i += 1
+            rows.extend(sorted(
+                self._natural[start:i], key=sort_key,
+                reverse=not self._sort_ascending))
+        return rows
 
     def entry(self, row: int) -> DownloadEntry | None:
         return self._rows[row] if 0 <= row < len(self._rows) else None
@@ -149,6 +220,8 @@ class DownloadsModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            if getattr(self, "_suppress_header_text", False):
+                return ""
             return self.tr(COLUMNS[section]) if COLUMNS[section] else ""
         return None
 
@@ -169,6 +242,9 @@ class DownloadsModel(QAbstractTableModel):
             return e
         if role == InstalledRole:
             return self.is_installed(e)
+        if role == HiddenRole:
+            return (not e.is_section_header and e.path is not None
+                    and e.path in self._hidden_entries)
         if role == Qt.DisplayRole:
             if e.is_section_header:
                 return e.section_name if col == COL_NAME else ""
@@ -176,6 +252,8 @@ class DownloadsModel(QAbstractTableModel):
                 return e.path.name if e.path else ""
             if col == COL_SIZE:
                 return e.size_str
+            if col == COL_DOWNLOADED and e.mtime:
+                return _downloaded_text(e.mtime)
         if role == Qt.CheckStateRole and col == COL_CHECK and not e.is_section_header:
             return (Qt.Checked if (e.path in self.checked) else Qt.Unchecked)
         return None

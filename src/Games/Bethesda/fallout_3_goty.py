@@ -49,12 +49,14 @@ class Fallout3_GOTY(Fallout_3):
                     "archive_keywords": ["fose"],
                 },
             ),
+            *self._fo3_mpi_wizard_tools("fo3goty"),
             WizardTool(
                 id="run_wrye_bash_fo3goty",
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("fo3goty"),
             *self._xedit_wizard_tools(
                 build="FO3Edit", id_suffix="fo3goty",
                 nexus_url="https://www.nexusmods.com/fallout3/mods/637?tab=files",

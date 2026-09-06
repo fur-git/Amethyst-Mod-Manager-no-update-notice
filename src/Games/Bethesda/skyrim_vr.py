@@ -52,6 +52,7 @@ class SkyrimVR(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("skyrimvr"),
             *self._xedit_wizard_tools(
                 build="TES5VREdit", id_suffix="skyrimvr", qac=False,
                 nexus_url="https://www.nexusmods.com/skyrimspecialedition/mods/164?tab=files",
@@ -106,7 +107,7 @@ class SkyrimVR(Fallout_3):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
             CustomRule(dest="", filenames=["sksevr_loader.exe"], flatten=True, loose_only=True),
             CustomRule(dest="", filenames=["sksevr*.dll"], flatten=True, loose_only=True),

@@ -6,7 +6,7 @@ Each row: a lock toggle (disabled for the default profile), the profile name (wi
 ``(default)`` / ``★`` markers), and Rename / Open / Remove buttons. Rename opens an
 inline bar under the row; Remove restores the game first if the profile is deployed,
 asks a second time if the profile has its own mods, then deletes the folder. All the
-persistence reuses the neutral ``Utils.profile_state`` helpers - no backend rewrite.
+persistence reuses the neutral ``Utils.profiles.state`` helpers - no backend rewrite.
 """
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ from gui_qt.theme_qt import active_palette, _c, close_button, contrast_text
 from gui_qt.icons import icon
 from gui_qt.safe_emit import safe_emit
 from gui_qt.i18n import profile_display, is_reserved_profile_name
-from Utils.profile_state import (
+from Utils.profiles.state import (
     read_profile_settings, merge_profile_settings, profile_uses_specific_mods,
 )
-from Utils.xdg import xdg_open
+from Utils.environment.xdg import xdg_open
 
 
 class _LockBox(QWidget):
@@ -153,7 +153,7 @@ class ProfileSettingsView(QWidget):
 
     # -- profile helpers (neutral, ported from the Tk overlay) --------------
     def _get_profile_dir(self, profile: str) -> Path:
-        from Utils.game_helpers import _GAMES
+        from Utils.games.registry import _GAMES
         game = _GAMES.get(self._game_name)
         if game is not None:
             return game.get_profile_root() / "profiles" / profile
@@ -161,7 +161,7 @@ class ProfileSettingsView(QWidget):
         return get_profiles_dir() / self._game_name / "profiles" / profile
 
     def _profiles(self) -> list[str]:
-        from Utils.game_helpers import _profiles_for_game
+        from Utils.games.registry import _profiles_for_game
         return _profiles_for_game(self._game_name)
 
     def _is_original_default(self, profile: str) -> bool:
@@ -344,6 +344,10 @@ class ProfileSettingsView(QWidget):
     def _do_rename(self):
         if self._rename_edit is None or self._rename_target is None:
             return
+        if getattr(self._window, "_filegraph_loading", False):
+            self._notify(self.tr("Wait for the profile to finish loading."),
+                         "info")
+            return
         old_name = self._rename_target
         new_name = self._rename_edit.text().strip()
 
@@ -397,14 +401,18 @@ class ProfileSettingsView(QWidget):
     def _on_remove(self, profile: str):
         if self._is_original_default(profile) or self._is_profile_locked(profile):
             return
+        if getattr(self._window, "_filegraph_loading", False):
+            self._notify(self.tr("Wait for the profile to finish loading."),
+                         "info")
+            return
         from gui_qt.confirm_overlay import ConfirmOverlay
-        from Utils.game_helpers import _GAMES
+        from Utils.games.registry import _GAMES
         game = _GAMES.get(self._game_name)
 
         # Deleting a MEMBER of a group that is currently deployed would leave
         # the game full of dangling links - require a restore first.
         try:
-            from Utils.profile_groups import is_group, member_of_groups
+            from Utils.profiles.groups import is_group, member_of_groups
             target_is_group = is_group(self._get_profile_dir(profile))
             if game is not None and not target_is_group:
                 groups = member_of_groups(game, profile)
@@ -460,6 +468,10 @@ class ProfileSettingsView(QWidget):
 
     def _start_remove_worker(self, profile: str, is_deployed: bool):
         win = self._window
+        if getattr(win, "_filegraph_loading", False):
+            self._notify(self.tr("Wait for the profile to finish loading."),
+                         "info")
+            return
         # Coordinate with the app's deploy/restore mutex.
         if getattr(win, "_deploy_running", False):
             self._notify(self.tr("A deploy is in progress - try again shortly."), "warning")
@@ -475,7 +487,7 @@ class ProfileSettingsView(QWidget):
             except Exception:
                 pass
 
-        from Utils.game_helpers import _GAMES
+        from Utils.games.registry import _GAMES
         game = _GAMES.get(self._game_name)
 
         def worker():
@@ -499,7 +511,7 @@ class ProfileSettingsView(QWidget):
         Mirrors the app's _on_restore sequence (borrows the window's op signals
         for the progress popup)."""
         win = self._window
-        from Utils.deploy import restore_root_folder_for_game
+        from Utils.deployment import restore_root_folder_for_game
         # Remember the profile we're actually on so the finally block restores to
         # it - restoring to None (default) would desync the game object from the
         # selected profile and make later path-derived opens resolve wrong.

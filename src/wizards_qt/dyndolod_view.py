@@ -11,8 +11,9 @@ already extracted under Profiles/<game>/Applications/<app_dir>/):
   2. Deploy the modlist (explicit Deploy button after the delete-previous-
      output reminder, through QtWizardContext.run_deploy).
   3. Choose Proton version + prefix placement (shared ProtonStepWidget).
-  4. Run the tool via Proton with ``-d:<game>/Data -o:<staging>/<Tool>_Output
-     -sse`` after prefix prep (registry seed, plugins.txt + My Games links).
+  4. Run the tool via Proton with ``-d:<game>/Data -o:<staging>/<Tool>_Output``
+     and its game-mode flag after prefix prep (registry seed, plugins.txt +
+     My Games links).
      Done enables once it has launched; the wizard closes and refreshes the
      modlist when the tool exits (the output dir is a new mod folder).
 
@@ -37,7 +38,8 @@ from gui_qt.theme_qt import (
     active_palette, _c, button_qss, close_button, ok_text, err_text,
 )
 from gui_qt.safe_emit import safe_emit
-from Utils.xedit_tools import tool_exe_path
+from Utils.bethesda.xedit import tool_exe_path
+from Utils.executables.arguments import XLODGEN_GAME_FLAGS
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -208,7 +210,7 @@ class DynDOLODView(QWidget):
         return page
 
     def _open_download_page(self):
-        from Utils.xdg import open_url
+        from Utils.environment.xdg import open_url
         open_url(_NEXUS_URL)
 
     # ---- step 1b: auto download (xLODGen) ---------------------------------------
@@ -230,10 +232,10 @@ class DynDOLODView(QWidget):
         def worker():
             import tempfile
             from Utils.ca_bundle import download_file
-            from Utils.wizard_archives import (
+            from Utils.wizards.archives import (
                 extract_archive, fetch_latest_github_asset,
             )
-            from Utils.xedit_tools import applications_dir, flatten_subdirs
+            from Utils.bethesda.xedit import applications_dir, flatten_subdirs
             try:
                 safe_emit(self._dl_status_sig,
                     self.tr("Fetching latest release from GitHub…"), "")
@@ -311,7 +313,7 @@ class DynDOLODView(QWidget):
         return page
 
     def _scan_downloads(self):
-        from Utils.wizard_archives import find_archive, get_downloads_dir
+        from Utils.wizards.archives import find_archive, get_downloads_dir
         found = find_archive(get_downloads_dir(), [self._archive_kw])
         if found:
             self._archive_path = found
@@ -329,7 +331,7 @@ class DynDOLODView(QWidget):
                 err_text())
 
     def _browse_archive(self):
-        from Utils.portal_filechooser import pick_file
+        from Utils.ui.portal import pick_file
         # Portal callback fires on a WORKER thread - marshal via Signal.
         pick_file(self.tr("Select the DynDOLOD archive"), lambda *a: safe_emit(self._picked_sig, *a))
 
@@ -354,8 +356,8 @@ class DynDOLODView(QWidget):
         exe_name, app_dir, name = self._exe_name, self._app_dir, self._name
 
         def worker():
-            from Utils.wizard_archives import extract_archive
-            from Utils.xedit_tools import applications_dir, flatten_subdirs
+            from Utils.wizards.archives import extract_archive
+            from Utils.bethesda.xedit import applications_dir, flatten_subdirs
             try:
                 if archive is None or not archive.is_file():
                     raise RuntimeError(self.tr("Archive not found."))
@@ -519,14 +521,23 @@ class DynDOLODView(QWidget):
         proton_name, prefix_mode = self._proton_name, self._prefix_mode
         prefer_discrete_gpu = self._prefer_discrete_gpu
         tool_id = self._tool_id
+        game_flag = (XLODGEN_GAME_FLAGS.get(game.game_id)
+                     if tool_id == "xlodgen" else "-sse")
+
+        if game_flag is None:
+            self._set_status(
+                self._run_status,
+                self.tr("xLODGen does not support {0}.").format(game.name),
+                err_text())
+            return
 
         def worker():
-            from Utils.exe_launch import (
+            from Utils.executables.launch import (
                 PREFIX_MODE_GAME, resolve_tool_prefix, run_tool_logged,
                 shutdown_prefix_wineserver,
             )
-            from Utils.wine_paths import to_wine_path
-            from Utils.xedit_tools import prepare_xedit_prefix
+            from Utils.wine.paths import to_wine_path
+            from Utils.bethesda.xedit import prepare_xedit_prefix
             _wlog = lambda m: self._log(f"{name} Wizard: {m}")
             proton_script = compat_data = None
             try:
@@ -551,7 +562,7 @@ class DynDOLODView(QWidget):
                     # processes inherit this environment, so filtering the
                     # Vulkan devices here makes the selected discrete GPU DXVK
                     # adapter 0 for texconv's DirectCompute codec as well.
-                    from Utils.texture_tools import apply_discrete_gpu_environment
+                    from Utils.wizards.textures import apply_discrete_gpu_environment
                     gpu_selection = apply_discrete_gpu_environment(
                         env, prefer_discrete_gpu)
                     _wlog(f"GPU: {gpu_selection}")
@@ -577,11 +588,11 @@ class DynDOLODView(QWidget):
                     game, compat_data, proton_script, env, log_fn=_wlog)
 
                 self._log(f"{name} Wizard: launching {exe} via Proton")
-                self._log(f"  args: {data_arg}  {output_arg}  -sse")
+                self._log(f"  args: {data_arg}  {output_arg}  {game_flag}")
                 safe_emit(self._run_started_sig)
                 run_tool_logged(
                     proton_script, exe, env, log_fn=_wlog,
-                    extra_args=[data_arg, output_arg, "-sse"], label=name,
+                    extra_args=[data_arg, output_arg, game_flag], label=name,
                     game=game, owner=self)
 
                 self._log(f"{name} Wizard: {exe.name} closed.")

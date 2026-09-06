@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub const API_VERSION: u32 = 11;
+pub const API_VERSION: u32 = 12;
 pub const SCHEMA_VERSION: u32 = 9;
 pub const ENGINE_REVISION: u64 = 1;
 pub const RULES_REVISION: u64 = 7;
@@ -180,6 +180,7 @@ fn default_casing_strategy() -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub id: i64,
+    pub file_id: i64,
     pub destination_id: i64,
     pub mod_id: i64,
     pub mod_name: Arc<str>,

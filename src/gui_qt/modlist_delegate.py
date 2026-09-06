@@ -18,12 +18,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QToolTip
 
-from gui_qt.theme_qt import bind_theme, _c, qc, qc_contrast
+from gui_qt.theme_qt import bind_theme, _c, qc, qc_contrast, link_on
 from gui_qt.icons import icon
+from gui_qt.tooltips import wrap_tooltip
 from gui_qt.modlist_model import (
     EntryRole, ConflictRole, BsaConflictRole, UuidConflictRole, FlagsRole,
     HighlightRole,
-    COL_NAME, COL_FLAGS, COL_CONFLICTS, COL_PRIORITY,
+    COL_NAME, COL_FLAGS, COL_CONFLICTS, COL_VERSION, COL_PRIORITY,
 )
 from gui_qt.modlist_data import (
     FLAG_UPDATE, FLAG_ENDORSED, FLAG_ROOT, FLAG_MODIFIED_MF, FLAG_MISSING_REQS,
@@ -63,6 +64,15 @@ _MONO_FLAG_ICONS = {"bundle_settings.png", "root.png", "eye2_white.png"}
 _INFO_FLAGS = (FLAG_PRERTX, FLAG_COLLECTION_BUNDLED, FLAG_COLLECTION_PATCHED)
 # The root-icon flags - only one root.png ever paints.
 _ROOT_FLAGS = (FLAG_ROOT, FLAG_ROOT_RULE)
+_CLICKABLE_FLAG_BITS = frozenset({
+    FLAG_NOTE,
+    FLAG_BUNDLE,
+    FLAG_MISSING_REQS,
+    FLAG_RERUN_FOMOD,
+    FLAG_UPDATE,
+    FLAG_MODIO_UPDATE,
+    FLAG_THUNDERSTORE_UPDATE,
+})
 _ALIGN_CENTER = Qt.AlignVCenter | Qt.AlignHCenter
 _ALIGN_LEFT = Qt.AlignVCenter | Qt.AlignLeft
 
@@ -309,6 +319,24 @@ class ModRowDelegate(QStyledItemDelegate):
         self.c_root_text = qc(p, "ROOT_SEP_FG")
         self.c_overwrite_text = qc(p, "OVERWRITE_SEP_FG")
         self.c_badge = qc(p, "LINK_BLUE")   # separator deploy-path badge
+        # Hovered clickable number (Version / Priority) - reads as a link. The
+        # tint is resolved per row fill, not once: several themes derive
+        # BG_SELECT (and the conflict bands) from the same accent as LINK_BLUE,
+        # so a single colour would vanish on exactly those rows.
+        # The tint has to clear the fill behind it AND differ from the text it
+        # replaces, so each entry names both. The plain-row base uses
+        # BG_ROW_HOVER (the tint only paints on a row the cursor is over);
+        # highlighted rows swap in TEXT_ON_ACCENT, which is what they paint.
+        self.c_action_hover = link_on(p, "BG_ROW_HOVER", "TEXT_MAIN")
+        self.c_action_hover_dim = link_on(p, "BG_ROW_HOVER", "TEXT_DIM")
+        self._action_hover_by_fill = {
+            "sel": link_on(p, "BG_SELECT", "TEXT_ON_ACCENT"),
+            2: link_on(p, "CONFLICT_HL_ANCHOR", "TEXT_ON_ACCENT"),
+            3: link_on(p, "REQ_HL_REQUIRES", "TEXT_ON_ACCENT"),
+            -3: link_on(p, "REQ_HL_REQUIRED_BY", "TEXT_ON_ACCENT"),
+            1: link_on(p, "CONFLICT_HL_WIN", "TEXT_ON_ACCENT"),
+            -1: link_on(p, "CONFLICT_HL_LOSE", "TEXT_ON_ACCENT"),
+        }
         parent = self.parent()
         if parent is not None:
             try:
@@ -319,14 +347,26 @@ class ModRowDelegate(QStyledItemDelegate):
     def sizeHint(self, opt, index):
         e = index.data(EntryRole)
         h = SEP_H if (e and e.is_separator) else ROW_H
+        if index.row() in getattr(self.parent(), "_group_end_markers", {}):
+            h += SEP_H
         return QSize(opt.rect.width(), h)
+
+    def paint_drop_divider(self, p, rect):
+        p.fillRect(rect, self.c_row)
+        pen = _sep_rule_pen(self.c_text_dim, self.c_row)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawLine(rect.left() + 8, rect.center().y(),
+                   rect.right() - 8, rect.center().y())
 
     def paint(self, p, opt, index):
         e = index.model().entry(index.row())
         if e is None:
             super().paint(p, opt, index)
             return
-        r = opt.rect
+        r = QRect(opt.rect)
+        if index.row() in getattr(self.parent(), "_group_end_markers", {}):
+            r.setHeight(r.height() - SEP_H)
         p.save()
         p.setRenderHint(p.RenderHint.Antialiasing, False)
 
@@ -337,16 +377,7 @@ class ModRowDelegate(QStyledItemDelegate):
             from gui_qt.modlist_model import OVERWRITE_NAME, ROOT_FOLDER_NAME
             from gui_qt.modlist_sort import DIVIDER_NAME
             if e.name == DIVIDER_NAME:
-                # Reverse-priority float divider: a thin dashed centred line on
-                # a plain row background, no controls (Tk BOUNDARY_NAME row).
-                p.fillRect(r, self.c_row)
-                # Sits on the plain row background, so it keys off TEXT_DIM
-                # rather than the separator band's TEXT_SEP.
-                pen = _sep_rule_pen(self.c_text_dim, self.c_row)
-                pen.setStyle(Qt.PenStyle.DashLine)
-                p.setPen(pen)
-                cy = r.center().y()
-                p.drawLine(r.left() + 8, cy, r.right() - 8, cy)
+                self.paint_drop_divider(p, r)
                 p.restore()
                 return
             sep_hl = index.data(HighlightRole) or 0
@@ -430,6 +461,9 @@ class ModRowDelegate(QStyledItemDelegate):
             # Plain columns (Installed/Version/Priority): centred to match the
             # centred headers + the icon columns.
             val = index.data(Qt.DisplayRole) or ""
+            if self._is_hover_action_cell(index):
+                text_color = self._action_hover_color(
+                    selected, highlighted, hl, e.enabled)
             p.setPen(text_color)
             p.setFont(self.f_row)
             pad = QRect(r.left() + 6, r.top(), r.width() - 12, r.height())
@@ -445,6 +479,9 @@ class ModRowDelegate(QStyledItemDelegate):
     def _arrow_rect(self, r):
         y = r.top() + (r.height() - self.ARROW_SZ) // 2
         return QRect(r.left() + self.PAD, y, self.ARROW_SZ, self.ARROW_SZ)
+
+    def _arrow_hit_rect(self, r):
+        return self._arrow_rect(r).adjusted(-6, -6, 6, 6).intersected(r)
 
     def _lock_rect(self, r):
         y = r.top() + (r.height() - self.LOCK_SZ) // 2
@@ -489,6 +526,9 @@ class ModRowDelegate(QStyledItemDelegate):
             p.drawLine(cx + gap, cy, r.right() - 6, cy)
             p.setPen(txt)
             p.drawText(nr, Qt.AlignVCenter | Qt.AlignHCenter, label)
+            self._paint_icons(
+                p, self._col_rect(COL_FLAGS, r),
+                self._flag_icons(index.data(FlagsRole) or 0))
             return
 
         name = e.display_name
@@ -622,7 +662,8 @@ class ModRowDelegate(QStyledItemDelegate):
         self._paint_icons(p, self._col_rect(COL_CONFLICTS, r), conflict_icons)
 
     def _paint_name(self, p, r, e, index, text_color):
-        x = r.left()
+        leader = index.model().group_leader(e.name)
+        x = r.left() + (24 if leader and leader != e.name else 0)
 
         # Checkbox (accent fill + white tick when enabled; hollow when not).
         box = QRect(x + 10, r.top() + (r.height() - CHECK_BOX) // 2,
@@ -640,6 +681,12 @@ class ModRowDelegate(QStyledItemDelegate):
         p.setRenderHint(p.RenderHint.Antialiasing, False)
 
         tx = box.right() + 10
+        if leader:
+            if leader == e.name:
+                arrow = icon("right.png" if index.model().is_group_collapsed(e.name)
+                             else "arrow.png", self.ARROW_SZ, color=self.c_arrow)
+                arrow.paint(p, self._group_arrow_rect(r))
+            tx += 24
 
         # Lock glyph.
         if e.locked:
@@ -653,6 +700,8 @@ class ModRowDelegate(QStyledItemDelegate):
         p.setFont(self.f_row)
         name_rect = QRect(tx, r.top(), r.right() - tx - 6, r.height())
         name = e.display_name
+        if leader == e.name:
+            name += f" ({len(index.model()._mod_groups[leader]['members'])})"
         text_width = self._name_widths.get(name)
         if text_width is None:
             text_width = self.fm_row.horizontalAdvance(name)
@@ -661,6 +710,17 @@ class ModRowDelegate(QStyledItemDelegate):
                  else self.fm_row.elidedText(name, Qt.ElideRight,
                                              name_rect.width()))
         p.drawText(name_rect, _ALIGN_LEFT, shown)
+
+    def _group_arrow_rect(self, rect):
+        return QRect(rect.left() + 10 + CHECK_BOX + 9,
+                     rect.top() + (rect.height() - self.ARROW_SZ) // 2,
+                     self.ARROW_SZ, self.ARROW_SZ)
+
+    def _checkbox_hit_rect(self, rect, index):
+        name = index.data(EntryRole).name
+        leader = index.model().group_leader(name)
+        offset = 24 if leader and leader != name else 0
+        return QRect(rect.left() + offset + 6, rect.top(), 26, rect.height())
 
     def _paint_conflicts(self, p, r, loose, bsa, uuid=0):
         """Conflicts cell: loose-file conflict icon on the left, BSA/BA2 archive
@@ -721,6 +781,10 @@ class ModRowDelegate(QStyledItemDelegate):
                 return bit
             x += sz + gap
         return 0
+
+    def _hit_clickable_flag_bit(self, pos, r, bits):
+        hit = self._hit_flag_bit(pos, r, bits)
+        return hit if hit in _CLICKABLE_FLAG_BITS else 0
 
     def _hit_conflict_icon(self, pos, r, index):
         """True if *pos* lands on a conflict icon in the Conflicts cell rect *r*.
@@ -815,6 +879,31 @@ class ModRowDelegate(QStyledItemDelegate):
         distinguishes e.g. collection bundled vs patched)."""
         try:
             if event.type() == QEvent.ToolTip and index.isValid():
+                entry = index.data(EntryRole)
+                if (entry is not None and index.model().is_group_collapsed(entry.name)
+                        and index.column() in (COL_FLAGS, COL_CONFLICTS)):
+                    if index.column() == COL_FLAGS:
+                        hit = self._hit_flag_bit(event.pos(), opt.rect, index.data(FlagsRole) or 0)
+                        tip = self.tr(_FLAG_TIPS[hit]) if hit in _FLAG_TIPS else None
+                    else:
+                        tip = self._conflict_tip(event.pos(), opt.rect, index)
+                    if tip:
+                        tip = self.tr("Group summary: {0}\nExpand the group to act on individual mods.").format(tip)
+                        QToolTip.showText(event.globalPos(), wrap_tooltip(tip), view, opt.rect)
+                    else:
+                        QToolTip.hideText()
+                    return True
+                if entry is not None and entry.is_separator:
+                    flags_rect = self._col_rect(COL_FLAGS, opt.rect)
+                    bits = index.data(FlagsRole) or 0
+                    hit = self._hit_flag_bit(event.pos(), flags_rect, bits)
+                    tip = self._flag_tip(hit, index)
+                    if tip:
+                        QToolTip.showText(
+                            event.globalPos(), wrap_tooltip(tip), view,
+                            flags_rect)
+                        return True
+                    QToolTip.hideText()
                 if index.column() == COL_FLAGS:
                     bits = index.data(FlagsRole) or 0
                     if bits:
@@ -824,13 +913,17 @@ class ModRowDelegate(QStyledItemDelegate):
                             # Pass the flags-cell rect so Qt hides the tooltip as
                             # soon as the cursor leaves the cell (instead of
                             # keeping it up for its full length-based timeout).
-                            QToolTip.showText(event.globalPos(), tip, view, opt.rect)
+                            QToolTip.showText(
+                                event.globalPos(), wrap_tooltip(tip), view,
+                                opt.rect)
                             return True
                     QToolTip.hideText()
                 elif index.column() == COL_CONFLICTS:
                     tip = self._conflict_tip(event.pos(), opt.rect, index)
                     if tip:
-                        QToolTip.showText(event.globalPos(), tip, view, opt.rect)
+                        QToolTip.showText(
+                            event.globalPos(), wrap_tooltip(tip), view,
+                            opt.rect)
                         return True
                     QToolTip.hideText()
         except Exception:
@@ -859,25 +952,70 @@ class ModRowDelegate(QStyledItemDelegate):
             if x > r.right() - sz:
                 break
 
+    def _action_hover_color(self, selected, highlighted, hl, enabled=True):
+        """Link tint for the hovered number, matched to the fill behind it."""
+        if selected:
+            return self._action_hover_by_fill["sel"]
+        if highlighted:
+            return self._action_hover_by_fill.get(
+                hl, self._action_hover_by_fill["sel"])
+        return self.c_action_hover if enabled else self.c_action_hover_dim
+
+    def _is_hover_action_cell(self, index):
+        """True when the view says this Version/Priority number is hovered."""
+        cell = getattr(self.parent(), "_hover_action_cell", None)
+        return cell is not None and cell == (index.row(), index.column())
+
+    def _hit_centered_text(self, pos, rect, index):
+        text = str(index.data(Qt.DisplayRole) or "")
+        if not text:
+            return False
+        width = min(self.fm_row.horizontalAdvance(text),
+                    max(0, rect.width() - 12))
+        hit = QRect(0, 0, width,
+                    self.fm_row.height())
+        hit.moveCenter(rect.center())
+        return hit.contains(pos)
+
     def editorEvent(self, event, model, opt, index):
         if event.type() != QEvent.MouseButtonRelease:
             return False
-        if index.column() not in (COL_NAME, COL_FLAGS, COL_CONFLICTS):
+        if index.column() not in (COL_NAME, COL_FLAGS, COL_CONFLICTS,
+                                  COL_VERSION, COL_PRIORITY):
             return False
         pos = event.position().toPoint()
         e = model.entry(index.row())
+        if (model.is_group_collapsed(e.name)
+                and index.column() in (COL_FLAGS, COL_CONFLICTS)):
+            return False
 
-        # Flags cell: a click on a flag icon may trigger an action (the update
-        # flag opens Change Version). Other flags are inert for now.
+        if index.column() == COL_VERSION:
+            if (event.button() != Qt.LeftButton or e.is_separator
+                    or not self._hit_centered_text(pos, opt.rect, index)):
+                return False
+            from gui_qt.modlist_menu import _set_version
+            _set_version(self.parent(), model, index.row())
+            return True
+
+        if index.column() == COL_PRIORITY:
+            if (event.button() != Qt.LeftButton or e.is_separator
+                    or e.locked
+                    or not self._hit_centered_text(pos, opt.rect, index)):
+                return False
+            from gui_qt.modlist_menu import _set_priority
+            _set_priority(self.parent(), model, index.row())
+            return True
+
+        # Only flags backed by an action consume the click.
         if index.column() == COL_FLAGS:
             if e.is_separator:
                 return False
             bits = model.data(index, FlagsRole) or 0
-            hit = self._hit_flag_bit(pos, opt.rect, bits)
+            hit = self._hit_clickable_flag_bit(pos, opt.rect, bits)
             if hit:
                 view = self.parent()
                 cb = getattr(view, "on_flag_clicked", None)
-                if cb is not None:
+                if callable(cb):
                     cb(index.row(), hit)
                     return True
             return False
@@ -890,21 +1028,18 @@ class ModRowDelegate(QStyledItemDelegate):
             if self._hit_conflict_icon(pos, opt.rect, index):
                 view = self.parent()
                 cb = getattr(view, "on_show_conflicts", None)
-                if cb is not None:
+                if callable(cb):
                     cb(e.name)
                     return True
             return False
 
         if e.is_separator:
-            # Real separators are never selectable: the view consumes their
-            # press (mousePressEvent) and does the collapse/lock toggle on
-            # release (_handle_separator_click), so it never reaches here. The
-            # _arrow_rect/_lock_rect geometry still lives on this delegate and
-            # is reused by that handler.
+            # The view handles the arrow and lock controls. Releases elsewhere
+            # stay unhandled so normal separator-row selection can complete.
             return False
 
         # Mod row: checkbox area toggles enabled.
-        box = QRect(opt.rect.left() + 6, opt.rect.top(), 26, opt.rect.height())
+        box = self._checkbox_hit_rect(opt.rect, index)
         if box.contains(pos):
             model.toggle(index.row())
             return True

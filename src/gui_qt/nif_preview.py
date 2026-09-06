@@ -2,12 +2,11 @@
 nif_preview.py
 Panel-scoped 3D preview for .nif meshes (QOpenGLWidget, no new deps).
 
-Parses off-thread via Utils.nif_reader, bakes world transforms into vertices,
-and resolves textures through Utils.asset_resolver (what the game would load)
+Parses off-thread via Utils.assets.nif, bakes world transforms into vertices,
+and resolves textures through Utils.assets.resolver (what the game would load)
 with archive/loose fallbacks. Starfield geometry is fetched from external
-.mesh files. Meshes are Z-up; dragging turns the asset about +Z like a
-turntable - the camera and lights stay put, so highlights sweep across the
-surface as it spins.
+.mesh files. Meshes are Z-up; the default turntable camera can be switched to
+an unrestricted trackball while the lights remain fixed around the asset.
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ except Exception:                                        # noqa: BLE001
     QOpenGLVersionProfile = QOpenGLVertexArrayObject = None
     QOpenGLWidget = QWidget
 
-from Utils.asset_resolver import DirCache as _DirCache
+from Utils.assets.resolver import DirCache as _DirCache
 from gui_qt.eliding_label import ElidingLabel
 from gui_qt.flow_layout import FlowLayout, enable_height_for_width
 from gui_qt.gl_support import gl_status
@@ -202,6 +201,7 @@ _SHEET_EXPORT_HEIGHT = 2048
 
 _HOME_YAW = math.radians(-60.0)
 _HOME_PITCH = math.radians(22.0)
+_TURNTABLE_PITCH_LIMIT = 1.5533
 
 # Wireframe: off, lines over the solid render, or lines only.
 WIRE_OFF, WIRE_OVERLAY, WIRE_ONLY = "off", "overlay", "only"
@@ -505,6 +505,17 @@ void main() {
 """
 
 
+class _Geometry:
+    __slots__ = ("verts", "indices", "lo", "hi", "has_colors")
+
+    def __init__(self, verts, indices, lo, hi, has_colors):
+        self.verts = verts
+        self.indices = indices
+        self.lo = lo
+        self.hi = hi
+        self.has_colors = has_colors
+
+
 class _Mesh:
     """One shape's CPU-side buffers, built off-thread and uploaded on demand."""
 
@@ -516,7 +527,7 @@ class _Mesh:
                  "srgb_albedo", "texture_clamp_mode",
                  "double_sided", "depth_test", "depth_write",
                  "vao", "vbo", "ibo", "texture", "normal_tex",
-                 "env_tex", "mask_tex")
+                 "env_tex", "mask_tex", "geometry")
 
     def __init__(self, name, verts, indices, image, tri_count,
                  normal_image=None, model_space_normals=False, spec=None,
@@ -525,10 +536,11 @@ class _Mesh:
                  has_colors=False, tint=(1.0, 1.0, 1.0), rmaos_image=None,
                  pbr=False, pbr_params=(0.04, 1.0), srgb_albedo=False,
                  texture_clamp_mode=3, double_sided=False,
-                 depth_test=True, depth_write=True):
+                 depth_test=True, depth_write=True, geometry=None):
         self.name = name
         self.verts = verts
         self.indices = indices
+        self.geometry = geometry
         self.image = image
         # Kept because `image` is dropped once the texture is on the GPU.
         self.has_image = image is not None
@@ -746,7 +758,7 @@ def _model_space_normal(nrm_blob, spec_blob, log=None):
         import io
         from PIL import Image as PilImage
         from PySide6.QtGui import QImage
-        from Utils.dds_compat import sanitise_dds, skip_dds_mips
+        from Utils.assets.dds import sanitise_dds, skip_dds_mips
         nrm_blob = skip_dds_mips(nrm_blob, TEXTURE_MAX_DIM)
         with PilImage.open(io.BytesIO(sanitise_dds(nrm_blob))) as im:
             big = max(im.width, im.height)
@@ -808,7 +820,7 @@ def _make_gl_texture(img, clamp_mode=3):
 def _qimage_from_bytes(data: bytes, log=None):
     """Decode texture bytes pulled from an archive (DDS goes via Pillow)."""
     from PySide6.QtGui import QImage
-    from Utils.dds_compat import sanitise_dds, skip_dds_mips
+    from Utils.assets.dds import sanitise_dds, skip_dds_mips
     # A DDS ships its own mip chain: decode the first level that fits the
     # cap rather than a 4K top mip (~400ms of BC7) we would only shrink.
     data = skip_dds_mips(data, TEXTURE_MAX_DIM)
@@ -1075,7 +1087,7 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
     def material_slot(rel: str) -> str:
         key = rel.lower()
         if key not in materials:
-            from Utils.bgsm_reader import read_material
+            from Utils.assets.materials import read_material
             blob = fetch(rel)
             materials[key] = read_material(blob) if blob else None
         mat = materials[key]
@@ -1247,7 +1259,7 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
         # The overlay belongs in the key: the head shares its base texture with
         # every other NPC using that skin, but the tint map is per-NPC.
         key = diffuse_key(shape)
-        overlay = getattr(shape, "tint_overlay", "")
+        overlay = getattr(shape, "tint_overlay", "") if slot == 0 else ""
         palette_index = getattr(shape, "palette_index", None)
         palette_rel = (palette_slot(shape)
                        if slot == 0 and palette_index is not None
@@ -1272,7 +1284,7 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
                           f"decoded ({_fmt_bytes(len(blob))}) - unsupported DDS format?")
             pre = (image.width(), image.height()) if image is not None else None
             image = _fit_texture(image)
-            from Utils.dds_compat import is_srgb_dds
+            from Utils.assets.dds import is_srgb_dds
             is_srgb = is_srgb_dds(blob) if blob else False
             if image is not None:
                 shared_put("diffuse", (rel,), (image, is_srgb))
@@ -1318,7 +1330,7 @@ def _make_texture_loader(texture_roots: list[Path], archives=None, resolver=None
 
 def _load_external_geometry(model, fetch):
     """Fill in Starfield shapes: geometry lives in geometries/<path>.mesh."""
-    from Utils.sf_mesh_reader import read_sf_mesh
+    from Utils.assets.starfield import read_sf_mesh
     cache: dict[str, object] = {}
     for shape in model.shapes:
         if shape.vertices or not shape.mesh_path:
@@ -1336,8 +1348,97 @@ def _load_external_geometry(model, fetch):
         shape.triangles = mesh.triangles
 
 
-def _build_meshes(model, load_texture, cancel=None):
-    """Bake world transforms and interleave into GL-ready buffers."""
+def _build_geometry(shape, uv_scale, uv_offset):
+    verts, tris = shape.vertices, shape.triangles
+    normals = shape.normals
+    if len(normals) != len(verts):
+        normals = _face_normals(verts, tris)
+        # The parsed/assembled model is retained for texture-source and
+        # texture-slot reloads. Keep this geometry-only result with it so
+        # a 100k-triangle body does not regenerate identical normals on
+        # every reload.
+        shape.normals = normals
+    uvs = shape.uvs
+    if len(uvs) != len(verts):
+        uvs = [(0.0, 0.0)] * len(verts)
+    if uv_scale != (1.0, 1.0) or uv_offset != (0.0, 0.0):
+        su, sv = uv_scale
+        ou, ov = uv_offset
+        uvs = [(u * su + ou, v * sv + ov) for u, v in uvs]
+    # No tangents (Skyrim LE data blocks, Starfield, unskinned bodies) just
+    # means no normal mapping for that shape; the shader falls back.
+    tangents = shape.tangents
+    if len(tangents) != len(verts):
+        tangents = [(0.0, 0.0, 0.0)] * len(verts)
+    signs = getattr(shape, "bitangent_signs", ())
+    if len(signs) != len(verts):
+        signs = [1.0] * len(verts)
+    # The engine ignores the colour array unless SLSF2_Vertex_Colors is
+    # set, and 405 shapes in one real load order carry a stale one.
+    use_colors = shape.vertex_colors and len(shape.colors) == len(verts)
+    colors = shape.colors if use_colors else None
+
+    tx, ty, tz = shape.translation
+    r = shape.rotation
+    s = shape.scale
+    r0, r1, r2, r3, r4, r5, r6, r7, r8 = r
+    # Transform in whole-list passes; the identity case (most statics)
+    # reuses the parsed lists untouched.
+    if r == _IDENTITY_ROT and s == 1.0:
+        if (tx, ty, tz) == (0.0, 0.0, 0.0):
+            wverts = verts
+        else:
+            wverts = [(x + tx, y + ty, z + tz) for x, y, z in verts]
+        wnorms = normals
+        wtans = tangents
+    else:
+        wverts = [(tx + s * (r0 * x + r1 * y + r2 * z),
+                   ty + s * (r3 * x + r4 * y + r5 * z),
+                   tz + s * (r6 * x + r7 * y + r8 * z))
+                  for x, y, z in verts]
+        wnorms = [(r0 * x + r1 * y + r2 * z,
+                   r3 * x + r4 * y + r5 * z,
+                   r6 * x + r7 * y + r8 * z)
+                  for x, y, z in normals]
+        wtans = [(r0 * x + r1 * y + r2 * z,
+                  r3 * x + r4 * y + r5 * z,
+                  r6 * x + r7 * y + r8 * z)
+                 for x, y, z in tangents]
+
+    # Compact tangent frame: xyz plus the one bit needed to reconstruct
+    # the stored bitangent direction in the shader.
+    wtans = [(x, y, z, sign)
+             for (x, y, z), sign in zip(wtans, signs)]
+
+    # Interleave pos/normal/uv/tangent(/colour) without a per-vertex
+    # Python loop: chain flattens the zipped tuples at C speed.
+    groups = (zip(wverts, wnorms, uvs, wtans, colors) if colors is not None
+              else zip(wverts, wnorms, uvs, wtans))
+    flat = array.array("f", chain.from_iterable(
+        chain.from_iterable(groups)))
+
+    # Bounds from strided slices of the final buffer (C speed); the
+    # per-shape centroid orders the blended pass.
+    fpv = 16 if colors is not None else 12
+    xs, ys, zs = flat[0::fpv], flat[1::fpv], flat[2::fpv]
+    mlo = (min(xs), min(ys), min(zs))
+    mhi = (max(xs), max(ys), max(zs))
+    nv = len(verts)
+    idx = array.array("I", chain.from_iterable(tris))
+    if idx and max(idx) >= nv:
+        # Rare corrupt file: drop only the out-of-range triangles.
+        idx = array.array("I")
+        for a, b, c in tris:
+            if a < nv and b < nv and c < nv:
+                idx.extend((a, b, c))
+    if not idx:
+        return None
+
+    return _Geometry(flat, idx, mlo, mhi, colors is not None)
+
+
+def _build_meshes(model, load_texture, cancel=None, geometry_cache=None):
+    """Build materials and reuse geometry cached for this prepared model."""
     meshes: list[_Mesh] = []
     lo = [float("inf")] * 3
     hi = [float("-inf")] * 3
@@ -1346,7 +1447,7 @@ def _build_meshes(model, load_texture, cancel=None):
     head_lo = [float("inf")] * 3
     head_hi = [float("-inf")] * 3
 
-    for shape in model.shapes:
+    for shape_index, shape in enumerate(model.shapes):
         if cancel is not None and cancel():
             return [], None, None
         if getattr(shape, "hidden", False):
@@ -1358,105 +1459,31 @@ def _build_meshes(model, load_texture, cancel=None):
         tris = shape.triangles
         if not verts or not tris:
             continue
-        normals = shape.normals
-        if len(normals) != len(verts):
-            normals = _face_normals(verts, tris)
-            # The parsed/assembled model is retained for texture-source and
-            # texture-slot reloads. Keep this geometry-only result with it so
-            # a 100k-triangle body does not regenerate identical normals on
-            # every reload.
-            shape.normals = normals
-        uvs = shape.uvs
-        if len(uvs) != len(verts):
-            uvs = [(0.0, 0.0)] * len(verts)
-        uv_scale = (external_material.uv_scale if external_material is not None
-                    else getattr(shape, "uv_scale", (1.0, 1.0)))
-        uv_offset = (external_material.uv_offset if external_material is not None
-                     else getattr(shape, "uv_offset", (0.0, 0.0)))
-        if uv_scale != (1.0, 1.0) or uv_offset != (0.0, 0.0):
-            su, sv = uv_scale
-            ou, ov = uv_offset
-            uvs = [(u * su + ou, v * sv + ov) for u, v in uvs]
-        # No tangents (Skyrim LE data blocks, Starfield, unskinned bodies) just
-        # means no normal mapping for that shape; the shader falls back.
-        tangents = shape.tangents
-        if len(tangents) != len(verts):
-            tangents = [(0.0, 0.0, 0.0)] * len(verts)
-        signs = getattr(shape, "bitangent_signs", ())
-        if len(signs) != len(verts):
-            signs = [1.0] * len(verts)
-        # The engine ignores the colour array unless SLSF2_Vertex_Colors is
-        # set, and 405 shapes in one real load order carry a stale one.
-        use_colors = shape.vertex_colors and len(shape.colors) == len(verts)
-        colors = shape.colors if use_colors else None
-
-        tx, ty, tz = shape.translation
-        r = shape.rotation
-        s = shape.scale
-        r0, r1, r2, r3, r4, r5, r6, r7, r8 = r
-        # Transform in whole-list passes; the identity case (most statics)
-        # reuses the parsed lists untouched.
-        if r == _IDENTITY_ROT and s == 1.0:
-            if (tx, ty, tz) == (0.0, 0.0, 0.0):
-                wverts = verts
-            else:
-                wverts = [(x + tx, y + ty, z + tz) for x, y, z in verts]
-            wnorms = normals
-            wtans = tangents
+        uv_scale = tuple(external_material.uv_scale
+                         if external_material is not None
+                         else getattr(shape, "uv_scale", (1.0, 1.0)))
+        uv_offset = tuple(external_material.uv_offset
+                          if external_material is not None
+                          else getattr(shape, "uv_offset", (0.0, 0.0)))
+        key = (uv_scale, uv_offset)
+        cached = (geometry_cache.get(shape_index)
+                  if geometry_cache is not None else None)
+        if cached is not None and cached[0] == key:
+            geometry = cached[1]
         else:
-            wverts = [(tx + s * (r0 * x + r1 * y + r2 * z),
-                       ty + s * (r3 * x + r4 * y + r5 * z),
-                       tz + s * (r6 * x + r7 * y + r8 * z))
-                      for x, y, z in verts]
-            wnorms = [(r0 * x + r1 * y + r2 * z,
-                       r3 * x + r4 * y + r5 * z,
-                       r6 * x + r7 * y + r8 * z)
-                      for x, y, z in normals]
-            wtans = [(r0 * x + r1 * y + r2 * z,
-                      r3 * x + r4 * y + r5 * z,
-                      r6 * x + r7 * y + r8 * z)
-                     for x, y, z in tangents]
-
-        # Compact tangent frame: xyz plus the one bit needed to reconstruct
-        # the stored bitangent direction in the shader.
-        wtans = [(x, y, z, sign)
-                 for (x, y, z), sign in zip(wtans, signs)]
-
-        # Interleave pos/normal/uv/tangent(/colour) without a per-vertex
-        # Python loop: chain flattens the zipped tuples at C speed.
-        groups = (zip(wverts, wnorms, uvs, wtans, colors) if colors is not None
-                  else zip(wverts, wnorms, uvs, wtans))
-        flat = array.array("f", chain.from_iterable(
-            chain.from_iterable(groups)))
-
-        # Bounds from strided slices of the final buffer (C speed); the
-        # per-shape centroid orders the blended pass.
-        fpv = 16 if colors is not None else 12
-        xs, ys, zs = flat[0::fpv], flat[1::fpv], flat[2::fpv]
-        mlo = (min(xs), min(ys), min(zs))
-        mhi = (max(xs), max(ys), max(zs))
-        for k in range(3):
-            if mlo[k] < lo[k]:
-                lo[k] = mlo[k]
-            if mhi[k] > hi[k]:
-                hi[k] = mhi[k]
-        if getattr(shape, "is_head", False):
-            for k in range(3):
-                if mlo[k] < head_lo[k]:
-                    head_lo[k] = mlo[k]
-                if mhi[k] > head_hi[k]:
-                    head_hi[k] = mhi[k]
-
-        nv = len(verts)
-        idx = array.array("I", chain.from_iterable(tris))
-        if idx and max(idx) >= nv:
-            # Rare corrupt file: drop only the out-of-range triangles.
-            idx = array.array("I")
-            for a, b, c in tris:
-                if a < nv and b < nv and c < nv:
-                    idx.extend((a, b, c))
-        if not idx:
+            geometry = _build_geometry(shape, uv_scale, uv_offset)
+            if geometry_cache is not None:
+                geometry_cache[shape_index] = (key, geometry)
+        if geometry is None:
             continue
+        flat, idx = geometry.verts, geometry.indices
+        mlo, mhi = geometry.lo, geometry.hi
+        for k in range(3):
+            lo[k] = min(lo[k], mlo[k])
+            hi[k] = max(hi[k], mhi[k])
+            if getattr(shape, "is_head", False):
+                head_lo[k] = min(head_lo[k], mlo[k])
+                head_hi[k] = max(head_hi[k], mhi[k])
 
         image = load_texture(shape)
         nrm_img, model_space = (load_texture.normal_map(shape)
@@ -1503,14 +1530,15 @@ def _build_meshes(model, load_texture, cancel=None):
                             env_img, mask_img,
                             shape.env_map_scale if env_img else 0.0,
                             thr, alpha_blend and image is not None,
-                            centre, colors is not None, shape.tint,
+                            centre, geometry.has_colors, shape.tint,
                             load_texture.rmaos_map(shape)
                             if hasattr(load_texture, 'rmaos_map') else None,
                             shape.pbr,
                             (shape.glossiness, shape.spec_strength),
                             bool(load_texture.is_srgb(shape))
                             if hasattr(load_texture, 'is_srgb') else False,
-                            clamp_mode, double_sided, depth_test, depth_write))
+                            clamp_mode, double_sided, depth_test, depth_write,
+                            geometry=geometry))
 
     if not meshes:
         return [], None, None
@@ -1565,16 +1593,37 @@ def _depth_write_for_draw(mesh, solid: bool, use_texture: bool) -> bool:
         and mesh.alpha_threshold >= 0.0))
 
 
-def _neutralise_meshes(meshes) -> None:
+def _release_mesh_buffers(meshes) -> None:
+    for m in meshes:
+        for obj in (m.vao, m.vbo, m.ibo):
+            if obj is not None:
+                try:
+                    obj.destroy()
+                except RuntimeError:
+                    pass
+        m.vao = m.vbo = m.ibo = None
+        m.texture = m.normal_tex = m.env_tex = m.mask_tex = m.rmaos_tex = None
+
+
+def _neutralise_meshes(meshes, textures=()) -> None:
     """Sever GL wrappers whose context is gone: QOpenGLTexture's destructor
     dereferences its creation context (areSharing), so letting GC run it after
     the context died segfaults. invalidate() leaks the tiny C++ shell instead;
     the GPU memory goes with the context's share group."""
     import shiboken6
+    seen = set()
+    for obj in textures:
+        if obj is not None and id(obj) not in seen:
+            seen.add(id(obj))
+            try:
+                shiboken6.invalidate(obj)
+            except Exception:                            # noqa: BLE001
+                pass
     for m in meshes:
         for obj in (m.vao, m.vbo, m.ibo, m.texture, m.normal_tex,
                     m.env_tex, m.mask_tex, m.rmaos_tex):
-            if obj is not None:
+            if obj is not None and id(obj) not in seen:
+                seen.add(id(obj))
                 try:
                     shiboken6.invalidate(obj)
                 except Exception:                        # noqa: BLE001
@@ -1613,15 +1662,15 @@ def _add_parts(model, parts, plugin_dirs, log, cancel, bones=None,
     keyed on the mesh path, and an unskinned piece (a shield) needs the
     skeleton node its own slot names, which only makes sense per part.
     """
-    from Utils.nif_reader import read_nif
-    from Utils.nif_skin import morph_weight_model, pose_model
-    from Utils.txst_lookup import apply_alt_textures
+    from Utils.assets.nif import read_nif
+    from Utils.assets.skinning import morph_weight_model, pose_model
+    from Utils.assets.texture_sets import apply_alt_textures
     hair_ctx = None
     if hair_mesh_rel:
         # A FO4 hat can replace the hidden scalp hair with a wig built into
         # the armour NIF. It still uses the NPC's CLFM palette row, so retain
         # the FACE's plugin context while loading the outfit's own textures.
-        from Utils.facegen_tint import FormsContext
+        from Utils.npc.facegen import FormsContext
         hair_ctx = FormsContext(plugin_dirs)
     for entry in parts:
         data, rel = entry[0], entry[1]
@@ -1666,7 +1715,7 @@ def _add_parts(model, parts, plugin_dirs, log, cancel, bones=None,
                 and getattr(getattr(part, "header", None), "bs_version", 0)
                 == 130):
             try:
-                from Utils.facegen_tint import apply_hair_tint
+                from Utils.npc.facegen import apply_hair_tint
                 hair_tinted = apply_hair_tint(
                     part, hair_mesh_rel, plugin_dirs, hair_ctx)
             except Exception:                            # noqa: BLE001
@@ -1703,9 +1752,9 @@ def _replace_head_parts(model, parts, plugin_dirs, log, cancel) -> None:
     space. Detach its skin metadata here so the later whole-actor pose does
     not undo the normalisation and put the hair a head-height above the NPC.
     """
-    from Utils.facegen_tint import remove_hair
-    from Utils.nif_reader import read_nif
-    from Utils.txst_lookup import apply_alt_textures
+    from Utils.npc.facegen import remove_hair
+    from Utils.assets.nif import read_nif
+    from Utils.assets.texture_sets import apply_alt_textures
 
     removed = remove_hair(model)
     added = 0
@@ -1843,14 +1892,14 @@ def _hide_facegen_runtime_shapes(model, mesh_rel: str) -> list[str]:
 
 def _pose_actor(model, bones, log) -> None:
     """Place the head's own shapes in the skeleton's space."""
-    from Utils.nif_skin import pose_model
+    from Utils.assets.skinning import pose_model
     posed = pose_model(model, bones)
     _log(log, f"  posed {posed}/{len(model.shapes)} head shape(s) "
               f"against {len(bones)} bones")
 
 
 def _read_bones(skeleton_data, log):
-    from Utils.nif_skin import read_skeleton
+    from Utils.assets.skinning import read_skeleton
     try:
         bones = read_skeleton(skeleton_data)
     except Exception as exc:                             # noqa: BLE001
@@ -2010,7 +2059,9 @@ def _log_build(log, meshes, bounds, loader) -> None:
 def _neutralise_view(view) -> None:
     """Last-resort orphan cleanup when a context dies (Python attrs only -
     the widget's C++ half may already be mid-destruction)."""
-    _neutralise_meshes(list(view._meshes) + list(view._pending or ()))
+    _neutralise_meshes(list(view._meshes) + list(view._pending or ()),
+                       view._gpu_textures.values())
+    view._gpu_textures.clear()
     view._meshes = []
     view._pending = None
 
@@ -2081,7 +2132,7 @@ def _compose_turntable_sheet(frames: list[QImage], portrait: QImage,
 
 
 class _Viewport(QOpenGLWidget):
-    """The GL canvas: turntable rotate/pan/zoom over the parsed shapes."""
+    """The GL canvas: turntable/free-camera orbit over the parsed shapes."""
 
     # meshes, bounds, gen, tex paths, head bounds
     loaded = Signal(object, object, int, object, object)
@@ -2117,6 +2168,7 @@ class _Viewport(QOpenGLWidget):
         self._u_tint = self._u_rmaostex = self._u_pbr = self._u_hasrmaos = -1
         self._u_pbrparams = self._u_srgb = -1
         self._meshes: list[_Mesh] = []
+        self._gpu_textures = {}
         self._pending: list[_Mesh] | None = None
         self._uploaded = False
         self._gl_error = ""
@@ -2127,21 +2179,21 @@ class _Viewport(QOpenGLWidget):
         # are invariant when only the texture source/slot changes.
         self._cached_model_key = None
         self._cached_model = None
+        self._cached_geometry = {}
         self._reload_args = None
         self._needs_reload = False
         self._keep_view = False
         # Built on the first resize; see resizeEvent for why paints pause.
         self._resize_hold = None
 
-        self._yaw = _HOME_YAW
-        self._pitch = _HOME_PITCH
+        self._right, self._up, self._forward = self._basis_for(
+            _HOME_YAW, _HOME_PITCH)
         self._distance = 100.0
         # (yaw, pitch, look-at height as a fraction of the model) or None for
         # the mesh-browser 3/4 default. Set by a host that shows ACTORS.
         self.home_view = None
-        # Bounds the camera was last framed against; keep_view only holds the
-        # view for geometry that has ALREADY been framed.
-        self._framed_bounds = None
+        self._source_key = None
+        self._framed_source = None
         # Set only while rendering into an export FBO, so _mvp uses that
         # size's aspect instead of the widget's.
         self._render_size = None
@@ -2152,9 +2204,11 @@ class _Viewport(QOpenGLWidget):
         # always spins the asset about its own centre instead of arcing a
         # panned view across the screen.
         self._pan = [0.0, 0.0]
-        self._home = (self._yaw, self._pitch, self._distance, QVector3D(0, 0, 0))
+        self._home = (self._copy_camera_basis(), self._distance,
+                      QVector3D(0, 0, 0))
         self._last_pos = None
         self._last_buttons = Qt.NoButton
+        self.free_camera = False
         self.wireframe = WIRE_OFF
         self.cull_backfaces = False
         self.textured = True
@@ -2196,6 +2250,12 @@ class _Viewport(QOpenGLWidget):
         gen = self._generation
         # keep_view: same mesh, new textures - don't snap the camera back.
         self._keep_view = bool(keep_view)
+        if mesh_rel:
+            self._source_key = ("asset", mesh_rel.replace("\\", "/").lower())
+        elif isinstance(source, (bytes, bytearray)):
+            self._source_key = ("memory", id(source))
+        else:
+            self._source_key = ("path", str(Path(source)))
         # Kept so the mesh can be rebuilt after a context loss (tab detach).
         self._reload_args = (source, texture_roots, archive_roots,
                              resolver, archives, tex_override,
@@ -2214,7 +2274,7 @@ class _Viewport(QOpenGLWidget):
         _log(log, f"  archive roots: "
                   f"{len(archive_roots or ()) if archive_roots else 0}"
                   f" · resolver: {'yes' if resolver else 'no'}"
-                  f" · archive index: {'yes' if archives else 'no'}"
+                  f" · archive index: {'yes' if archives is not None else 'no'}"
                   f" · texture slot: {self.texture_slot}"
                   f" · override: {'yes' if tex_override else 'no'}")
         if mesh_rel:
@@ -2222,7 +2282,7 @@ class _Viewport(QOpenGLWidget):
 
         def work():
             import time
-            from Utils.nif_reader import read_nif
+            from Utils.assets.nif import read_nif
             t_start = time.monotonic()
             try:
                 model_key = _model_cache_key(
@@ -2232,7 +2292,7 @@ class _Viewport(QOpenGLWidget):
                     face_skin_tint)
                 extra = archives
                 if extra is None and archive_roots:
-                    from Utils.archive_lookup import ArchiveLookup, find_archives
+                    from Utils.archives.lookup import ArchiveLookup, find_archives
                     found = find_archives(archive_roots)
                     _log(log, f"  scanned {len(archive_roots)} archive root(s):"
                               f" {len(found)} archive(s) indexed")
@@ -2245,6 +2305,7 @@ class _Viewport(QOpenGLWidget):
                 if (model_key == self._cached_model_key
                         and self._cached_model is not None):
                     model = self._cached_model
+                    geometry_cache = self._cached_geometry
                     _log(log, "  reused parsed model and plugin/geometry lookups")
                 else:
                     t0 = time.monotonic()
@@ -2262,7 +2323,7 @@ class _Viewport(QOpenGLWidget):
                     if mesh_rel:
                         # The game may swap the baked texture set via plugin
                         # records; without this such meshes preview as white clay.
-                        from Utils.txst_lookup import apply_alt_textures
+                        from Utils.assets.texture_sets import apply_alt_textures
                         dirs = plugin_dirs or texture_roots
                         _log(log, "  plugin scan dirs: "
                                   + (", ".join(str(d) for d in dirs) or "none"))
@@ -2288,7 +2349,7 @@ class _Viewport(QOpenGLWidget):
                                       f"{changed} shape(s)")
                         if face_morph:
                             try:
-                                from Utils.fo4_facegen import apply_face_morphs
+                                from Utils.npc.fo4 import apply_face_morphs
                                 tri, weights, tri_rel = face_morph
                                 applied, vertices = apply_face_morphs(
                                     model, tri, weights)
@@ -2301,7 +2362,7 @@ class _Viewport(QOpenGLWidget):
                         # Skyrim ships hair textures greyscale and tints them from
                         # the NPC record, so FaceGen hair is white without this.
                         try:
-                            from Utils.facegen_tint import apply_hair_tint
+                            from Utils.npc.facegen import apply_hair_tint
                             t0 = time.monotonic()
                             n = apply_hair_tint(model, mesh_rel, dirs)
                             if n:
@@ -2322,7 +2383,7 @@ class _Viewport(QOpenGLWidget):
                         # brows and skin tone live in the per-NPC FaceTint map
                         # the engine multiplies over it.
                         try:
-                            from Utils.facegen_tint import apply_face_tint
+                            from Utils.npc.facegen import apply_face_tint
                             apply_face_tint(model, mesh_rel)
                         except Exception as exc:         # noqa: BLE001
                             _log(log, f"  ! face tint lookup failed: {exc!r}")
@@ -2331,7 +2392,7 @@ class _Viewport(QOpenGLWidget):
                         # hides the hair. The baked head still carries it and
                         # it would grow straight through the hat.
                         try:
-                            from Utils.facegen_tint import remove_hair
+                            from Utils.npc.facegen import remove_hair
                             gone = remove_hair(model)
                             _log(log, f"  outfit covers the hair slot: "
                                       f"{gone} hair shape(s) hidden")
@@ -2355,7 +2416,7 @@ class _Viewport(QOpenGLWidget):
                     # keeps every NPC the same size and simply crops the hair.
                     if "facegeom" in mesh_rel.replace("\\", "/").lower():
                         try:
-                            from Utils.facegen_tint import head_shape
+                            from Utils.npc.facegen import head_shape
                             _face = head_shape(model)
                         except Exception:                # noqa: BLE001
                             _face = None
@@ -2387,9 +2448,12 @@ class _Viewport(QOpenGLWidget):
                         return
                     self._cached_model_key = model_key
                     self._cached_model = model
+                    geometry_cache = {}
+                    self._cached_geometry = geometry_cache
                 t0 = time.monotonic()
                 meshes, bounds, head_bounds = _build_meshes(
-                    model, loader, cancel=lambda: gen != self._generation)
+                    model, loader, cancel=lambda: gen != self._generation,
+                    geometry_cache=geometry_cache)
                 if gen != self._generation:
                     return
                 _log(log, f"  built {len(meshes)} drawable mesh(es) in "
@@ -2429,17 +2493,17 @@ class _Viewport(QOpenGLWidget):
         self.cancel_load()
         self._cached_model_key = None
         self._cached_model = None
+        self._cached_geometry = {}
+        self._framed_source = None
         if self.context() is not None:
             try:
                 self.makeCurrent()
                 self._release_gpu()
                 self.doneCurrent()
             except RuntimeError:
-                _neutralise_meshes(self._meshes)
-                self._meshes = []
+                _neutralise_view(self)
         else:
-            _neutralise_meshes(self._meshes)
-            self._meshes = []
+            _neutralise_view(self)
         self._uploaded = False
         self._bounds = None
         self._head_bounds = None
@@ -2449,32 +2513,20 @@ class _Viewport(QOpenGLWidget):
                    head_bounds=None):
         if gen != self._generation:
             return                                   # a newer file won the race
-        # GL deletes need the context current or the driver keeps the objects.
-        if self.context() is not None:
-            self.makeCurrent()
-            self._release_gpu()
-            self.doneCurrent()
-        else:
-            _neutralise_meshes(self._meshes)
-            self._meshes = []
         self._pending = meshes
         self._uploaded = False
         self._bounds = bounds
         self._head_bounds = head_bounds
-        # keep_view means "same geometry, different textures" - it must not
-        # hold the camera on geometry that has never been framed. A texture
-        # reload is armed the moment a mesh opens and can SUPERSEDE the first
-        # load, so the only load that completes carries keep_view=True and the
-        # actor was left at the startup camera: distance 100 looking at the
-        # origin, i.e. staring at its boots from behind. Framing is therefore
-        # keyed on the BOUNDS, which a texture change cannot alter.
+        # Variants share a camera even when their bounds differ. A reload
+        # superseding the first load must still frame its new asset.
         if bounds is not None and (not self._keep_view
-                                   or bounds != self._framed_bounds):
+                                   or self._source_key != self._framed_source):
             self._frame(bounds)
-            self._framed_bounds = bounds
+            self._framed_source = self._source_key
+            yaw, pitch = self._camera_angles()
             _log(self.log_fn,
-                 f"  framed: yaw {math.degrees(self._yaw):.0f}° "
-                 f"pitch {math.degrees(self._pitch):.0f}° "
+                 f"  framed: yaw {math.degrees(yaw):.0f}° "
+                 f"pitch {math.degrees(pitch):.0f}° "
                  f"dist {self._distance:.0f} "
                  f"look-at z {self._center.z():.1f}"
                  f"{' (actor home)' if self.home_view else ''}")
@@ -2502,7 +2554,7 @@ class _Viewport(QOpenGLWidget):
             return None
         if self.context() is None:
             return None
-        saved = (self._yaw, self._pitch, self._distance,
+        saved = (self._copy_camera_basis(), self._distance,
                  QVector3D(self._center), list(self._pan))
         try:
             # One framing for the inset, the single export and the batch, so
@@ -2513,8 +2565,8 @@ class _Viewport(QOpenGLWidget):
             _log(self.log_fn, f"  ! portrait capture failed: {exc!r}")
             image = None
         finally:
-            (self._yaw, self._pitch, self._distance,
-             self._center, self._pan) = saved
+            basis, self._distance, self._center, self._pan = saved
+            self._set_camera_basis(basis)
             self.update()
         if image is None or image.isNull():
             return None
@@ -2555,7 +2607,7 @@ class _Viewport(QOpenGLWidget):
             return None
         if self.context() is None:
             return None
-        saved = (self._yaw, self._pitch, self._distance,
+        saved = (self._copy_camera_basis(), self._distance,
                  QVector3D(self._center), list(self._pan), self._home)
         # The backdrop drives the clay and wireframe colours too, so swapping
         # it for the grab means saving the whole trio, not just _bg.
@@ -2570,10 +2622,9 @@ class _Viewport(QOpenGLWidget):
             # A level, consistently framed turntable. Skyrim actors face +Y,
             # hence +90 is front and -90 is back.
             self._frame(bounds)
-            self._pitch = 0.0
             body_size = (max(1, round(height * _SHEET_BODY_ASPECT)), height)
             for degrees in (0.0, 90.0, -90.0, 180.0):
-                self._yaw = math.radians(degrees)
+                self._set_camera_angles(math.radians(degrees), 0.0)
                 frame = self._grab(body_size)
                 if frame is None or frame.isNull():
                     return None
@@ -2588,8 +2639,8 @@ class _Viewport(QOpenGLWidget):
         finally:
             self._clear_transparent = False
             self._bg, self._base = saved_bg
-            (self._yaw, self._pitch, self._distance,
-             self._center, self._pan, self._home) = saved
+            basis, self._distance, self._center, self._pan, self._home = saved
+            self._set_camera_basis(basis)
             self.update()
         if portrait is None or portrait.isNull():
             return None
@@ -2631,8 +2682,8 @@ class _Viewport(QOpenGLWidget):
         want = max(top - bottom, hx - lx, 1e-3) * _PORTRAIT_FILL
         half_fov = math.radians(_VIEWPORT_FOV / 2.0)
         self._distance = want / (2.0 * math.tan(half_fov))
-        self._yaw = math.radians(_PORTRAIT_YAW)
-        self._pitch = math.radians(_PORTRAIT_PITCH)
+        self._set_camera_angles(math.radians(_PORTRAIT_YAW),
+                                math.radians(_PORTRAIT_PITCH))
 
     def capture_face_image(self, background: str | None = None,
                            size: int = _SHEET_EXPORT_HEIGHT):
@@ -2647,7 +2698,7 @@ class _Viewport(QOpenGLWidget):
             return None
         if self.context() is None:
             return None
-        saved = (self._yaw, self._pitch, self._distance,
+        saved = (self._copy_camera_basis(), self._distance,
                  QVector3D(self._center), list(self._pan), self._home)
         saved_bg = (QColor(self._bg), self._base)
         transparent = background == BACKGROUND_TRANSPARENT
@@ -2663,8 +2714,8 @@ class _Viewport(QOpenGLWidget):
         finally:
             self._clear_transparent = False
             self._bg, self._base = saved_bg
-            (self._yaw, self._pitch, self._distance,
-             self._center, self._pan, self._home) = saved
+            basis, self._distance, self._center, self._pan, self._home = saved
+            self._set_camera_basis(basis)
             self.update()
 
     def _render_offscreen(self, width: int, height: int):
@@ -2740,9 +2791,8 @@ class _Viewport(QOpenGLWidget):
         self._center = QVector3D(cx, cy, cz)
         self._pan = [0.0, 0.0]
         self._distance = radius * 3.0
-        self._yaw = yaw
-        self._pitch = pitch
-        self._home = (self._yaw, self._pitch, self._distance,
+        self._set_camera_angles(yaw, pitch)
+        self._home = (self._copy_camera_basis(), self._distance,
                       QVector3D(cx, cy, cz))
 
     # -- GL -----------------------------------------------------------------
@@ -2877,8 +2927,7 @@ class _Viewport(QOpenGLWidget):
             # is gone even a later destroy() crashes (it derefs the stored
             # context in areSharing; seen as a GC-time SIGSEGV). Sever the
             # wrappers instead; the share group reclaims the GPU side.
-            _neutralise_meshes(self._meshes)
-            self._meshes = []
+            _neutralise_view(self)
         self._pending = None
         self._uploaded = False
         self._needs_reload = True
@@ -2887,6 +2936,7 @@ class _Viewport(QOpenGLWidget):
         """Free GL objects while the context lives (called on DeferredDelete;
         aboutToBeDestroyed fires too late - Qt has dropped our connections)."""
         if self.context() is None:
+            _neutralise_view(self)
             return
         try:
             self.makeCurrent()
@@ -2903,83 +2953,121 @@ class _Viewport(QOpenGLWidget):
         return super().event(e)
 
     def _release_gpu(self):
-        for m in self._meshes:
-            for obj in (m.vao, m.vbo, m.ibo, m.texture, m.normal_tex,
-                        m.env_tex, m.mask_tex, m.rmaos_tex):
-                if obj is not None:
-                    try:
-                        obj.destroy()
-                    except RuntimeError:
-                        pass
-            m.vao = m.vbo = m.ibo = m.texture = m.normal_tex = None
-            m.env_tex = m.mask_tex = m.rmaos_tex = None
+        _release_mesh_buffers(self._meshes + list(self._pending or ()))
+        for tex in self._gpu_textures.values():
+            try:
+                tex.destroy()
+            except RuntimeError:
+                pass
+        self._gpu_textures.clear()
         self._meshes = []
+        self._pending = None
+
+    def _upload_geometry(self, m):
+        prog = self._program
+        m.vao = QOpenGLVertexArrayObject()
+        m.vao.create()
+        m.vao.bind()
+
+        m.vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        m.vbo.create()
+        m.vbo.bind()
+        data = m.verts.tobytes()
+        m.vbo.allocate(data, len(data))
+
+        # Colours widen the vertex; the enable state is captured by this
+        # mesh's VAO, so meshes without them never read attribute 4.
+        stride = (16 if m.has_colors else 12) * 4
+        prog.enableAttributeArray(0)
+        prog.setAttributeBuffer(0, _GL_FLOAT, 0, 3, stride)
+        prog.enableAttributeArray(1)
+        prog.setAttributeBuffer(1, _GL_FLOAT, 3 * 4, 3, stride)
+        prog.enableAttributeArray(2)
+        prog.setAttributeBuffer(2, _GL_FLOAT, 6 * 4, 2, stride)
+        prog.enableAttributeArray(3)
+        prog.setAttributeBuffer(3, _GL_FLOAT, 8 * 4, 4, stride)
+        if m.has_colors:
+            prog.enableAttributeArray(4)
+            prog.setAttributeBuffer(4, _GL_FLOAT, 12 * 4, 4, stride)
+
+        m.ibo = QOpenGLBuffer(QOpenGLBuffer.IndexBuffer)
+        m.ibo.create()
+        m.ibo.bind()
+        idata = m.indices.tobytes()
+        m.ibo.allocate(idata, len(idata))
+
+        m.vao.release()
+        m.vbo.release()
+        m.ibo.release()
+
+        return len(data) + len(idata)
 
     def _upload(self):
-        prog = self._program
-        vram = tex_count = 0
-        for m in self._pending or []:
-            m.vao = QOpenGLVertexArrayObject()
-            m.vao.create()
-            m.vao.bind()
+        previous = {m.geometry: m for m in self._meshes
+                    if m.geometry is not None}
+        used_textures = set()
+        vram = tex_count = reused_meshes = reused_textures = 0
+        pending = self._pending or []
+        try:
+            for m in pending:
+                old = previous.pop(m.geometry, None)
+                if old is not None and all(
+                        obj is not None for obj in (old.vao, old.vbo, old.ibo)):
+                    m.vao, m.vbo, m.ibo = old.vao, old.vbo, old.ibo
+                    old.vao = old.vbo = old.ibo = None
+                    reused_meshes += 1
+                else:
+                    vram += self._upload_geometry(m)
 
-            m.vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
-            m.vbo.create()
-            m.vbo.bind()
-            data = m.verts.tobytes()
-            m.vbo.allocate(data, len(data))
+                for attr, img in (("texture", m.image),
+                                  ("normal_tex", m.normal_image),
+                                  ("env_tex", m.env_image),
+                                  ("mask_tex", m.mask_image),
+                                  ("rmaos_tex", m.rmaos_image)):
+                    if img is None or img.isNull():
+                        continue
+                    key = (img.cacheKey(), m.texture_clamp_mode)
+                    tex = self._gpu_textures.get(key)
+                    if tex is None:
+                        tex = _make_gl_texture(img, m.texture_clamp_mode)
+                        if tex is not None:
+                            self._gpu_textures[key] = tex
+                            tex_count += 1
+                            vram += img.width() * img.height() * 16 // 3
+                    else:
+                        reused_textures += 1
+                    if tex is not None:
+                        setattr(m, attr, tex)
+                        used_textures.add(key)
+                    else:
+                        _log(self.log_fn, f"  ! {m.name!r}: {attr} failed to "
+                                          f"upload to the GPU")
+                m.normal_image = m.env_image = m.mask_image = None
+                m.rmaos_image = m.image = None
+                m.verts = array.array("f")
+        except Exception as exc:                         # noqa: BLE001
+            self._release_gpu()
+            self._uploaded = False
+            message, gen, failed = str(exc), self._generation, self.failed
+            _log(self.log_fn, f"  ! GPU upload failed: {message}")
+            QTimer.singleShot(0, lambda: safe_emit(failed, message, gen))
+            return
 
-            # Colours widen the vertex; the enable state is captured by this
-            # mesh's VAO, so meshes without them never read attribute 4.
-            stride = (16 if m.has_colors else 12) * 4
-            prog.enableAttributeArray(0)
-            prog.setAttributeBuffer(0, _GL_FLOAT, 0, 3, stride)
-            prog.enableAttributeArray(1)
-            prog.setAttributeBuffer(1, _GL_FLOAT, 3 * 4, 3, stride)
-            prog.enableAttributeArray(2)
-            prog.setAttributeBuffer(2, _GL_FLOAT, 6 * 4, 2, stride)
-            prog.enableAttributeArray(3)
-            prog.setAttributeBuffer(3, _GL_FLOAT, 8 * 4, 4, stride)
-            if m.has_colors:
-                prog.enableAttributeArray(4)
-                prog.setAttributeBuffer(4, _GL_FLOAT, 12 * 4, 4, stride)
-
-            m.ibo = QOpenGLBuffer(QOpenGLBuffer.IndexBuffer)
-            m.ibo.create()
-            m.ibo.bind()
-            idata = m.indices.tobytes()
-            m.ibo.allocate(idata, len(idata))
-
-            m.vao.release()
-            m.vbo.release()
-            m.ibo.release()
-
-            vram += len(data) + len(idata)
-            for attr, img in (("texture", m.image),
-                              ("normal_tex", m.normal_image),
-                              ("env_tex", m.env_image),
-                              ("mask_tex", m.mask_image),
-                              ("rmaos_tex", m.rmaos_image)):
-                tex = _make_gl_texture(img, m.texture_clamp_mode)
-                if tex is not None:
-                    setattr(m, attr, tex)
-                    tex_count += 1
-                    vram += img.width() * img.height() * 4
-                elif img is not None:
-                    _log(self.log_fn, f"  ! {m.name!r}: {attr} failed to "
-                                      f"upload to the GPU")
-            m.normal_image = m.env_image = m.mask_image = None
-            m.rmaos_image = None
-            # Free both CPU copies now the GPU owns the data.
-            m.verts = array.array("f")
-            m.image = None
-        n = len(self._pending or [])
-        self._meshes = self._pending or []
+        _release_mesh_buffers(self._meshes)
+        for key in self._gpu_textures.keys() - used_textures:
+            tex = self._gpu_textures.pop(key)
+            try:
+                tex.destroy()
+            except RuntimeError:
+                pass
+        self._meshes = pending
         self._pending = None
         self._uploaded = True
-        if n:
-            _log(self.log_fn, f"  uploaded {n} mesh(es) and {tex_count} "
-                              f"texture(s) to the GPU (~{_fmt_bytes(vram)})")
+        if pending:
+            _log(self.log_fn,
+                 f"  uploaded {len(pending) - reused_meshes} mesh(es) and "
+                 f"{tex_count} texture(s) (~{_fmt_bytes(vram)}); reused "
+                 f"{reused_meshes} mesh(es), {reused_textures} texture binding(s)")
 
     def paintGL(self):
         f = self.context().functions()
@@ -3214,9 +3302,25 @@ class _Viewport(QOpenGLWidget):
         right = right.normalized()
         return right, QVector3D.crossProduct(right, fwd), fwd
 
+    def _set_camera_angles(self, yaw: float, pitch: float):
+        self._right, self._up, self._forward = self._basis_for(yaw, pitch)
+
+    def _set_camera_basis(self, basis):
+        self._right, self._up, self._forward = (
+            QVector3D(axis) for axis in basis)
+
+    def _copy_camera_basis(self):
+        return tuple(QVector3D(axis) for axis in self._camera_basis())
+
     def _camera_basis(self):
         """(right, up, forward) unit vectors of the current camera."""
-        return self._basis_for(self._yaw, self._pitch)
+        return self._right, self._up, self._forward
+
+    def _camera_angles(self):
+        """Orbital yaw/pitch for diagnostics; roll is held by the basis."""
+        yaw = math.atan2(-self._forward.y(), -self._forward.x())
+        pitch = math.asin(max(-1.0, min(1.0, -self._forward.z())))
+        return yaw, pitch
 
     def _light_dirs(self):
         """The rig on the home basis - fixed in the world, not the viewer."""
@@ -3229,13 +3333,7 @@ class _Viewport(QOpenGLWidget):
 
     def _pan_axes(self):
         """(right, up) drag axes of the view plane at the current angles."""
-        right = QVector3D(math.sin(self._yaw), -math.cos(self._yaw), 0.0)
-        up = QVector3D(
-            -math.sin(self._pitch) * math.cos(self._yaw),
-            -math.sin(self._pitch) * math.sin(self._yaw),
-            math.cos(self._pitch),
-        )
-        return right, up
+        return -self._right, self._up
 
     def _look_target(self) -> QVector3D:
         """The look-at point: the mesh centre pushed by the pan offset."""
@@ -3245,11 +3343,7 @@ class _Viewport(QOpenGLWidget):
     def _eye(self) -> QVector3D:
         d = max(self._distance, 1e-3)
         t = self._look_target()
-        return QVector3D(
-            t.x() + d * math.cos(self._pitch) * math.cos(self._yaw),
-            t.y() + d * math.cos(self._pitch) * math.sin(self._yaw),
-            t.z() + d * math.sin(self._pitch),
-        )
+        return t - self._forward * d
 
     def _mvp(self) -> QMatrix4x4:
         # An offscreen grab renders at its own size, not the widget's, and the
@@ -3264,8 +3358,43 @@ class _Viewport(QOpenGLWidget):
         proj = QMatrix4x4()
         proj.perspective(_VIEWPORT_FOV, w / h, max(d * 0.001, 1e-3), d * 50.0)
         view = QMatrix4x4()
-        view.lookAt(eye, self._look_target(), QVector3D(0, 0, 1))
+        view.lookAt(eye, self._look_target(), self._up)
         return proj * view
+
+    @staticmethod
+    def _rotated(vector: QVector3D, axis: QVector3D,
+                 angle: float) -> QVector3D:
+        c = math.cos(angle)
+        s = math.sin(angle)
+        return (vector * c + QVector3D.crossProduct(axis, vector) * s
+                + axis * QVector3D.dotProduct(axis, vector) * (1.0 - c))
+
+    def _orbit(self, horizontal: float, vertical: float):
+        """Rotate the whole camera frame about axes in the current view plane."""
+        angle = math.hypot(horizontal, vertical)
+        if angle < 1e-12:
+            return
+        axis = (self._up * horizontal + self._right * vertical) / angle
+        self._right = self._rotated(self._right, axis, angle)
+        self._up = self._rotated(self._up, axis, angle)
+        self._forward = self._rotated(
+            self._forward, axis, angle).normalized()
+        self._right = QVector3D.crossProduct(
+            self._forward, self._up).normalized()
+        self._up = QVector3D.crossProduct(
+            self._right, self._forward).normalized()
+
+    def set_free_camera(self, enabled: bool):
+        enabled = bool(enabled)
+        if self.free_camera == enabled:
+            return
+        self.free_camera = enabled
+        if not enabled:
+            yaw, pitch = self._camera_angles()
+            pitch = max(-_TURNTABLE_PITCH_LIMIT,
+                        min(_TURNTABLE_PITCH_LIMIT, pitch))
+            self._set_camera_angles(yaw, pitch)
+        self.update()
 
     # -- interaction --------------------------------------------------------
     def mousePressEvent(self, e):
@@ -3281,9 +3410,16 @@ class _Viewport(QOpenGLWidget):
         rot_sign = -1.0 if self.invert_mouse else 1.0
         pan_sign = -rot_sign
         if e.buttons() & Qt.LeftButton:
-            self._yaw += rot_sign * delta.x() * 0.01
-            self._pitch = max(-1.5533, min(
-                1.5533, self._pitch - rot_sign * delta.y() * 0.01))
+            horizontal = rot_sign * delta.x() * 0.01
+            vertical = rot_sign * delta.y() * 0.01
+            if self.free_camera:
+                self._orbit(horizontal, vertical)
+            else:
+                yaw, pitch = self._camera_angles()
+                yaw += horizontal
+                pitch = max(-_TURNTABLE_PITCH_LIMIT,
+                            min(_TURNTABLE_PITCH_LIMIT, pitch - vertical))
+                self._set_camera_angles(yaw, pitch)
         elif e.buttons() & (Qt.RightButton | Qt.MiddleButton):
             # Pan across the view plane, scaled so the drag tracks the cursor.
             scale = self._distance * 0.0022 * pan_sign
@@ -3318,7 +3454,8 @@ class _Viewport(QOpenGLWidget):
         self.update()
 
     def mouseDoubleClickEvent(self, e):
-        self._yaw, self._pitch, self._distance, center = self._home
+        basis, self._distance, center = self._home
+        self._set_camera_basis(basis)
         self._center = QVector3D(center)
         self._pan = [0.0, 0.0]
         self.update()
@@ -3354,6 +3491,7 @@ class _NoGLViewport(QWidget):
 
         # The attributes NifPreview's toggles write straight through.
         self.invert_mouse = True
+        self.free_camera = False
         self.cull_backfaces = False
         self.textured = True
         self.detail = True
@@ -3390,6 +3528,9 @@ class _NoGLViewport(QWidget):
 
     def set_background(self, *_a):
         pass
+
+    def set_free_camera(self, enabled):
+        self.free_camera = bool(enabled)
 
     def release_gl(self, *_a):
         pass
@@ -3523,6 +3664,12 @@ class NifPreview(QWidget):
             "Reverse the drag direction for rotating and panning"))
         self._act_invert.triggered.connect(self._on_invert_mouse)
 
+        self._act_free_camera = self._menu.addAction(self.tr("Free camera"))
+        self._act_free_camera.setCheckable(True)
+        self._act_free_camera.setToolTip(self.tr(
+            "Allow unrestricted rotation around every axis"))
+        self._act_free_camera.triggered.connect(self._on_free_camera)
+
         self._bright = QSlider(Qt.Horizontal)
         self._bright.setRange(BRIGHTNESS_MIN, BRIGHTNESS_MAX)
         self._bright.setFixedWidth(90)
@@ -3560,7 +3707,7 @@ class NifPreview(QWidget):
         # Restore prefs. QAction.triggered and QSlider.sliderReleased are
         # user-only, so setting state here can never rewrite the config.
         try:
-            from Utils.ui_config import load_nif_invert_mouse
+            from Utils.ui.config import load_nif_invert_mouse
             inverted = load_nif_invert_mouse()
         except Exception:
             inverted = True
@@ -3568,7 +3715,15 @@ class NifPreview(QWidget):
         self._act_invert.setChecked(bool(inverted))
 
         try:
-            from Utils.ui_config import load_nif_cull_backfaces
+            from Utils.ui.config import load_nif_free_camera
+            free_camera = load_nif_free_camera()
+        except Exception:
+            free_camera = False
+        self._view.set_free_camera(bool(free_camera))
+        self._act_free_camera.setChecked(bool(free_camera))
+
+        try:
+            from Utils.ui.config import load_nif_cull_backfaces
             cull = load_nif_cull_backfaces()
         except Exception:
             cull = False
@@ -3576,7 +3731,7 @@ class NifPreview(QWidget):
         self._act_cull.setChecked(bool(cull))
 
         try:
-            from Utils.ui_config import load_nif_brightness
+            from Utils.ui.config import load_nif_brightness
             bright = load_nif_brightness()
         except Exception:
             bright = BRIGHTNESS_DEFAULT
@@ -3587,7 +3742,7 @@ class NifPreview(QWidget):
         self._bright.sliderReleased.connect(self._save_brightness)
 
         try:
-            from Utils.ui_config import load_nif_background
+            from Utils.ui.config import load_nif_background
             saved = load_nif_background()
         except Exception:
             saved = "light"
@@ -3794,7 +3949,7 @@ class NifPreview(QWidget):
         self._view.cull_backfaces = bool(on)
         self._view.update()
         try:
-            from Utils.ui_config import save_nif_cull_backfaces
+            from Utils.ui.config import save_nif_cull_backfaces
             save_nif_cull_backfaces(bool(on))
         except Exception as exc:
             _log(self.log_fn, f"! could not save cull setting: {exc!r}")
@@ -3810,10 +3965,19 @@ class NifPreview(QWidget):
         _log(self.log_fn, f"option: invert mouse {'on' if on else 'off'}")
         self._view.invert_mouse = bool(on)
         try:
-            from Utils.ui_config import save_nif_invert_mouse
+            from Utils.ui.config import save_nif_invert_mouse
             save_nif_invert_mouse(bool(on))
         except Exception as exc:
             _log(self.log_fn, f"! could not save invert setting: {exc!r}")
+
+    def _on_free_camera(self, on):
+        _log(self.log_fn, f"option: free camera {'on' if on else 'off'}")
+        self._view.set_free_camera(bool(on))
+        try:
+            from Utils.ui.config import save_nif_free_camera
+            save_nif_free_camera(bool(on))
+        except Exception as exc:
+            _log(self.log_fn, f"! could not save camera setting: {exc!r}")
 
     def eventFilter(self, obj, e):
         # Double-click the brightness slider to snap back to neutral.
@@ -3830,7 +3994,7 @@ class NifPreview(QWidget):
     def _save_brightness(self):
         _log(self.log_fn, f"option: brightness {self._bright.value()}%")
         try:
-            from Utils.ui_config import save_nif_brightness
+            from Utils.ui.config import save_nif_brightness
             save_nif_brightness(int(self._bright.value()))
         except Exception as exc:
             _log(self.log_fn, f"! could not save brightness: {exc!r}")
@@ -3841,7 +4005,7 @@ class NifPreview(QWidget):
         self._bg_key = key
         self._view.set_background(key)
         try:
-            from Utils.ui_config import save_nif_background
+            from Utils.ui.config import save_nif_background
             save_nif_background(key)
         except Exception as exc:
             _log(self.log_fn, f"! could not save background: {exc!r}")

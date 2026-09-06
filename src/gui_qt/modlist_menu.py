@@ -19,15 +19,18 @@ from PySide6.QtCore import QCoreApplication, QT_TRANSLATE_NOOP
 
 from gui_qt.confirm_overlay import ConfirmOverlay
 from gui_qt.i18n import profile_display
-from gui_qt.modlist_model import COL_NAME
+from gui_qt.modlist_model import COL_NAME, COL_VERSION, NEW_MOD_VERSION
 from gui_qt.text_input_overlay import TextInputOverlay
 
-# Display-only shortcut hints shown right-aligned in the context menu. These MUST
-# match the real window-level QShortcut bindings in gui_qt/shortcuts.py - they are
-# not registered as accelerators here, only rendered as menu text.
-_SC_RENAME = "F2"
-_SC_REMOVE = "Del"
-_SC_TOGGLE = "Enter"
+
+def _shortcut_hint(action_id: str) -> str:
+    """Display-only hint for the matching configurable global shortcut."""
+    try:
+        from gui_qt.shortcuts import shortcut_text
+        return shortcut_text(action_id)
+    except Exception:
+        return {"rename": "F2", "remove": "Del",
+                "toggle_selected": "Enter"}.get(action_id, "")
 
 
 def _mt(label: str) -> str:
@@ -86,10 +89,11 @@ def build_context_menu(view, index):
         # and clobbers that default. Wrap so the bool is always swallowed.
         action.triggered.connect(lambda _checked=False, _s=slot: _s())
 
-    def act(label, slot, enabled=True, shortcut=None):
+    def act(label, slot, enabled=True, shortcut=None, parent_menu=None):
         # `label` is already translated by the caller (via _mt / _mtf); helpers
         # never translate, so count-templates like _mtf("… ({0})", n) work.
-        a = QAction(label, menu)
+        target = menu if parent_menu is None else parent_menu
+        a = QAction(label, target)
         _connect(a, slot)
         a.setEnabled(enabled)
         if shortcut:
@@ -99,7 +103,7 @@ def build_context_menu(view, index):
             # is registered (which would trigger Qt's ambiguous-shortcut warning
             # and could steal the key from the real window-level QShortcut).
             a.setText(f"{label}\t{shortcut}")  # i18n: skip — label already tr'd by caller
-        menu.addAction(a)
+        target.addAction(a)
         state["group_started"] = True
         state["any"] = True
         return a
@@ -108,7 +112,7 @@ def build_context_menu(view, index):
         # Greyed-out placeholder for an action not yet wired.
         return act(label, lambda: None, enabled=False)
 
-    def submenu(label, items, enabled=True, scroll_cap=0):
+    def submenu(label, items, enabled=True, scroll_cap=0, parent_menu=None):
         """Add a nested QMenu. *items* is a list of (text, slot) pairs - one
         action each. Used for Copy/Move to profile (the profile list nests as a
         submenu instead of opening a picker window).
@@ -120,7 +124,8 @@ def build_context_menu(view, index):
         SCREEN height, and a max-height-constrained QMenu just clips and
         mis-positions."""
         # `label` is already translated by the caller.
-        sub = QMenu(label, menu)
+        target = menu if parent_menu is None else parent_menu
+        sub = QMenu(label, target)
         sub.setEnabled(enabled)
         if scroll_cap and len(items) > scroll_cap:
             _fill_scroll_submenu(menu, sub, items, scroll_cap)
@@ -130,7 +135,7 @@ def build_context_menu(view, index):
                 a = QAction(text, sub)
                 _connect(a, slot)
                 sub.addAction(a)
-        menu.addMenu(sub)
+        target.addMenu(sub)
         state["group_started"] = True
         state["any"] = True
         return sub
@@ -146,7 +151,7 @@ def build_context_menu(view, index):
         #   Log         - both (files swept in on restore; Root Folder gets its
         #                 own .mm_overwrite_log.txt written by _move_runtime_files)
         #   Show Conflicts - Overwrite only (Root Folder has no conflict data)
-        from Utils.filegraph_constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
+        from Utils.filegraph.constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
         if multi_mods or multi_seps:
             return None
         has_game = getattr(view, "game", None) is not None
@@ -154,6 +159,13 @@ def build_context_menu(view, index):
         act(_mt("Open folder"), lambda: _open_folder(view, model, row))
         act(_mt("Log"), lambda: _show_overwrite_log(view, entry.name),
             enabled=has_game)
+        if entry.name == OVERWRITE_NAME:
+            act(_mt("Manage Overwrite…"), lambda: _manage_overwrite(view),
+                enabled=has_game and _staging_ok)
+        elif entry.name == ROOT_FOLDER_NAME:
+            act(_mt("Manage root folder"),
+                lambda: _manage_root_folder(view),
+                enabled=has_game and _staging_ok)
         if entry.name == OVERWRITE_NAME and _has_conflict(model, row):
             act(_mt("Show Conflicts"), lambda: _show_conflicts(view, entry.name))
             act(_mt("Clear Conflict Filter")
@@ -174,14 +186,15 @@ def build_context_menu(view, index):
 
     if entry.is_separator:
         _build_separator_menu(view, model, row, entry, sel_seps, multi_seps,
-                              act, stub, divider)
+                              act, stub, divider, submenu)
     else:
         _build_mod_menu(view, model, row, entry, sel_mods, multi_mods,
                         act, stub, divider, submenu)
     return menu
 
 
-def _build_separator_menu(view, model, row, entry, sel_seps, multi, act, stub, divider):
+def _build_separator_menu(view, model, row, entry, sel_seps, multi, act, stub,
+                          divider, submenu):
     if multi:
         # ≥2 separators selected.
         all_locked = all(model.is_sep_locked(model.entry(r).display_name)
@@ -198,8 +211,17 @@ def _build_separator_menu(view, model, row, entry, sel_seps, multi, act, stub, d
         lambda: _toggle_sep_lock(view, model, row))
     divider()
     act(_mt("Rename separator"), lambda: _rename(view, model, row),
-        shortcut=_SC_RENAME)
+        shortcut=_shortcut_hint("rename"))
     act(_mt("Separator settings…"), lambda: _open_sep_settings(view, model, row))
+    others = _other_profiles(view)
+    if others:
+        mod_rows = list(model.sep_block_rows(row))
+        names = [model.entry(r).name for r in mod_rows]
+        submenu(
+            _mt("Copy separator to profile"),
+            _profile_submenu_items(
+                view, names, mod_rows, others, False,
+                separator_name=entry.name))
     act(_mt("Add separator above"), lambda: _add_separator(view, model, row, True))
     act(_mt("Add separator below"), lambda: _add_separator(view, model, row, False))
     divider()
@@ -274,18 +296,20 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
                 lambda ns=_reinstall_multi: _reinstall(view, ns))
         divider()
         # Group: organise
+        _build_group_actions(model, sel_mods, act, submenu)
         _others = _other_profiles(view)
         if _others:
-            submenu(_mtf("Copy to profile ({0})", n),
+            transfer_count = len(model.expand_group_selection(sel_mods))
+            submenu(_mtf("Copy to profile ({0})", transfer_count),
                     _profile_submenu_items(view, _names, sel_mods, _others, False))
-            submenu(_mtf("Move to profile ({0})", n),
+            submenu(_mtf("Move to profile ({0})", transfer_count),
                     _profile_submenu_items(view, _names, sel_mods, _others, True))
         act(_mtf("Disable selected ({0})", n),
             lambda: _set_enabled(view, model, sel_mods, False),
-            shortcut=_SC_TOGGLE)
+            shortcut=_shortcut_hint("toggle_selected"))
         act(_mtf("Enable selected ({0})", n),
             lambda: _set_enabled(view, model, sel_mods, True),
-            shortcut=_SC_TOGGLE)
+            shortcut=_shortcut_hint("toggle_selected"))
         if _separator_choices(model):
             submenu(_mtf("Move to separator ({0})", n),
                     _separator_submenu_items(view, model, sel_mods),
@@ -304,7 +328,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         # Group: remove
         act(_mtf("Remove mod ({0})", n),
             lambda: _remove_mods_multi(view, model, sel_mods),
-            shortcut=_SC_REMOVE)
+            shortcut=_shortcut_hint("remove"))
         return
 
     locked = entry.locked
@@ -328,7 +352,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
     elif _can_redownload(view, name):
         act(_mt("Reinstall (Redownload)"), lambda: _reinstall(view, [name]))
     act(_mt("Rename mod"), lambda: _rename(view, model, row), enabled=not locked,
-        shortcut=_SC_RENAME)
+        shortcut=_shortcut_hint("rename"))
     divider()
     # Group 2: files & install options
     if _staging_ok:
@@ -377,6 +401,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         act(_mt("Quick Update"), lambda: _quick_update(view, [name]))
     divider()
     # Group 4: organise / layout
+    _build_group_actions(model, [row], act, submenu)
     act(_mt("Add separator above"), lambda: _add_separator(view, model, row, True))
     act(_mt("Add separator below"), lambda: _add_separator(view, model, row, False))
     _others = _other_profiles(view)
@@ -417,7 +442,51 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
     divider()
     # Group 6: remove
     act(_mt("Remove mod"), lambda: _remove(view, model, row), enabled=not locked,
-        shortcut=_SC_REMOVE)
+        shortcut=_shortcut_hint("remove"))
+
+
+def _build_group_actions(model, rows, act, submenu):
+    from Utils.mods.groups import expand_leaders
+    group_menu = None
+
+    def container():
+        nonlocal group_menu
+        if group_menu is None:
+            group_menu = submenu(_mt("Group options"), [])
+        return group_menu
+
+    names = [model.entry(r).name for r in rows]
+    moving = expand_leaders(names, model._mod_groups)
+    entries = model.natural_entries()
+    if not any(e.locked for e in entries if e.name in moving):
+        choices = sorted((e for e in entries if not e.is_separator
+                          and e.name not in moving
+                          and model.group_leader(e.name) in (None, e.name)),
+                         key=lambda e: e.display_name.casefold())
+        if choices:
+            submenu(_mt("Group with"), [
+                (e.display_name, lambda target=e.name: model.group_with(names, target))
+                for e in choices], scroll_cap=10, parent_menu=container())
+    members = [n for n in names if model.group_leader(n) not in (None, n)]
+    if members:
+        act(_mt("Ungroup"), lambda: model.ungroup_mods(members),
+            parent_menu=container())
+    leaders = [n for n in names if model.is_group_leader(n)]
+    if leaders:
+        act(_mt("Ungroup all"), lambda: model.ungroup_mods(leaders),
+            parent_menu=container())
+        def toggle(enabled):
+            targets = expand_leaders(leaders, model._mod_groups)
+            model.set_rows_enabled([r for r in range(model.rowCount())
+                                    if model.entry(r).name in targets], enabled)
+        act(_mt("Enable group"), lambda: toggle(True), parent_menu=container())
+        act(_mt("Disable group"), lambda: toggle(False), parent_menu=container())
+    if len(names) == 1 and leaders:
+        leader = leaders[0]
+        submenu(_mt("Change group leader"), [
+            (n, lambda new=n: model.change_group_leader(leader, new))
+            for n in sorted(model._mod_groups[leader]["members"], key=str.casefold)],
+            scroll_cap=10, parent_menu=container())
 
 
 def _fill_scroll_submenu(root_menu, sub, items, scroll_cap):
@@ -538,7 +607,7 @@ def _set_enabled(view, model, rows, state):
 
 
 def _open_folder(view, model, row):
-    """Open the row's on-disk folder via the platform opener (Utils.xdg).
+    """Open the row's on-disk folder via the platform opener (Utils.environment.xdg).
 
     Uses the view's _resolve_entry_folder so the synthetic Overwrite /
     Root Folder rows open their effective deploy paths, not staging/<name>."""
@@ -552,7 +621,7 @@ def _open_folder(view, model, row):
             return
         path = staging / model.entry(row).name
     try:
-        from Utils.xdg import xdg_open
+        from Utils.environment.xdg import xdg_open
         # Surface opener failures - the whole chain can fail on the host side
         # (no file-manager association) and would otherwise be silent.
         xdg_open(str(path), log_fn=lambda m: _notify(view, m, "warning"))
@@ -656,6 +725,10 @@ def _view_requirements(view, name):
 
 def _has_conflict(model, row) -> bool:
     """True if the row has a loose OR BSA conflict (so Show Conflicts is useful)."""
+    entry = model.entry(row)
+    if model.is_group_leader(entry.name):
+        return bool(entry.enabled and (model._conflicts.get(entry.name)
+                                       or model._bsa_conflicts.get(entry.name)))
     from gui_qt.modlist_model import COL_CONFLICTS, ConflictRole, BsaConflictRole
     idx = model.index(row, COL_CONFLICTS)
     loose = model.data(idx, ConflictRole) or 0
@@ -703,7 +776,7 @@ def _has_fomod_choices(view, name: str) -> bool:
     if not name:
         return False
     try:
-        from Utils.fomod_choices import has_choices
+        from Utils.fomod.choices import has_choices
         game = getattr(view, "game", None)
         return has_choices(name, getattr(view, "profile_dir", None),
                            getattr(game, "name", "") or "")
@@ -726,7 +799,7 @@ def _nif_viewer_available(view) -> bool:
     if not game_id:
         return False
     try:
-        from Utils.plugin_loader import get_builtin_wizard_tools_for_game
+        from Utils.wizards.plugins import get_builtin_wizard_tools_for_game
         return any(t.id == "nif_viewer"
                    for t in get_builtin_wizard_tools_for_game(game_id))
     except Exception:
@@ -739,7 +812,7 @@ def _has_meshes(view, name: str) -> bool:
     if staging is None:
         return False
     try:
-        from Utils.mesh_catalog import mod_has_assets
+        from Utils.assets.catalog import mod_has_assets
         return mod_has_assets(staging, name, game=getattr(view, "game", None))
     except Exception:
         return False
@@ -785,7 +858,7 @@ def _open_on_nexus(view, name: str):
     if not url:
         return
     try:
-        from Utils.xdg import open_url
+        from Utils.environment.xdg import open_url
         open_url(url)
     except Exception:
         pass
@@ -817,7 +890,7 @@ def _open_on_modio(view, name: str):
     if not url:
         return
     try:
-        from Utils.xdg import open_url
+        from Utils.environment.xdg import open_url
         open_url(url)
     except Exception:
         pass
@@ -890,7 +963,7 @@ def _open_on_thunderstore(view, name: str):
         except Exception:
             return
     try:
-        from Utils.xdg import open_url
+        from Utils.environment.xdg import open_url
         open_url(url)
     except Exception:
         pass
@@ -939,6 +1012,9 @@ def _move_to_separator(view, model, mod_rows, sep_name):
     of its group in the reverse-priority display, matching Tk). Rebuilds the body
     without the moved mods, then inserts them right after the separator."""
     from gui_qt.modlist_model import _PINNED_NAMES
+    if model._mod_groups:
+        model.move_group_to_separator(mod_rows, sep_name)
+        return
     rows = sorted(r for r in mod_rows
                   if not model.entry(r).is_separator
                   and model.entry(r).name not in _PINNED_NAMES)
@@ -950,7 +1026,7 @@ def _move_to_separator(view, model, mod_rows, sep_name):
     # splicing a display-ordered block into the natural list flips the mods'
     # relative priorities (GH#380).
     moved = [e for e in model.natural_entries() if e.name in moved_names]
-    from Utils.conflict_timing import ConflictTimeline
+    from Utils.diagnostics.conflicts import ConflictTimeline
     timing = ConflictTimeline("move", [e.name for e in moved])
     phase_started = timing.now()
     old_order = [e.name for e in model.natural_entries() if not e.is_separator]
@@ -989,8 +1065,8 @@ def _other_profiles(view):
     if game is None or pdir is None:
         return []
     try:
-        from Utils.game_helpers import _profiles_for_game
-        from Utils.profile_groups import is_group
+        from Utils.games.registry import _profiles_for_game
+        from Utils.profiles.groups import is_group
         cur = pdir.name
         profiles_dir = pdir.parent
         return [p for p in _profiles_for_game(game.name)
@@ -999,36 +1075,38 @@ def _other_profiles(view):
         return []
 
 
-def _profile_submenu_items(view, names, mod_rows, others, move: bool):
+def _profile_submenu_items(view, names, mod_rows, others, move: bool, *,
+                           separator_name: str | None = None):
     """Build the (profile_name, slot) list for the Copy/Move-to-profile submenu.
     Each entry copies/moves *names* to that profile (Tk lists the profiles as a
     submenu rather than opening a picker window)."""
     model = view.model()
-    # The copy worker registers the block in the target modlist assuming
-    # highest-priority-first (app._run_copy_to_profile prepends it as one
-    # unit) - reorder the display-ordered selection into NATURAL order so a
-    # reverse-priority (or column-sorted) view doesn't flip the block.
-    nat = {e.name: i for i, e in enumerate(model.natural_entries())}
-    names = sorted(names, key=lambda n: nat.get(n, len(nat)))
-    enabled_map = {}
-    for r in mod_rows:
-        e = model.entry(r)
-        if not e.is_separator:
-            enabled_map[e.name] = e.enabled
+    from Utils.mods.groups import expand_leaders
+    names = expand_leaders(names, model._mod_groups)
+    # Transfer in saved priority order, including hidden group members.
+    entries = [e for e in model.natural_entries()
+               if e.name in names and not e.is_separator]
+    names = [e.name for e in entries]
+    enabled_map = {e.name: e.enabled for e in entries}
     # The label is display-only; the callback closes over the FOLDER name.
     return [
         (profile_display(prof), (lambda p=prof: _copy_to_profile(
-            view, names, dict(enabled_map), p, move)))
+            view, names, dict(enabled_map), p, move, separator_name)))
         for prof in others
     ]
 
 
-def _copy_to_profile(view, names, enabled_map, target_profile, move):
+def _copy_to_profile(view, names, enabled_map, target_profile, move,
+                     separator_name=None):
     """Delegate the copy/move to the window (needs game, worker thread, collision
     overlay, and - for move - remove_mods + reload)."""
     cb = getattr(view, "on_copy_to_profile", None)
-    if cb is not None and names and target_profile:
-        cb(list(names), dict(enabled_map), target_profile, move)
+    if cb is not None and (names or separator_name) and target_profile:
+        args = (list(names), dict(enabled_map), target_profile, move)
+        if separator_name:
+            cb(*args, separator_name)
+        else:
+            cb(*args)
 
 
 def _read_mod_meta(view, name):
@@ -1093,7 +1171,7 @@ def _installation_archive(view, name: str):
     search_dirs = []
     try:
         from Utils.config_paths import list_all_cache_dirs
-        from Utils.download_locations import (
+        from Utils.downloads.locations import (
             get_default_downloads_dir, is_default_downloads_disabled,
             load_extra_download_locations)
         if not is_default_downloads_disabled():
@@ -1201,7 +1279,7 @@ def _profile_notes(view):
     if pdir is None:
         return None, {}
     try:
-        from Utils.profile_state import read_mod_notes
+        from Utils.profiles.state import read_mod_notes
         return pdir, read_mod_notes(pdir)
     except Exception:
         return pdir, {}
@@ -1218,7 +1296,7 @@ def _open_note_editor(view, names):
     pdir, notes = _profile_notes(view)
     if pdir is None or not names:
         return
-    from Utils.profile_state import write_mod_notes
+    from Utils.profiles.state import write_mod_notes
     single = len(names) == 1
     title = names[0] if single else f"{len(names)} mods"
     initial = notes.get(names[0], "") if single else ""
@@ -1267,7 +1345,7 @@ def _remove_notes(view, names):
     pdir, notes = _profile_notes(view)
     if pdir is None or not names:
         return
-    from Utils.profile_state import write_mod_notes
+    from Utils.profiles.state import write_mod_notes
     cur = dict(notes)
     removed = False
     for nm in names:
@@ -1286,7 +1364,7 @@ def _remove_notes(view, names):
 def _open_on_nexus_multi(view, names):
     """Open each selected mod's Nexus page (skips mods without one)."""
     try:
-        from Utils.xdg import open_url
+        from Utils.environment.xdg import open_url
     except Exception:
         return
     for nm in names:
@@ -1303,6 +1381,9 @@ def _sort_selected_alphabetically(view, model, mod_rows):
     selection occupied (other rows + separators stay put). Port of Tk
     _sort_selected_alphabetically."""
     from gui_qt.modlist_model import _PINNED_NAMES
+    if model._mod_groups:
+        model.sort_group_selection(mod_rows)
+        return
     sel = [model.entry(r) for r in mod_rows]
     sel = [e for e in sel
            if not e.is_separator and e.name not in _PINNED_NAMES]
@@ -1323,7 +1404,7 @@ def _sort_selected_alphabetically(view, model, mod_rows):
     # permutation); at each selected slot drop in the next sorted entry.
     # set_entries re-appends boundaries.
     sel_ids = {id(e) for e in sel}
-    from Utils.conflict_timing import ConflictTimeline
+    from Utils.diagnostics.conflicts import ConflictTimeline
     timing = ConflictTimeline("move", [e.name for e in sel])
     phase_started = timing.now()
     old_order = [e.name for e in model.natural_entries() if not e.is_separator]
@@ -1388,19 +1469,47 @@ def _create_empty_mod_prompt(view, model, insert):
         try:
             from datetime import datetime
             mod_dir = staging / name
+            created = not mod_dir.exists()
             mod_dir.mkdir(parents=True, exist_ok=True)
             installed = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             (mod_dir / "meta.ini").write_text(
-                f"[General]\ninstalled={installed}\n", encoding="utf-8")
+                f"[General]\ninstalled={installed}\n"
+                f"version={NEW_MOD_VERSION}\n", encoding="utf-8")
         except OSError as exc:
             ConfirmOverlay.show_message(
                 view, _mt("Create empty mod"),
                 _mtf("Could not create the mod folder:\n{0}", exc))
             return
-        insert(name)
+        if insert(name) is False:
+            if created:
+                import shutil
+                try:
+                    shutil.rmtree(mod_dir)
+                except OSError:
+                    pass
+            return
+        # The insert only saves the modlist; the meta pass that fills the
+        # Version column runs on a full reload. Push the version we just wrote
+        # straight into the model so the column is right immediately.
+        model.set_version(name, NEW_MOD_VERSION)
 
     TextInputOverlay.show_over(view, _mt("Create empty mod"), _mt("Mod name:"),
                                _named, ok_label=_mt("Create"))
+
+
+def _manage_overwrite(view):
+    """Open the Overwrite manager tab (tree of the Overwrite folder, with
+    move-to-mod / move-to-new-mod / delete). The window installs the callback in
+    _reload_modlist; no-op if it isn't wired (e.g. headless)."""
+    cb = getattr(view, "on_manage_overwrite", None)
+    if callable(cb):
+        cb()
+
+
+def _manage_root_folder(view):
+    cb = getattr(view, "on_manage_root_folder", None)
+    if callable(cb):
+        cb()
 
 
 def _show_overwrite_log(view, boundary_name=None):
@@ -1412,11 +1521,11 @@ def _show_overwrite_log(view, boundary_name=None):
     game = getattr(view, "game", None)
     if game is None:
         return
-    from Utils.filegraph_constants import ROOT_FOLDER_NAME
+    from Utils.filegraph.constants import ROOT_FOLDER_NAME
     is_root = boundary_name == ROOT_FOLDER_NAME
     text = ""
     try:
-        from Utils.deploy_shared import OVERWRITE_LOG_NAME
+        from Utils.deployment.shared import OVERWRITE_LOG_NAME
         base = (game.get_effective_root_folder_path() if is_root
                 else game.get_effective_overwrite_path())
         log_path = base / OVERWRITE_LOG_NAME
@@ -1474,11 +1583,41 @@ def _name_suggestions(view, name):
     if staging is None:
         return []
     try:
-        from Utils.mod_name_utils import suggest_names_for_staged_mod
+        from Utils.mods.names import suggest_names_for_staged_mod
         return suggest_names_for_staged_mod(staging, name)
     except Exception as exc:
         print(f"[gui_qt] name suggestions failed for {name!r}: {exc}", flush=True)
         return []
+
+
+def _set_version(view, model, row):
+    entry = model.entry(row)
+    name = entry.name
+    initial = str(model.data(model.index(row, COL_VERSION), 0) or "")
+    staging = getattr(view, "staging_dir", None)
+    if staging is None:
+        return
+
+    def _picked(text):
+        if text is None:
+            return
+        version = text.strip()
+        if not version or version == initial:
+            return
+        try:
+            from Nexus.nexus_meta import read_meta, write_meta
+            meta_path = staging / name / "meta.ini"
+            meta = read_meta(meta_path)
+            meta.version = version
+            write_meta(meta_path, meta)
+        except Exception as exc:
+            _notify(view, _mtf("Could not set version:\n{0}", exc))
+            return
+        model.set_version(name, version)
+
+    TextInputOverlay.show_over(view, _mt("Set version"),
+                               _mtf("Version for {0}:", entry.display_name),
+                               _picked, initial=initial)
 
 
 def _set_priority(view, model, row):
@@ -1525,7 +1664,7 @@ def _group_owners(view, names):
     if profile_dir is None:
         return None
     try:
-        from Utils.profile_groups import is_group, owner_of
+        from Utils.profiles.groups import is_group, owner_of
         if not is_group(profile_dir):
             return None
         owners = {}
@@ -1544,7 +1683,7 @@ def _locked_group_mods(view, names):
     if profile_dir is None:
         return {}
     try:
-        from Utils.profile_groups import is_group, locked_owners
+        from Utils.profiles.groups import is_group, locked_owners
         if not is_group(profile_dir):
             return {}
         return locked_owners(profile_dir, list(names))
@@ -1567,9 +1706,9 @@ def _run_remove(view, game, profile_dir, names, owners) -> list:
     log = lambda m: print(f"[remove] {m}", flush=True)  # noqa: E731
     try:
         if owners is not None:
-            from Utils.profile_groups import remove_mods_from_group
+            from Utils.profiles.groups import remove_mods_from_group
             return remove_mods_from_group(game, profile_dir, names, log_fn=log)
-        from Utils.mod_remove import remove_mods
+        from Utils.mods.remove import remove_mods
         remove_mods(game, profile_dir, names, log_fn=log)
         return list(names)
     except Exception as exc:
@@ -1639,7 +1778,7 @@ def _open_sep_settings(view, model, row):
     profile_dir = getattr(view, "profile_dir", None)
     if profile_dir is not None:
         try:
-            from Utils.profile_state import read_separator_deploy_paths
+            from Utils.profiles.state import read_separator_deploy_paths
             current_deploy = read_separator_deploy_paths(profile_dir).get(
                 e.name, {})
         except Exception:
@@ -1760,6 +1899,13 @@ def _remove_mods_multi(view, model, mod_rows):
 # runtime via QCoreApplication.translate("ModListMenu", …), which lupdate
 # cannot see through - so each literal is registered here explicitly.
 _TR_MARKERS = (
+    QT_TRANSLATE_NOOP("ModListMenu", "Group options"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Group with"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Change group leader"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Ungroup"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Ungroup all"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Enable group"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Disable group"),
     QT_TRANSLATE_NOOP("ModListMenu", "Abstain from Endorsement"),
     QT_TRANSLATE_NOOP("ModListMenu", "Abstain selected ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Add note"),
@@ -1775,11 +1921,13 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Clear Conflict Filter"),
     QT_TRANSLATE_NOOP("ModListMenu", "Copy to profile"),
     QT_TRANSLATE_NOOP("ModListMenu", "Copy to profile ({0})"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Copy separator to profile"),
     QT_TRANSLATE_NOOP("ModListMenu", "Could not create the mod folder:\n{0}"),
     QT_TRANSLATE_NOOP("ModListMenu", "Create"),
     QT_TRANSLATE_NOOP("ModListMenu", "Create an empty mod below"),
     QT_TRANSLATE_NOOP("ModListMenu", "Create empty mod"),
     QT_TRANSLATE_NOOP("ModListMenu", "Create empty mod below"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Could not set version:\n{0}"),
     QT_TRANSLATE_NOOP("ModListMenu", "Disable Root Folder install"),
     QT_TRANSLATE_NOOP("ModListMenu", "Disable Root Folder install ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Disable selected ({0})"),
@@ -1798,6 +1946,8 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Lock Separator"),
     QT_TRANSLATE_NOOP("ModListMenu", "Lock Separators"),
     QT_TRANSLATE_NOOP("ModListMenu", "Log"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Manage Overwrite…"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Manage root folder"),
     QT_TRANSLATE_NOOP("ModListMenu", "Missing Requirements"),
     QT_TRANSLATE_NOOP("ModListMenu", "Missing Requirements ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "View Requirements"),
@@ -1833,7 +1983,9 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Separator settings…"),
     QT_TRANSLATE_NOOP("ModListMenu", "Set priority"),
     QT_TRANSLATE_NOOP("ModListMenu", "Set priority…"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Set version"),
     QT_TRANSLATE_NOOP("ModListMenu", "Priority for {0}:"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Version for {0}:"),
     QT_TRANSLATE_NOOP("ModListMenu", "Show Conflicts"),
     QT_TRANSLATE_NOOP("ModListMenu", "Sort Alphabetically ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Track Mod"),

@@ -53,7 +53,7 @@ from Utils.vfs import (  # noqa: E402
     wrap_command,
 )
 from Utils.vfs.overlay import _move_materialized_tree  # noqa: E402
-from Utils.deploy import (  # noqa: E402
+from Utils.deployment import (  # noqa: E402
     CustomRule,
     LinkMode,
     RestoreIncompleteError,
@@ -64,13 +64,13 @@ from Utils.deploy import (  # noqa: E402
     restore_custom_rules,
     restore_root_folder,
 )
-from Utils.quick_configure import (  # noqa: E402
+from Utils.games.quick_configure import (  # noqa: E402
     build_quick_configure_options,
     deploy_mode_change_blocked,
 )
-from Utils.launch_handoff import build_launch_handoff  # noqa: E402
+from Utils.launchers.handoff import build_launch_handoff  # noqa: E402
 from cli import cmd_launch  # noqa: E402
-from Utils.exe_launch import (  # noqa: E402
+from Utils.executables.launch import (  # noqa: E402
     _is_amethyst_steam_handoff,
     is_game_launch_exe,
     launch_exe_via_proton,
@@ -79,7 +79,7 @@ from Utils.exe_launch import (  # noqa: E402
     run_tool_logged,
     spawn_process_watched,
 )
-from Utils.xedit_tools import (  # noqa: E402
+from Utils.bethesda.xedit import (  # noqa: E402
     begin_xedit_vfs_session,
     persist_xedit_vfs_changes,
 )
@@ -500,9 +500,9 @@ class _FakeWitcher3Game(_FakeCustomPaths, Witcher3):
 
 def _deploy_custom_fixture(game, **kwargs):
     """Deploy without importing optional filemap-index dependencies."""
-    mod_files_stub = types.ModuleType("Utils.mod_files")
+    mod_files_stub = types.ModuleType("Utils.mods.files")
     mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
-    with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+    with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
         return game.deploy(**kwargs)
 
 
@@ -733,7 +733,7 @@ def test_layer_build_and_skse_selection() -> None:
 
 def test_incremental_vfs_redeploy() -> None:
     """Same-profile redeploy retains, captures, then replaces the old view."""
-    from Utils.deploy_incremental import plan_vfs_redeploy
+    from Utils.deployment.incremental import plan_vfs_redeploy
 
     with tempfile.TemporaryDirectory() as tmp:
         game = _FakeGame(Path(tmp))
@@ -1212,7 +1212,7 @@ def test_wizard_tools_use_vfs_and_xedit_edits_persist() -> None:
         view_data = effective_shadow_data_root(game)
         assert effective_tool_game_root(game) == effective_shadow_root(game)
         assert effective_tool_data_root(game) == view_data
-        from Utils.bodyslide_tools import find_deployed_exe
+        from Utils.bethesda.bodyslide import find_deployed_exe
         assert find_deployed_exe(game, "BodySlide.exe") == (
             view_data / "CalienteTools/BodySlide/BodySlide.exe")
         session = begin_xedit_vfs_session(game)
@@ -1237,12 +1237,12 @@ def test_wizard_tools_use_vfs_and_xedit_edits_persist() -> None:
 
         fake_proc = types.SimpleNamespace(stdout=[], wait=lambda: 0)
         with patch(
-            "Utils.steam_finder.proton_run_command",
+            "Utils.launchers.steam.proton_run_command",
             return_value=["proton", "runinprefix", "/tools/SSEEdit.exe"],
         ), patch(
             "Utils.vfs.wrap_command", return_value=["vfs-wrapped-tool"],
         ) as wrap, patch(
-            "Utils.exe_launch.subprocess.Popen", return_value=fake_proc,
+            "Utils.executables.launch.subprocess.Popen", return_value=fake_proc,
         ) as popen:
             rc = run_tool_logged(
                 Path("/proton"), Path("/tools/SSEEdit.exe"), {}, game=game)
@@ -2171,7 +2171,7 @@ def test_custom_rule_prefix_restore_failure_is_retryable() -> None:
             real_unlink(path, *args, **kwargs)
 
         try:
-            with patch("Utils.deploy_custom_rules.os.unlink", _fail_target_once):
+            with patch("Utils.deployment.custom_rules.os.unlink", _fail_target_once):
                 restore_custom_rules(
                     game.filemap,
                     game.game,
@@ -2304,9 +2304,9 @@ def test_ue5_nested_project_shadow_view() -> None:
             encoding="utf-8",
         )
 
-        mod_files_stub = types.ModuleType("Utils.mod_files")
+        mod_files_stub = types.ModuleType("Utils.mods.files")
         mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
-        with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+        with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
             game.deploy(profile="default")
 
         state = game.profile / STATE_DIR_NAME
@@ -2433,13 +2433,13 @@ def test_ue5_external_routes_restore_and_failure_rollback() -> None:
         )
         return prefix_target, external_target
 
-    mod_files_stub = types.ModuleType("Utils.mod_files")
+    mod_files_stub = types.ModuleType("Utils.mods.files")
     mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
 
     with tempfile.TemporaryDirectory() as tmp:
         game = _FakeUE5RoutedGame(Path(tmp))
         prefix_target, external_target = _prepare(game, Path(tmp))
-        with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+        with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
             game.deploy(profile="default")
         assert prefix_target.read_text() == "profile-prefix"
         assert external_target.read_text() == "profile-external"
@@ -2447,7 +2447,7 @@ def test_ue5_external_routes_restore_and_failure_rollback() -> None:
         assert not (game.profiles / "ue5_deployed.txt").exists()
         # Redeploy must first reverse the previous physical side effects; an
         # old mod hardlink must never be mistaken for the vanilla backup.
-        with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+        with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
             game.deploy(profile="default")
         assert prefix_target.read_text() == "profile-prefix"
         assert external_target.read_text() == "profile-external"
@@ -2460,7 +2460,7 @@ def test_ue5_external_routes_restore_and_failure_rollback() -> None:
         game = _FakeUE5FailingGame(Path(tmp))
         prefix_target, external_target = _prepare(game, Path(tmp))
         try:
-            with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+            with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
                 game.deploy(profile="default")
         except RuntimeError as exc:
             assert "injected UE5 layer hook failure" in str(exc)
@@ -2505,7 +2505,7 @@ def test_ue5_external_routes_restore_and_failure_rollback() -> None:
             raise RuntimeError("injected progress callback failure")
 
         try:
-            with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+            with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
                 game.deploy(
                     profile="default",
                     progress_fn=_interrupt_after_placement,
@@ -2662,9 +2662,9 @@ def test_subnautica_shadow_view() -> None:
         assert game._vfs_per_mod_subdirs(game.profile, game.staging) == {
             "MapMod": "ExampleAuthor-MapMod",
         }
-        mod_files_stub = types.ModuleType("Utils.mod_files")
+        mod_files_stub = types.ModuleType("Utils.mods.files")
         mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
-        with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+        with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
             game.deploy(profile="default")
         state = game.profile / STATE_DIR_NAME
         view = state / "view"
@@ -2756,9 +2756,9 @@ def test_native_bepinex_shadow_launch() -> None:
             encoding="utf-8",
         )
 
-        mod_files_stub = types.ModuleType("Utils.mod_files")
+        mod_files_stub = types.ModuleType("Utils.mods.files")
         mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
-        with patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}):
+        with patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}):
             game.deploy(profile="default")
 
         state = game.profile / STATE_DIR_NAME
@@ -2785,30 +2785,30 @@ def test_native_bepinex_shadow_launch() -> None:
             "SteamOverlayGameId": "999999",
             "STEAM_COMPAT_APP_ID": "999999",
         }
-        with patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.launch_exe_via_proton") as proton, \
-                patch("Utils.exe_launch.game_is_steam_install",
+        with patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.launch_exe_via_proton") as proton, \
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="1092790"), \
-                patch("Utils.exe_launch.load_exe_args",
+                patch("Utils.executables.launch.load_exe_args",
                       side_effect=lambda _game, key: (
                           "--saved-argument"
                           if key == game.exe_name else "--wrong-native-key"
                       )) as load_args, \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_launch_options",
                       side_effect=lambda _game, key: (
                           "BEP_TEST_ENV=profile /usr/bin/env %command% "
                           "--launch-suffix"
                           if key == game.exe_name else "--wrong-option-key"
                       )) as launch_options, \
-                patch("Utils.exe_launch.steam_launch_options_for_game") \
+                patch("Utils.executables.launch.steam_launch_options_for_game") \
                       as steam_options, \
                 patch.object(game, "default_launch_args_for_exe",
                              return_value=["--default-argument"]), \
-                patch("Utils.xdg.host_env", return_value=dict(inherited_env)):
+                patch("Utils.environment.xdg.host_env", return_value=dict(inherited_env)):
             launch_game(game)
         proton.assert_not_called()
         steam_options.assert_not_called()
@@ -2838,29 +2838,29 @@ def test_native_bepinex_shadow_launch() -> None:
 
         # With no per-executable value, native VFS Play inherits Steam's
         # launch options just like the normal store/direct routes.
-        with patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.game_is_steam_install",
+        with patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="1092790"), \
-                patch("Utils.exe_launch.load_exe_args",
+                patch("Utils.executables.launch.load_exe_args",
                       side_effect=lambda _game, key: (
                           "" if key == game.exe_name else "--wrong-native-key"
                       )) as load_args, \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_launch_options",
                       side_effect=lambda _game, key: (
                           "" if key == game.exe_name else "--wrong-option-key"
                       )) as launch_options, \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=(
                           "STEAM_FALLBACK_ENV=1 /usr/bin/env %command% "
                           "--steam-fallback"
                       )) as steam_options, \
                 patch.object(game, "default_launch_args_for_exe",
                              return_value=[]), \
-                patch("Utils.xdg.host_env", return_value=dict(inherited_env)):
+                patch("Utils.environment.xdg.host_env", return_value=dict(inherited_env)):
             launch_game(game)
         steam_options.assert_called_once()
         load_args.assert_called_once_with(game, game.exe_name)
@@ -2972,29 +2972,29 @@ def test_native_none_launch_steam_context() -> None:
         }
         launch_order: list[str] = []
 
-        with patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.load_launch_mode",
+        with patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.load_launch_mode",
                       return_value="none"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="2868840"), \
-                patch("Utils.exe_launch.load_exe_args",
+                patch("Utils.executables.launch.load_exe_args",
                       return_value="--saved-argument") as load_args, \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=(
                           "DIRECT_TEST_ENV=profile /usr/bin/env %command% "
                           "--launch-suffix"
                       )) as launch_options, \
-                patch("Utils.exe_launch.steam_launch_options_for_game") \
+                patch("Utils.executables.launch.steam_launch_options_for_game") \
                       as steam_options, \
-                patch("Utils.steam_client.ensure_steam_client_running",
+                patch("Utils.launchers.steam_client.ensure_steam_client_running",
                       side_effect=lambda **_kwargs: (
                           launch_order.append("client-ready") or True
                       )) as ensure_steam, \
-                patch("Utils.xdg.host_env", return_value=dict(inherited_env)):
+                patch("Utils.environment.xdg.host_env", return_value=dict(inherited_env)):
             spawn.side_effect = lambda *_args, **_kwargs: (
                 launch_order.append("game-spawn"))
             launch_game(game)
@@ -3029,22 +3029,22 @@ def test_native_none_launch_steam_context() -> None:
             "SteamOverlayGameId": "999999",
             "STEAM_COMPAT_APP_ID": "999999",
         }
-        with patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.load_launch_mode",
+        with patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.load_launch_mode",
                       return_value="none"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=False), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value=""), \
-                patch("Utils.exe_launch.load_exe_args",
+                patch("Utils.executables.launch.load_exe_args",
                       return_value=""), \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=""), \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=""), \
-                patch("Utils.steam_client.ensure_steam_client_running") \
+                patch("Utils.launchers.steam_client.ensure_steam_client_running") \
                       as ensure_steam, \
-                patch("Utils.xdg.host_env",
+                patch("Utils.environment.xdg.host_env",
                       return_value=dict(inherited_nonsteam)):
             launch_game(game)
         spawn.assert_called_once()
@@ -3062,13 +3062,13 @@ def test_native_none_launch_steam_context() -> None:
 
 
 def test_native_steam_client_lifecycle() -> None:
-    from Utils.steam_client import ensure_steam_client_running
+    from Utils.launchers.steam_client import ensure_steam_client_running
 
     # An existing client is accepted without touching any launcher process.
     already_messages: list[str] = []
-    with patch("Utils.steam_client.steam_client_running",
+    with patch("Utils.launchers.steam_client.steam_client_running",
                return_value=True) as running, \
-            patch("Utils.steam_client.subprocess.Popen") as client_spawn:
+            patch("Utils.launchers.steam_client.subprocess.Popen") as client_spawn:
         assert ensure_steam_client_running(log_fn=already_messages.append)
     running.assert_called_once_with(strict=True)
     client_spawn.assert_not_called()
@@ -3077,7 +3077,7 @@ def test_native_steam_client_lifecycle() -> None:
     # A Flatpak-host PID that cannot be queried is intentionally ambiguous:
     # config writers retain the historical conservative True, while native
     # Steamworks launch readiness must fail its strict proof.
-    from Utils.steam_finder import steam_client_running
+    from Utils.launchers.steam import steam_client_running
     with tempfile.TemporaryDirectory() as tmp:
         fake_home = Path(tmp)
         pid_file = fake_home / ".steam" / "steam.pid"
@@ -3090,16 +3090,82 @@ def test_native_steam_client_lifecycle() -> None:
                 return True
             return real_exists(path)
 
-        with patch("Utils.steam_finder._HOME", fake_home), \
+        with patch("Utils.launchers.steam._HOME", fake_home), \
                 patch.object(Path, "exists", autospec=True,
                              side_effect=_flatpak_exists), \
                 patch("shutil.which", return_value=None):
             assert steam_client_running()
             assert not steam_client_running(strict=True)
 
-    # A closed client is started without a game URI. Process liveness is
-    # checked again after the PID appears, covering Steam's bootstrap/PID
-    # replacement window without claiming that login or IPC is ready.
+        host_result = types.SimpleNamespace(returncode=0)
+        with patch("Utils.launchers.steam._HOME", fake_home), \
+                patch.object(Path, "exists", autospec=True,
+                             side_effect=_flatpak_exists), \
+                patch("shutil.which", return_value="/usr/bin/flatpak-spawn"), \
+                patch("subprocess.run", return_value=host_result) as host_run:
+            assert steam_client_running(strict=True)
+        host_command = host_run.call_args.args[0]
+        assert host_command[:4] == [
+            "flatpak-spawn", "--host", "sh", "-c",
+        ]
+        assert ' -ef "$2"' in host_command[4]
+        assert host_command[-1] == str(fake_home / ".steam/steam.pipe")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_home = Path(tmp)
+        snap_pid = fake_home / "snap/steam/common/.steam/steam.pid"
+        snap_pid.parent.mkdir(parents=True)
+        snap_pid.write_text("424242\n", encoding="ascii")
+        real_read_text = Path.read_text
+        real_exists = Path.exists
+
+        def _snap_process(path: Path, *args, **kwargs) -> str:
+            if path == Path("/proc/424242/comm"):
+                return "steam\n"
+            return real_read_text(path, *args, **kwargs)
+
+        def _outside_flatpak(path: Path) -> bool:
+            if str(path) == "/.flatpak-info":
+                return False
+            return real_exists(path)
+
+        with patch("Utils.launchers.steam._HOME", fake_home), \
+                patch.object(Path, "read_text", autospec=True,
+                             side_effect=_snap_process), \
+                patch.object(Path, "exists", autospec=True,
+                             side_effect=_outside_flatpak), \
+                patch("Utils.launchers.steam._process_has_open_path",
+                      return_value=True):
+            assert steam_client_running(strict=True)
+
+    from Utils.launchers.steam_client import (
+        _steam_login_log_cursors,
+        _steam_login_log_paths,
+        _steam_login_ready_since,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_home = Path(tmp)
+        login_paths = tuple(map(str, _steam_login_log_paths(fake_home)))
+        assert any("com.valvesoftware.Steam" in path for path in login_paths)
+        assert any("snap/steam/common" in path for path in login_paths)
+        login_log = (
+            fake_home / ".local/share/Steam/logs/steamui_login.txt"
+        )
+        login_log.parent.mkdir(parents=True)
+        login_log.write_bytes(
+            b"[old] SetLoginState: Success - OK\n"
+        )
+        cursors = _steam_login_log_cursors(fake_home)
+        assert not _steam_login_ready_since(cursors)[0]
+        with login_log.open("ab") as stream:
+            stream.write(b"[new] SetLoginState: WaitingForLibraryReady - OK\n")
+        assert _steam_login_ready_since(cursors) == (False, True)
+        with login_log.open("ab") as stream:
+            stream.write(b"[new] SetLoginState: Success - OK\n")
+        assert _steam_login_ready_since(cursors) == (True, True)
+
+    # A closed client is started without a game URI and held until both
+    # Steam's command pipe and a fresh successful login state are visible.
     with tempfile.TemporaryDirectory() as tmp:
         fake_home = Path(tmp)
         inherited = {
@@ -3120,18 +3186,22 @@ def test_native_steam_client_lifecycle() -> None:
         }
         ready_messages: list[str] = []
         client_proc = types.SimpleNamespace(poll=lambda: None)
-        with patch("Utils.steam_client.Path") as path_type, \
-                patch("Utils.steam_client.steam_client_running",
+        with patch("Utils.launchers.steam_client.Path") as path_type, \
+                patch("Utils.launchers.steam_client.steam_client_running",
                       side_effect=[False, True, True]) as running, \
-                patch("Utils.steam_client.shutil.which",
+                patch("Utils.launchers.steam_client._steam_login_log_cursors",
+                      return_value={}), \
+                patch("Utils.launchers.steam_client._steam_login_ready_since",
+                      return_value=(True, True)), \
+                patch("Utils.launchers.steam_client.shutil.which",
                       side_effect=lambda name: f"/usr/bin/{name}"), \
-                patch("Utils.steam_client.subprocess.Popen", side_effect=[
+                patch("Utils.launchers.steam_client.subprocess.Popen", side_effect=[
                     OSError("injected stale xdg-open association"),
                     OSError("injected missing native Steam"),
                     client_proc,
                 ]) as client_spawn, \
-                patch("Utils.steam_client.time.sleep") as sleep, \
-                patch("Utils.xdg.host_env",
+                patch("Utils.launchers.steam_client.time.sleep") as sleep, \
+                patch("Utils.environment.xdg.host_env",
                       return_value=dict(inherited)):
             path_type.home.return_value = fake_home
             path_type.return_value.exists.return_value = False
@@ -3141,7 +3211,7 @@ def test_native_steam_client_lifecycle() -> None:
         assert running.call_count == 3
         assert all(call.kwargs == {"strict": True}
                    for call in running.call_args_list)
-        sleep.assert_called_once_with(2.0)
+        sleep.assert_not_called()
         assert [call.args[0] for call in client_spawn.call_args_list] == [
             ["xdg-open", "steam://open/main"],
             ["steam", "-silent"],
@@ -3158,24 +3228,51 @@ def test_native_steam_client_lifecycle() -> None:
             "PRESSURE_VESSEL_FILESYSTEMS_RW",
         ))
         assert client_spawn.call_args_list[-1].kwargs["cwd"] == str(fake_home)
-        assert any("client process is running" in message
+        assert any("signed in and ready" in message
                    for message in ready_messages)
 
-    # The legacy helper still safely handles client-start failures for callers
-    # which explicitly ask it to start Steam.
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_home = Path(tmp)
+        client_proc = types.SimpleNamespace(poll=lambda: None)
+        with patch("Utils.launchers.steam_client.Path") as path_type, \
+                patch("Utils.launchers.steam_client.steam_client_running",
+                      side_effect=[False, True, True]), \
+                patch("Utils.launchers.steam_client._steam_login_log_cursors",
+                      return_value={}), \
+                patch("Utils.launchers.steam_client._steam_login_ready_since",
+                      return_value=(True, True)), \
+                patch("Utils.launchers.steam_client.shutil.which",
+                      side_effect=lambda name: (
+                          "/usr/bin/snap" if name == "snap" else None
+                      )), \
+                patch("Utils.launchers.steam_client.subprocess.Popen",
+                      return_value=client_proc) as client_spawn, \
+                patch("Utils.launchers.steam_client.time.sleep"), \
+                patch("Utils.environment.xdg.host_env", return_value={}):
+            path_type.home.return_value = fake_home
+            path_type.return_value.exists.return_value = False
+            assert ensure_steam_client_running(timeout=5.0)
+        client_spawn.assert_called_once()
+        assert client_spawn.call_args.args[0] == [
+            "snap", "run", "steam", "-silent",
+        ]
+
+    # Startup failures remain actionable and never fall through to the game.
     failed_messages: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         fake_home = Path(tmp)
-        with patch("Utils.steam_client.Path") as path_type, \
-                patch("Utils.steam_client.steam_client_running",
+        with patch("Utils.launchers.steam_client.Path") as path_type, \
+                patch("Utils.launchers.steam_client.steam_client_running",
                       return_value=False), \
-                patch("Utils.steam_client.shutil.which",
+                patch("Utils.launchers.steam_client._steam_login_log_cursors",
+                      return_value={}), \
+                patch("Utils.launchers.steam_client.shutil.which",
                       side_effect=lambda name: (
                           "/usr/bin/xdg-open" if name == "xdg-open" else None
                       )), \
-                patch("Utils.steam_client.subprocess.Popen",
+                patch("Utils.launchers.steam_client.subprocess.Popen",
                       side_effect=OSError("injected client start failure")), \
-                patch("Utils.xdg.host_env", return_value={}):
+                patch("Utils.environment.xdg.host_env", return_value={}):
             path_type.home.return_value = fake_home
             path_type.return_value.exists.return_value = False
             assert not ensure_steam_client_running(
@@ -3189,32 +3286,33 @@ def test_native_steam_client_lifecycle() -> None:
         native_exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         native_exe.chmod(0o755)
         launch_messages: list[str] = []
-        with patch("Utils.exe_launch.spawn_process_watched") as game_spawn, \
-                patch("Utils.exe_launch.load_launch_mode",
+        with patch("Utils.executables.launch.spawn_process_watched") as game_spawn, \
+                patch("Utils.executables.launch.load_launch_mode",
                       return_value="none"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=False), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="2868840"), \
-                patch("Utils.exe_launch.load_exe_args", return_value=""), \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_exe_args", return_value=""), \
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=""), \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=""), \
-                patch("Utils.steam_client.ensure_steam_client_running") \
+                patch("Utils.launchers.steam_client.ensure_steam_client_running") \
                       as ensure_steam, \
-                patch("Utils.exe_launch.launch_report.actionable",
+                patch("Utils.executables.launch.launch_report.actionable",
                       side_effect=lambda reason: reason), \
-                patch("Utils.exe_launch.launch_report.mark_failed") \
+                patch("Utils.executables.launch.launch_report.mark_failed") \
                       as mark_failed, \
-                patch("Utils.xdg.host_env", return_value={}):
+                patch("Utils.environment.xdg.host_env", return_value={}):
+            ensure_steam.return_value = False
             launch_game(game, log_fn=launch_messages.append)
-        ensure_steam.assert_not_called()
+        ensure_steam.assert_called_once()
         game_spawn.assert_not_called()
         mark_failed.assert_called_once()
-        assert "Steam needs to be running" in mark_failed.call_args.args[0]
+        assert "could not start or confirm" in mark_failed.call_args.args[0]
         assert any("refusing to launch" in message
                    for message in launch_messages)
         assert not (native_exe.parent / "steam_appid.txt").exists()
@@ -3223,31 +3321,31 @@ def test_native_steam_client_lifecycle() -> None:
         # native launch proceeds. The old native opt-in remains responsible
         # only for its second/race-safe readiness check.
         game.native_steam_client_required = False
-        with patch("Utils.exe_launch.spawn_process_watched") as game_spawn, \
-                patch("Utils.exe_launch.load_launch_mode",
+        with patch("Utils.executables.launch.spawn_process_watched") as game_spawn, \
+                patch("Utils.executables.launch.load_launch_mode",
                       return_value="none"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="2868840"), \
-                patch("Utils.exe_launch.load_exe_args", return_value=""), \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_exe_args", return_value=""), \
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=""), \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=""), \
-                patch("Utils.steam_client.ensure_steam_client_running") \
+                patch("Utils.launchers.steam_client.ensure_steam_client_running") \
                       as ensure_steam, \
-                patch("Utils.xdg.host_env", return_value={}):
+                patch("Utils.environment.xdg.host_env", return_value={}):
             launch_game(game)
         ensure_steam.assert_not_called()
         game_spawn.assert_called_once()
     print("✓ native Steam client startup, readiness, and failure lifecycle")
 
 
-def test_direct_steam_launch_requires_running_client() -> None:
-    """VFS and Run Via: None must fail visibly before starting Proton."""
+def test_direct_steam_launch_starts_or_reports_client() -> None:
+    """VFS and Run Via: None start Steam, retaining an actionable fallback."""
     with tempfile.TemporaryDirectory() as tmp:
         game = _FakeBethesdaGame(Path(tmp))
         exe = game.game / "fose_loader.exe"
@@ -3256,22 +3354,25 @@ def test_direct_steam_launch_requires_running_client() -> None:
         failures: list[str] = []
         messages: list[str] = []
 
-        from Utils import launch_report
+        from Utils.processes import report as launch_report
         with (
-            patch("Utils.exe_launch.game_is_steam_install",
+            patch("Utils.executables.launch.game_is_steam_install",
                   return_value=True),
-            patch("Utils.steam_finder.steam_client_running",
+            patch("Utils.launchers.steam.steam_client_running",
                   return_value=False) as running,
-            patch("Utils.exe_launch.spawn_process_watched") as spawn,
+            patch("Utils.launchers.steam_client.ensure_steam_client_running",
+                  return_value=False) as ensure_steam,
+            patch("Utils.executables.launch.spawn_process_watched") as spawn,
             launch_report.report(failures.append) as report,
         ):
             launch_game(game, log_fn=messages.append)
             report.finish()
         running.assert_called_once_with(strict=True)
+        ensure_steam.assert_called_once()
         spawn.assert_not_called()
         assert len(failures) == 1
         assert launch_report.is_actionable(failures[0])
-        assert "Steam needs to be running" in failures[0]
+        assert "could not start or confirm" in failures[0]
         assert any("refusing to launch" in message for message in messages)
 
         # The physical/None route uses the same preflight, without requiring
@@ -3280,21 +3381,34 @@ def test_direct_steam_launch_requires_running_client() -> None:
         failures.clear()
         messages.clear()
         with (
-            patch("Utils.exe_launch.load_launch_mode", return_value="none"),
-            patch("Utils.exe_launch.game_is_steam_install",
+            patch("Utils.executables.launch.load_launch_mode", return_value="none"),
+            patch("Utils.executables.launch.game_is_steam_install",
                   return_value=True),
-            patch("Utils.steam_finder.steam_client_running",
+            patch("Utils.launchers.steam.steam_client_running",
                   return_value=False) as running,
-            patch("Utils.exe_launch.launch_exe_via_proton") as proton,
+            patch("Utils.launchers.steam_client.ensure_steam_client_running",
+                  return_value=False) as ensure_steam,
+            patch("Utils.executables.launch.launch_exe_via_proton") as proton,
             launch_report.report(failures.append) as report,
         ):
             launch_game(game, log_fn=messages.append)
             report.finish()
         running.assert_called_once_with(strict=True)
+        ensure_steam.assert_called_once()
         proton.assert_not_called()
         assert len(failures) == 1
-        assert "Steam needs to be running" in failures[0]
-    print("✓ direct Steam Play reports when the client is not running")
+        assert "could not start or confirm" in failures[0]
+
+        from Utils.executables.launch import _require_direct_steam_client
+        with patch("Utils.executables.launch.game_is_steam_install",
+                   return_value=True), \
+                patch("Utils.launchers.steam.steam_client_running",
+                      return_value=False), \
+                patch("Utils.launchers.steam_client.ensure_steam_client_running",
+                      return_value=True) as ensure_steam:
+            assert _require_direct_steam_client(game, messages.append)
+        ensure_steam.assert_called_once()
+    print("✓ direct Steam Play starts the client and reports startup failures")
 
 
 def test_native_vfs_flatpak_forwards_launch_environment() -> None:
@@ -3336,20 +3450,20 @@ def test_native_vfs_flatpak_forwards_launch_environment() -> None:
         # real forwarding filter must recognise it as an explicit override.
         with patch.dict(os.environ, {
                 "FLATPAK_LAUNCH_OPTION": "sandbox-baseline",
-             }), patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.game_is_steam_install",
+             }), patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="2868840"), \
-                patch("Utils.exe_launch.load_exe_args", return_value=""), \
-                patch("Utils.exe_launch.load_launch_options", return_value=(
+                patch("Utils.executables.launch.load_exe_args", return_value=""), \
+                patch("Utils.executables.launch.load_launch_options", return_value=(
                     "FLATPAK_LAUNCH_OPTION=profile /usr/bin/env %command%"
                 )), \
-                patch("Utils.steam_client.ensure_steam_client_running",
+                patch("Utils.launchers.steam_client.ensure_steam_client_running",
                       return_value=True) as ensure_steam, \
-                patch("Utils.xdg.host_env",
+                patch("Utils.environment.xdg.host_env",
                       return_value=dict(inherited_env)), \
                 patch("Utils.vfs.overlay._inside_flatpak",
                       return_value=True):
@@ -3411,21 +3525,21 @@ def test_native_steam_handoff_fallback_is_not_recursive() -> None:
 
         with patch("Utils.config_paths.get_default_staging_root",
                    return_value=root / "Amethyst"), \
-                patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.load_launch_mode",
+                patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.load_launch_mode",
                       return_value="none"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="2868840"), \
-                patch("Utils.exe_launch.load_exe_args", return_value=""), \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_exe_args", return_value=""), \
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=""), \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=generated_handoff) as steam_options, \
-                patch("Utils.xdg.host_env",
+                patch("Utils.environment.xdg.host_env",
                       return_value=dict(inherited_env)):
             launch_game(game, log_fn=messages.append)
 
@@ -3447,21 +3561,21 @@ def test_native_steam_handoff_fallback_is_not_recursive() -> None:
         )
         with patch("Utils.config_paths.get_default_staging_root",
                    return_value=root / "Amethyst"), \
-                patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.load_launch_mode",
+                patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.load_launch_mode",
                       return_value="none"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="2868840"), \
-                patch("Utils.exe_launch.load_exe_args", return_value=""), \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_exe_args", return_value=""), \
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=""), \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=normal_options), \
-                patch("Utils.xdg.host_env",
+                patch("Utils.environment.xdg.host_env",
                       return_value=dict(inherited_env)):
             launch_game(game)
         normal_command = spawn.call_args.args[0]
@@ -3504,31 +3618,31 @@ def test_proton_steam_handoff_fallback_is_not_recursive() -> None:
 
         with patch("Utils.config_paths.get_default_staging_root",
                    return_value=handoff_root), \
-                patch("Utils.exe_launch.load_proton_override",
+                patch("Utils.executables.launch.load_proton_override",
                    return_value=None), \
-                patch("Utils.exe_launch.load_exe_args", return_value=""), \
-                patch("Utils.exe_launch.load_launch_options",
+                patch("Utils.executables.launch.load_exe_args", return_value=""), \
+                patch("Utils.executables.launch.load_launch_options",
                       return_value=""), \
-                patch("Utils.exe_launch.steam_launch_options_for_game",
+                patch("Utils.executables.launch.steam_launch_options_for_game",
                       return_value=generated_handoff) as steam_options, \
-                patch("Utils.exe_launch.effective_steam_id",
+                patch("Utils.executables.launch.effective_steam_id",
                       return_value="489830"), \
-                patch("Utils.exe_launch.game_is_steam_install",
+                patch("Utils.executables.launch.game_is_steam_install",
                       return_value=True), \
-                patch("Utils.steam_finder.steam_client_running",
+                patch("Utils.launchers.steam.steam_client_running",
                       return_value=True), \
-                patch("Utils.umu_launcher.ensure_umu_run"), \
-                patch("Utils.proton_prefix.resolve_compat_data",
+                patch("Utils.launchers.umu.ensure_umu_run"), \
+                patch("Utils.wine.prefix.resolve_compat_data",
                       return_value=compat_data), \
-                patch("Utils.steam_finder.find_proton_for_game",
+                patch("Utils.launchers.steam.find_proton_for_game",
                       return_value=proton), \
-                patch("Utils.steam_finder.find_steam_root_for_proton_script",
+                patch("Utils.launchers.steam.find_steam_root_for_proton_script",
                       return_value=steam_root), \
-                patch("Utils.steam_finder.proton_run_command",
+                patch("Utils.launchers.steam.proton_run_command",
                       return_value=["fake-runtime", str(exe)]), \
-                patch("Utils.lutris_finder.is_lutris_prefix",
+                patch("Utils.launchers.lutris.is_lutris_prefix",
                       return_value=False), \
-                patch("Utils.exe_launch.spawn_process_watched") as spawn:
+                patch("Utils.executables.launch.spawn_process_watched") as spawn:
             launch_exe_via_proton(exe, game, log_fn=messages.append)
 
         steam_options.assert_called_once_with(game, messages.append)
@@ -3607,12 +3721,12 @@ def test_stardew_shadow_view() -> None:
         )
         staged_launcher.chmod(0o755)
 
-        mod_files_stub = types.ModuleType("Utils.mod_files")
+        mod_files_stub = types.ModuleType("Utils.mods.files")
         mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
         filemap_stub = types.ModuleType("Utils.filemap")
         filemap_stub.OVERWRITE_NAME = "[Overwrite]"
         with patch.dict(sys.modules, {
-            "Utils.mod_files": mod_files_stub,
+            "Utils.mods.files": mod_files_stub,
             "Utils.filemap": filemap_stub,
         }):
             game.deploy(profile="default")
@@ -3635,8 +3749,8 @@ def test_stardew_shadow_view() -> None:
 
         # The shared Play path must recognize the extensionless Linux binary
         # and never hand it to Proton.
-        with patch("Utils.exe_launch.spawn_process_watched") as spawn, \
-                patch("Utils.exe_launch.launch_exe_via_proton") as proton:
+        with patch("Utils.executables.launch.spawn_process_watched") as spawn, \
+                patch("Utils.executables.launch.launch_exe_via_proton") as proton:
             launch_game(game)
         proton.assert_not_called()
         spawn.assert_called_once()
@@ -4005,7 +4119,7 @@ def test_witcher3_shadow_view_and_script_merger() -> None:
         merged = view / "mods/mod0000_MergedFiles/content/scripts/merged.ws"
         merged.parent.mkdir(parents=True)
         merged.write_text("merged output", encoding="utf-8")
-        from Utils.script_merger_inventory import (
+        from Utils.witcher3.script_merger import (
             app_inventory_path,
             collateral_keys,
             missing_merge_sources,
@@ -4104,7 +4218,7 @@ def test_deploy_pipeline_stops_on_incomplete_restore() -> None:
     filemap_stub = types.ModuleType("Utils.filemap")
     filemap_stub.build_filemap = lambda *_args, **_kwargs: None
     with patch.dict(sys.modules, {"Utils.filemap": filemap_stub}):
-        from Utils.deploy_pipeline import run_deploy_pipeline
+        from Utils.deployment.pipeline import run_deploy_pipeline
 
     class _PipelineGame:
         name = "Restore Pipeline Test"
@@ -4222,28 +4336,28 @@ def test_deploy_pipeline_stops_on_incomplete_restore() -> None:
 
     def _run(game: _PipelineGame) -> tuple[bool, list[str]]:
         messages: list[str] = []
-        mod_files_stub = types.ModuleType("Utils.mod_files")
+        mod_files_stub = types.ModuleType("Utils.mods.files")
         mod_files_stub.excluded_raw_by_mod = lambda _profile: {}
         with (
-            patch.dict(sys.modules, {"Utils.mod_files": mod_files_stub}),
+            patch.dict(sys.modules, {"Utils.mods.files": mod_files_stub}),
             patch(
-                "Utils.profile_groups.materialize_if_group",
+                "Utils.profiles.groups.materialize_if_group",
                 return_value=None,
             ),
             patch(
-                "Utils.deploy_pipeline._build_filemap_for_game",
+                "Utils.deployment.pipeline._build_filemap_for_game",
                 return_value=None,
             ),
             patch(
-                "Utils.flatpak_sandbox.ensure_symlink_target_access",
+                "Utils.flatpak.sandbox.ensure_symlink_target_access",
                 return_value=None,
             ),
             patch(
-                "Utils.deploy_pipeline.load_per_mod_strip_prefixes",
+                "Utils.deployment.pipeline.load_per_mod_strip_prefixes",
                 return_value={},
             ),
             patch(
-                "Utils.deploy_pipeline.deploy_root_flagged_mods",
+                "Utils.deployment.pipeline.deploy_root_flagged_mods",
                 return_value=0,
             ),
         ):
@@ -4413,7 +4527,7 @@ def test_watched_game_launch_uses_safe_standard_handles() -> None:
         cache = Path(tmp) / "flatpak-cache"
         with (
             patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache)}),
-            patch("Utils.exe_launch.subprocess.Popen",
+            patch("Utils.executables.launch.subprocess.Popen",
                   return_value=fake_proc) as popen,
             patch("threading.Thread") as thread,
         ):
@@ -4681,7 +4795,7 @@ def test_launcher_aware_handoffs() -> None:
         short_script = Path(tmp) / "Amethyst" / "launchers" \
             / "Handoff_Test.sh"
         heroic_game = _FakeHandoffGame("heroic_app_name", "heroic-id")
-        with patch("Utils.launch_handoff._heroic_launch_is_flatpak",
+        with patch("Utils.launchers.handoff._heroic_launch_is_flatpak",
                    return_value=True):
             heroic = build_launch_handoff(heroic_game)
         assert heroic is not None and heroic.launcher_id == "heroic"
@@ -4700,7 +4814,7 @@ def test_launcher_aware_handoffs() -> None:
 
         lutris_game = _FakeHandoffGame("lutris_slug", "lutris-id")
         with patch(
-            "Utils.lutris_finder.find_lutris_launch_info",
+            "Utils.launchers.lutris.find_lutris_launch_info",
             return_value=("lutris-id", False),
         ):
             lutris = build_launch_handoff(lutris_game)
@@ -4714,7 +4828,7 @@ def test_launcher_aware_handoffs() -> None:
 
         faugus_game = _FakeHandoffGame("faugus_gameid", "faugus-id")
         with patch(
-            "Utils.faugus_finder.find_faugus_launch_info",
+            "Utils.launchers.faugus.find_faugus_launch_info",
             return_value=("faugus-id", True),
         ):
             faugus = build_launch_handoff(faugus_game)
@@ -4733,7 +4847,7 @@ def test_launcher_aware_handoffs() -> None:
         native_faugus_game = _FakeHandoffGame(
             "faugus_gameid", "native-faugus-id")
         with patch(
-            "Utils.faugus_finder.find_faugus_launch_info",
+            "Utils.launchers.faugus.find_faugus_launch_info",
             return_value=("native-faugus-id", False),
         ):
             native_faugus = build_launch_handoff(native_faugus_game)
@@ -4746,7 +4860,7 @@ def test_launcher_aware_handoffs() -> None:
         # strips it and forwards the launcher's original argv losslessly.
         with patch("Utils.config_paths.cli_invocation",
                    return_value=["/bin/echo", "AMETHYST"]), patch(
-            "Utils.faugus_finder.find_faugus_launch_info",
+            "Utils.launchers.faugus.find_faugus_launch_info",
             return_value=("native-faugus-id", False),
         ):
             build_launch_handoff(native_faugus_game)
@@ -4759,7 +4873,7 @@ def test_launcher_aware_handoffs() -> None:
             "AMETHYST launch Handoff_Test -- runner game path/Game.exe")
 
         steam_game = _FakeHandoffGame("shortcut_appid", "123456")
-        with patch("Utils.flatpak_sandbox.sandbox_app_for_game",
+        with patch("Utils.flatpak.sandbox.sandbox_app_for_game",
                    return_value=None):
             steam = build_launch_handoff(steam_game)
         assert steam is not None and steam.launcher_id == "steam"
@@ -4767,7 +4881,7 @@ def test_launcher_aware_handoffs() -> None:
             steam.fields[0].value.replace(" %command%", "")) == [
                 str(short_script), "--"]
 
-        with patch("Utils.flatpak_sandbox.sandbox_app_for_game",
+        with patch("Utils.flatpak.sandbox.sandbox_app_for_game",
                    return_value="com.valvesoftware.Steam"):
             flatpak_steam = build_launch_handoff(steam_game)
         assert flatpak_steam is not None
@@ -4783,7 +4897,7 @@ def test_launcher_aware_handoffs() -> None:
         # the launcher sandbox.
         external = _FakeHandoffGame("heroic_app_name", "heroic-id")
         external.vfs_launch_enabled = False
-        with patch("Utils.launch_handoff._heroic_launch_is_flatpak",
+        with patch("Utils.launchers.handoff._heroic_launch_is_flatpak",
                    return_value=True):
             external_handoff = build_launch_handoff(external)
         assert external_handoff is not None
@@ -4908,7 +5022,7 @@ def test_launcher_handoff_is_transparent_when_undeployed() -> None:
         deployed = _DeployedGame(Path(tmp))
         with (
             patch("os.execvp") as execvp,
-            patch("Utils.deploy_pipeline.run_deploy_pipeline") as deploy,
+            patch("Utils.deployment.pipeline.run_deploy_pipeline") as deploy,
         ):
             cmd_launch(
                 {deployed.name: deployed}, deployed.game_id,
@@ -4944,7 +5058,7 @@ def test_flatpak_cli_handoff_scrubs_steam_runtime_loader() -> None:
 
 def test_flatpak_epic_auth_finds_host_heroic() -> None:
     """Amethyst's sandbox must discover Heroic's host-side legendary."""
-    from Utils import heroic_finder
+    from Utils.launchers import heroic
 
     heroic_root = Path("/home/test/.var/app/com.heroicgameslauncher.hgl/config/heroic")
 
@@ -4954,11 +5068,11 @@ def test_flatpak_epic_auth_finds_host_heroic() -> None:
         return None
 
     with (
-        patch.object(heroic_finder, "_in_flatpak_sandbox", return_value=True),
-        patch.object(heroic_finder.shutil, "which", side_effect=_which),
-        patch.object(heroic_finder.os, "access", return_value=False),
+        patch.object(heroic, "_in_flatpak_sandbox", return_value=True),
+        patch.object(heroic.shutil, "which", side_effect=_which),
+        patch.object(heroic.os, "access", return_value=False),
     ):
-        commands = heroic_finder._legendary_commands(heroic_root)
+        commands = heroic._legendary_commands(heroic_root)
 
     assert len(commands) == 1
     assert commands[0][:4] == [
@@ -4968,7 +5082,7 @@ def test_flatpak_epic_auth_finds_host_heroic() -> None:
 
 
 def test_flatpak_handoff_permission_is_deploy_managed() -> None:
-    from Utils.flatpak_sandbox import (
+    from Utils.flatpak.sandbox import (
         _has_session_bus_talk,
         ensure_launcher_handoff_access,
         ensure_symlink_target_access,
@@ -4991,14 +5105,14 @@ def test_flatpak_handoff_permission_is_deploy_managed() -> None:
     logs: list[str] = []
     completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
     with patch(
-        "Utils.faugus_finder.find_faugus_launch_info",
+        "Utils.launchers.faugus.find_faugus_launch_info",
         return_value=("faugus-id", True),
     ), patch(
-        "Utils.flatpak_sandbox._read_override_text", return_value="",
+        "Utils.flatpak.sandbox._read_override_text", return_value="",
     ), patch(
-        "Utils.flatpak_sandbox.subprocess.run", return_value=completed,
+        "Utils.flatpak.sandbox.subprocess.run", return_value=completed,
     ) as run, patch(
-        "Utils.flatpak_sandbox._notify_handoff_restart_needed",
+        "Utils.flatpak.sandbox._notify_handoff_restart_needed",
     ) as notify:
         ensure_launcher_handoff_access(game, log_fn=logs.append)
     commands = [call.args[0] for call in run.call_args_list]
@@ -5013,14 +5127,14 @@ def test_flatpak_handoff_permission_is_deploy_managed() -> None:
     # An existing manifest or user override is authoritative and must avoid
     # re-running the idempotent command (and avoid another restart prompt).
     with patch(
-        "Utils.faugus_finder.find_faugus_launch_info",
+        "Utils.launchers.faugus.find_faugus_launch_info",
         return_value=("faugus-id", True),
     ), patch(
-        "Utils.flatpak_sandbox._read_override_text",
+        "Utils.flatpak.sandbox._read_override_text",
         return_value=(
             "[Session Bus Policy]\norg.freedesktop.Flatpak=talk\n"
         ),
-    ), patch("Utils.flatpak_sandbox.subprocess.run") as run:
+    ), patch("Utils.flatpak.sandbox.subprocess.run") as run:
         ensure_launcher_handoff_access(game, log_fn=logs.append)
     run.assert_not_called()
 
@@ -5033,15 +5147,15 @@ def test_flatpak_handoff_permission_is_deploy_managed() -> None:
         with (
             patch("Utils.config_paths.get_default_staging_root",
                   return_value=launch_root),
-            patch("Utils.flatpak_sandbox.sandbox_app_for_game",
+            patch("Utils.flatpak.sandbox.sandbox_app_for_game",
                   return_value="io.github.Faugus.faugus-launcher"),
-            patch("Utils.flatpak_sandbox._granted_filesystems",
+            patch("Utils.flatpak.sandbox._granted_filesystems",
                   return_value=(set(), [])),
-            patch("Utils.flatpak_sandbox._baseline_filesystems",
+            patch("Utils.flatpak.sandbox._baseline_filesystems",
                   return_value=(set(), [])),
-            patch("Utils.flatpak_sandbox._grant_paths",
+            patch("Utils.flatpak.sandbox._grant_paths",
                   return_value=True) as grant,
-            patch("Utils.flatpak_sandbox._notify_restart_needed"),
+            patch("Utils.flatpak.sandbox._notify_restart_needed"),
         ):
             ensure_symlink_target_access(
                 game,
@@ -5093,7 +5207,7 @@ def main() -> None:
     test_native_bepinex_shadow_launch()
     test_native_none_launch_steam_context()
     test_native_steam_client_lifecycle()
-    test_direct_steam_launch_requires_running_client()
+    test_direct_steam_launch_starts_or_reports_client()
     test_native_vfs_flatpak_forwards_launch_environment()
     test_native_steam_handoff_fallback_is_not_recursive()
     test_proton_steam_handoff_fallback_is_not_recursive()

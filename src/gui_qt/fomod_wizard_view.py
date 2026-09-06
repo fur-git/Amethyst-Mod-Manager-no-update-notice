@@ -23,11 +23,11 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.theme_qt import active_palette, _c
-from Utils.fomod_installer import (
+from Utils.fomod.installer import (
     get_visible_steps, get_default_selections, update_flags,
     validate_selections, resolve_plugin_type, plugin_dep_unmet, plugin_dep_met,
 )
-from Utils.fomod_parser import resolve_path_ci
+from Utils.fomod.parser import resolve_path_ci
 
 
 class FomodWizardView(QWidget):
@@ -80,6 +80,9 @@ class FomodWizardView(QWidget):
         title = QLabel(self._config.name or self._mod_name)
         title.setStyleSheet("font-size:15px; font-weight:600;")
         hb.addWidget(title)
+        hb.addStretch(1)
+        self._step_name = QLabel("")
+        hb.addWidget(self._step_name)
         hb.addStretch(1)
         self._step_lbl = QLabel("")
         self._step_lbl.setStyleSheet(f"color:{self._c('TEXT_DIM')};")
@@ -299,6 +302,7 @@ class FomodWizardView(QWidget):
         self._show_plugin(selected_plugin or first_plugin)
 
         total = len(self._visible_steps)
+        self._step_name.setText(step.name.strip())
         self._step_lbl.setText(self.tr("Step {0} of {1}").format(self._cur + 1, total))
         self._back_btn.setEnabled(self._cur > 0)
         self._next_btn.setText(self.tr("Finish") if self._cur >= total - 1 else self.tr("Next"))

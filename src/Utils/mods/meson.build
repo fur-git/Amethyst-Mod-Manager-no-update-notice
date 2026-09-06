@@ -1,0 +1,18 @@
+py.install_sources(
+  '__init__.py',
+  'bain.py',
+  'copy.py',
+  'files.py',
+  'groups.py',
+  'install.py',
+  'install_as_mod.py',
+  'metadata.py',
+  'modlist.py',
+  'names.py',
+  'quick_update.py',
+  'remove.py',
+  'rename.py',
+  'staging.py',
+  'versions.py',
+  subdir: 'Utils/mods',
+)

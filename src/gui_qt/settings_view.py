@@ -1,12 +1,12 @@
 """Settings modal opened from the top-bar gear button.
 
 The settings UI is a dimmed, in-window modal rather than a detachable or
-panel-scoped tab. Six tabs group the existing settings into Appearance,
-Downloads, General, Paths, Advanced and About while keeping every setting's
-existing save-on-change behaviour.
+panel-scoped tab. Seven tabs group the existing settings into Appearance,
+Downloads, General, Shortcuts, Paths, Advanced and About while keeping every
+setting's existing save-on-change behaviour.
 
 Save-on-change: every control writes straight to amethyst.ini through the
-toolkit-free `Utils.ui_config` load_*/save_* helpers the moment it changes - there
+toolkit-free `Utils.ui.config` load_*/save_* helpers the moment it changes - there
 is no Save/Cancel button. Language and UI Scale take effect on restart; themes
 are applied to the running Qt application immediately.
 
@@ -33,12 +33,12 @@ per-section footer that `_finish_section` flushes at the bottom of the group.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QRect, QRectF, QSize
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import Qt, Signal, QRect, QRectF, QSize, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame,
     QLabel, QCheckBox, QComboBox, QSlider, QLineEdit, QPushButton, QGroupBox,
-    QApplication, QTabWidget, QAbstractButton, QSizePolicy,
+    QApplication, QTabWidget, QAbstractButton, QSizePolicy, QListWidget,
 )
 
 from gui_qt.theme_qt import active_palette, close_button, _c, _QT_DEFAULT_THEME
@@ -46,7 +46,9 @@ from gui_qt.help_marker import tip_text, make_help_marker, help_mark_qss
 from gui_qt.wheel_guard import no_wheel
 from gui_qt.flow_layout import FlowLayout, enable_height_for_width
 from gui_qt.overlay_base import OverlayBase
-from Utils import ui_config as uc
+from Utils.ui import config as uc
+
+CROWDIN_URL = "https://crowdin.com/project/amethyst-mod-manager"
 
 
 # ---------------------------------------------------------------------------
@@ -191,15 +193,19 @@ class SettingsView(OverlayBase):
         self._tabs.setDocumentMode(True)
         self._tabs.tabBar().setExpanding(False)
         outer.addWidget(self._tabs, 1)
+        self._pending_tabs: dict[int, tuple[QVBoxLayout, tuple]] = {}
 
-        self._add_tab(self.tr("Appearance"), self._build_user_interface)
+        self._add_tab(
+            self.tr("Appearance"), self._build_user_interface, eager=True)
         self._add_tab(
             self.tr("Downloads"), self._build_archives,
             self._build_downloads, self._build_extraction)
         self._add_tab(self.tr("General"), self._build_general)
+        self._add_tab(self.tr("Shortcuts"), self._build_shortcuts)
         self._add_tab(self.tr("Paths"), self._build_paths)
         self._add_tab(self.tr("Advanced"), self._build_advanced)
         self._add_tab(self.tr("About"), self._build_system_info)
+        self._tabs.currentChanged.connect(self._ensure_tab_built)
         self._tabs.setCurrentIndex(0)
 
         self.setStyleSheet(self._qss())
@@ -226,8 +232,8 @@ class SettingsView(OverlayBase):
         row.addWidget(close)
         outer.addWidget(bar)
 
-    def _add_tab(self, label: str, *builders) -> None:
-        """Build one independently scrollable settings tab."""
+    def _add_tab(self, label: str, *builders, eager: bool = False) -> None:
+        """Add one independently scrollable settings tab."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -235,14 +241,23 @@ class SettingsView(OverlayBase):
 
         body = QWidget()
         body.setObjectName("SettingsPage")
-        self._v = QVBoxLayout(body)
-        self._v.setContentsMargins(16, 14, 16, 18)
-        self._v.setSpacing(14)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(16, 14, 16, 18)
+        layout.setSpacing(14)
+        scroll.setWidget(body)
+        index = self._tabs.addTab(scroll, label)
+        self._pending_tabs[index] = (layout, builders)
+        if eager:
+            self._ensure_tab_built(index)
+
+    def _ensure_tab_built(self, index: int) -> None:
+        pending = self._pending_tabs.pop(index, None)
+        if pending is None:
+            return
+        self._v, builders = pending
         for build in builders:
             build()
         self._v.addStretch(1)
-        scroll.setWidget(body)
-        self._tabs.addTab(scroll, label)
 
     # ---- styling ----------------------------------------------------------
     def _qss(self) -> str:
@@ -277,8 +292,8 @@ class SettingsView(OverlayBase):
             font-weight: bold;
         }}
         {help_mark_qss(self._pal)}
-        QLabel#RestartNote {{ color: {c('TEXT_WARN')}; }}
         QLabel#Help {{ color: {c('TEXT_DIM')}; }}
+        QLabel#ScaleValue:disabled {{ color: {c('TEXT_DIM')}; }}
         QSlider::groove:horizontal {{
             height: 4px; background: {c('BG_DEEP')}; border-radius: 2px;
         }}
@@ -287,6 +302,10 @@ class SettingsView(OverlayBase):
             border-radius: 7px;
         }}
         QSlider::sub-page:horizontal {{ background: {c('ACCENT')}; border-radius: 2px; }}
+        QSlider#ScaleSlider::handle:horizontal:disabled,
+        QSlider#ScaleSlider::sub-page:horizontal:disabled {{
+            background: {c('TEXT_DIM')};
+        }}
         """
 
     # ---- section + control builders --------------------------------------
@@ -526,19 +545,13 @@ class SettingsView(OverlayBase):
         self._finish_section(theme_group)
 
         g = self._section(self.tr("User Interface"))
-        # Language row: the combo sits in the shared control column; its
-        # "Sync language files" button moves to the section footer with the
-        # other actions, so the option rows stay a clean label|control grid.
         row = self._next_row(g)
         g.addWidget(QLabel(self.tr("Language")), row, self.COL_LABEL)
         self._lang_combo = QComboBox()
         no_wheel(self._lang_combo)
-        # Keep the selector compact instead of stretching across the modal.
         self._lang_combo.setFixedWidth(self.COMBO_W)
         g.addWidget(self._lang_combo, row, self.COL_CTRL, Qt.AlignLeft)
         self._populate_language_combo()
-
-        self._build_ui_scale(g)
 
         # Applies live. As a side bar the buttons are icon-only, with their
         # labels as tooltips.
@@ -549,14 +562,25 @@ class SettingsView(OverlayBase):
              (self.tr("Right side"), "right")],
             uc.load_header_position(), self._save_header_position)
 
-        # Theme and toolbar position are live; only Language / UI Scale still
-        # need a restart. Indented to the control column so it reads as a note
-        # about the controls above rather than a row label of its own.
+        self._build_ui_scale(g)
+
         note = QLabel(self.tr(
             "Language and UI scale changes take effect after restart."))
-        note.setObjectName("RestartNote")
-        g.addWidget(note, self._next_row(g), self.COL_CTRL)
+        note.setObjectName("Help")
+        note.setWordWrap(True)
+        g.addWidget(note, self._next_row(g), self.COL_LABEL, 1, 2)
 
+        self._lang_sync_btn = self._action_row(
+            g, self.tr("Sync language files"), self._on_sync_languages)
+        crowdin_btn = self._action_row(
+            g, self.tr("Translate on Crowdin"), self._open_crowdin)
+        crowdin_btn.setToolTip(self._tip_text(self.tr(
+            "Open the Amethyst Crowdin project to help translate the app.")))
+        for button in (self._lang_sync_btn, crowdin_btn):
+            button.setObjectName("FooterButton")
+        self._finish_section(g)
+
+        g = self._section(self.tr("Mod list"))
         self._checkbox(
             g, self.tr("Hide BSA conflicts"),
             uc.load_hide_bsa_conflicts, uc.save_hide_bsa_conflicts,
@@ -571,7 +595,9 @@ class SettingsView(OverlayBase):
             uc.load_show_summary_tooltips, uc.save_show_summary_tooltips,
             help=self.tr("Show a mod's Nexus description as a tooltip when you "
                  "hover over its name in the mod list."))
+        self._finish_section(g)
 
+        g = self._section(self.tr("Status bar"))
         self._checkbox(
             g, self.tr("Hide Ko-Fi button"),
             uc.load_hide_kofi_button, uc.save_hide_kofi_button,
@@ -584,9 +610,11 @@ class SettingsView(OverlayBase):
             help=self.tr("Hide the Endorse AMM button in the status bar."),
             on_changed=lambda _v: self._apply_support_buttons())
 
-        self._lang_sync_btn = self._action_row(
-            g, self.tr("Sync language files"), self._on_sync_languages)
         self._finish_section(g)
+
+    def _open_crowdin(self) -> None:
+        """Open the Amethyst Crowdin project in the user's browser."""
+        QDesktopServices.openUrl(QUrl(CROWDIN_URL))
 
     def _save_header_position(self, value: str):
         """Persist the toolbar position, then move the bar there immediately."""
@@ -624,7 +652,7 @@ class SettingsView(OverlayBase):
     def refresh_theme_options(self, select_id: str | None = None):
         """Reload built-in/custom palettes and rebuild their preview tiles."""
         try:
-            from Utils.themes import load_display_names, load_palettes
+            from themes import load_display_names, load_palettes
             names = load_display_names()
             palettes = load_palettes()
         except Exception:
@@ -764,6 +792,11 @@ class SettingsView(OverlayBase):
             g, self.tr("UI Scale"), 50, 200, pct, lambda _v: None,
             help=self.tr("Make the whole interface bigger or smaller. "
                "Changes take effect after a restart."))
+        self._scale_slider.setObjectName("ScaleSlider")
+        self._scale_slider.setFixedWidth(self.COMBO_W)
+        self._scale_val_lbl.setObjectName("ScaleValue")
+        self._scale_val_lbl.setFixedWidth(
+            self._scale_val_lbl.fontMetrics().horizontalAdvance("200%") + 4)
         self._scale_slider.setSingleStep(5)
         self._scale_slider.setPageStep(10)
         self._scale_val_lbl.setText(f"{pct}%")
@@ -774,6 +807,7 @@ class SettingsView(OverlayBase):
         self._scale_slider.valueChanged.connect(self._on_scale_value_changed)
         self._scale_slider.sliderReleased.connect(self._commit_ui_scale)
         self._scale_slider.setEnabled(not is_auto)
+        self._scale_val_lbl.setEnabled(not is_auto)
 
         # Auto checkbox - sits below the slider; ticking it disables the slider.
         # Placed in the control column (not spanning from the label column) so
@@ -781,10 +815,11 @@ class SettingsView(OverlayBase):
         self._scale_auto_cb = QCheckBox(self.tr("Auto (match display)"))
         self._scale_auto_cb.setChecked(is_auto)
         self._scale_auto_cb.toggled.connect(self._on_ui_scale_auto_toggled)
-        g.addWidget(self._scale_auto_cb, self._next_row(g), self.COL_CTRL, 1, 2)
+        g.addWidget(self._scale_auto_cb, self._next_row(g), self.COL_CTRL)
 
     def _on_ui_scale_auto_toggled(self, on: bool):
         self._scale_slider.setEnabled(not on)
+        self._scale_val_lbl.setEnabled(not on)
         if on:
             # Enabling auto switches to the detected scale, which differs from
             # whatever manual value is applied - needs a restart to take effect.
@@ -923,8 +958,8 @@ class SettingsView(OverlayBase):
             g, self.tr("Download speed limit"), 0, 250,
             int(uc.load_download_speed_limit()), self._save_speed_limit,
             help=self.tr("Cap the combined download speed of all downloads "
-               "(collections, single mods, nxm links) so they don't use the "
-               "whole connection. Applies immediately, including to a running "
+               "(collections, single mods, nxm and modl links) so they don't use "
+               "the whole connection. Applies immediately, including to a running "
                "collection install."))
         def _fmt_limit(v, _lbl=lim_lbl):
             _lbl.setText(self.tr("Unlimited") if int(v) == 0 else
@@ -936,10 +971,10 @@ class SettingsView(OverlayBase):
             g, self.tr("Download only (don't install)"),
             uc.load_download_only, uc.save_download_only,
             help=self.tr("Downloads are saved to the cache but not installed. Applies "
-                 "to nxm:// links, the Nexus browser, Change Version, collection "
-                 "installs, requirement downloads and update/reinstall redownloads "
-                 "- their Install buttons become Download. Install them yourself "
-                 "from the Downloads tab or the Install Mod button."),
+                 "to nxm:// and modl:// links, the Nexus browser, Change Version, "
+                 "collection installs, requirement downloads and update/reinstall "
+                 "redownloads - their Install buttons become Download. Install them "
+                 "yourself from the Downloads tab or the Install Mod button."),
             on_changed=self._on_download_only_changed)
 
         # Manage Caches action - a footer button like every other action,
@@ -1030,6 +1065,10 @@ class SettingsView(OverlayBase):
         self._maybe_add_flatpak_enroll(g)
         self._finish_section(g)
 
+    def _build_shortcuts(self):
+        from gui_qt.shortcut_editor import ShortcutEditor
+        self._v.addWidget(ShortcutEditor(self._window, self))
+
     def _on_reset_dismissed_notices(self):
         """Confirm, then re-arm every "Don't show this again" notice."""
         from gui_qt.confirm_overlay import ConfirmOverlay
@@ -1072,7 +1111,7 @@ class SettingsView(OverlayBase):
         GNOME Software / Discover, delta downloads). Once enrolled, the button
         is hidden. No-op outside the flatpak or when already remote-tracked.
         """
-        from Utils.version_check import (
+        from Utils.github.app_updates import (
             is_flatpak, flatpak_installed_from_remote,
         )
         if not is_flatpak() or flatpak_installed_from_remote():
@@ -1089,8 +1128,8 @@ class SettingsView(OverlayBase):
     def _on_enroll_flatpak_remote(self):
         """Confirm, then add the remote + reinstall-from-remote (relaunches)."""
         from gui_qt.confirm_overlay import ConfirmOverlay
-        from Utils.version_check import enroll_flatpak_remote
-        from Utils.ui_config import load_allow_prerelease
+        from Utils.github.app_updates import enroll_flatpak_remote
+        from Utils.ui.config import load_allow_prerelease
 
         def _go(ok: bool):
             if not ok:
@@ -1189,6 +1228,30 @@ class SettingsView(OverlayBase):
         self._finish_section(g)
 
     def _build_advanced(self):
+        restore = self._section(self.tr("Global restore whitelist"))
+        intro = QLabel(self.tr(
+            "Matching runtime-created files stay in the game folder during "
+            "restore instead of being moved to Overwrite. File and folder "
+            "names match case-insensitively at any depth; * and ? wildcards "
+            "are supported. This applies to every game."))
+        intro.setObjectName("Help")
+        intro.setWordWrap(True)
+        restore.addWidget(
+            intro, self._next_row(restore), self.COL_LABEL, 1, 2)
+        try:
+            files, folders = uc.load_global_restore_whitelist()
+        except Exception:
+            files = list(uc.DEFAULT_GLOBAL_RESTORE_WHITELIST_FILES)
+            folders = list(uc.DEFAULT_GLOBAL_RESTORE_WHITELIST_FOLDERS)
+        self._restore_whitelist_lists: dict[str, QListWidget] = {}
+        self._restore_whitelist_row(
+            restore, "files", self.tr("File names"), files,
+            self.tr("File name or wildcard"), self.tr("Add file"))
+        self._restore_whitelist_row(
+            restore, "folders", self.tr("Folder names"), folders,
+            self.tr("Folder name or wildcard"), self.tr("Add folder"))
+        self._finish_section(restore)
+
         g = self._section(self.tr("Advanced"))
         # Summarise what's already set so the section isn't a blind door.
         try:
@@ -1210,10 +1273,83 @@ class SettingsView(OverlayBase):
             extra=summary)
         self._finish_section(g)
 
+    def _restore_whitelist_row(self, grid, kind: str, label: str,
+                               patterns, placeholder: str,
+                               add_label: str) -> None:
+        row = self._next_row(grid)
+        grid.addWidget(QLabel(label), row, self.COL_LABEL, Qt.AlignTop)
+        wrap = QVBoxLayout()
+        wrap.setContentsMargins(0, 0, 0, 0)
+        wrap.setSpacing(6)
+
+        values = QListWidget()
+        values.setMinimumHeight(78)
+        values.setMaximumHeight(110)
+        for pattern in patterns:
+            values.addItem(str(pattern))
+        self._restore_whitelist_lists[kind] = values
+        wrap.addWidget(values)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(6)
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        add = QPushButton(add_label)
+        add.setCursor(Qt.PointingHandCursor)
+        remove = QPushButton(self.tr("Remove selected"))
+        remove.setCursor(Qt.PointingHandCursor)
+        remove.setEnabled(False)
+        values.itemSelectionChanged.connect(
+            lambda: remove.setEnabled(bool(values.selectedItems())))
+        add.clicked.connect(
+            lambda: self._add_restore_whitelist_pattern(kind, edit))
+        edit.returnPressed.connect(
+            lambda: self._add_restore_whitelist_pattern(kind, edit))
+        remove.clicked.connect(
+            lambda: self._remove_restore_whitelist_patterns(kind))
+        controls.addWidget(edit, 1)
+        controls.addWidget(add)
+        controls.addWidget(remove)
+        wrap.addLayout(controls)
+
+        holder = QWidget()
+        holder.setLayout(wrap)
+        grid.addWidget(holder, row, self.COL_CTRL)
+
+    def _add_restore_whitelist_pattern(self, kind: str, edit: QLineEdit) -> None:
+        pattern = edit.text().strip()
+        if not pattern:
+            return
+        values = self._restore_whitelist_lists[kind]
+        key = pattern.casefold()
+        for index in range(values.count()):
+            if values.item(index).text().casefold() == key:
+                values.setCurrentRow(index)
+                return
+        values.addItem(pattern)
+        edit.clear()
+        self._save_restore_whitelist()
+
+    def _remove_restore_whitelist_patterns(self, kind: str) -> None:
+        values = self._restore_whitelist_lists[kind]
+        for item in values.selectedItems():
+            values.takeItem(values.row(item))
+        self._save_restore_whitelist()
+
+    def _save_restore_whitelist(self) -> None:
+        def _items(kind: str) -> list[str]:
+            values = self._restore_whitelist_lists[kind]
+            return [values.item(i).text() for i in range(values.count())]
+
+        self._safe_save(
+            uc.save_global_restore_whitelist,
+            _items("files"), _items("folders"))
+
     def _build_system_info(self):
         """Read-only environment facts + a Copy button, for bug reports."""
         g = self._section(self.tr("System Information"))
-        from Utils import system_info
+        from Utils.diagnostics import system as system_info
 
         try:
             pairs = system_info.collect()
@@ -1256,7 +1392,7 @@ class SettingsView(OverlayBase):
 
     def _copy_system_info(self):
         from PySide6.QtWidgets import QApplication
-        from Utils import system_info
+        from Utils.diagnostics import system as system_info
         try:
             QApplication.clipboard().setText("\n".join(system_info.log_lines()))
         except Exception:
@@ -1282,8 +1418,8 @@ class SettingsView(OverlayBase):
 
     def _save_speed_limit(self, value: int):
         # Apply to in-flight downloads immediately, then persist.
-        from Utils import bandwidth_limit
-        bandwidth_limit.set_limit_mbps(float(value))
+        from Utils.downloads import bandwidth
+        bandwidth.set_limit_mbps(float(value))
         self._safe_save(uc.save_download_speed_limit, float(value))
 
     def _on_download_only_changed(self, _value):
@@ -1307,7 +1443,7 @@ class SettingsView(OverlayBase):
 
     # ---- path browse / clear ----------------------------------------------
     def _browse_into(self, edit: QLineEdit, save_fn, title: str):
-        from Utils.portal_filechooser import pick_folder
+        from Utils.ui.portal import pick_folder
         pick_folder(f"Select {title}",
                     lambda path: self._folder_picked.emit((edit, save_fn, path)))
 
@@ -1315,7 +1451,7 @@ class SettingsView(OverlayBase):
                           filters=None):
         # Reuse the folder-picked signal/slot - the payload shape is identical
         # (edit, save_fn, path); pick_file just returns a file Path.
-        from Utils.portal_filechooser import pick_file
+        from Utils.ui.portal import pick_file
         pick_file(f"Select {title}",
                   lambda path: self._folder_picked.emit((edit, save_fn, path)),
                   filters=filters)

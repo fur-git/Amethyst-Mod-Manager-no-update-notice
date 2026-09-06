@@ -75,7 +75,7 @@ class EnderalSE(Fallout_3):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
             CustomRule(dest="", filenames=["skse64_loader.exe"], flatten=True, loose_only=True),
             CustomRule(dest="", filenames=["skse64*.dll"], flatten=True, loose_only=True),
@@ -114,6 +114,7 @@ class EnderalSE(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("enderalse"),
             *self._xedit_wizard_tools(
                 build="EnderalSEEdit", id_suffix="enderalse",
                 nexus_url="https://www.nexusmods.com/enderalspecialedition/mods/78?tab=files",

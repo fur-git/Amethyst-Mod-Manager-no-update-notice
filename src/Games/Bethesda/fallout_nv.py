@@ -112,6 +112,7 @@ class Fallout_NV(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("fonv"),
             *self._xedit_wizard_tools(
                 build="FNVEdit", id_suffix="fonv",
                 nexus_url="https://www.nexusmods.com/newvegas/mods/34703?tab=files",
@@ -152,7 +153,7 @@ class Fallout_NV(Fallout_3):
     
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
             CustomRule(dest="", filenames=["nvse*.dll"], flatten=True, loose_only=True),
             CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
@@ -176,8 +177,8 @@ class Fallout_NV(Fallout_3):
         # the runtime sweep would otherwise move it into Root_Folder/ whenever
         # _undo_4gb_patch skips it - auto-patching turned off between deploy
         # and restore, or a fresh unpatched exe after Steam verify-files.
-        from Utils.deploy import RestoreWhitelistRule
-        from Utils.fnv4gb_tools import BACKUP_NAME
+        from Utils.deployment import RestoreWhitelistRule
+        from Utils.bethesda.fnv4gb import BACKUP_NAME
         return super().restore_whitelist + [
             RestoreWhitelistRule(path="", filenames=[BACKUP_NAME]),
         ]
@@ -248,7 +249,7 @@ class Fallout_NV(Fallout_3):
         if game_root is None or not game_root.is_dir():
             return
         try:
-            from Utils.fnv4gb_tools import (
+            from Utils.bethesda.fnv4gb import (
                 EXE_NAME, inspect_exe, restore_backup,
             )
             info = inspect_exe(game_root)
@@ -265,7 +266,7 @@ class Fallout_NV(Fallout_3):
         game_root = self.get_game_path()
         if game_root is None or not game_root.is_dir():
             return
-        from Utils.fnv4gb_tools import (
+        from Utils.bethesda.fnv4gb import (
             BACKUP_NAME, EXE_NAME, apply_4gb_patch, inspect_exe,
         )
         patch_root = game_root
@@ -394,7 +395,7 @@ class Fallout_NC(Fallout_NV):
         *Fallout_NV.vanilla_plugins,
         *_new_california_plugins,
     ]
-    _ARCHIVE_INI_FILENAME = "FALLOUT.INI"
+    _ARCHIVE_INI_FILENAME = "Fallout.ini"
 
     @property
     def name(self) -> str:
@@ -471,6 +472,7 @@ class Fallout_NC(Fallout_NV):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("falloutnc"),
             *self._xedit_wizard_tools(
                 build="FNVEdit", id_suffix="fonv",
                 nexus_url="https://www.nexusmods.com/newvegas/mods/34703?tab=files",

@@ -12,10 +12,10 @@ vanilla-only selection shows NO menu (Tk parity: it filters to non-vanilla rows 
 returns early if none remain).
 
 Core items wired: Enable / Disable (single + multi), the ESL flag toggle
-(single + multi), and the userlist items (Add to userlist / Add to group /
-Remove from userlist / Show cycle / Show userlist rules - via view callbacks
-set by app._reload_plugins), plus links embedded in LOOT messages. The rest are
-gated greyed stubs.
+(single + multi), constrained priority changes, and the userlist items (Add to
+userlist / Add to group / Remove from userlist / Show cycle / Show userlist
+rules - via view callbacks set by app._reload_plugins), plus links embedded in
+LOOT messages. The rest are gated greyed stubs.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ from urllib.parse import urlsplit
 from PySide6.QtWidgets import QMenu
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, QCoreApplication, QT_TRANSLATE_NOOP
+
+from gui_qt.text_input_overlay import TextInputOverlay
 
 
 _MARKDOWN_LINK_RE = re.compile(
@@ -129,6 +131,10 @@ def _build_plugin_menu(view, model, row, toggleable, multi,
     else:
         act(_mt("Enable plugin"), lambda: _set_enabled(view, toggleable, True))
         act(_mt("Disable plugin"), lambda: _set_enabled(view, toggleable, False))
+
+    if not multi and model.is_movable(row):
+        divider()
+        act(_mt("Set priority…"), lambda: _set_priority(view, model, row))
 
     # ---- OpenMW groundcover classification -------------------------------
     groundcover_exts = tuple(
@@ -257,7 +263,7 @@ def _build_esl_items(view, model, esl_rows, multi, act, stub):
     game_type_attr = getattr(game, "loot_game_type", "") or ""
     paths = _plugin_paths(view)
 
-    from Utils.plugin_parser import is_esl_flagged, check_esl_eligible
+    from Utils.plugins.parser import is_esl_flagged, check_esl_eligible
 
     def esl_state(i):
         p = paths.get(model.row(i).name.lower())
@@ -310,6 +316,25 @@ def _set_enabled(view, indices, enabled: bool):
         cb()
 
 
+def _set_priority(view, model, row):
+    plugin = model.row(row)
+    priority = model.natural_index(plugin.name)
+
+    def _picked(text):
+        try:
+            value = int((text or "").strip())
+        except ValueError:
+            return
+        model.set_priority(row, value)
+
+    from PySide6.QtGui import QIntValidator
+    TextInputOverlay.show_over(
+        view, _mt("Set priority"), _mtf("Priority for {0}:", plugin.name),
+        _picked, initial=str(max(0, priority)),
+        validator=QIntValidator(0, 99999),
+    )
+
+
 def _set_groundcover(view, indices, enabled: bool):
     model = view.model()
     game = getattr(view, "game", None)
@@ -327,7 +352,7 @@ def _set_groundcover(view, indices, enabled: bool):
             PF_GROUNDCOVER,
             groundcover_plugins_for_profile,
         )
-        from Utils.profile_state import write_groundcover_plugins
+        from Utils.profiles.state import write_groundcover_plugins
         current = {
             name.lower(): name
             for name in groundcover_plugins_for_profile(game, profile_dir)
@@ -363,7 +388,7 @@ def _set_groundcover(view, indices, enabled: bool):
 def _toggle_esl(view, indices, enable: bool):
     """Port of Tk _toggle_esl_flag: skip .esl / unknown-path / ineligible rows,
     write the header flag, then refresh so the flag column repaints."""
-    from Utils.plugin_parser import set_esl_flag, check_esl_eligible
+    from Utils.plugins.parser import set_esl_flag, check_esl_eligible
     model = view.model()
     game = getattr(view, "game", None)
     game_type_attr = getattr(game, "loot_game_type", "") or ""
@@ -494,7 +519,7 @@ def _open_url(url: str) -> None:
     """Open a validated LOOT link using the host/Flatpak-aware launcher."""
     if not _valid_web_url(url):
         return
-    from Utils.xdg import open_url
+    from Utils.environment.xdg import open_url
     open_url(url)
 
 
@@ -523,10 +548,13 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("PluginMenu", "Not ESL-safe (per LOOT - compact in xEdit first)"),
     QT_TRANSLATE_NOOP("PluginMenu", "Open LOOT message link"),
     QT_TRANSLATE_NOOP("PluginMenu", "Open LOOT message link…"),
+    QT_TRANSLATE_NOOP("PluginMenu", "Priority for {0}:"),
     QT_TRANSLATE_NOOP("PluginMenu", "Remove ESL flag (un-light)"),
     QT_TRANSLATE_NOOP("PluginMenu", "Remove ESL flag from selected ({0})"),
     QT_TRANSLATE_NOOP("PluginMenu", "Remove from userlist"),
     QT_TRANSLATE_NOOP("PluginMenu", "Remove selected from userlist"),
+    QT_TRANSLATE_NOOP("PluginMenu", "Set priority"),
+    QT_TRANSLATE_NOOP("PluginMenu", "Set priority…"),
     QT_TRANSLATE_NOOP("PluginMenu", "Show cycle…"),
     QT_TRANSLATE_NOOP("PluginMenu", "Show overlapping plugins…"),
     QT_TRANSLATE_NOOP("PluginMenu", "Show userlist rules…"),

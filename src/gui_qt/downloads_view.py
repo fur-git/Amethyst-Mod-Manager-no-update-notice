@@ -1,7 +1,7 @@
 """Qt Downloads tab - scans archive folders (Downloads + per-game cache + extras),
 lists them grouped by source with Install/Reinstall buttons + checkboxes. Reuses
-Utils.downloads_core for all scanning/filtering/installed-detection, and
-Utils.download_locations for the (backward-compatible) settings. Built lazily:
+Utils.downloads.core for all scanning/filtering/installed-detection, and
+Utils.downloads.locations for the (backward-compatible) settings. Built lazily:
 only (re)scans when the sub-tab is visible.
 """
 
@@ -14,10 +14,21 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeView, QAbstractItemView,
 )
 
-import Utils.downloads_core as dc
-from gui_qt.downloads_model import (
-    DownloadsModel, COL_CHECK, COL_NAME, COL_SIZE, COL_INSTALL,
+import Utils.downloads.core as dc
+from Utils.downloads.locations import (
+    archive_path_key, load_hidden_archive_paths, save_hidden_archive_paths,
 )
+from gui_qt.downloads_model import (
+    DownloadsModel, COLUMNS, COL_CHECK, COL_NAME, COL_SIZE, COL_DOWNLOADED,
+    COL_INSTALL,
+)
+
+
+_COL_TO_SORTKEY = {
+    COL_NAME: "name", COL_SIZE: "size", COL_DOWNLOADED: "downloaded",
+}
+_TOGGLEABLE_COLUMNS = (COL_SIZE, COL_DOWNLOADED)
+_COLUMN_STATE_SECTION = "qt_columns_downloads"
 
 
 class DownloadsView(QWidget):
@@ -37,6 +48,8 @@ class DownloadsView(QWidget):
         self._search = ""
         self._only_installed = 0
         self._only_not_installed = 0
+        self._show_hidden = False
+        self._hidden_paths = load_hidden_archive_paths()
         self._inc_exts: set = set()
         self._exc_exts: set = set()
         self._inc_locs: set = set()
@@ -99,14 +112,26 @@ class DownloadsView(QWidget):
         self._model.dataChanged.connect(self._on_model_changed)
 
         from gui_qt.modlist_header import TkStyleHeader
-        col_mins = {COL_CHECK: 34, COL_NAME: 160, COL_SIZE: 70, COL_INSTALL: 100}
-        col_defaults = {COL_CHECK: 34, COL_SIZE: 90, COL_INSTALL: 100}
-        hdr = TkStyleHeader(self._tree, col_mins, col_defaults)
+        col_mins = {
+            COL_CHECK: 34, COL_NAME: 160, COL_SIZE: 70,
+            COL_DOWNLOADED: 100, COL_INSTALL: 100,
+        }
+        col_defaults = {
+            COL_CHECK: 34, COL_SIZE: 90, COL_DOWNLOADED: 110,
+            COL_INSTALL: 100,
+        }
+        hdr = TkStyleHeader(self, col_mins, col_defaults, parent=self._tree)
         self._tree.setHeader(hdr)
+        hdr.setSectionsClickable(True)
         hdr.setMinimumSectionSize(min(col_mins.values()))
+        hdr.setSortIndicatorShown(False)
+        hdr.setSortIndicator(-1, Qt.AscendingOrder)
+        hdr.sectionClicked.connect(self._on_header_sort_clicked)
         for col, wdt in col_defaults.items():
             self._tree.setColumnWidth(col, wdt)
+        self._column_defaults = col_defaults
         self._name_min = col_mins[COL_NAME]
+        self._restore_column_visibility()
         self._tree.viewport().installEventFilter(self)
         v.addWidget(self._tree, 1)
 
@@ -136,10 +161,11 @@ class DownloadsView(QWidget):
 
     def _draggable_path_at(self, pos):
         """The archive path under *pos* if a drag may start there: the Name or
-        Size cell of a real archive row (never the checkbox / Install button,
-        so press-and-slide on those still works as a click)."""
+        Size or Downloaded cell of a real archive row (never the checkbox /
+        Install button, so press-and-slide on those still works as a click)."""
         index = self._tree.indexAt(pos)
-        if not index.isValid() or index.column() not in (COL_NAME, COL_SIZE):
+        if (not index.isValid()
+                or index.column() not in (COL_NAME, COL_SIZE, COL_DOWNLOADED)):
             return None
         e = self._model.entry(index.row())
         if e is None or e.is_section_header or e.path is None:
@@ -205,10 +231,77 @@ class DownloadsView(QWidget):
             return
         others = (self._tree.columnWidth(COL_CHECK)
                   + self._tree.columnWidth(COL_SIZE)
+                  + self._tree.columnWidth(COL_DOWNLOADED)
                   + self._tree.columnWidth(COL_INSTALL))
         target = vp - others
         if target >= self._name_min and target != self._tree.columnWidth(COL_NAME):
             self._tree.header().resizeSection(COL_NAME, target)
+
+    # -- column sorting ----------------------------------------------------
+    def _on_header_sort_clicked(self, logical: int):
+        key = _COL_TO_SORTKEY.get(logical)
+        if key is None:
+            return
+        current, ascending = self._model.sort_state()
+        if current == key:
+            new_key, new_ascending = ((key, False) if ascending
+                                      else (None, True))
+        else:
+            new_key, new_ascending = key, True
+        self._model.set_sort(new_key, new_ascending)
+        hdr = self._tree.header()
+        if new_key is None:
+            hdr.setSortIndicator(-1, Qt.AscendingOrder)
+        else:
+            order = (Qt.AscendingOrder if new_ascending
+                     else Qt.DescendingOrder)
+            hdr.setSortIndicator(logical, order)
+        hdr.viewport().update()
+
+    def sort_triangle_spec(self, logical: int):
+        key = _COL_TO_SORTKEY.get(logical)
+        if key is None:
+            return None
+        current, ascending = self._model.sort_state()
+        return (current == key, ascending if current == key else True)
+
+    # -- column visibility -------------------------------------------------
+    def column_menu_items(self):
+        return [
+            (col, self._model.tr(COLUMNS[col]),
+             not self._tree.isColumnHidden(col))
+            for col in _TOGGLEABLE_COLUMNS
+        ]
+
+    def set_column_visible(self, col: int, visible: bool):
+        if col not in _TOGGLEABLE_COLUMNS:
+            return
+        self._tree.setColumnHidden(col, not visible)
+        if visible and self._tree.columnWidth(col) <= 0:
+            self._tree.header().resizeSection(
+                col, self._column_defaults.get(col, 90))
+        self._fit_name_to_width()
+        self._tree.viewport().update()
+        self._save_column_visibility()
+
+    def _save_column_visibility(self):
+        from gui_qt import column_state
+        hidden = {
+            COLUMNS[col] for col in _TOGGLEABLE_COLUMNS
+            if self._tree.isColumnHidden(col)
+        }
+        column_state.save_state(
+            {}, [], hidden, None, True, section=_COLUMN_STATE_SECTION)
+
+    def _restore_column_visibility(self):
+        from gui_qt import column_state
+        state = column_state.load_state(
+            section=_COLUMN_STATE_SECTION, columns=COLUMNS)
+        name_to_col = {COLUMNS[col]: col for col in _TOGGLEABLE_COLUMNS}
+        for name in state["hidden"]:
+            col = name_to_col.get(name)
+            if col is not None:
+                self._tree.setColumnHidden(col, True)
 
     # -- scan / filter ------------------------------------------------------
     def _game_name(self):
@@ -220,6 +313,7 @@ class DownloadsView(QWidget):
     def _rescan(self):
         name = self._game_name()
         self._update_watch_dirs(name)
+        self._hidden_paths = load_hidden_archive_paths()
         self._all_entries = dc.scan_download_dirs(name)
         self.filetypes_changed.emit()
         self._apply()
@@ -234,8 +328,11 @@ class DownloadsView(QWidget):
             locations_exclude=frozenset(self._exc_locs) or None,
             filetypes=frozenset(self._inc_exts) or None,
             filetypes_exclude=frozenset(self._exc_exts) or None,
-            search=self._search)
-        self._model.set_rows(rows, installed)
+            search=self._search,
+            hidden_paths=frozenset(self._hidden_paths),
+            show_hidden=self._show_hidden)
+        self._model.set_rows(
+            rows, installed, hidden_paths=frozenset(self._hidden_paths))
         self.selection_changed.emit()
 
     # -- auto-refresh (filesystem watch) ------------------------------------
@@ -278,9 +375,11 @@ class DownloadsView(QWidget):
     # -- filter spec / state ------------------------------------------------
     def filter_spec(self) -> list[dict]:
         return [
-            {"title": "By status", "type": "checks", "items": [
+            {"title": "By status", "type": "checks",
+             "two_state_keys": {"show_hidden"}, "items": [
                 ("only_installed", "Show only installed", True),
                 ("only_not_installed", "Show only not installed", True),
+                ("show_hidden", "Show hidden archives", True),
             ]},
             {"title": "By location", "type": "dynamic", "id": "locations"},
             {"title": "By file type", "type": "dynamic", "id": "filetypes"},
@@ -289,6 +388,7 @@ class DownloadsView(QWidget):
     def apply_filter_state(self, state: dict):
         self._only_installed = state.get("only_installed", 0)
         self._only_not_installed = state.get("only_not_installed", 0)
+        self._show_hidden = state.get("show_hidden", 0) == 1
         self._inc_exts = set(state.get("filetypes") or ())
         self._exc_exts = set(state.get("filetypes_exclude") or ())
         self._inc_locs = set(state.get("locations") or ())
@@ -346,6 +446,30 @@ class DownloadsView(QWidget):
     def clear_checks(self):
         self._model.clear_checks()
         self.selection_changed.emit()
+
+    def selected_all_hidden(self) -> bool:
+        paths = self._model.checked_paths()
+        return bool(paths) and all(
+            archive_path_key(path) in self._hidden_paths for path in paths)
+
+    def set_selected_hidden(self, hidden: bool) -> int:
+        paths = self._model.checked_paths()
+        if not paths:
+            return 0
+        keys = {archive_path_key(path) for path in paths}
+        updated = set(self._hidden_paths)
+        before = len(updated)
+        if hidden:
+            updated.update(keys)
+            changed = len(updated) - before
+        else:
+            updated.difference_update(keys)
+            changed = before - len(updated)
+        save_hidden_archive_paths(updated)
+        self._hidden_paths = updated
+        self._model.clear_checks()
+        self._apply()
+        return changed
 
     def install_selected(self):
         paths = self.checked_paths()

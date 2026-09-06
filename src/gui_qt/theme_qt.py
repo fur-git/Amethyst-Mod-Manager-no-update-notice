@@ -1,6 +1,6 @@
 """Qt theming - builds a QSS stylesheet from the existing theme palettes.
 
-The palette data in ``gui/themes/*.py`` is plain ``{KEY: "#hex"}`` dicts
+The palette data in ``themes/*.py`` is plain ``{KEY: "#hex"}`` dicts
 (toolkit-neutral), so the Qt app reuses it directly rather than duplicating
 colours. Per-theme overrides flow through the same ``THEME_DEFAULTS_OVERRIDE``
 mechanism the Tk app uses.
@@ -14,8 +14,8 @@ import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Callable
 
-from Utils.themes import load_palettes
-from Utils.ui_config import get_appearance_mode
+from themes import load_palettes
+from Utils.ui.config import get_appearance_mode
 
 if TYPE_CHECKING:
     from PySide6.QtGui import QColor, QPalette
@@ -72,7 +72,7 @@ def _tinted_icon_url(name: str, color: str) -> str:
 # The Qt app defaults to the signature "amethyst" palette (violet accent over
 # cool near-black zinc). The original near-black "dark" palette with the blue
 # #0078d4 accent stays available as appearance_mode = "dark", as does Breeze
-# Dark as "breeze". Existing installs keep "dark" - Utils.ui_config pins it.
+# Dark as "breeze". Existing installs keep "dark" - Utils.ui.config pins it.
 _QT_DEFAULT_THEME = "amethyst"
 
 
@@ -1120,6 +1120,82 @@ def qc(pal: dict, key: str) -> "QColor":
     the incantation every delegate __init__ repeats per colour."""
     from PySide6.QtGui import QColor
     return QColor(_c(pal, key))
+
+
+def _contrast_ratio(a: str, b: str) -> float:
+    """WCAG contrast ratio between two "#rrggbb" colours (1.0 = identical)."""
+    def _rel_lum(h):
+        h = h.lstrip("#")
+        if len(h) != 6:
+            return 0.0
+        try:
+            ch = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        except ValueError:
+            return 0.0
+        def _lin(c):
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+        r, g, b = (_lin(c) for c in ch)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    la, lb = _rel_lum(a), _rel_lum(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def link_on(pal: dict, bg_key: str, text_key: str = "TEXT_MAIN",
+            min_ratio: float = 2.2, min_vs_text: float = 1.8) -> "QColor":
+    """QColor for "this text is clickable" on the *bg_key* fill.
+
+    Has to satisfy two constraints at once, and themes routinely break both:
+
+    * legible against the fill - many themes derive BG_SELECT from the same
+      accent as LINK_BLUE (Breeze/Adwaita/Pip-Boy use the identical value), so
+      a plain accent tint disappears on a selected row; and
+    * distinct from the text it replaces - monochrome themes build everything
+      from one hue, so Cyberpunk's #00e5ff link on #00ffff text (and Pip-Boy's
+      green on green) is invisible *as a hover cue* even though it is perfectly
+      readable. Hue cannot separate those, because the theme only has one hue.
+
+    Prefer the theme's own LINK_BLUE when it clears both. Otherwise separate it
+    on the brightness axis instead - stepping toward whichever end of the range
+    the fill can still carry - so single-hue themes keep their colour and still
+    visibly change on hover."""
+    from PySide6.QtGui import QColor
+    link, bg = _c(pal, "LINK_BLUE"), _c(pal, bg_key)
+    text = _c(pal, text_key)
+
+    def _ok(c):
+        return (_contrast_ratio(c, bg) >= min_ratio
+                and _contrast_ratio(c, text) >= min_vs_text)
+
+    if _ok(link):
+        return QColor(link)
+
+    # Walk the accent toward white and toward black in steps, taking the first
+    # that clears the fill *and* separates from the body text. Ordering by step
+    # size keeps the result as close to the theme's accent as the palette allows.
+    for step in (0.25, 0.4, 0.55, 0.7, 0.85):
+        for target in ("#ffffff", "#000000"):
+            cand = _mix(link, target, step)
+            if _ok(cand):
+                return QColor(cand)
+
+    # Nothing derived from the accent worked; fall back to the plain legible
+    # text for the fill, which is at worst a readable non-cue.
+    return QColor(contrast_text(bg))
+
+
+def _mix(a: str, b: str, factor: float) -> str:
+    """Blend *a* toward *b* by *factor* (0..1)."""
+    ha, hb = a.lstrip("#"), b.lstrip("#")
+    if len(ha) != 6 or len(hb) != 6:
+        return a
+    try:
+        ca = [int(ha[i:i + 2], 16) for i in (0, 2, 4)]
+        cb = [int(hb[i:i + 2], 16) for i in (0, 2, 4)]
+    except ValueError:
+        return a
+    out = [int(x + (y - x) * factor) for x, y in zip(ca, cb)]
+    return "#%02x%02x%02x" % tuple(out)
 
 
 def qc_contrast(pal: dict, key: str) -> "QColor":

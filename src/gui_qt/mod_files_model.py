@@ -1,7 +1,7 @@
 """Qt tree model for the Mod Files tab.
 
 A QAbstractItemModel over a folder/file hierarchy built from a mod's raw file
-listing (Utils.mod_files.build_tree). Four columns:
+listing (Utils.mods.files.build_tree). Four columns:
 
   0  File name  - the tree (folder/file names)
   1  Top Level  - checkbox: is this path promoted to deploy at the game root
@@ -9,17 +9,17 @@ listing (Utils.mod_files.build_tree). Four columns:
   3  Disable    - checkbox: is this file excluded from deploy (folders = tri-state)
 
 The model is display-only state; all persistence + the strip/exclusion
-algorithms live in Utils.mod_files. The view drives saves on checkbox clicks.
+algorithms live in Utils.mods.files. The view drives saves on checkbox clicks.
 """
 
 from __future__ import annotations
 
-import textwrap
-
 from PySide6.QtCore import (
-    Qt, QAbstractItemModel, QCoreApplication, QModelIndex, QT_TRANSLATE_NOOP)
+    Qt, QAbstractItemModel, QCoreApplication, QModelIndex, QT_TRANSLATE_NOOP,
+    Signal)
 
 from gui_qt.theme_qt import bind_theme, qc
+from gui_qt.tooltips import wrap_tooltip
 
 COL_NAME = 0
 COL_TOPLEVEL = 1
@@ -89,6 +89,8 @@ class _Node:
 
 
 class ModFilesModel(QAbstractItemModel):
+    themeChanged = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._root = _Node("", "", is_dir=True)
@@ -102,20 +104,7 @@ class ModFilesModel(QAbstractItemModel):
         self._c_dim = qc(p, "FILE_DIM")
         self._c_win = qc(p, "FILE_WIN")
         self._c_lose = qc(p, "FILE_LOSE")
-        self._emit_theme_changed()
-
-    def _emit_theme_changed(self, parent=QModelIndex()) -> None:
-        rows = self.rowCount(parent)
-        if not rows:
-            return
-        self.dataChanged.emit(
-            self.index(0, 0, parent),
-            self.index(rows - 1, COL_DISABLE, parent),
-            [Qt.ForegroundRole])
-        for row in range(rows):
-            child = self.index(row, 0, parent)
-            if self.rowCount(child):
-                self._emit_theme_changed(child)
+        self.themeChanged.emit()
 
     # ---- population -------------------------------------------------------
     def set_root(self, root: _Node, by_path: dict[str, _Node]):
@@ -179,8 +168,7 @@ class ModFilesModel(QAbstractItemModel):
         widths in its rich-text subset), so we insert the breaks ourselves.
         """
         text = QCoreApplication.translate("ModFilesModel", COLUMN_TIPS[section])
-        return textwrap.fill(text, width=64, break_long_words=False,
-                             break_on_hyphens=False)
+        return wrap_tooltip(text)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal:
@@ -297,7 +285,7 @@ class ModFilesModel(QAbstractItemModel):
                 stack.extend(n.children)
         return out
 
-    # ---- mutation (view calls these, then persists via Utils.mod_files) ---
+    # ---- mutation (view calls these, then persists via Utils.mods.files) ---
     def set_disabled_subtree(self, node: _Node, included: bool):
         """Set the Disable state for a node + all descendants (folder toggle)."""
         if node.is_dir:
