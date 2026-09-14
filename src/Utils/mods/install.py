@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from Utils.archives.budget import ArchiveProbe, probe_archive
+from Utils.downloads.core import record_download_install
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, Optional[str]], None]
@@ -45,6 +46,16 @@ BAIN_DEFERRED = "__BAIN_DEFERRED__"
 # (parallel batch installs, collection install consumers) would otherwise
 # race, silently dropping entries.
 _commit_lock = threading.Lock()
+
+_SMALL_ZIP_MAX_ARCHIVE_BYTES = 1024 * 1024
+_SMALL_ZIP_MAX_EXPANDED_BYTES = 64 * 1024 * 1024
+_SMALL_ZIP_MAX_MEMBERS = 2048
+_ZIPFILE_COMPRESSION_TYPES = {
+    zipfile.ZIP_STORED,
+    zipfile.ZIP_DEFLATED,
+    zipfile.ZIP_BZIP2,
+    zipfile.ZIP_LZMA,
+}
 
 
 class UnsafeInstallPath(ValueError):
@@ -668,6 +679,18 @@ def stage_file_list(game, extract_dir: str, *, is_root_install: bool = False,
     return filtered
 
 
+def _bain_content_prefixes(game) -> set[str]:
+    return {
+        *(getattr(game, "mod_folder_strip_prefixes", None) or ()),
+        *(getattr(game, "mod_folder_strip_prefixes_post", None) or ()),
+    }
+
+
+def _bain_data_dirs(game) -> set[str]:
+    return _bain_content_prefixes(game) | set(
+        getattr(game, "mod_required_top_level_folders", None) or ())
+
+
 # ---------------------------------------------------------------- temp location
 # Guards /tmp space accounting so parallel extractions (collection installs run
 # several workers at once) don't all claim the same free space before any of
@@ -919,11 +942,28 @@ def _debackslash_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
     return moved
 
 
-def _validate_zip_member_paths(archive_path: str) -> None:
+def _small_zip_fast_path_eligible(archive_path: str) -> bool:
+    try:
+        if os.path.getsize(archive_path) > _SMALL_ZIP_MAX_ARCHIVE_BYTES:
+            size_ok = False
+        else:
+            size_ok = True
+    except OSError:
+        size_ok = False
     with zipfile.ZipFile(archive_path, "r") as archive:
-        for member in archive.infolist():
+        members = archive.infolist()
+        expanded = 0
+        conventional = size_ok and len(members) <= _SMALL_ZIP_MAX_MEMBERS
+        for member in members:
             _normalise_relative_install_path(
                 member.filename, label="archive member", allow_empty=False)
+            expanded += max(0, member.file_size)
+            if (member.flag_bits & 0x1
+                    or member.compress_type not in _ZIPFILE_COMPRESSION_TYPES
+                    or (not (member.flag_bits & 0x800)
+                        and not member.filename.isascii())):
+                conventional = False
+        return conventional and expanded <= _SMALL_ZIP_MAX_EXPANDED_BYTES
 
 
 def _fix_perms_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
@@ -990,7 +1030,8 @@ def _fix_nonutf8_names_extracted_tree(extract_dir: str, log_fn: LogFn) -> int:
 
 def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
                      cancel=None, error_sink: "list[str] | None" = None,
-                     progress_cb: "Callable[[int], None] | None" = None) -> bool:
+                     progress_cb: "Callable[[int], None] | None" = None,
+                     *, cpu_threads: int | None = None, finalize=None) -> bool:
     """Extract *archive_path* into *dest_dir*. Native 7z → bsdtar → py7zr →
     Python zipfile/tarfile, mirroring gui.install_mod's fallback chain. After a
     successful native/zip extraction, backslash-named members are normalised
@@ -1014,9 +1055,10 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
         if error_sink is not None:
             error_sink.append(str(err))
 
+    small_zip = False
     try:
         if zipfile.is_zipfile(archive_path):
-            _validate_zip_member_paths(archive_path)
+            small_zip = _small_zip_fast_path_eligible(archive_path)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         _note(exc)
         log_fn(f"Unsafe archive path rejected ({exc}).")
@@ -1030,7 +1072,10 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
                 tf.extractall(dest_dir, filter="data")
             # tarfile's "data" filter keeps member modes (masked to 0755), so a
             # mode-000 member stays unreadable here too.
-            _fix_perms_extracted_tree(dest_dir, log_fn)
+            if finalize is not None:
+                finalize(dest_dir)
+            else:
+                _fix_perms_extracted_tree(dest_dir, log_fn)
             log_fn("Extracted with tarfile.")
             return True
         except Exception as exc:
@@ -1039,6 +1084,9 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
             # fall through to the generic extractors
 
     def _ok() -> bool:
+        if finalize is not None:
+            finalize(dest_dir)
+            return True
         # Archives can carry a mode-000 Unix attribute; clear it FIRST or the
         # repair sweeps below (and staging) can't even read the tree.
         _fix_perms_extracted_tree(dest_dir, log_fn)
@@ -1062,6 +1110,50 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
     if _cancelled():
         return False
 
+    def _extract_zipfile() -> bool:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            infos = archive.infolist()
+            total = sum(info.file_size for info in infos) or 1
+            done = 0
+            last_pct = -1
+            permissions = []
+            for info in infos:
+                if _cancelled():
+                    return False
+                extracted = archive.extract(info, dest_dir)
+                mode = (info.external_attr >> 16) & 0o777
+                if mode:
+                    permissions.append((extracted, mode))
+                done += info.file_size
+                if progress_cb is not None:
+                    pct = min(100, int(done * 100 / total))
+                    if pct != last_pct:
+                        last_pct = pct
+                        progress_cb(pct)
+            for extracted, mode in permissions:
+                try:
+                    os.chmod(extracted, mode)
+                except OSError:
+                    pass
+        return True
+
+    if small_zip:
+        try:
+            if not _extract_zipfile():
+                log_fn("Extraction cancelled (zipfile).")
+                return False
+            log_fn("Extracted small ZIP with zipfile.")
+            return _ok()
+        except Exception as exc:
+            _note(exc)
+            log_fn(f"Small ZIP extraction failed ({exc}), trying compatibility extractors…")
+            try:
+                shutil.rmtree(dest_dir)
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError as cleanup_exc:
+                _note(cleanup_exc)
+                return False
+
     # Extraction resource limits (Settings ▸ Downloads & Collections). Read per
     # archive so a settings change applies to the next extraction without a
     # restart - the INI parse is trivial next to the extractor spawn it gates.
@@ -1071,6 +1163,8 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
     except Exception:
         _limits = {}
     _threads = int(_limits.get("cpu_threads", 0) or 0)
+    if cpu_threads is not None:
+        _threads = min(_threads or cpu_threads, cpu_threads)
     _low_prio = bool(_limits.get("low_priority", False))
     _mmt = f"-mmt={_threads}" if _threads > 0 else "-mmt=on"
 
@@ -1116,22 +1210,9 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
     if _cancelled():
         return False
     try:
-        with zipfile.ZipFile(archive_path, "r") as z:
-            infos = z.infolist()
-            total = sum(i.file_size for i in infos) or 1
-            done = 0
-            last_pct = -1
-            for info in infos:
-                if _cancelled():
-                    log_fn("Extraction cancelled (zipfile).")
-                    return False
-                z.extract(info, dest_dir)
-                done += info.file_size
-                if progress_cb is not None:
-                    pct = min(100, int(done * 100 / total))
-                    if pct != last_pct:
-                        last_pct = pct
-                        progress_cb(pct)
+        if not _extract_zipfile():
+            log_fn("Extraction cancelled (zipfile).")
+            return False
         log_fn("Extracted with zipfile.")
         return _ok()
     except Exception as exc:
@@ -1542,9 +1623,13 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
     if fomod_result is None and getattr(game, "supports_bain", True):
         try:
             from Utils.mods.bain import detect_bain, bain_unwrap_single_folder
-            bain_root = bain_unwrap_single_folder(str(extract_dir))
+            bain_prefixes = _bain_content_prefixes(game)
+            bain_data_dirs = _bain_data_dirs(game)
+            bain_root = bain_unwrap_single_folder(
+                str(extract_dir), extra_data_dirs=bain_data_dirs)
             subpkgs = detect_bain(
-                bain_root, extra_exts=getattr(game, "plugin_extensions", None))
+                bain_root, extra_exts=getattr(game, "plugin_extensions", None),
+                extra_data_dirs=bain_data_dirs)
         except Exception as exc:
             log_fn(f"BAIN detection failed ({exc}); will install verbatim.")
             subpkgs = None
@@ -1554,7 +1639,7 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
             # picker's win/lose recolour needs them and must not walk the
             # disk on the GUI thread.
             from Utils.mods.bain import scan_subpackage_files
-            scan_subpackage_files(subpkgs)
+            scan_subpackage_files(subpkgs, bain_prefixes)
             prepared.bain_subpkgs = subpkgs
             prepared.bain_root = bain_root
             prepared.readme_text = _read_bain_readme(bain_root)
@@ -1785,6 +1870,8 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
                 p._preserved_endorsed = False
             if p.is_bundle():
                 old_bundle_spec = _read_old_bundle_spec(dest_root)
+            record_download_install(
+                p.profile_dir, dest_root, log_fn=log_fn)
             log_fn(f"Replacing existing mod folder: {p.mod_name}")
             shutil.rmtree(dest_root, ignore_errors=True)
             p._preserve_position = True
@@ -1811,6 +1898,8 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
                         p._preserved_endorsed = False
                     if p.is_bundle():
                         old_bundle_spec = _read_old_bundle_spec(dest_root)
+                    record_download_install(
+                        p.profile_dir, dest_root, log_fn=log_fn)
                     log_fn(f"Replacing existing mod folder: {p.mod_name}")
                     shutil.rmtree(dest_root, ignore_errors=True)
                     p._preserve_position = True
@@ -1860,7 +1949,9 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
                 bain_selected = [pkg.name for pkg in p.bain_subpkgs
                                  if pkg.default_selected]
                 log_fn("BAIN: using default sub-package selection.")
-            file_list = resolve_bain_files(p.bain_subpkgs, set(bain_selected))
+            file_list = resolve_bain_files(
+                p.bain_subpkgs, set(bain_selected),
+                _bain_content_prefixes(p.game))
             log_fn(f"BAIN: {len(bain_selected)} sub-package(s), "
                    f"{len(file_list)} file(s) to install.")
             dest_root.mkdir(parents=True, exist_ok=True)
@@ -1985,6 +2076,8 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
     # "Check updates".
     _check_nexus_flags_after_install(p.game, p.mod_name, log_fn,
                                      profile_dir=p.profile_dir)
+    record_download_install(
+        p.profile_dir, dest_root, archive_name=p.archive.name, log_fn=log_fn)
     log_fn(f"Installed '{p.mod_name}'.")
     return p.mod_name
 
@@ -2302,12 +2395,10 @@ def install_collection_archive(
                     is_fomod_install = False
 
         # ---- BAIN ---------------------------------------------------------
-        elif getattr(game, "supports_bain", True):
-            from Utils.mods.bain import (
-                detect_bain, resolve_bain_files, bain_unwrap_single_folder)
-            bain_root = bain_unwrap_single_folder(str(prepared.extract_dir))
-            bain_subpkgs = detect_bain(
-                bain_root, extra_exts=getattr(game, "plugin_extensions", None))
+        elif prepared.is_bain():
+            from Utils.mods.bain import resolve_bain_files
+            bain_root = prepared.bain_root
+            bain_subpkgs = prepared.bain_subpkgs
             if bain_subpkgs:
                 stage_src_root = bain_root
                 default_names = [p.name for p in bain_subpkgs if p.default_selected]
@@ -2321,11 +2412,6 @@ def install_collection_archive(
                     selected = bain_auto_selections.get("selected", [])
                     log_fn("BAIN: applying exported selection automatically.")
                 elif resolve_bain is not None:
-                    # Worker thread: fill the per-package file sets before the
-                    # picker shows (its recolour must not walk the disk on the
-                    # GUI thread).
-                    from Utils.mods.bain import scan_subpackage_files
-                    scan_subpackage_files(bain_subpkgs)
                     result = resolve_bain(bain_subpkgs, bain_root, prepared.mod_name)
                     if result is None:
                         log_fn("BAIN install cancelled.")
@@ -2340,7 +2426,9 @@ def install_collection_archive(
                     _write_profile_bain_selection(
                         game, prepared.mod_name, {"selected": selected},
                         prepared.profile_dir)
-                    file_list = resolve_bain_files(bain_subpkgs, set(selected))
+                    file_list = resolve_bain_files(
+                        bain_subpkgs, set(selected),
+                        _bain_content_prefixes(game))
                     log_fn(f"BAIN complete - {len(selected)} sub-package(s), "
                            f"{len(file_list)} file(s) to install.")
 
@@ -2361,6 +2449,8 @@ def install_collection_archive(
                 _preserved_endorsed = False
             if prepared.is_bundle():
                 old_bundle_spec = _read_old_bundle_spec(dest_root)
+            record_download_install(
+                profile_dir, dest_root, log_fn=log_fn)
             log_fn(f"Replacing existing mod folder: {prepared.mod_name}")
             shutil.rmtree(dest_root, ignore_errors=True)
 
@@ -2472,6 +2562,8 @@ def install_collection_archive(
             on_catalogued(prepared.mod_name)
         except Exception:
             pass
+    record_download_install(
+        profile_dir, dest_root, archive_name=archive.name, log_fn=log_fn)
     log_fn(f"Installed '{prepared.mod_name}'.")
     _fire_on_installed(on_installed, is_fomod_install)
     return prepared.mod_name
@@ -2929,6 +3021,8 @@ def _install_multi_mod(p: "PreparedInstall", log_fn: LogFn, _pp) -> str | None:
                 continue
             m_dest = staging_root / m_name
             if m_dest.exists():
+                record_download_install(
+                    p.profile_dir, m_dest, log_fn=log_fn)
                 log_fn(f"Replacing existing mod folder: {m_name}")
                 shutil.rmtree(m_dest, ignore_errors=True)
             m_dest.mkdir(parents=True, exist_ok=True)
@@ -2939,6 +3033,9 @@ def _install_multi_mod(p: "PreparedInstall", log_fn: LogFn, _pp) -> str | None:
                 _update_indexes(p.game, p.profile_dir, m_name, m_dest, log_fn)
                 _add_to_modlist(p.profile_dir, m_name, log_fn)
                 _add_plugins(p.game, p.profile_dir, m_dest, log_fn)
+            record_download_install(
+                p.profile_dir, m_dest,
+                archive_name=p.archive.name, log_fn=log_fn)
             log_fn(f"  Installed '{m_name}' → {m_dest}")
             installed.append(m_name)
     finally:
