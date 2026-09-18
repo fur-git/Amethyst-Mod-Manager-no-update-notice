@@ -1,19 +1,4 @@
-"""Double-ended download dispatch for collection installs (toolkit-neutral).
-
-Problem: with N equal download workers all pulling from one size-sorted list,
-many tiny archives finish faster than the Nexus API can hand out the next CDN
-link, so the queue stutters and bandwidth sits idle until a big mod happens to
-land in a slot.
-
-Fix: dedicate ONE worker to the largest-remaining mods (it stays busy on long
-transfers that keep the pipe full) and let the other workers burn through the
-smallest-remaining mods from the other end. They converge in the middle, so
-every mod is dispatched exactly once and the link-fetch latency of the small
-mods is hidden behind the big worker's ongoing transfer.
-
-This module only owns the *dispatch order*; the actual per-mod work (link
-fetch, download, hand-off to the install queue) is the caller's `work` fn.
-"""
+"""Bounded download dispatch with small-first and large-first lanes."""
 
 from __future__ import annotations
 
@@ -119,6 +104,8 @@ def run_pipelined(mods: list, fetch: Callable[[object], Any],
                   large_workers: int = 1,
                   large_download: "Callable[[object, Any], None] | None" = None,
                   strict_order: bool = False,
+                  size_key: "Callable[[object], int] | None" = None,
+                  group_key: "Callable[[object], object] | None" = None,
                   stop: "threading.Event | None" = None,
                   worker_done: "Callable[[], None] | None" = None,
                   spawn: Callable[[Callable, str], object] | None = None
@@ -151,6 +138,7 @@ def run_pipelined(mods: list, fetch: Callable[[object], Any],
     *large_download* - optional callback for items downloaded by those lanes.
     *strict_order* - publish prefetched items to each download lane in claim
                     order, even when concurrent link fetches finish out of order.
+    *size_key*    - identify unknown sizes at the end, claimed after known sizes.
     *stop*        - optional cancel event; when set, both stages drain the
                     remainder (feeding *download* with ``links=None``) so every
                     mod is still handed off once and the caller short-circuits.
@@ -174,15 +162,37 @@ def run_pipelined(mods: list, fetch: Callable[[object], Any],
     small_workers = dl_workers - large_workers
 
     lock = threading.Lock()
-    cursor = {"lo": 0, "hi": n - 1}
+    known_end = (next((i for i, mod in enumerate(mods) if size_key(mod) <= 0), n)
+                 if size_key is not None else n)
+    cursor = {"lo": 0, "hi": known_end - 1, "unknown": known_end}
     claim_sequence = {False: 0, True: 0}
     _READY_DONE = object()
+    grouped = {}
+    active_groups = {}
+    if group_key is not None:
+        from collections import deque
+        for mod in mods:
+            group = group_key(mod)
+            queues = grouped.setdefault(group, (deque(), deque()))
+            queues[int(size_key is not None and size_key(mod) <= 0)].append(mod)
+            active_groups[group] = 0
 
     def _claim(from_tail: bool):
         with lock:
-            if cursor["lo"] > cursor["hi"]:
-                return None, True, -1
-            if from_tail:
+            if group_key is not None:
+                candidates = [key for key, queues in grouped.items() if any(queues)]
+                if not candidates:
+                    return None, True, -1
+                group = min(candidates, key=lambda key: (active_groups[key], key))
+                known, unknown = grouped[group]
+                mod = (known.pop() if from_tail else known.popleft()) if known else unknown.popleft()
+                active_groups[group] += 1
+            elif cursor["lo"] > cursor["hi"]:
+                if cursor["unknown"] >= n:
+                    return None, True, -1
+                mod = mods[cursor["unknown"]]
+                cursor["unknown"] += 1
+            elif from_tail:
                 mod = mods[cursor["hi"]]
                 cursor["hi"] -= 1
             else:
@@ -234,6 +244,9 @@ def run_pipelined(mods: list, fetch: Callable[[object], Any],
                     # block on a full ready queue. Drop this mod and keep going.
                     pass
                 finally:
+                    if group_key is not None:
+                        with lock:
+                            active_groups[group_key(mod)] -= 1
                     if claim_gate is not None:
                         claim_gate.release()
         finally:
