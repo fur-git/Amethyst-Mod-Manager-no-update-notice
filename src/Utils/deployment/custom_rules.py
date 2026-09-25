@@ -9,13 +9,15 @@ behaviour preserved at the time of extraction.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import fnmatch
 import json
 import os
 import re
 import shutil
+import time
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from Utils.app_log import safe_log as _safe_log
 from Utils.atomic_write import write_atomic_text
@@ -211,7 +213,7 @@ def _match_single_rule(
         return strip_len, matched_ext or ""
     if rule.loose_only and not is_loose:
         return None
-    if matched_ext is not None and not folders and not filenames:
+    if matched_ext is not None and not folders:
         return -1, matched_ext
     if filenames and _name_match(filename, filenames):
         return -1, ""
@@ -642,6 +644,8 @@ def deploy_custom_rules(
     progress_fn=None,
     prefix_root: Path | None = None,
     claim_paths: set[str] | None = None,
+    projected_data_prefix: str | None = None,
+    projected_targets: tuple[str, ...] = ("game", "prefix"),
 ) -> set[str]:
     """Deploy filemap entries that match a CustomRule to their designated dirs.
 
@@ -664,10 +668,13 @@ def deploy_custom_rules(
     lowercased filemap paths. It lets callers preserve rule ownership while
     materializing different destination namespaces separately.
 
+    ``projected_data_prefix`` uses pinned destinations outside that Data
+    folder instead of matching rules again.
+
     A log of placed absolute paths and the identities of their destination
     roots are written beside the filemap for use by restore_custom_rules().
     """
-    if not rules:
+    if not rules and projected_data_prefix is None:
         return set()
 
     _log = _safe_log(log_fn)
@@ -749,7 +756,7 @@ def deploy_custom_rules(
     if skipped:
         _log(f"  Skipping {len(skipped)} prefix-routed rule(s): no Proton prefix configured.")
     rules = [r for r in rules if not (r.to_prefix and prefix_root is None)]
-    if not rules:
+    if not rules and projected_data_prefix is None:
         return set()
     overwrite_dir = staging_root.parent / "overwrite"
     _overwrite_str = str(overwrite_dir)
@@ -761,7 +768,7 @@ def deploy_custom_rules(
     # Extensions are kept as a list sorted longest-first so that multi-dot
     # extensions like ".dekcns.json" win over their plain ".json" suffix.
     _rules: list[tuple[CustomRule, set[str], list[str], set[str]]] = []
-    for rule in rules:
+    for rule in ([] if projected_data_prefix is not None else rules):
         ext_list = sorted({e.lower() for e in rule.extensions}, key=len, reverse=True)
         _rules.append((
             rule,
@@ -803,6 +810,31 @@ def deploy_custom_rules(
     _source_roots: dict[str, str] = {}
     for _entry in filegraph_entries():
         if not _entry.legacy_rel or _entry.mod_name == "[Root_Folder]":
+            continue
+        if projected_data_prefix is not None:
+            if _entry.target not in projected_targets:
+                continue
+            relative = _entry.destination.replace("\\", "/")
+            data_prefix = projected_data_prefix.strip("/").lower() + "/"
+            if _entry.target == "game" and relative.lower().startswith(data_prefix):
+                continue
+            if (_claim_paths is not None
+                    and _entry.legacy_rel.lower() not in _claim_paths):
+                continue
+            from Utils.environment.paths import has_path_traversal
+            if (not relative or has_path_traversal(relative)
+                    or Path(relative).is_absolute() or PureWindowsPath(relative).drive):
+                raise RuntimeError(f"Unsafe projected destination: {relative!r}")
+            prefix = _entry.target == "prefix"
+            base = prefix_root if prefix else game_root
+            if base is None:
+                raise RuntimeError("A Proton prefix is required for the resolved deployment.")
+            if _entry.source_path is None:
+                raise RuntimeError(f"Missing source for {_entry.legacy_rel}")
+            rule = CustomRule(dest="", to_prefix=prefix)
+            tasks.append((_entry.source_path,
+                          _resolve_destination(rule, base / relative), _entry.mod_name))
+            handled_lower.add(_entry.legacy_rel.lower())
             continue
         _legacy_rows.append((_entry.legacy_rel, _entry.mod_name))
         if _entry.source_root is None:
@@ -1331,28 +1363,77 @@ def restore_custom_rules(
 
     import stat as _stat
 
-    def _unlink_one(item: tuple[str, Path]) -> tuple[str, bool, int]:
+    def _unlink_one(
+        item: tuple[str, Path],
+    ) -> tuple[str, Path, bool, int, OSError | None]:
         abs_str, p = item
         try:
             st = os.lstat(p)
         except FileNotFoundError:
-            return abs_str, True, 0
-        except OSError:
-            return abs_str, False, 0
+            return abs_str, p, True, 0, None
+        except OSError as exc:
+            return abs_str, p, False, 0, exc
         if _stat.S_ISLNK(st.st_mode) or _stat.S_ISREG(st.st_mode):
             try:
                 os.unlink(p)
-                return abs_str, True, 1
-            except OSError:
-                return abs_str, False, 0
-        return abs_str, False, 0
+                return abs_str, p, True, 1, None
+            except OSError as exc:
+                return abs_str, p, False, 0, exc
+        if _stat.S_ISDIR(st.st_mode):
+            try:
+                os.rmdir(p)
+                return abs_str, p, True, 0, None
+            except OSError as exc:
+                return abs_str, p, False, 0, exc
+        exc = OSError(
+            errno.EINVAL,
+            f"refusing to remove journaled {_stat.filemode(st.st_mode)} target",
+            str(p),
+        )
+        return abs_str, p, False, 0, exc
 
+    failed_targets: list[tuple[str, Path, OSError]] = []
     if safe_targets:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_deploy_workers()) as pool:
-            for abs_str, cleared, n in pool.map(_unlink_one, safe_targets):
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_deploy_workers()
+        ) as pool:
+            for abs_str, p, cleared, n, exc in pool.map(
+                _unlink_one, safe_targets
+            ):
                 removed += n
                 if not cleared:
-                    retry_entries.append(abs_str)
+                    assert exc is not None
+                    failed_targets.append((abs_str, p, exc))
+
+    retryable_errnos = {
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.EINTR,
+        errno.ENOTEMPTY,
+        errno.ETXTBSY,
+        getattr(errno, "ESTALE", -1),
+    }
+    if any(exc.errno in retryable_errnos for _, _, exc in failed_targets):
+        time.sleep(0.05)
+    unresolved: list[tuple[str, Path, OSError]] = []
+    for abs_str, p, first_exc in failed_targets:
+        if first_exc.errno not in retryable_errnos:
+            unresolved.append((abs_str, p, first_exc))
+            continue
+        _, _, cleared, n, retry_exc = _unlink_one((abs_str, p))
+        removed += n
+        if cleared:
+            _log(f"  Custom rules restore: retry cleared {p}")
+        else:
+            assert retry_exc is not None
+            unresolved.append((abs_str, p, retry_exc))
+
+    failure_details: list[str] = []
+    for abs_str, p, exc in unresolved:
+        retry_entries.append(abs_str)
+        detail = f"{p}: {exc}"
+        failure_details.append(detail)
+        _log(f"  WARN: could not remove custom-routed {detail}")
 
     if retry_entries:
         stop_dirs = {game_root}
@@ -1364,9 +1445,14 @@ def restore_custom_rules(
             "\n".join(retry_entries),
             errors="surrogateescape",
         )
+        detail = (
+            f" First failure: {failure_details[0]}"
+            if failure_details else " Check the deployment log for the blocked path."
+        )
         raise RestoreIncompleteError(
             "Some custom-routed files could not be removed; their originals "
-            "and recovery journal were retained for another Restore attempt."
+            "and recovery journal were retained for another Restore attempt. "
+            f"{len(retry_entries)} path(s) remain.{detail}"
         )
 
     # Clear the journal before restoring originals. A retry after an

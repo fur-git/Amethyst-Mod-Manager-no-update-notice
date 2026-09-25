@@ -21,6 +21,7 @@ domains; the selector chooses which one this browser session uses.
 from __future__ import annotations
 
 import threading
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QDate, QStringListModel
 from PySide6.QtWidgets import (
@@ -36,6 +37,7 @@ from gui_qt.worker import run_in_worker
 from gui_qt.selector_button import SelectorButton
 from gui_qt.nexus_mod_card import NexusModCard, ThumbnailLoader, CARD_W
 from gui_qt.mouse_navigation import MouseNavigationFilter
+from Utils.diagnostics import performance as perftrace
 
 # label → API value (verbatim from Tk browse_mods_panel.SORT_KEYS / TIME_RANGES)
 SORT_KEYS = [
@@ -87,6 +89,7 @@ ENDORSEMENTS_PRESETS = [
 PAGE_SIZE_BROWSE = 30
 # User-selectable "shown per page" counts (footer dropdown).
 PAGE_SIZE_CHOICES = [20, 30, 40, 50]
+CARD_BATCH_SIZE = 8
 INSTALL_ALL_MAX_BYTES = 100 * 1024 * 1024
 INSTALL_ALL_CONCURRENCY = 4
 
@@ -152,9 +155,7 @@ class NexusBrowserView(QWidget):
         self._install_fn = install_fn or (lambda paths, metas=None: None)
         self._log = log_fn or (lambda m: None)
         # progress_fn(key, name, downloaded, total) reports one download's
-        # bytes to the host (which combines concurrent downloads into a single
-        # progress item); total<0 means "this download finished". Defaults to
-        # a no-op.
+        # status-bar item; total<0 means "this download finished".
         self._progress_fn = progress_fn or (lambda *args: None)
         self._dl_seq = 0                # unique progress-card key per download
 
@@ -180,7 +181,16 @@ class NexusBrowserView(QWidget):
         self._entries = []
         self._cards: list[NexusModCard] = []
         self._cols = 0
+        self._card_entries = []
+        self._card_next = 0
+        self._card_build_token = 0
+        self._card_build_started = 0.0
+        self._card_timer = QTimer(self)
+        self._card_timer.setSingleShot(True)
+        self._card_timer.setInterval(1)
+        self._card_timer.timeout.connect(self._append_card_batch)
         self._fetch_token = 0           # guards against stale async results
+        self._fetch_started = 0.0
         self._cats_loaded = False
 
         # advanced search state (see Nexus.nexus_api.NexusSearchFilters)
@@ -246,6 +256,9 @@ class NexusBrowserView(QWidget):
         self._install_all_failed = 0
         self._install_all_skipped = 0
         self._install_all_aborted = False
+        self._install_all_archives: list[str] = []
+        self._install_all_metas: dict = {}
+        self._install_all_game: str | None = None
         self._loading = False
 
         def _stop_watchers(*_, w=self._manual_watchers,
@@ -257,12 +270,17 @@ class NexusBrowserView(QWidget):
                 except Exception:
                     pass
             w.clear()
-            for cancel in list(dc.values()):
+            for key, cancel in list(dc.items()):
                 cancel.set()
+                try:
+                    pf(key, "", 0, -1)
+                except Exception:
+                    pass
             dc.clear()
         self.destroyed.connect(_stop_watchers)
 
-        self._build()
+        with perftrace.span("nexus.browser.build"):
+            self._build()
         self._mouse_navigation = MouseNavigationFilter(
             self, self._mouse_back, self._mouse_forward)
         self._update_section_buttons()
@@ -790,11 +808,15 @@ class NexusBrowserView(QWidget):
             return
 
         domain = self._domain
+        def fetch_categories():
+            with perftrace.span("nexus.categories.fetch"):
+                return self._api.get_game_categories(domain), domain
         run_in_worker(
-            lambda: (self._api.get_game_categories(domain), domain),
+            fetch_categories,
             self._cats_ready, name="nexus-categories", unpack=True,
             error_result=([], domain))
 
+    @perftrace.timed("nexus.categories.apply")
     def _on_cats(self, cats, domain: str):
         if domain != self._domain:
             return                       # stale result from the previous domain
@@ -855,11 +877,15 @@ class NexusBrowserView(QWidget):
         if self._tags_loaded or not self._domain:
             return
         domain = self._domain
+        def fetch_tags():
+            with perftrace.span("nexus.tags.fetch"):
+                return self._api.get_game_tags(domain), domain
         run_in_worker(
-            lambda: (self._api.get_game_tags(domain), domain),
+            fetch_tags,
             self._tags_ready, name="nexus-tags", unpack=True,
             error_result=([], domain))
 
+    @perftrace.timed("nexus.tags.apply")
     def _on_tags_ready(self, tags, domain: str):
         if domain != self._domain:
             return                       # stale result from the previous domain
@@ -1311,6 +1337,8 @@ class NexusBrowserView(QWidget):
             return
         self._fetch_token += 1
         token = self._fetch_token
+        self._thumbs.discard_pending()
+        self._fetch_started = time.perf_counter() if perftrace.is_enabled() else 0.0
         self._set_loading(True)
         section = self._section
         page = self._page
@@ -1330,6 +1358,7 @@ class NexusBrowserView(QWidget):
         def worker():
             entries = []
             status = ""
+            started = time.perf_counter() if perftrace.is_enabled() else 0.0
             try:
                 if section == "Browse" and query:
                     if mode == "Author":
@@ -1377,6 +1406,8 @@ class NexusBrowserView(QWidget):
                 self._log(f"Nexus: fetch error: {exc}")
                 status = f"Error: {exc}"
                 entries = []
+            if started:
+                perftrace.mark("nexus.list.fetch", time.perf_counter() - started)
             safe_emit(self._results_ready, entries, status, token)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1402,6 +1433,12 @@ class NexusBrowserView(QWidget):
     def _on_results(self, entries, status, token):
         if token != self._fetch_token:
             return                       # stale
+        if self._fetch_started:
+            perftrace.mark("nexus.list.wait", time.perf_counter() - self._fetch_started)
+        with perftrace.span("nexus.list.apply"):
+            self._apply_results(entries, status)
+
+    def _apply_results(self, entries, status):
         self._entries = list(entries or [])
         # Some REST/GraphQL shapes omit the slug. Stamp the domain captured by
         # this accepted result so later file fetches and metadata never fall
@@ -1498,27 +1535,69 @@ class NexusBrowserView(QWidget):
             return set()
 
     def _rebuild_cards(self):
-        for c in self._cards:
-            c.setParent(None)
-        self._cards.clear()
-        installed = self._installed_ids()
-        dl_only = self._download_only()      # one ini read for the whole grid, not per card
-        for e in self._visible_entries():
-            card = NexusModCard(e, self._on_view, self._on_install,
-                                on_context=self._show_card_menu,
-                                is_installed=e.mod_id in installed,
-                                download_only=dl_only)
-            if e.mod_id in self._manual_watchers:
-                card.set_watching(True)
-            self._cards.append(card)
-            self._thumbs.request(e.mod_id, getattr(e, "picture_url", "") or "")
-        self._cols = 0
-        self._relayout()
+        with perftrace.span("nexus.cards.rebuild"):
+            self._card_build_started = time.perf_counter() if perftrace.is_enabled() else 0.0
+            self._card_timer.stop()
+            self._thumbs.discard_pending()
+            with perftrace.span("nexus.cards.remove"):
+                for c in self._cards:
+                    c.setParent(None)
+                self._cards.clear()
+            with perftrace.span("nexus.cards.installed_scan"):
+                self._card_installed = self._installed_ids()
+            self._card_dl_only = self._download_only()
+            self._card_entries = list(self._visible_entries())
+            self._card_next = 0
+            self._card_build_token = self._fetch_token
+            self._cols = 0
+            self._append_card_batch()
+
+    def _append_card_batch(self):
+        if self._card_build_token != self._fetch_token:
+            return
+        start = self._card_next
+        end = min(start + CARD_BATCH_SIZE, len(self._card_entries))
+        with perftrace.span("nexus.cards.create_batch"):
+            for e in self._card_entries[start:end]:
+                card = NexusModCard(e, self._on_view, self._on_install,
+                                    on_context=self._show_card_menu,
+                                    is_installed=e.mod_id in self._card_installed,
+                                    download_only=self._card_dl_only)
+                if e.mod_id in self._manual_watchers:
+                    card.set_watching(True)
+                self._cards.append(card)
+        self._card_next = end
+        with perftrace.span("nexus.cards.layout"):
+            cols = self._cols_for_width()
+            if cols != self._cols:
+                self._relayout()
+            else:
+                for i in range(start, end):
+                    card = self._cards[i]
+                    self._grid.addWidget(card, i // cols, 1 + (i % cols),
+                                         Qt.AlignTop | Qt.AlignHCenter)
+                    card.show()
+                if self._cols_for_width() != cols:
+                    self._relayout()
+        with perftrace.span("nexus.cards.thumbnails"):
+            for e in self._card_entries[start:end]:
+                self._thumbs.request(e.mod_id, getattr(e, "picture_url", "") or "")
+        if self._card_build_started and start == 0:
+            perftrace.mark("nexus.cards.first_batch",
+                           time.perf_counter() - self._card_build_started)
+        if end < len(self._card_entries):
+            self._card_timer.start()
+        else:
+            if self._card_build_started:
+                perftrace.mark("nexus.cards.all_batches",
+                               time.perf_counter() - self._card_build_started)
+            self._card_entries = []
 
     def refresh_installed(self):
         """Recompute installed IDs and flip card buttons. Call on profile change
         and after an install completes - the browser tab persists across both."""
         installed = self._installed_ids()
+        self._card_installed = installed
         for card in self._cards:
             card.set_installed(card.entry.mod_id in installed)
         detail = getattr(self, "_detail_view", None)
@@ -1538,6 +1617,7 @@ class NexusBrowserView(QWidget):
         """Re-read 'Download only' and relabel the card buttons."""
         # The right-click menu is rebuilt per click, so it needs nothing here.
         flag = self._download_only()
+        self._card_dl_only = flag
         for card in self._cards:
             card.set_download_only(flag)
         detail = getattr(self, "_detail_view", None)
@@ -1890,6 +1970,8 @@ class NexusBrowserView(QWidget):
         self._install_all_failed = 0
         self._install_all_skipped = len(plan.get("skipped") or [])
         self._install_all_aborted = False
+        self._install_all_archives = []
+        self._install_all_metas = {}
         self._install_all_game = current_game
         self._log(f"Nexus: Install all starting {len(candidates)} download(s).")
         self._pump_install_all()
@@ -1920,6 +2002,7 @@ class NexusBrowserView(QWidget):
             self._finish_install_all()
 
     def _abort_install_all_for_game_change(self):
+        self._install_all_game = None
         self._abort_install_all("the game changed")
 
     def _abort_install_all(self, reason: str):
@@ -1946,6 +2029,9 @@ class NexusBrowserView(QWidget):
         failed = self._install_all_failed
         skipped = self._install_all_skipped
         aborted = self._install_all_aborted
+        archives = self._install_all_archives
+        metas = self._install_all_metas
+        game = self._install_all_game
         self._install_all_queue.clear()
         self._install_all_active.clear()
         self._install_all_total = 0
@@ -1954,10 +2040,19 @@ class NexusBrowserView(QWidget):
         self._install_all_failed = 0
         self._install_all_skipped = 0
         self._install_all_aborted = False
+        self._install_all_archives = []
+        self._install_all_metas = {}
+        self._install_all_game = None
         if total and not aborted:
             self._log(f"Nexus: Install all finished: {succeeded} downloaded, "
                       f"{failed} failed, {skipped} skipped.")
         self._sync_install_all_button()
+        if archives:
+            if game and (getattr(self._game, "name", "") or "") == game:
+                self._install_fn(archives, metas or None)
+            else:
+                self._log("Nexus: Install all kept completed archives in the "
+                          "original game's cache because the active game changed.")
 
     def _premium_install_allowed(self) -> bool:
         premium = bool(self._api.validate().is_premium)
@@ -2187,14 +2282,20 @@ class NexusBrowserView(QWidget):
         self._dl_seq += 1
         dl_key = f"nxb-{self._dl_seq}"
         self._log(f"Nexus: downloading {dl_label}…")
-        cancel = threading.Event()
+        from Utils.downloads.control import DownloadControl
+        cancel = DownloadControl()
         too_large = threading.Event()
         self._download_cancels[dl_key] = cancel
         self._download_games[dl_key] = game_name
         self._download_oversize[dl_key] = too_large
         # Show the popup immediately (indeterminate) so there's feedback even
         # before the first progress callback arrives.
-        self._progress_fn(dl_key, dl_label, 0, 0, cancel.set)
+        self._progress_fn(
+            dl_key, dl_label, 0, 0, cancel.cancel,
+            cancel.pause, cancel.resume)
+        progress_signal = self._download_progress
+        done_signal = self._download_done
+        progress_error = [False]
 
         def report_progress(downloaded, total):
             if (max_size_bytes > 0
@@ -2202,8 +2303,14 @@ class NexusBrowserView(QWidget):
                 too_large.set()
                 cancel.set()
                 return
-            safe_emit(self._download_progress, dl_key, dl_label,
-                      int(downloaded), int(total))
+            if cancel.is_set() or progress_error[0]:
+                return
+            try:
+                safe_emit(progress_signal, dl_key, dl_label,
+                          int(downloaded), int(total))
+            except TypeError as exc:
+                progress_error[0] = True
+                self._log(f"Nexus: progress display failed: {exc}")
 
         def worker():
             archive = None
@@ -2256,7 +2363,7 @@ class NexusBrowserView(QWidget):
                                   f"{result.error or 'unknown error'}")
             except Exception as exc:
                 self._log(f"Nexus: download error: {exc}")
-            safe_emit(self._download_done, archive, meta, dl_key)
+            safe_emit(done_signal, archive, meta, dl_key)
 
         threading.Thread(target=worker, daemon=True).start()
         # The download is underway on its own thread with its own progress
@@ -2267,7 +2374,7 @@ class NexusBrowserView(QWidget):
         return dl_key
 
     def _on_download_progress(self, key, name, downloaded, total):
-        """UI thread: forward download bytes to its notification progress item."""
+        """UI thread: forward download bytes to the status bar."""
         self._progress_fn(key, name, downloaded, total)
 
     def _on_download_done(self, archive, meta, dl_key):
@@ -2283,6 +2390,7 @@ class NexusBrowserView(QWidget):
         current_game = getattr(self._game, "name", "") or ""
         game_changed = bool(download_game and current_game != download_game)
         is_bulk = dl_key in self._install_all_active
+        abort_bulk = False
         if is_bulk:
             self._install_all_active.discard(dl_key)
             self._install_all_done += 1
@@ -2294,16 +2402,24 @@ class NexusBrowserView(QWidget):
                 self._install_all_failed += 1
             if (was_cancelled and not was_oversize and not game_changed
                     and not self._install_all_aborted):
-                self._abort_install_all("a bulk download was cancelled")
+                abort_bulk = True
         if not archive:
             pass
         elif game_changed:
             self._log(f"Nexus: downloaded → {archive}; kept in the "
                       "original game's cache because the active game changed.")
         else:
-            self._log(f"Nexus: downloaded → {archive}"
-                      f"{'' if self._download_only() else '; installing…'}")
-            self._install_fn(
-                [archive], {archive: meta} if meta is not None else None)
+            if is_bulk:
+                self._log(f"Nexus: downloaded → {archive}")
+                self._install_all_archives.append(archive)
+                if meta is not None:
+                    self._install_all_metas[archive] = meta
+            else:
+                self._log(f"Nexus: downloaded → {archive}"
+                          f"{'' if self._download_only() else '; installing…'}")
+                self._install_fn(
+                    [archive], {archive: meta} if meta is not None else None)
         if is_bulk:
+            if abort_bulk:
+                self._abort_install_all("a bulk download was cancelled")
             QTimer.singleShot(0, self._pump_install_all)

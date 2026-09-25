@@ -5,11 +5,13 @@ py.install_sources(
   'ini_tweaks.py',
   'install.py',
   'installed.py',
+  'ownership.py',
   'manifest.py',
   'options.py',
   'grouping.py',
   'group_reset.py',
   'patches.py',
+  'replicate.py',
   'reset.py',
   subdir: 'Utils/collections',
 )

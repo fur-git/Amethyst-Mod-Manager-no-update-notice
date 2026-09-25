@@ -30,6 +30,7 @@ _COL_TO_SORTKEY = {
 }
 _TOGGLEABLE_COLUMNS = (COL_SIZE, COL_DOWNLOADED)
 _COLUMN_STATE_SECTION = "qt_columns_downloads"
+_INSTALL_PAIR_WIDTH = 170
 
 
 class DownloadsView(QWidget):
@@ -44,6 +45,9 @@ class DownloadsView(QWidget):
         self.profile_dir = None
         self.game_name_getter = None      # callable -> active game name | None
         self.on_install = None            # callback(path) - per-row / selected
+        self.on_cancel_download = None
+        self.on_pause_download = None
+        self.on_resume_download = None
         self._dirty = True
         self._is_visible = False
         self._all_entries: list = []      # unfiltered scan result
@@ -110,22 +114,26 @@ class DownloadsView(QWidget):
         self._tree.setAlternatingRowColors(False)
         self._tree.setSelectionMode(QAbstractItemView.NoSelection)
         self._tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        from gui_qt.downloads_delegate import DownloadsDelegate
+        from gui_qt.downloads_delegate import DownloadsDelegate, BTN_W
         self._delegate = DownloadsDelegate(self._tree)
         self._delegate.on_install = self._on_row_install
+        self._delegate.on_cancel = self._on_cancel_download
+        self._delegate.on_pause = self._on_pause_download
+        self._delegate.on_resume = self._on_resume_download
         self._delegate.on_toggle_section = self._on_toggle_section
         self._tree.setItemDelegate(self._delegate)
         # Checkbox toggles (delegate → model) bubble up so the footer counts.
         self._model.dataChanged.connect(self._on_model_changed)
 
         from gui_qt.modlist_header import TkStyleHeader
+        install_width = BTN_W + 12
         col_mins = {
             COL_CHECK: 34, COL_NAME: 160, COL_SIZE: 70,
-            COL_DOWNLOADED: 100, COL_INSTALL: 100,
+            COL_DOWNLOADED: 100, COL_INSTALL: install_width,
         }
         col_defaults = {
             COL_CHECK: 34, COL_SIZE: 90, COL_DOWNLOADED: 110,
-            COL_INSTALL: 100,
+            COL_INSTALL: install_width,
         }
         hdr = TkStyleHeader(self, col_mins, col_defaults, parent=self._tree)
         self._tree.setHeader(hdr)
@@ -137,7 +145,10 @@ class DownloadsView(QWidget):
         for col, wdt in col_defaults.items():
             self._tree.setColumnWidth(col, wdt)
         self._column_defaults = col_defaults
+        self._column_mins = col_mins
         self._name_min = col_mins[COL_NAME]
+        self._has_paired_buttons = False
+        self._install_width_before_pair = install_width
         self._restore_column_visibility()
         self._tree.viewport().installEventFilter(self)
         v.addWidget(self._tree, 1)
@@ -236,13 +247,26 @@ class DownloadsView(QWidget):
         vp = self._tree.viewport().width()
         if vp <= 0:
             return
-        others = (self._tree.columnWidth(COL_CHECK)
-                  + self._tree.columnWidth(COL_SIZE)
-                  + self._tree.columnWidth(COL_DOWNLOADED)
-                  + self._tree.columnWidth(COL_INSTALL))
+        other_cols = [c for c in (COL_CHECK, COL_SIZE, COL_DOWNLOADED,
+                                  COL_INSTALL) if not self._tree.isColumnHidden(c)]
+        others = sum(self._tree.columnWidth(c) for c in other_cols)
         target = vp - others
-        if target >= self._name_min and target != self._tree.columnWidth(COL_NAME):
-            self._tree.header().resizeSection(COL_NAME, target)
+        hdr = self._tree.header()
+        if target >= self._name_min:
+            if target != self._tree.columnWidth(COL_NAME):
+                hdr.resizeSection(COL_NAME, target)
+            return
+
+        hdr.resizeSection(COL_NAME, self._name_min)
+        deficit = self._name_min + others - vp
+        for col in reversed(other_cols):
+            if deficit <= 0:
+                break
+            width = self._tree.columnWidth(col)
+            take = min(max(0, width - self._column_mins[col]), deficit)
+            if take:
+                hdr.resizeSection(col, width - take)
+                deficit -= take
 
     # -- column sorting ----------------------------------------------------
     def _on_header_sort_clicked(self, logical: int):
@@ -433,6 +457,34 @@ class DownloadsView(QWidget):
         t.start()
 
     # -- selection / install ------------------------------------------------
+    def set_active_downloads(self, downloads: list[tuple]):
+        paired = any(row[6] for row in downloads)
+        if paired != self._has_paired_buttons:
+            hdr = self._tree.header()
+            if paired:
+                self._install_width_before_pair = self._tree.columnWidth(COL_INSTALL)
+                self._column_mins[COL_INSTALL] = _INSTALL_PAIR_WIDTH
+                hdr.resizeSection(COL_INSTALL, max(
+                    self._install_width_before_pair, _INSTALL_PAIR_WIDTH))
+            else:
+                self._column_mins[COL_INSTALL] = self._column_defaults[COL_INSTALL]
+                hdr.resizeSection(COL_INSTALL, self._install_width_before_pair)
+            self._has_paired_buttons = paired
+            self._fit_name_to_width()
+        self._model.set_active_downloads(downloads)
+
+    def _on_cancel_download(self, key: str):
+        if self.on_cancel_download is not None:
+            self.on_cancel_download(key)
+
+    def _on_pause_download(self, key: str):
+        if self.on_pause_download is not None:
+            self.on_pause_download(key)
+
+    def _on_resume_download(self, key: str):
+        if self.on_resume_download is not None:
+            self.on_resume_download(key)
+
     def _on_row_install(self, path: Path):
         if self.on_install is not None:
             self.on_install([str(path)])
