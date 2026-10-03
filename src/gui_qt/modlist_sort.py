@@ -1,9 +1,7 @@
 """Pure column-sort helpers for the Qt modlist - no Qt imports, fully
 headless-testable.
 
-Ports the Tk sort semantics (gui/modlist_panel.py - REFERENCE, do not modify):
-separators never move, mods are sorted within their separator group, and the
-special reverse-priority mode ("priority" ascending, 0 at top) inverts the
+The reverse-priority mode ("priority" ascending, 0 at top) inverts the
 whole display: Root Folder on top, user groups reversed (lowest priority
 first), a divider row, the ungrouped float (highest-priority mods without a
 separator), then Overwrite at the bottom.
@@ -16,6 +14,8 @@ reachable and the divider never pops in/out.
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from Utils.mods.modlist import ModEntry
 from Utils.filegraph.constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
@@ -73,7 +73,7 @@ def sort_key_fn(key: str, ctx: dict):
     data dicts: categories / versions / installed / size_bytes / flags
     (effective FLAG_* bits incl. overlays) / conflicts (display codes)."""
     if key == "name":
-        return lambda e: e.name.lower()
+        return lambda e: e.display_name.lower()
 
     if key == "category":
         cats = ctx.get("categories") or {}
@@ -85,14 +85,17 @@ def sort_key_fn(key: str, ctx: dict):
         # Missing author sorts last, like category.
         return lambda e: (auths.get(e.name, "") or "￿").lower()
 
-    if key == "installed":
-        inst = ctx.get("installed") or {}
+    if key in ("installed", "updated"):
+        inst = ctx.get(key) or {}
 
         def _installed_key(e):
             s = inst.get(e.name, "")
-            # ISO "YYYY-MM-DD" strings sort identically to datetimes; mods
-            # without a date sort last.
-            return (0, s) if s else (1, "")
+            if not s:
+                return (1, 0.0)
+            try:
+                return (0, datetime.fromisoformat(s).timestamp())
+            except (TypeError, ValueError, OverflowError, OSError):
+                return (1, 0.0)
         return _installed_key
 
     if key == "flags":
@@ -100,13 +103,15 @@ def sort_key_fn(key: str, ctx: dict):
             FLAG_MISSING_REQS, FLAG_UPDATE, FLAG_MODIO_UPDATE, FLAG_ROOT,
             FLAG_ROOT_RULE, FLAG_MODIFIED_MF, FLAG_PRERTX,
             FLAG_COLLECTION_BUNDLED, FLAG_COLLECTION_PATCHED, FLAG_ENDORSED,
-            FLAG_THUNDERSTORE_UPDATE,
+            FLAG_THUNDERSTORE_UPDATE, FLAG_SKSE_INCOMPATIBLE,
         )
         flags = ctx.get("flags") or {}
 
         def _flags_key(e):
             bits = flags.get(e.name, 0)
             score = 0
+            if bits & FLAG_SKSE_INCOMPATIBLE:
+                score |= 256
             if bits & FLAG_MISSING_REQS:
                 score |= 128
             if e.locked:
@@ -169,18 +174,36 @@ def sort_key_fn(key: str, ctx: dict):
 # ---------------------------------------------------------------------------
 def build_display(natural: list[ModEntry], key: str | None, ascending: bool,
                   ctx: dict, divider: ModEntry | None = None,
-                  flatten_groups: bool = False, mod_groups: dict | None = None
+                  mod_groups: dict | None = None
                   ) -> list[ModEntry]:
     """Derive the display order from the natural order. Returns a NEW list
     holding the SAME entry objects (plus the divider in reverse mode).
 
-    When *flatten_groups* is set (the "hide separators" filter is active), a
-    plain column sort ignores separator boundaries and orders every mod as one
-    flat list - otherwise mods only sort within their own separator group and
-    still cluster under the (now-hidden) separator, which reads as broken. The
-    separators are appended at the end (hidden by the filter anyway) so the
-    natural round-trip and boundary handling stay intact. The special
-    reverse-priority mode is unaffected - its grouping is intrinsic."""
+    Non-priority sorts show all mods in one list. Separator and cosmetic group
+    rows remain in the model for the natural round-trip but are hidden by the
+    view. The priority sort retains its own grouping and boundaries."""
+    if key and key != "priority":
+        mods = [e for e in natural if not e.is_separator and not e.is_group_header]
+        hidden = [e for e in natural if e.is_group_header or
+                  (e.is_separator and e.name not in (OVERWRITE_NAME, ROOT_FOLDER_NAME))]
+        boundaries = {e.name: e for e in natural if e.is_separator and
+                      e.name in (OVERWRITE_NAME, ROOT_FOLDER_NAME)}
+        display = [boundaries[OVERWRITE_NAME]] if OVERWRITE_NAME in boundaries else []
+        key_fn = sort_key_fn(key, ctx)
+        if key in ("installed", "updated"):
+            dated, undated = [], []
+            for mod in mods:
+                sort_key = key_fn(mod)
+                (dated if sort_key[0] == 0 else undated).append((sort_key, mod))
+            dated.sort(key=lambda item: item[0][1], reverse=not ascending)
+            display.extend(mod for _, mod in dated + undated)
+        else:
+            display.extend(sorted(mods, key=key_fn, reverse=not ascending))
+        display.extend(hidden)
+        if ROOT_FOLDER_NAME in boundaries:
+            display.append(boundaries[ROOT_FOLDER_NAME])
+        return display
+
     if mod_groups:
         from Utils.mods.groups import blocks, owners
         membership = owners(mod_groups)
@@ -193,23 +216,14 @@ def build_display(natural: list[ModEntry], key: str | None, ascending: bool,
                 members = [e for e in block if e.name != leader]
                 if is_reverse(key, ascending):
                     members.reverse()
-                elif key and key != "priority":
-                    members.sort(key=sort_key_fn(key, ctx), reverse=not ascending)
                 children[leader] = members
             else:
                 representatives.extend(block)
-        display = build_display(representatives, key, ascending, ctx, divider,
-                                flatten_groups)
+        display = build_display(representatives, key, ascending, ctx, divider)
         return [e for head in display for e in (head, *children.get(head.name, []))]
 
     if not key:
         return list(natural)
-
-    if flatten_groups and key != "priority":
-        key_fn = sort_key_fn(key, ctx)
-        mods = [e for e in natural if not e.is_separator]
-        seps = [e for e in natural if e.is_separator]
-        return sorted(mods, key=key_fn, reverse=not ascending) + seps
 
     groups = split_groups(natural)
 
@@ -248,14 +262,6 @@ def build_display(natural: list[ModEntry], key: str | None, ascending: bool,
         if ow is not None:
             out.append(ow[0])
         return out
-
-    key_fn = sort_key_fn(key, ctx)
-    out = []
-    for sep, mods in groups:
-        if sep is not None:
-            out.append(sep)
-        out.extend(sorted(mods, key=key_fn, reverse=not ascending))
-    return out
 
 
 def uninvert_display(display: list[ModEntry]) -> list[ModEntry]:

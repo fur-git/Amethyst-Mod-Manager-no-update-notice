@@ -1135,6 +1135,7 @@ def run_collection_install(
         getattr(m, "size_bytes", 0) or 0 for m in ordered_mods
         if getattr(m, "file_id", None) not in _to_download_fids)
     _per_mod_prev: dict[int, int] = {}
+    _dl_started: set[int] = set()
 
     import time as _time_mod
     _speed = RollingDownloadSpeed()
@@ -1450,12 +1451,14 @@ def run_collection_install(
             nonlocal _dl_bytes_done, _total_bytes
             with _dl_lock:
                 prev = _per_mod_prev.get(_fid, 0)
-                delta = max(cur - prev, 0)
+                delta = cur - prev
                 _per_mod_prev[_fid] = cur
                 _dl_bytes_done += delta
                 if network and delta > 0:
                     _speed.add(delta)
-                is_first = prev == 0 and cur > 0
+                is_first = _fid not in _dl_started and cur > 0
+                if is_first:
+                    _dl_started.add(_fid)
                 # A mod's declared size is often unknown (0) or an estimate; the
                 # real content-length (`tot`) or bytes seen so far may exceed it.
                 # Grow the aggregate denominator so the download bar stays within
@@ -1719,11 +1722,6 @@ def run_collection_install(
                            and _keep_fomod_archives_cfg)
         _should_clear = _col_force_clear_cfg or (
             _clear_after_install_cfg and not _keep_for_fomod)
-        if manual_mode:
-            # Tk manual parity: always delete after a successful install unless
-            # it was a FOMOD and the user keeps FOMOD archives (the user just
-            # downloaded it by hand - leaving it behind clutters ~/Downloads).
-            _should_clear = not (was_fomod and _keep_fomod_archives_cfg)
         if not (_archive_use_count[archive_path] == 0 and _should_clear
                 and archive_path not in _external_archive_paths):
             return
@@ -1986,11 +1984,8 @@ def run_collection_install(
             with _dl_lock:
                 _dl_done += 1
             with _install_lock:
-                # Counted but NOT marked external → deleted after install IF
-                # it appeared during this run (fresh hand-download; Tk manual
-                # parity - declutters ~/Downloads). Archives that predate the
-                # run are kept by _maybe_delete_archive's mtime guard.
                 _akey = str(archive)
+                _external_archive_paths.add(_akey)
                 _archive_use_count[_akey] = _archive_use_count.get(_akey, 0) + 1
             if not download_only:
                 cb.on_extract_queue(mod.file_id, mod.mod_name or mod.file_name or "")
@@ -2387,7 +2382,8 @@ def run_collection_install(
             and not _is_append_run):
         try:
             _am_stats = _apply_amethyst_profile_state(
-                profile_dir, modlist_path, _amethyst_state, log)
+                profile_dir, modlist_path, _amethyst_state, log,
+                staging_root=staging_root)
             _strip_changed = (_am_stats or {}).get("strip_changed") or []
             if _strip_changed:
                 # Strip prefixes are baked into modindex.bin at rebuild time -
@@ -2872,7 +2868,7 @@ def _read_amethyst_export_data(archive_root, log) -> "dict | None":
 
 
 def _apply_amethyst_profile_state(profile_dir, modlist_path, data,
-                                  log) -> dict:
+                                  log, staging_root=None) -> dict:
     """Apply an Amethyst-authored collection's exact modlist (order, separators,
     enabled state) and portable profile_state on top of the finished install.
     Caller gates to fresh installs (Reset Load Order reuses it on an existing
@@ -3031,6 +3027,14 @@ def _apply_amethyst_profile_state(profile_dir, modlist_path, data,
                 _ps.read_root_mod_files, _ps.write_root_mod_files, _mod_dict)
     _merge_dict("mod_notes",
                 _ps.read_mod_notes, _ps.write_mod_notes, _mod_dict)
+    _merge_dict("ignored_mod_updates",
+                _ps.read_ignored_mod_updates, _ps.write_ignored_mod_updates,
+                _mod_dict)
+    if staging_root is not None:
+        try:
+            _ps.restore_ignored_mod_updates(profile_dir, staging_root)
+        except Exception as exc:
+            log(f"Collection install: ignored updates not restored: {exc}")
     _merge_dict("plugin_locks",
                 _ps.read_plugin_locks, _ps.write_plugin_locks,
                 lambda raw: dict(raw) if isinstance(raw, dict) else {})

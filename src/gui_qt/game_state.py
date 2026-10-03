@@ -31,11 +31,13 @@ def _loose_code_without_archive_wins(summary, archive_wins: int) -> int:
     """
     wins = max(0, int(summary.loose_wins) - max(0, int(archive_wins)))
     losses = max(0, int(summary.loose_losses))
+    if losses and int(summary.loose_surviving) == 0:
+        return 3
     if wins:
         return 2 if losses else 1
     if not losses:
         return 0
-    return 3 if int(summary.loose_surviving) == 0 else -1
+    return -1
 
 
 @dataclass
@@ -64,6 +66,8 @@ class ConflictData:
     # (root flag). Computed from modindex.bin in build_conflicts.
     prertx_mods: set = field(default_factory=set)
     root_rule_mods: set = field(default_factory=set)
+    skse_issues: dict[str, tuple] = field(default_factory=dict)
+    skse_file_mods: set = field(default_factory=set)
     # Framework banner rows (list[FrameworkStatus]) precomputed on the conflict
     # worker - detect_frameworks re-reads filemap.txt (+ the mod index), which
     # is too slow for the UI thread on a 100k-file modlist.
@@ -307,6 +311,14 @@ class GameState:
                         f"structure: " + ", ".join(fixed))
             except Exception as exc:
                 log(f"Flat-staging check failed: {exc}")
+        prepare_staging = getattr(g, "prepare_mod_staging", None)
+        if callable(prepare_staging):
+            try:
+                staging = self.staging_dir()
+                if staging is not None and prepare_staging(staging, log):
+                    rescan_index = True
+            except Exception as exc:
+                log(f"Game staging preparation failed: {exc}")
         if timing is not None:
             timing.mark("flat-staging validation complete",
                         phase_started=phase_started, lane="worker")
@@ -571,6 +583,20 @@ class GameState:
                 "framework statuses reused (changed mods have no framework files)"
                 if reuse_frameworks else "framework statuses resolved",
                 phase_started=phase_started, lane="worker")
+        if getattr(g, "game_id", "") in {"skyrim_se", "Fallout4"}:
+            from Utils.bethesda.skse_plugins import scan_script_extender_plugins
+            from Utils.mods.modlist import read_modlist
+            try:
+                with span("filegraph.script_extender_compatibility"):
+                    entries = read_modlist(profile_dir / "modlist.txt")
+                    data.skse_issues, data.skse_file_mods = scan_script_extender_plugins(
+                        g, snapshot, (e.name for e in entries if not e.is_separator),
+                        adapter=session.adapter,
+                        enabled_mods={e.name for e in entries if e.enabled})
+            except Exception as exc:
+                data.skse_issues = {}
+                data.skse_file_mods = set()
+                log(f"Script extender compatibility check failed: {exc}")
         self._filegraph_conflict_cache[cache_key] = data
         self._filegraph_conflict_cache.move_to_end(cache_key)
         while len(self._filegraph_conflict_cache) > self._FILEGRAPH_CACHE_LIMIT:

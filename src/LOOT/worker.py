@@ -13,6 +13,7 @@ import weakref
 from pathlib import Path
 
 from Utils.environment.temp import make_tracked_tmpdir, sweep_stale_tmpdirs
+from Utils.diagnostics.privacy import start_log_redactor
 
 
 _TIMEOUT = 180.0
@@ -35,13 +36,17 @@ class LootWorker:
         self.root = make_tracked_tmpdir("amethyst-loot-worker-")
         self.process = None
         self._buffer = b""
-        self._stderr = (self.root / "stderr.log").open("w+b")
+        stderr_path = self.root / "stderr.log"
+        self._stderr_reader = start_log_redactor(stderr_path, "w")
+        self._stderr = stderr_path.open("rb")
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(str(Path(p or os.getcwd()).absolute()) for p in sys.path)
         try:
             self.process = subprocess.Popen(
-                [sys.executable, "-u", "-m", "LOOT.worker", str(self.root), str(os.getpid())],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
+                [sys.executable, "-u", "-m", "LOOT.worker", str(self.root),
+                 str(os.getpid()), "--progress"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=self._stderr_reader.stdin,
                 env=env,
             )
             os.set_blocking(self.process.stdin.fileno(), False)
@@ -64,13 +69,23 @@ class LootWorker:
             process.wait()
             process.stdin.close()
             process.stdout.close()
+        self._finish_stderr()
         self._stderr.close()
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def _finish_stderr(self):
+        self._stderr_reader.stdin.close()
+        try:
+            self._stderr_reader.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._stderr_reader.kill()
+            self._stderr_reader.wait()
 
     def call(self, operation: str, *, timeout: float | None = None, **arguments):
         if self.process is None:
             raise RuntimeError("LOOT worker is no longer running.")
-        deadline = time.monotonic() + (_TIMEOUT if timeout is None else timeout)
+        idle_timeout = _TIMEOUT if timeout is None else timeout
+        deadline = time.monotonic() + idle_timeout
         stage = operation
         try:
             payload = json.dumps({"operation": operation, **arguments}, ensure_ascii=True).encode() + b"\n"
@@ -87,17 +102,19 @@ class LootWorker:
             while True:
                 if self.cancelled():
                     raise RuntimeError("LOOT cancelled.")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError(
-                        f"LOOT timed out while {stage}. The worker was stopped. "
-                        "A plugin or archive may be unreadable, or libloot may have stalled.")
                 if b"\n" not in self._buffer:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"LOOT timed out after {idle_timeout:g}s without progress while {stage}. "
+                            "The worker was stopped. A plugin or archive may be unreadable, "
+                            "or libloot may have stalled.")
                     ready, _, _ = select.select([self.process.stdout], [], [], min(remaining, 0.2))
                     if not ready:
                         continue
                     chunk = os.read(self.process.stdout.fileno(), 65536)
                     if not chunk:
+                        self._finish_stderr()
                         self._stderr.seek(max(0, os.fstat(self._stderr.fileno()).st_size - 4000))
                         detail = self._stderr.read()[-4000:].decode("utf-8", "replace").strip()
                         raise RuntimeError(f"LOOT worker exited while {stage}. {detail}".strip())
@@ -105,13 +122,21 @@ class LootWorker:
                     continue
                 line, self._buffer = self._buffer.split(b"\n", 1)
                 response = json.loads(line)
-                if "log" in response:
+                if not isinstance(response, dict):
+                    raise RuntimeError("LOOT worker returned an invalid response.")
+                if "progress" in response:
+                    stage = response["progress"]
+                    deadline = time.monotonic() + idle_timeout
+                elif "log" in response:
                     stage = response["log"]
                     self.log(stage)
                 elif "error" in response:
                     raise RuntimeError(response["error"])
-                else:
+                elif "result" in response:
                     return response["result"]
+                else:
+                    raise RuntimeError(
+                        "LOOT worker returned an unexpected response. Restart Amethyst and try again.")
         except BaseException:
             self.close()
             raise
@@ -123,7 +148,7 @@ def _cleanup():
         worker.close()
 
 
-def _serve(root: Path, parent_pid: int):
+def _serve(root: Path, parent_pid: int, *, report_progress: bool = False):
     import ctypes
     import logging
     import signal
@@ -137,6 +162,7 @@ def _serve(root: Path, parent_pid: int):
     def send(value):
         print(json.dumps(value, ensure_ascii=True), flush=True)
 
+    progress_fn = (lambda message: send({"progress": message})) if report_progress else None
     errors = []
 
     class NativeLog(logging.Handler):
@@ -174,14 +200,19 @@ def _serve(root: Path, parent_pid: int):
                 result = {
                     "active_path": str(game.active_plugins_file_path()),
                     "directories": sorted(condition_directories(
-                        db, request["plugin_names"], request["data_relative"]))
+                        db, request["plugin_names"], request["data_relative"],
+                        progress_fn=progress_fn))
                     if request.get("masterlist") else [],
                 }
             elif operation == "sort":
                 from dataclasses import asdict
-                result = asdict(_sort_game(game, log_fn=lambda m: send({"log": m}), **request))
+                result = asdict(_sort_game(
+                    game, log_fn=lambda m: send({"log": m}),
+                    progress_fn=progress_fn, **request))
             elif operation == "overlap":
-                _load_plugins(game, request["paths"], lambda m: send({"log": m}))
+                _load_plugins(game, request["paths"],
+                              log_fn=lambda m: send({"log": m}),
+                              progress_fn=progress_fn)
                 target = game.plugin(request["target"])
                 if target is None:
                     raise RuntimeError(f"LOOT could not load {request['target']}.")
@@ -231,4 +262,4 @@ def _serve(root: Path, parent_pid: int):
 
 
 if __name__ == "__main__":
-    _serve(Path(sys.argv[1]), int(sys.argv[2]))
+    _serve(Path(sys.argv[1]), int(sys.argv[2]), report_progress="--progress" in sys.argv[3:])

@@ -11,6 +11,7 @@ download → build_meta → install_fn flow as the Nexus browser tab.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QTimer, QT_TRANSLATE_NOOP
 from PySide6.QtWidgets import (
@@ -132,12 +133,13 @@ class ChangeVersionView(QWidget):
     _api_progress = Signal(str, str, "qlonglong", "qlonglong")
 
     def __init__(self, api, game, mod_name, meta, install_fn,
-                 on_close, log_fn=None, progress_fn=None):
+                 on_close, log_fn=None, progress_fn=None, profile_dir=None):
         super().__init__()
         self._api = api
         self._game = game
         self._mod_name = mod_name
         self._meta = meta
+        self._profile_dir = Path(profile_dir) if profile_dir is not None else None
         self._install_fn = install_fn or (lambda paths, metas=None: None)
         self._on_close = on_close or (lambda: None)
         self._log = log_fn or (lambda _m: None)
@@ -153,6 +155,7 @@ class ChangeVersionView(QWidget):
         self._render_context = None
         self._render_position = 0
         self._install_prev = None   # mod name captured when an install started
+        self._version_change = None
         self._install_status = False  # status line shows "Installing…"
         # (file_id, watcher, install_btn) while a non-premium install waits
         # for a browser download; the row's Install button shows Cancel.
@@ -599,27 +602,31 @@ class ChangeVersionView(QWidget):
             pass
 
     def _on_ignore_toggled(self, state):
-        """Write ignore_update (+ ignored_version) to the mod's meta.ini. The
-        modlist flag refresh happens when the overlay closes (_reload_modlist)."""
+        """Save the ignored update to mod and profile state."""
         staging = getattr(self._game, "get_effective_mod_staging_path", None)
         try:
-            from Nexus.nexus_meta import read_meta, write_meta
+            from Nexus.nexus_meta import set_ignore_update
             mp = (self._game.get_effective_mod_staging_path()
                   if staging else None)
             if mp is None:
                 return
             meta_path = mp / self._mod_name / "meta.ini"
-            m = read_meta(meta_path)
-            m.ignore_update = bool(state)
-            if state:
-                m.has_update = False
-                m.ignored_version = m.latest_version
-            else:
-                m.ignored_version = ""
-            write_meta(meta_path, m)
-            self._meta = m
+            self._meta = set_ignore_update(meta_path, state)
         except Exception as exc:
             self._log(f"Nexus: could not save ignore flag - {exc}")
+            return
+        if self._profile_dir is not None:
+            try:
+                from Utils.profiles.state import update_ignored_mod_updates
+                update_ignored_mod_updates(self._profile_dir, (self._meta,))
+            except Exception as exc:
+                self._log(f"Nexus: could not save ignored updates to profile state - {exc}")
+
+    def sync_ignore_update(self, meta):
+        self._meta = meta
+        self._ignore_cb.blockSignals(True)
+        self._ignore_cb.setChecked(bool(meta.ignore_update))
+        self._ignore_cb.blockSignals(False)
 
     def _domain_and_mod_id(self):
         domain = self._effective_domain()
@@ -653,6 +660,15 @@ class ChangeVersionView(QWidget):
             if watched_fid == f.file_id:
                 return
         if self._installing:
+            return
+        from Utils.mods.version_history import VersionChangeContext
+        try:
+            self._version_change = VersionChangeContext.capture(
+                self._game, self._profile_dir, self._mod_name, "nexus")
+        except Exception as exc:
+            self._log(f"Nexus: could not start version change: {exc}")
+            self._status.setText(str(exc))
+            self._status.setVisible(True)
             return
         self._installing = True
         self._pending_btn = btn
@@ -841,6 +857,14 @@ class ChangeVersionView(QWidget):
         self._end_manual_watch()
         self._log("Nexus: cancelled download detection.")
 
+    def pending_version_change(self, mod_id, game_domain, file_id):
+        if (self._manual_watch is not None
+                and self._manual_watch[0] == file_id
+                and self._effective_domain() == game_domain
+                and self._meta.mod_id == mod_id):
+            return self._version_change
+        return None
+
     def _on_download_done(self, archive, meta):
         self._installing = False
         self._cancel_holder.clear()
@@ -855,7 +879,9 @@ class ChangeVersionView(QWidget):
         metas = {archive: meta} if meta is not None else None
         try:
             queued = self._install_fn([archive], metas,
-                                      previous_mod_name=prev or self._mod_name)
+                                      previous_mod_name=prev or self._mod_name,
+                                      version_changes={archive: self._version_change}
+                                      if self._version_change is not None else None)
         except TypeError:
             # install_fn without the previous_mod_name kwarg (defensive).
             queued = self._install_fn([archive], metas)

@@ -15,12 +15,33 @@ from Utils.app_log import safe_print as print  # noqa: A004
 
 from PySide6.QtWidgets import QMenu
 from PySide6.QtGui import QAction
-from PySide6.QtCore import QCoreApplication, QT_TRANSLATE_NOOP
+from PySide6.QtCore import QCoreApplication, QT_TRANSLATE_NOOP, Qt
 
 from gui_qt.confirm_overlay import ConfirmOverlay
 from gui_qt.i18n import profile_display
 from gui_qt.modlist_model import COL_NAME, COL_VERSION, NEW_MOD_VERSION
 from gui_qt.text_input_overlay import TextInputOverlay
+
+
+class _ContextMenu(QMenu):
+    def mouseReleaseEvent(self, event):
+        action = self.actionAt(event.position().toPoint())
+        if (event.button() == Qt.MouseButton.LeftButton and action is not None
+                and action.isEnabled() and action.isCheckable()):
+            action.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        action = self.activeAction()
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space)
+                and action is not None and action.isEnabled()
+                and action.isCheckable()):
+            action.trigger()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 def _shortcut_hint(action_id: str) -> str:
@@ -78,12 +99,15 @@ def build_context_menu(view, index):
     multi_mods = len(sel_mods) > 1
     multi_seps = len(sel_seps) > 1
 
-    menu = QMenu(view)
+    menu = _ContextMenu(view)
     # Track whether the current group emitted anything, so dividers only appear
     # between non-empty groups (Tk behaviour).
     state = {"group_started": False, "any": False}
 
     def _connect(action, slot):
+        if action.isCheckable():
+            action.triggered.connect(slot)
+            return
         # QAction.triggered emits a `checked` bool. If a slot captures data via a
         # default arg (e.g. `lambda ns=names:`), Qt passes `checked` positionally
         # and clobbers that default. Wrap so the bool is always swallowed.
@@ -113,9 +137,9 @@ def build_context_menu(view, index):
         return act(label, lambda: None, enabled=False)
 
     def submenu(label, items, enabled=True, scroll_cap=0, parent_menu=None):
-        """Add a nested QMenu. *items* is a list of (text, slot) pairs - one
-        action each. Used for Copy/Move to profile (the profile list nests as a
-        submenu instead of opening a picker window).
+        """Add a nested QMenu. *items* contains (text, slot) pairs, optionally
+        with a third checked-state value. Used for Copy/Move to profile (the
+        profile list nests as a submenu instead of opening a picker window).
 
         *scroll_cap* > 0 caps the visible height at that many rows: past the cap
         the submenu holds a single QWidgetAction wrapping a scrollable list
@@ -125,14 +149,18 @@ def build_context_menu(view, index):
         mis-positions."""
         # `label` is already translated by the caller.
         target = menu if parent_menu is None else parent_menu
-        sub = QMenu(label, target)
+        sub = _ContextMenu(label, target)
         sub.setEnabled(enabled)
         if scroll_cap and len(items) > scroll_cap:
             _fill_scroll_submenu(menu, sub, items, scroll_cap)
         else:
-            for text, slot in items:
+            for item in items:
+                text, slot = item[:2]
                 # Profile names in items are DATA (not translated).
                 a = QAction(text, sub)
+                if len(item) > 2:
+                    a.setCheckable(True)
+                    a.setChecked(item[2])
                 _connect(a, slot)
                 sub.addAction(a)
         target.addMenu(sub)
@@ -167,12 +195,16 @@ def build_context_menu(view, index):
                 lambda: _manage_root_folder(view),
                 enabled=has_game and _staging_ok)
         if entry.name == OVERWRITE_NAME and _has_conflict(model, row):
-            act(_mt("Show Conflicts"), lambda: _show_conflicts(view, entry.name))
-            act(_mt("Clear Conflict Filter")
-                if _conflict_filter_on(view, entry.name) else _mt("Filter Conflicts"),
-                lambda: _filter_conflicts(view, entry.name))
+            submenu(_mt("Conflicts"), [
+                (_mt("Show Conflicts"), lambda: _show_conflicts(view, entry.name)),
+                (_mt("Clear Conflict Filter")
+                 if _conflict_filter_on(view, entry.name) else _mt("Filter Conflicts"),
+                 lambda: _filter_conflicts(view, entry.name)),
+            ])
         elif _conflict_filter_on(view):
-            act(_mt("Clear Conflict Filter"), lambda: _clear_conflict_filter(view))
+            submenu(_mt("Conflicts"), [
+                (_mt("Clear Conflict Filter"), lambda: _clear_conflict_filter(view)),
+            ])
         # Create an empty mod below - lives on the Overwrite row in normal mode
         # and the Root Folder row in reverse-priority mode, so it stays usable
         # even when the modlist has no mods to right-click.
@@ -222,17 +254,39 @@ def _build_separator_menu(view, model, row, entry, sel_seps, multi, act, stub,
             _profile_submenu_items(
                 view, names, mod_rows, others, False,
                 separator_name=entry.name))
-    act(_mt("Add separator above"), lambda: _add_separator(view, model, row, True))
-    act(_mt("Add separator below"), lambda: _add_separator(view, model, row, False))
+    submenu(_mt("Add separator"), [
+        (_mt("Add separator above"), lambda: _add_separator(view, model, row, True)),
+        (_mt("Add separator below"), lambda: _add_separator(view, model, row, False)),
+    ])
     divider()
     act(_mt("Remove separator"), lambda: _remove_separator(view, model, row))
 
 
 def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider,
                     submenu):
+    if not multi and entry.is_group_header:
+        rows = sel_mods or [row]
+        names = [model.entry(r).name for r in rows]
+        if len(rows) == 1:
+            act(_mt("Rename group"), lambda: _rename(view, model, row),
+                shortcut=_shortcut_hint("rename"))
+        _build_group_actions(view, model, rows, act, submenu)
+        others = _other_profiles(view)
+        if others:
+            submenu(_mt("Copy to profile"),
+                    _profile_submenu_items(view, names, rows, others, False))
+            submenu(_mt("Move to profile"),
+                    _profile_submenu_items(view, names, rows, others, True))
+        if _separator_choices(model):
+            submenu(_mt("Move to separator"),
+                    _separator_submenu_items(view, model, rows), scroll_cap=10)
+        return
     if multi:
-        n = len(sel_mods)
-        _names = [model.entry(r).name for r in sel_mods]
+        action_rows = [r for r in model.expand_group_selection(sel_mods)
+                       if not model.entry(r).is_separator
+                       and not model.entry(r).is_group_header]
+        n = len(action_rows)
+        _names = [model.entry(r).name for r in action_rows]
         _staging_ok = getattr(view, "staging_dir", None) is not None
         # Group: files - Root Folder toggles gate on the non-empty subset each
         # applies to (Tk root_folder_enable_multi / _disable_multi).
@@ -251,26 +305,19 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
                           if _has_nexus_id(view, nm) and not _is_endorsed(view, nm)]
         _abstain_multi = [nm for nm in _names
                           if _has_nexus_id(view, nm) and _is_endorsed(view, nm)]
-        _check_multi = [nm for nm in _names
-                        if _has_nexus_id(view, nm) or bool(_modio_url(view, nm))]
         _nexus_multi = [nm for nm in _names if _has_nexus_page(view, nm)]
         _reqs_multi = [nm for nm in _names if _has_missing_reqs(view, nm)]
-        _qu = [nm for nm in _names if _has_update_flag(view, nm)]
         # Reinstall: archive on disk OR redownloadable from Nexus/Thunderstore.
         _reinstall_multi = [nm for nm in _names
                             if _installation_archive(view, nm) is not None
                             or _can_redownload(view, nm)]
-        # Endorse/version/check/track/open-on-Nexus nest under "Nexus Actions".
+        # Nexus account actions remain under "Nexus Actions".
         _track_multi = [nm for nm in _names if _has_nexus_id(view, nm)]
         _nexus_sub = []
         if _abstain_multi:
             _nexus_sub.append(
                 (_mtf("Abstain selected ({0})", len(_abstain_multi)),
                  lambda ns=_abstain_multi: _endorse(view, ns, False)))
-        if _check_multi:
-            _nexus_sub.append(
-                (_mtf("Check Updates ({0})", len(_check_multi)),
-                 lambda ns=_check_multi: _check_updates(view, ns)))
         if _endorse_multi:
             _nexus_sub.append(
                 (_mtf("Endorse selected ({0})", len(_endorse_multi)),
@@ -285,36 +332,37 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
                  lambda ns=_nexus_multi: _open_on_nexus_multi(view, ns)))
         if _nexus_sub:
             submenu(_mt("Nexus Actions"), _nexus_sub)
+        updates = _update_menu_items(view, _names, True)
+        if updates:
+            submenu(_mt("Updates"), updates)
         if _reqs_multi:
             act(_mtf("Missing Requirements ({0})", len(_reqs_multi)),
                 lambda ns=_reqs_multi: _missing_reqs(view, ns))
-        if _qu:
-            act(_mtf("Quick Update ({0})", len(_qu)),
-                lambda ns=_qu: _quick_update(view, ns))
+
         if _reinstall_multi:
             act(_mtf("Reinstall ({0})", len(_reinstall_multi)),
                 lambda ns=_reinstall_multi: _reinstall(view, ns))
         divider()
         # Group: organise
-        _build_group_actions(model, sel_mods, act, submenu)
+        _build_group_actions(view, model, sel_mods, act, submenu)
         _others = _other_profiles(view)
         if _others:
-            transfer_count = len(model.expand_group_selection(sel_mods))
+            transfer_count = n
             submenu(_mtf("Copy to profile ({0})", transfer_count),
                     _profile_submenu_items(view, _names, sel_mods, _others, False))
             submenu(_mtf("Move to profile ({0})", transfer_count),
                     _profile_submenu_items(view, _names, sel_mods, _others, True))
         act(_mtf("Disable selected ({0})", n),
-            lambda: _set_enabled(view, model, sel_mods, False),
+            lambda: _set_enabled(view, model, action_rows, False),
             shortcut=_shortcut_hint("toggle_selected"))
         act(_mtf("Enable selected ({0})", n),
-            lambda: _set_enabled(view, model, sel_mods, True),
+            lambda: _set_enabled(view, model, action_rows, True),
             shortcut=_shortcut_hint("toggle_selected"))
         if _separator_choices(model):
             submenu(_mtf("Move to separator ({0})", n),
                     _separator_submenu_items(view, model, sel_mods),
                     scroll_cap=10)
-        if len(sel_mods) >= 2:
+        if len(sel_mods) >= 2 and not model.flat_sort_active:
             act(_mtf("Sort Alphabetically ({0})", n),
                 lambda: _sort_selected_alphabetically(view, model, sel_mods))
         divider()
@@ -327,7 +375,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         divider()
         # Group: remove
         act(_mtf("Remove mod ({0})", n),
-            lambda: _remove_mods_multi(view, model, sel_mods),
+            lambda: _remove_mods_multi(view, model, action_rows),
             shortcut=_shortcut_hint("remove"))
         return
 
@@ -360,9 +408,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         act(_mt("Disable Root Folder install") if _is_rf else _mt("Enable Root Folder install"),
             lambda: _toggle_root_folder(view, [name], not _is_rf))
     divider()
-    # Group 3: Nexus / online & updates - each item shows only when applicable.
-    # The endorse/version/check/track/open-on-Nexus items nest under a
-    # "Nexus Actions" submenu; the rest stay inline.
+    # Group 3: source actions and updates.
     _endorsed = _is_endorsed(view, name)
     _has_id = _has_nexus_id(view, name)
     _nexus_items = []
@@ -372,9 +418,6 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
              lambda: _endorse(view, [name], not _endorsed)))
         _nexus_items.append(
             (_mt("Change Version"), lambda: _change_version(view, name)))
-    if _has_id or bool(_modio_url(view, name)):
-        _nexus_items.append(
-            (_mt("Check Updates"), lambda: _check_updates(view, [name])))
     if _has_id:
         _nexus_items.append(
             (_mt("Track Mod"), lambda: _track(view, [name])))
@@ -390,8 +433,6 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         submenu(_mt("Thunderstore Actions"), [
             (_mt("Change Version"),
              lambda: _thunderstore_change_version(view, name)),
-            (_mt("Check Updates"),
-             lambda: _thunderstore_check_updates(view, [name])),
             (_mt("Open on Thunderstore"),
              lambda: _open_on_thunderstore(view, name)),
         ])
@@ -401,13 +442,17 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
     if workshop_url:
         from Utils.environment.xdg import open_url
         act(_mt("Open on Steam Workshop"), lambda: open_url(workshop_url))
-    if _has_update_flag(view, name):
-        act(_mt("Quick Update"), lambda: _quick_update(view, [name]))
+    updates = _update_menu_items(view, [name])
+    if updates:
+        submenu(_mt("Updates"), updates)
     divider()
     # Group 4: organise / layout
-    _build_group_actions(model, [row], act, submenu)
-    act(_mt("Add separator above"), lambda: _add_separator(view, model, row, True))
-    act(_mt("Add separator below"), lambda: _add_separator(view, model, row, False))
+    _build_group_actions(view, model, [row], act, submenu)
+    if not model.flat_sort_active:
+        submenu(_mt("Add separator"), [
+            (_mt("Add separator above"), lambda: _add_separator(view, model, row, True)),
+            (_mt("Add separator below"), lambda: _add_separator(view, model, row, False)),
+        ])
     _others = _other_profiles(view)
     if _others:
         submenu(_mt("Copy to profile"),
@@ -418,7 +463,7 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
         submenu(_mt("Move to separator"),
                 _separator_submenu_items(view, model, [row]),
                 scroll_cap=10)
-    if not locked:
+    if not locked and not model.flat_sort_active:
         act(_mt("Set priority…"), lambda: _set_priority(view, model, row))
     divider()
     # Group 5: info / conflicts / notes
@@ -430,26 +475,37 @@ def _build_mod_menu(view, model, row, entry, sel_mods, multi, act, stub, divider
     if _has_fomod_choices(view, name):
         act(_mt("View FOMOD Choices"), lambda: _show_fomod_choices(view, name))
     if _has_conflict(model, row):
-        act(_mt("Show Conflicts"), lambda: _show_conflicts(view, name))
-        act(_mt("Clear Conflict Filter") if _conflict_filter_on(view, name)
-            else _mt("Filter Conflicts"),
-            lambda: _filter_conflicts(view, name))
+        submenu(_mt("Conflicts"), [
+            (_mt("Show Conflicts"), lambda: _show_conflicts(view, name)),
+            (_mt("Clear Conflict Filter") if _conflict_filter_on(view, name)
+             else _mt("Filter Conflicts"),
+             lambda: _filter_conflicts(view, name)),
+        ])
     elif _conflict_filter_on(view):
         # Conflict-free rows can't start the filter, but they stay reachable
         # while it's on (they show up inside a separator block that has a
         # match) - so keep the off switch on them too.
-        act(_mt("Clear Conflict Filter"), lambda: _clear_conflict_filter(view))
+        submenu(_mt("Conflicts"), [
+            (_mt("Clear Conflict Filter"), lambda: _clear_conflict_filter(view)),
+        ])
+    _requirements_items = []
     if _has_missing_reqs(view, name):
-        act(_mt("Missing Requirements"), lambda: _missing_reqs(view, [name]))
+        _requirements_items.append(
+            (_mt("Missing Requirements"), lambda: _missing_reqs(view, [name])))
     if _has_id:
-        act(_mt("View Requirements"), lambda: _view_requirements(view, name))
+        _requirements_items.append(
+            (_mt("View Requirements"), lambda: _view_requirements(view, name)))
+    if _requirements_items:
+        submenu(_mt("Requirements"), _requirements_items)
     divider()
     # Group 6: remove
     act(_mt("Remove mod"), lambda: _remove(view, model, row), enabled=not locked,
         shortcut=_shortcut_hint("remove"))
 
 
-def _build_group_actions(model, rows, act, submenu):
+def _build_group_actions(view, model, rows, act, submenu):
+    if model.flat_sort_active:
+        return
     from Utils.mods.groups import expand_leaders
     group_menu = None
 
@@ -461,8 +517,14 @@ def _build_group_actions(model, rows, act, submenu):
 
     names = [model.entry(r).name for r in rows]
     moving = expand_leaders(names, model._mod_groups)
-    entries = model.natural_entries()
+    entries = model.natural_entries(include_headers=True)
     if not any(e.locked for e in entries if e.name in moving):
+        act(_mt("Group with a new cosmetic mod…"),
+            lambda: TextInputOverlay.show_over(
+                view, _mt("Create group"),
+                _mt("Group name (cosmetic only; no mod folder is created or exported):"),
+                lambda title: model.create_cosmetic_group(names, title) if title else None),
+            parent_menu=container())
         choices = sorted((e for e in entries if not e.is_separator
                           and e.name not in moving
                           and model.group_leader(e.name) in (None, e.name)),
@@ -647,6 +709,83 @@ def _change_version(view, name):
     cb = getattr(view, "on_change_version", None)
     if cb is not None and name:
         cb(name)
+
+
+def _ignore_updates(view, names, state):
+    from Nexus.nexus_meta import set_ignore_update
+    staging = getattr(view, "staging_dir", None)
+    if staging is None:
+        return
+    changed = {}
+    nexus_changed = {}
+    for name in names:
+        meta_path = staging / name / "meta.ini"
+        if not meta_path.is_file():
+            continue
+        try:
+            if _has_nexus_id(view, name):
+                changed[name] = set_ignore_update(meta_path, state)
+                nexus_changed[name] = changed[name]
+            if _is_thunderstore_mod(view, name):
+                from Thunderstore.thunderstore_update_checker import (
+                    set_ignore_update as set_ts_ignore)
+                set_ts_ignore(meta_path, state)
+                changed.setdefault(name, _read_mod_meta(view, name))
+        except Exception as exc:
+            _notify(view, _mtf('Could not save ignored updates for "{0}":\n{1}',
+                               name, str(exc)))
+    profile_dir = getattr(view, "profile_dir", None)
+    if nexus_changed and profile_dir is not None:
+        try:
+            from Utils.profiles.state import update_ignored_mod_updates
+            update_ignored_mod_updates(profile_dir, nexus_changed.values())
+        except Exception as exc:
+            _notify(view, _mtf('Could not save ignored updates to profile state:\n{0}',
+                               str(exc)))
+    cb = getattr(view, "on_ignore_updates_changed", None)
+    if cb is not None and changed:
+        cb(changed)
+
+
+def _can_roll_back(view, name):
+    previous = getattr(_read_mod_meta(view, name), "previous_version", None)
+    return previous is not None and previous.valid
+
+
+def _roll_back(view, names):
+    cb = getattr(view, "on_roll_back", None)
+    if cb is not None:
+        cb(list(names))
+
+
+def _update_menu_items(view, names, multi=False):
+    def label(text, count):
+        return _mtf(text + " ({0})", count) if multi else _mt(text)
+
+    items = []
+    check = [n for n in names if _has_nexus_id(view, n)
+             or _modio_url(view, n) or _is_thunderstore_mod(view, n)]
+    ignore = [n for n in names if _has_nexus_id(view, n)
+              or _is_thunderstore_mod(view, n)]
+    quick = [n for n in names if _has_update_flag(view, n)]
+    rollback = [n for n in names if _can_roll_back(view, n)]
+    if check:
+        items.append((label("Check Updates", len(check)),
+                      lambda: _check_updates(view, check)))
+    if ignore:
+        ignored = all(
+            (not _has_nexus_id(view, n) or _read_mod_meta(view, n).ignore_update)
+            and (not _is_thunderstore_mod(view, n)
+                 or _thunderstore_meta(view, n).ignore_update) for n in ignore)
+        items.append((label("Ignore Updates", len(ignore)),
+                      lambda checked: _ignore_updates(view, ignore, checked), ignored))
+    if quick:
+        items.append((label("Quick Update", len(quick)),
+                      lambda: _quick_update(view, quick)))
+    if rollback:
+        items.append((label("Roll Back", len(rollback)),
+                      lambda: _roll_back(view, rollback)))
+    return items
 
 
 def _open_bundle(view, name):
@@ -990,6 +1129,8 @@ def _thunderstore_check_updates(view, names):
 # ---- Move to separator -----------------------------------------------------
 def _separator_choices(model):
     """(display, internal_name) for every non-boundary separator, in list order."""
+    if model.flat_sort_active:
+        return []
     from gui_qt.modlist_model import _BOUNDARY_NAMES
     out = []
     for r in range(model.rowCount()):
@@ -1015,6 +1156,8 @@ def _move_to_separator(view, model, mod_rows, sep_name):
     """Reposition the selected mods directly below *sep_name* (lowest-priority end
     of its group in the reverse-priority display, matching Tk). Rebuilds the body
     without the moved mods, then inserts them right after the separator."""
+    if model.flat_sort_active:
+        return
     from gui_qt.modlist_model import _PINNED_NAMES
     if model._mod_groups:
         model.move_group_to_separator(mod_rows, sep_name)
@@ -1086,8 +1229,9 @@ def _profile_submenu_items(view, names, mod_rows, others, move: bool, *,
     submenu rather than opening a picker window)."""
     model = view.model()
     from Utils.mods.groups import expand_leaders
-    names = expand_leaders(names, model._mod_groups)
-    # Transfer in saved priority order, including hidden group members.
+    if not model.flat_sort_active:
+        names = expand_leaders(names, model._mod_groups)
+    # Transfer in saved priority order.
     entries = [e for e in model.natural_entries()
                if e.name in names and not e.is_separator]
     names = [e.name for e in entries]
@@ -1183,6 +1327,10 @@ def _installation_archive(view, name: str):
             filenames.append(ts_filename)
     if not filenames:
         return None
+    return _find_installation_archive(view, filenames)
+
+
+def _find_installation_archive(view, filenames, expected_size=0):
     from pathlib import Path
     game = getattr(view, "game", None)
     game_name = getattr(game, "name", "") or ""
@@ -1200,9 +1348,15 @@ def _installation_archive(view, name: str):
         return None
     for d in search_dirs:
         for filename in filenames:
+            if Path(filename).name != filename:
+                continue
             cand = Path(d) / filename
-            if cand.is_file():
-                return cand
+            try:
+                if cand.is_file() and (not expected_size or
+                                       cand.stat().st_size == expected_size):
+                    return cand
+            except OSError:
+                continue
     return None
 
 
@@ -1399,6 +1553,8 @@ def _sort_selected_alphabetically(view, model, mod_rows):
     selection occupied (other rows + separators stay put). Port of Tk
     _sort_selected_alphabetically."""
     from gui_qt.modlist_model import _PINNED_NAMES
+    if model.flat_sort_active:
+        return
     if model._mod_groups:
         model.sort_group_selection(mod_rows)
         return
@@ -1568,6 +1724,9 @@ def _rename(view, model, row):
     def _named(new):
         if new is None or not new.strip() or new.strip() == e.display_name:
             return
+        if e.is_group_header:
+            model.rename_cosmetic_group(e.name, new)
+            return
         if e.is_separator:
             # No folder on disk - a pure modlist.txt edit is the whole rename.
             # Migrate the separator's colour + deploy override to the new name
@@ -1589,7 +1748,7 @@ def _rename(view, model, row):
 
     # Separators have no folder (and so no meta.ini) - only mods get the
     # suggested-name dropdown.
-    suggestions = [] if e.is_separator else _name_suggestions(view, e.name)
+    suggestions = [] if e.is_separator or e.is_group_header else _name_suggestions(view, e.name)
     TextInputOverlay.show_over(view, _mt("Rename"), _mt("New name:"), _named,
                                initial=e.display_name, ok_label=_mt("Rename"),
                                suggestions=suggestions)
@@ -1611,7 +1770,7 @@ def _name_suggestions(view, name):
 def _set_version(view, model, row):
     entry = model.entry(row)
     name = entry.name
-    initial = str(model.data(model.index(row, COL_VERSION), 0) or "")
+    initial = str(model.data(model.index(row, COL_VERSION), Qt.EditRole) or "")
     staging = getattr(view, "staging_dir", None)
     if staging is None:
         return
@@ -1639,6 +1798,8 @@ def _set_version(view, model, row):
 
 
 def _set_priority(view, model, row):
+    if model.flat_sort_active:
+        return
     cur = model.data(model.index(row, COL_NAME), 0)
 
     def _picked(text):
@@ -1721,6 +1882,10 @@ def _notify(view, text, state="warning"):
 def _run_remove(view, game, profile_dir, names, owners) -> list:
     """Dispatch the file-side removal: group-aware when *owners* is set.
     Returns the names actually removed (a group skips locked members')."""
+    if not view.isEnabled():
+        _notify(view, QCoreApplication.translate("MainWindow",
+                "Wait for the current archive, install, deployment, or tool operation to finish."))
+        return []
     log = lambda m: print(f"[remove] {m}", flush=True)  # noqa: E731
     try:
         if owners is not None:
@@ -1742,6 +1907,9 @@ def _remove(view, model, row):
     the confirm names it."""
     e = model.entry(row)
     if e is None or e.is_separator:
+        return
+    if e.is_group_header:
+        model.ungroup_mods([e.name])
         return
     # A mod belonging to a LOCKED member profile can't be removed through the
     # group (the lock protects that profile's mods); it can still be removed
@@ -1868,10 +2036,13 @@ def _set_sep_locks_multi(view, model, sep_rows, lock):
 def _remove_mods_multi(view, model, mod_rows):
     """Fully remove every selected mod (one confirm), then drop the rows.
     On a Profile Group each mod is removed from its owning member too."""
+    headers = [model.entry(r).name for r in mod_rows if model.entry(r).is_group_header]
     rows = [r for r in mod_rows
             if (e := model.entry(r)) is not None
-            and not e.is_separator and not e.locked]
+            and not e.is_separator and not e.is_group_header and not e.locked]
     if not rows:
+        if headers:
+            model.ungroup_mods(headers)
         return
     # Drop mods owned by a LOCKED member profile - they stay removable from
     # that profile itself, just not through the group.
@@ -1899,6 +2070,8 @@ def _remove_mods_multi(view, model, mod_rows):
             model.remove_row(r, save=False)
         if gone:
             model.save()  # single save → one filemap rebuild for the batch
+        if headers:
+            model.ungroup_mods(headers)
         _notify_mods_removed(view)
 
     if owners is not None:
@@ -1917,6 +2090,10 @@ def _remove_mods_multi(view, model, mod_rows):
 # runtime via QCoreApplication.translate("ModListMenu", …), which lupdate
 # cannot see through - so each literal is registered here explicitly.
 _TR_MARKERS = (
+    QT_TRANSLATE_NOOP("ModListMenu", "Group with a new cosmetic mod…"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Create group"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Group name (cosmetic only; no mod folder is created or exported):"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Rename group"),
     QT_TRANSLATE_NOOP("ModListMenu", "Group options"),
     QT_TRANSLATE_NOOP("ModListMenu", "Group with"),
     QT_TRANSLATE_NOOP("ModListMenu", "Change group leader"),
@@ -1937,6 +2114,7 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Check Updates"),
     QT_TRANSLATE_NOOP("ModListMenu", "Check Updates ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Clear Conflict Filter"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Conflicts"),
     QT_TRANSLATE_NOOP("ModListMenu", "Copy to profile"),
     QT_TRANSLATE_NOOP("ModListMenu", "Copy to profile ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Copy separator to profile"),
@@ -1946,6 +2124,7 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Create empty mod"),
     QT_TRANSLATE_NOOP("ModListMenu", "Create empty mod below"),
     QT_TRANSLATE_NOOP("ModListMenu", "Could not set version:\n{0}"),
+    QT_TRANSLATE_NOOP("ModListMenu", 'Could not save ignored updates for "{0}":\n{1}'),
     QT_TRANSLATE_NOOP("ModListMenu", "Disable Root Folder install"),
     QT_TRANSLATE_NOOP("ModListMenu", "Disable Root Folder install ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Disable selected ({0})"),
@@ -1956,6 +2135,8 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Endorse Mod"),
     QT_TRANSLATE_NOOP("ModListMenu", "Endorse selected ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Filter Conflicts"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Ignore Updates"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Ignore Updates ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "'{0}' belongs to the locked profile "
                       "'{1}' - switch to that profile to remove it, or "
                       "unlock it."),
@@ -1975,6 +2156,9 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Move to separator"),
     QT_TRANSLATE_NOOP("ModListMenu", "Move to separator ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Nexus Actions"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Updates"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Roll Back"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Roll Back ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "New name:"),
     QT_TRANSLATE_NOOP("ModListMenu", "Open folder"),
     QT_TRANSLATE_NOOP("ModListMenu", "Open in NIF Viewer"),
@@ -1994,6 +2178,7 @@ _TR_MARKERS = (
     QT_TRANSLATE_NOOP("ModListMenu", "Remove note ({0})"),
     QT_TRANSLATE_NOOP("ModListMenu", "Remove separator"),
     QT_TRANSLATE_NOOP("ModListMenu", "Remove separators ({0})"),
+    QT_TRANSLATE_NOOP("ModListMenu", "Requirements"),
     QT_TRANSLATE_NOOP("ModListMenu", "Rename"),
     QT_TRANSLATE_NOOP("ModListMenu", "Rename mod"),
     QT_TRANSLATE_NOOP("ModListMenu", "Rename separator"),

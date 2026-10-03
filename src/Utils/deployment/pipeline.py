@@ -642,6 +642,11 @@ def run_deploy_pipeline(
         if on_pre_filemap is not None:
             on_pre_filemap()
 
+        prepare_staging = getattr(game, "prepare_mod_staging", None)
+        staging_changed = (prepare_staging(
+            game.get_effective_mod_staging_path(), log_fn)
+            if callable(prepare_staging) else False)
+
         # Open/reconcile the required native catalog and pin the generation
         # that every deploy handler below will consume. No legacy map is built
         # or refreshed here.
@@ -651,7 +656,7 @@ def run_deploy_pipeline(
         profile_dir = game.get_profile_root() / "profiles" / profile
         filegraph_library = FileGraphService.open_library(
             game, profile_dir, log_fn=log_fn)
-        if on_pre_filemap is not None:
+        if on_pre_filemap is not None or staging_changed:
             # The hook is a manager-owned staging mutation (wizard output), so
             # update the catalog immediately rather than waiting for Refresh.
             filegraph_library.refresh(profile_dir)
@@ -784,11 +789,8 @@ def run_deploy_pipeline(
         # the handler walking the game root now and the pipeline walking it
         # again for the refresh.
         game.begin_deferred_runtime_snapshot()
-        # A VFS-aware handler consumes Root_Folder itself while building its
-        # private layer. Keep the session toggle available without widening
-        # every game's long-standing deploy() signature.
-        if getattr(game, "virtualizes_game_root", False):
-            game._pipeline_root_folder_enabled = bool(root_folder_enabled)
+        # Handlers also need this toggle when checking root payload ownership.
+        game._pipeline_root_folder_enabled = bool(root_folder_enabled)
         try:
             # Source resolution must never pick a disabled variant when two
             # staged files collapse onto one filemap key. Set inside the try so
@@ -952,6 +954,8 @@ def run_deploy_pipeline(
         try:
             game.post_deploy(log_fn=log_fn)
         except Exception as pd_err:
+            if getattr(game, "post_deploy_failure_is_fatal", False):
+                raise
             log_fn(f"post_deploy warning: {pd_err}")
 
         pfx = game.get_prefix_path()

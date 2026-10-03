@@ -6,7 +6,6 @@ they can run on a worker thread.
 from __future__ import annotations
 
 import os
-from datetime import datetime
 from pathlib import Path
 
 from Utils.mods.modlist import ModEntry
@@ -29,6 +28,7 @@ FLAG_PRERTX = 1 << 11      # contains pre-RTX (natives/x64) files - filemap-deri
 FLAG_ROOT_RULE = 1 << 12   # owns files with a custom root-routing rule - filemap-derived
 FLAG_RERUN_FOMOD = 1 << 13  # a FOMOD option's fileDependency plugin is now in the load order - live overlay
 FLAG_THUNDERSTORE_UPDATE = 1 << 14  # Thunderstore update ([thunderstore] hasUpdate)
+FLAG_SKSE_INCOMPATIBLE = 1 << 15
 
 
 def _parse_missing_req_pairs(raw: str) -> list[tuple[int, str]]:
@@ -87,7 +87,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     """Return a MetaInfo-ish tuple keyed by mod name.
 
     versions[name]     -> version string ("" if none)
-    installed[name]    -> short date string ("" if none)
+    installed[name]    -> original installation timestamp ("" if none)
     flags[name]        -> int bitmask of FLAG_* above
     categories[name]   -> Nexus category display name ("" if none)
     updates            -> set of mod names with a pending update
@@ -108,6 +108,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     """
     versions: dict[str, str] = {}
     installed: dict[str, str] = {}
+    updated: dict[str, str] = {}
     flags: dict[str, int] = {}
     categories: dict[str, str] = {}
     updates: set[str] = set()
@@ -130,7 +131,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
     except Exception:
         return (versions, installed, flags, categories, updates, fomod, bain,
                 missing_reqs, descriptions, authors, source_locations,
-                nexus_mod_ids, nexus_file_ids)
+                nexus_mod_ids, nexus_file_ids, updated)
 
     # Per-profile user notes (Note flag) - one read for the whole list.
     notes: dict[str, str] = {}
@@ -164,14 +165,9 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
             versions[e.name] = meta.version
 
         if meta.installed:
-            try:
-                dt = datetime.fromisoformat(meta.installed)
-                if dt.date() == datetime.now().date():
-                    installed[e.name] = dt.strftime("%H:%M")
-                else:
-                    installed[e.name] = dt.strftime("%m/%d/%y")
-            except Exception:
-                installed[e.name] = meta.installed[:10]
+            installed[e.name] = meta.installed
+        if meta.updated:
+            updated[e.name] = meta.updated
 
         if meta.category_name:
             categories[e.name] = meta.category_name
@@ -283,7 +279,7 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
 
     return (versions, installed, flags, categories, updates, fomod, bain,
             missing_reqs, descriptions, authors, source_locations,
-            nexus_mod_ids, nexus_file_ids)
+            nexus_mod_ids, nexus_file_ids, updated)
 
 
 # ---- mod folder sizes (Size column) - ported from gui/modlist_panel.py --------

@@ -37,6 +37,7 @@ from typing import Iterable, Optional
 from Utils.app_log import app_log
 from Utils.atomic_write import atomic_writer
 from Utils.mods.metadata import locked_meta_write
+from Utils.mods.version_history import PreviousVersion, read_previous_version
 
 
 @dataclass
@@ -55,6 +56,8 @@ class NexusModMeta:
     installation_file: str = ""        # original archive filename
     file_size: int = 0                 # original archive size in bytes
     installed: str = ""                # ISO-8601 timestamp
+    updated: str = ""
+    previous_version: PreviousVersion | None = None
     nexus_url: str = ""                # full Nexus mod page URL
     workshop_app_id: str = ""
     workshop_item_id: str = ""
@@ -154,6 +157,7 @@ _KEY_MAP: dict[str, str] = {
     "installationFile":  "installation_file",
     "fileSize":          "file_size",
     "installed":         "installed",
+    "updated":           "updated",
     "nexusUrl":          "nexus_url",
     "workshopAppId":     "workshop_app_id",
     "workshopItemId":    "workshop_item_id",
@@ -257,6 +261,8 @@ def read_meta(meta_ini_path: Path) -> NexusModMeta:
             else:
                 setattr(meta, attr, raw)
 
+    meta.previous_version = read_previous_version(cp)
+
     if mtime_ns is not None:
         if len(_META_CACHE) >= _META_CACHE_MAX:
             for k in list(_META_CACHE.keys())[: _META_CACHE_MAX // 4]:
@@ -331,6 +337,8 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
             # check; a fresh NexusModMeta without it must not blank the value.
             if attr == "uploaded_by" and not value:
                 continue
+            if attr == "updated" and not value:
+                continue
             if attr.startswith("workshop_") and not value:
                 continue
             cp.set(_SECTION, ini_key, str(value).replace("%", "%%"))
@@ -340,6 +348,19 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
         cp.write(f)
 
     app_log(f"Wrote meta.ini: {meta_ini_path}")
+
+
+@locked_meta_write
+def set_ignore_update(meta_ini_path: Path, state: bool) -> NexusModMeta:
+    meta = read_meta(meta_ini_path)
+    meta.ignore_update = bool(state)
+    if state:
+        meta.has_update = False
+        meta.ignored_version = meta.latest_version
+    else:
+        meta.ignored_version = ""
+    write_meta(meta_ini_path, meta)
+    return meta
 
 
 def set_meta_key(meta_ini_path: Path, ini_key: str, value: str) -> None:
@@ -787,6 +808,7 @@ def resolve_nexus_meta_for_archive(
         results = api.get_file_by_md5(game_domain, md5_hex)
         if isinstance(results, list) and results:
             valid = {}
+            live_mods = {}
             for hit in results:
                 if not isinstance(hit, dict):
                     continue
@@ -801,59 +823,47 @@ def resolve_nexus_meta_for_archive(
                     continue
                 if mod_id <= 0 or file_id <= 0 or not mod_data.get("name") or mod_data.get("available") is False:
                     continue
-                try:
-                    live_mod = api.get_mod(game_domain, mod_id)
-                except Exception:
+                if mod_id not in live_mods:
+                    try:
+                        live_mod, _ = api.get_mod_and_file_info_graphql(
+                            game_domain, mod_id, file_id=file_id)
+                    except Exception:
+                        live_mod = None
+                    if live_mod is None:
+                        try:
+                            live_mod = api.get_mod(game_domain, mod_id)
+                        except Exception:
+                            live_mod = None
+                    live_mods[mod_id] = live_mod
+                live_mod = live_mods[mod_id]
+                if live_mod is None:
                     continue
                 if (live_mod.mod_id != mod_id or not live_mod.name
                         or not getattr(live_mod, "available", True)
                         or getattr(live_mod, "status", "").casefold() in
                         {"deleted", "discarded", "hidden", "removed"}):
                     continue
-                valid[mod_id, file_id] = hit
+                valid[mod_id, file_id] = (hit, live_mod)
 
-            exact = [hit for hit in valid.values() if
-                     (hit["file_details"].get("file_name") or "").casefold() == archive_name.casefold()]
+            exact = [match for match in valid.values() if
+                     (match[0]["file_details"].get("file_name") or "").casefold() == archive_name.casefold()]
             matches = exact if exact else list(valid.values())
             if len(matches) != 1:
                 _log(f"Nexus: MD5 returned {len(results)} result(s), but no unique usable match.")
                 return None
-            hit = matches[0]
-            mod_data = hit.get("mod", {})
+            hit, live_mod = matches[0]
             file_data = hit.get("file_details", {})
 
-            cat_name = mod_data.get("category_name", "") or mod_data.get("category", "") or ""
-            if not isinstance(cat_name, str):
-                cat_name = ""
-            try:
-                cat_id = int(mod_data.get("category_id", 0) or 0)
-            except (TypeError, ValueError):
-                cat_id = 0
-            if not cat_name and cat_id:
-                try:
-                    for c in api.get_game_categories(game_domain):
-                        if c.category_id == cat_id:
-                            cat_name = c.name or ""
-                            break
-                except Exception:
-                    pass
-            meta = NexusModMeta(
+            meta = build_meta_from_download(
                 game_domain=game_domain,
-                mod_id=mod_data.get("mod_id", 0),
-                file_id=file_data.get("file_id", 0),
-                version=file_data.get("version", "") or file_data.get("mod_version", ""),
-                author=mod_data.get("author", ""),
-                uploaded_by=mod_data.get("uploaded_by", "") or "",
-                nexus_name=mod_data.get("name", ""),
-                nexus_file_name=file_data.get("name", "") or file_data.get("file_name", ""),
-                installation_file=archive_name,
-                installed=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-                description=mod_data.get("summary", ""),
-                category_id=cat_id,
-                category_name=cat_name,
-                file_category=file_data.get("category_name", ""),
-                nexus_url=f"https://www.nexusmods.com/{game_domain}/mods/{mod_data.get('mod_id', 0)}",
+                mod_id=live_mod.mod_id,
+                file_id=int(file_data["file_id"]),
+                archive_name=archive_name,
+                mod_info=live_mod,
             )
+            meta.version = file_data.get("version", "") or file_data.get("mod_version", "") or meta.version
+            meta.nexus_file_name = file_data.get("name", "") or file_data.get("file_name", "")
+            meta.file_category = file_data.get("category_name", "")
             _log(f"Nexus: MD5 match - '{meta.nexus_name}' "
                  f"(mod {meta.mod_id}, file {meta.file_id}).")
             return meta

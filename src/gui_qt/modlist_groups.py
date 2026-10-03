@@ -24,6 +24,7 @@ class ModGrouping:
         self._group_summary_cache = {}
         self._group_repainting = False
         self._group_recovery_needed = False
+        self._group_headers = {}
         self.dataChanged.connect(self._group_data_changed)
 
     def _index_groups(self):
@@ -31,6 +32,12 @@ class ModGrouping:
         self._group_row_map = None
         self._group_summary_cache.clear()
         self._sep_hl_cache.clear()
+        self._group_headers = {}
+        if any("title" in data for data in self._mod_groups.values()):
+            by_name = {e.name: e for e in self._natural}
+            self._group_headers = {
+                leader: (by_name[leader], [by_name[n] for n in data["members"]])
+                for leader, data in self._mod_groups.items() if "title" in data}
 
     def _group_data_changed(self, *_args):
         if self._group_repainting:
@@ -38,6 +45,7 @@ class ModGrouping:
         self._group_summary_cache.clear()
         if not self._mod_groups:
             return
+        self._sync_group_headers()
         rows = [rows[0] for rows in self._group_rows().values() if rows]
         if rows:
             self._group_repainting = True
@@ -50,11 +58,17 @@ class ModGrouping:
     def group_leader(self, name):
         return self._group_owners.get(name)
 
+    def display_group_leader(self, name):
+        return None if self.flat_sort_active else self.group_leader(name)
+
     def is_group_leader(self, name):
         return name in self._mod_groups
 
     def is_group_collapsed(self, name):
         return self._mod_groups.get(name, {}).get("collapsed", False)
+
+    def display_group_collapsed(self, name):
+        return not self.flat_sort_active and self.is_group_collapsed(name)
 
     def _group_rows(self):
         if self._group_row_map is None:
@@ -87,6 +101,7 @@ class ModGrouping:
             self.beginResetModel()
         self._natural, self._mod_groups = list(entries), groups
         self._index_groups()
+        self._sync_group_headers()
         if reset:
             self._entries = self._derive_display()
             self.endResetModel()
@@ -95,6 +110,7 @@ class ModGrouping:
 
     def _commit_group_edit(self, entries, groups):
         groups = grouping.normalize_groups(groups, entries)
+        entries = grouping.with_group_headers(entries, groups)
         entries = grouping.prioritize_leaders(entries, groups)
         if entries == self._natural and groups == self._mod_groups:
             return False
@@ -102,7 +118,8 @@ class ModGrouping:
         old_names = self._mod_name_order()
         self._group_recovery_needed = False
         self._publish_group_edit(entries, groups)
-        reordered = old_entries != self._natural
+        reordered = ([e for e in old_entries if not e.is_group_header]
+                     != [e for e in self._natural if not e.is_group_header])
         reported = False
         try:
             if reordered:
@@ -129,6 +146,35 @@ class ModGrouping:
         return self._commit_group_edit(*grouping.group_with(
             self._natural, self._mod_groups, names, leader, self.reverse_mode_active))
 
+    def _sync_group_headers(self):
+        for header, members in self._group_headers.values():
+            header.enabled = any(e.enabled for e in members)
+
+    def create_cosmetic_group(self, names, title):
+        from uuid import uuid4
+        title = title.strip()
+        moving = grouping.expand_leaders(names, self._mod_groups)
+        entries = [e for e in self._natural if not e.is_group_header]
+        block = [e for e in entries if e.name in moving and not e.is_separator]
+        if not title or not block or any(e.locked for e in block):
+            return False
+        block_names = {e.name for e in block}
+        at = next(i for i, e in enumerate(entries) if e.name in block_names)
+        rest = [e for e in entries if e.name not in block_names]
+        rest[at:at] = block
+        groups = grouping.detach(self._mod_groups, moving)
+        leader = f"@group:{uuid4().hex}"
+        groups[leader] = {"title": title, "members": [e.name for e in block],
+                          "collapsed": True}
+        return self._commit_group_edit(rest, groups)
+
+    def rename_cosmetic_group(self, leader, title):
+        groups = deepcopy(self._mod_groups)
+        if not title.strip() or "title" not in groups.get(leader, {}):
+            return False
+        groups[leader]["title"] = title.strip()
+        return self._commit_group_edit(self._natural, groups)
+
     def change_group_leader(self, leader, new):
         return self._commit_group_edit(self._natural,
                                       grouping.promote(self._mod_groups, leader, new))
@@ -151,6 +197,8 @@ class ModGrouping:
         self._commit_group_edit(self._natural, groups)
 
     def expand_group_selection(self, rows):
+        if self.flat_sort_active:
+            return list(rows)
         names = grouping.expand_leaders(
             [self.entry(r).name for r in rows], self._mod_groups)
         return [r for r, e in enumerate(self._entries) if e.name in names]
@@ -257,7 +305,7 @@ class ModGrouping:
     def set_group_priority(self, row, priority):
         entry = self.entry(row)
         moving = grouping.expand_leaders([entry.name], self._mod_groups)
-        mods = [e for e in self._natural if not e.is_separator]
+        mods = [e for e in self._natural if not e.is_separator and not e.is_group_header]
         target = max(0, min(len(mods) - 1, len(mods) - 1 - priority))
         source = mods.index(entry)
         if source == target:
@@ -265,7 +313,7 @@ class ModGrouping:
         block = [e for e in mods if e.name in moving]
         start = max(0, min(len(mods) - len(block), target - block.index(entry)))
         others = [e for e in self._natural if e.name not in moving]
-        other_mods = [e for e in others if not e.is_separator]
+        other_mods = [e for e in others if not e.is_separator and not e.is_group_header]
         if start < len(other_mods):
             anchor = other_mods[start]
             slot = self._natural.index(anchor)
@@ -314,8 +362,9 @@ class ModGrouping:
                 block = [next(it) if e.name in names else e for e in block]
             result.append(block)
         chosen = [b for b in result if all(e.name in names for e in b)]
+        labels = {e.name: e.display_name for e in self._natural}
         chosen = ordered(chosen,
-                         lambda b: (self.group_leader(b[0].name) or b[0].name).casefold(),
+                         lambda b: labels[self.group_leader(b[0].name) or b[0].name].casefold(),
                          lambda b: any(self.loose_conflict_code(e.name) for e in b))
         it = iter(chosen)
         arranged = [next(it) if all(e.name in names for e in b) else b for b in result]

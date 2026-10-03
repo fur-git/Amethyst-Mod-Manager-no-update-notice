@@ -26,6 +26,7 @@ from Utils.downloads.core import (
 )
 from Utils.downloads.locations import archive_path_key
 from Utils.downloads.cache import format_size
+from Utils.ui import config as uc
 
 COL_CHECK = 0
 COL_NAME = 1
@@ -54,7 +55,7 @@ def _downloaded_text(mtime: float) -> str:
         return ""
     if downloaded.date() == datetime.now().date():
         return downloaded.strftime("%H:%M")
-    return downloaded.strftime("%m/%d/%y")
+    return downloaded.strftime(uc.display_date_pattern())
 
 
 @dataclass
@@ -67,6 +68,7 @@ class ActiveDownload(DownloadEntry):
     cancelling: bool = False
     pausable: bool = False
     paused: bool = False
+    interrupted: bool = False
 
 
 class DownloadsModel(QAbstractTableModel):
@@ -75,6 +77,7 @@ class DownloadsModel(QAbstractTableModel):
         self._natural: list[DownloadEntry] = []
         self._rows: list[DownloadEntry] = []
         self._active_downloads: list[ActiveDownload] = []
+        self._interrupted_downloads: list[ActiveDownload] = []
         self._installed = InstalledIndex()
         self._hidden_entries: frozenset[Path] = frozenset()
         self._sort_key: str | None = None
@@ -126,8 +129,22 @@ class DownloadsModel(QAbstractTableModel):
         self._rows = self._derive_rows()
         self.endResetModel()
 
+    def set_interrupted_downloads(self, downloads) -> None:
+        interrupted = [ActiveDownload(
+            key=f"part:{item.metadata_path}", name=item.file_name,
+            done=item.downloaded, total=item.total,
+            cancellable=True, pausable=True, paused=True, interrupted=True)
+            for item in downloads]
+        self.beginResetModel()
+        self._interrupted_downloads = interrupted
+        self._rows = self._derive_rows()
+        self.endResetModel()
+
     def is_downloading_section(self, row: int) -> bool:
-        return row == 0 and bool(self._active_downloads)
+        if self._active_downloads and row == 0:
+            return True
+        interrupted_header = len(self._active_downloads) + bool(self._active_downloads)
+        return bool(self._interrupted_downloads and row == interrupted_header)
 
     # ---- column sorting --------------------------------------------------
     def set_sort(self, key: str | None, ascending: bool = True):
@@ -145,10 +162,15 @@ class DownloadsModel(QAbstractTableModel):
         return self._sort_key, self._sort_ascending
 
     def _derive_rows(self) -> list[DownloadEntry]:
-        prefix = ([DownloadEntry(is_section_header=True,
-                                 section_name=self.tr("Downloading")),
-                   *self._active_downloads]
-                  if self._active_downloads else [])
+        prefix = []
+        if self._active_downloads:
+            prefix.extend([DownloadEntry(
+                is_section_header=True, section_name=self.tr("Downloading")),
+                *self._active_downloads])
+        if self._interrupted_downloads:
+            prefix.extend([DownloadEntry(
+                is_section_header=True, section_name=self.tr("Interrupted")),
+                *self._interrupted_downloads])
         if self._sort_key is None:
             return prefix + list(self._natural)
 

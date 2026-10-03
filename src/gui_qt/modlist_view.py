@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from gui_qt.modlist_model import (
     ModListModel, COLUMNS, COL_NAME, COL_CATEGORY, COL_PRIORITY, COL_FLAGS,
     COL_CONFLICTS, COL_INSTALLED, COL_VERSION, COL_AUTHOR, COL_SIZE,
-    COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID, COL_CONTENT,
+    COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID, COL_CONTENT, COL_UPDATED,
     FlagsRole, HighlightRole,
 )
 from gui_qt.modlist_delegate import ModRowDelegate, ROW_H, SEP_H
@@ -49,15 +49,17 @@ class _StayOpenMenu(QMenu):
 # Per-column default width + minimum (design px), mirroring the Tk app's
 # _layout_columns data_defaults / data_mins. Name auto-fills the leftover.
 COL_DEFAULTS = {
-    COL_CATEGORY: 120, COL_FLAGS: 70, COL_CONFLICTS: 95, COL_INSTALLED: 100,
+    COL_CATEGORY: 120, COL_FLAGS: 70, COL_CONFLICTS: 95, COL_INSTALLED: 120,
     COL_VERSION: 90, COL_AUTHOR: 110, COL_PRIORITY: 75, COL_SIZE: 85,
     COL_NEXUS_MOD_ID: 105, COL_NEXUS_FILE_ID: 105, COL_CONTENT: 200,
+    COL_UPDATED: 120,
 }
 COL_MINS = {
     COL_NAME: 120, COL_CATEGORY: 90, COL_FLAGS: 60, COL_CONFLICTS: 90,
-    COL_INSTALLED: 90, COL_VERSION: 80, COL_AUTHOR: 80, COL_PRIORITY: 70,
+    COL_INSTALLED: 116, COL_VERSION: 80, COL_AUTHOR: 80, COL_PRIORITY: 70,
     COL_SIZE: 70,
     COL_NEXUS_MOD_ID: 90, COL_NEXUS_FILE_ID: 90, COL_CONTENT: 90,
+    COL_UPDATED: 116,
 }
 NAME_MIN = COL_MINS[COL_NAME]
 
@@ -70,6 +72,7 @@ ARCHIVE_DROP_MIME = "application/x-amethyst-archive-paths"
 _FIRST_RUN_HIDDEN = {
     COL_CATEGORY, COL_INSTALLED, COL_AUTHOR, COL_SIZE,
     COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID, COL_CONTENT,
+    COL_UPDATED,
 }
 
 # Order the column show/hide menu lists its entries in. COLUMNS itself is
@@ -77,7 +80,7 @@ _FIRST_RUN_HIDDEN = {
 # lands last there - this decouples how the menu reads from how it's stored.
 # Any column missing here falls back to its COLUMNS position.
 _COL_MENU_ORDER = (
-    COL_CATEGORY, COL_FLAGS, COL_CONFLICTS, COL_INSTALLED, COL_VERSION,
+    COL_CATEGORY, COL_FLAGS, COL_CONFLICTS, COL_INSTALLED, COL_UPDATED, COL_VERSION,
     COL_AUTHOR, COL_PRIORITY, COL_SIZE, COL_CONTENT,
     COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID,
 )
@@ -100,6 +103,7 @@ _COL_TO_SORTKEY = {
     COL_VERSION: "version", COL_AUTHOR: "author", COL_PRIORITY: "priority",
     COL_SIZE: "size", COL_NEXUS_MOD_ID: "nexus_mod_id",
     COL_NEXUS_FILE_ID: "nexus_file_id", COL_CONTENT: "content",
+    COL_UPDATED: "updated",
 }
 
 
@@ -147,6 +151,7 @@ class ModListView(QTreeView):
         self._lock_anchor_row = -1
         self._lock_range_locking = True
         self._drop_slot = -1              # insertion row for the drop indicator
+        self._drop_collapsed_sep = -1
         self._drop_group = None
         self._drop_group_end = None
         self._group_end_markers: dict[int, str] = {}
@@ -265,6 +270,14 @@ class ModListView(QTreeView):
         spanning + hidden-row state is row-indexed and must be re-applied."""
         self._apply_separator_spanning()
         self.apply_collapse()
+        if self.model().flat_sort_active:
+            from PySide6.QtCore import QItemSelectionModel
+            selection = self.selectionModel()
+            for index in selection.selectedRows():
+                entry = self.model().entry(index.row())
+                if entry.is_group_header or self._is_real_separator(index.row()):
+                    selection.select(index, QItemSelectionModel.Deselect
+                                     | QItemSelectionModel.Rows)
         self.viewport().update()
 
     # ---- column-sort header clicks -----------------------------------------
@@ -668,12 +681,14 @@ class ModListView(QTreeView):
         flt = self._filter_hidden
         srch = self._search_hidden
         query_hidden = set(flt | srch if self._searching else flt)
-        for leader, rows in self.model()._group_rows().items():
-            if any(r not in query_hidden for r in rows):
-                query_hidden.discard(rows[0])
+        if not self.model().flat_sort_active:
+            for leader, rows in self.model()._group_rows().items():
+                if any(r not in query_hidden for r in rows):
+                    query_hidden.discard(rows[0])
         if self._searching:
             # Search drives visibility; collapse is ignored so matches surface.
-            hidden = query_hidden
+            hidden = (self.model().hidden_rows() | query_hidden
+                      if self.model().flat_sort_active else query_hidden)
         else:
             hidden = self.model().hidden_rows() | query_hidden
         # Only touch rows whose visibility actually changes - setRowHidden is
@@ -761,6 +776,8 @@ class ModListView(QTreeView):
             return None
         e = m.entry(row)
         staging = getattr(self, "staging_dir", None)
+        if e.is_group_header:
+            return None
         if not e.is_separator:
             return (staging / e.name) if staging is not None else None
         if e.name == OVERWRITE_NAME:
@@ -776,6 +793,8 @@ class ModListView(QTreeView):
         return None
 
     def _toggle_collapse_row(self, row):
+        if self.model().flat_sort_active:
+            return
         if self.model().is_group_leader(self.model().entry(row).name):
             self.model().toggle_group(self.model().entry(row).name)
             self.viewport().update()
@@ -810,6 +829,8 @@ class ModListView(QTreeView):
 
     def set_all_collapsed(self, collapsed: bool):
         """Collapse or expand every separator (Expand all / Collapse all)."""
+        if self.model().flat_sort_active:
+            return
         self.model().set_all_collapsed(collapsed)
         self.apply_collapse()
         self._save_separator_state()
@@ -914,7 +935,8 @@ class ModListView(QTreeView):
     def _separator_control_at(self, row: int, pos: QPoint,
                               row_rect: QRect | None = None) -> str | None:
         m = self.model()
-        if 0 <= row < m.rowCount() and m.is_group_leader(m.entry(row).name):
+        if (not m.flat_sort_active and 0 <= row < m.rowCount()
+                and m.is_group_leader(m.entry(row).name)):
             index = m.index(row, COL_NAME)
             rect = self.visualRect(index)
             if self.itemDelegate()._group_arrow_rect(rect).adjusted(-3, 0, 3, 0).contains(pos):
@@ -1105,8 +1127,7 @@ class ModListView(QTreeView):
                   | QItemSelectionModel.Rows)
 
     def selected_mod_names(self) -> set[str]:
-        """Names of the selected mods. A selected separator contributes all the
-        mods in its block (Tk parity)."""
+        """Selected mods, including separator blocks and collapsed groups."""
         m = self.model()
         names: set[str] = set()
         from gui_qt.modlist_model import _PINNED_NAMES
@@ -1117,9 +1138,12 @@ class ModListView(QTreeView):
                     continue
                 for r in m.sep_block_rows(idx.row()):
                     names.add(m.entry(r).name)
+            elif e.is_group_header or m.display_group_collapsed(e.name):
+                for r in m.group_rows(e.name):
+                    names.add(m.entry(r).name)
             else:
                 names.add(e.name)
-        return names
+        return names.intersection(m.mod_names())
 
     def conflict_partners(self, names: set[str]) -> tuple[set[str], set[str]]:
         """For a set of mod names, return (higher, lower): the mods they beat
@@ -1192,9 +1216,18 @@ class ModListView(QTreeView):
                     break
 
     # ---- custom drag-reorder ---------------------------------------------
+    def _drag_can_join_group(self):
+        if not self._drag_rows:
+            return False
+        for row in self._drag_rows:
+            entry = self.model().entry(row)
+            if entry.is_separator or entry.locked:
+                return False
+        return True
+
     def _sync_group_end_markers(self):
         markers = {}
-        if self._drag_active:
+        if self._drag_active and self._drag_can_join_group():
             for leader, rows in self.model()._group_rows().items():
                 last = next((r for r in reversed(rows)
                              if not self.isRowHidden(r, self.rootIndex())), None)
@@ -1225,6 +1258,7 @@ class ModListView(QTreeView):
         self._drag_active = False
         self._drag_rows = []
         self._drop_slot = -1
+        self._drop_collapsed_sep = -1
         self._drop_group = None
         self._drop_group_end = None
         self._press_row = -1
@@ -1250,6 +1284,8 @@ class ModListView(QTreeView):
         carries its whole block; everything else carries the selected rows (or
         just itself)."""
         m = self.model()
+        if m.flat_sort_active:
+            return None
         e = m.entry(row)
         from gui_qt.modlist_model import _PINNED_NAMES
         if e.name in _PINNED_NAMES:
@@ -1276,7 +1312,7 @@ class ModListView(QTreeView):
         if not 0 <= row < self.model().rowCount():
             return
         entry = self.model().entry(row)
-        if entry.is_separator:
+        if entry.is_separator or entry.is_group_header:
             return
         from gui_qt.modlist_menu import (
             _is_thunderstore_mod, _modio_url, _open_on_modio,
@@ -1354,7 +1390,8 @@ class ModListView(QTreeView):
         if event.button() == Qt.LeftButton:
             pos = event.position().toPoint()
             idx = self.indexAt(pos)
-            if (idx.isValid() and self.model().is_group_leader(self.model().entry(idx.row()).name)
+            if (idx.isValid() and not self.model().flat_sort_active
+                    and self.model().is_group_leader(self.model().entry(idx.row()).name)
                     and self._separator_control_at(idx.row(), pos) == "collapse"):
                 self._separator_control_press = None
                 event.accept()
@@ -1376,8 +1413,9 @@ class ModListView(QTreeView):
                 entry = self.model().entry(idx.row())
                 delegate = self.itemDelegate()
                 rect = self.visualRect(idx)
-                summary = self.model().is_group_collapsed(entry.name)
-                if (idx.column() == COL_NAME and self.model().is_group_leader(entry.name)):
+                summary = self.model().display_group_collapsed(entry.name)
+                if (idx.column() == COL_NAME and not self.model().flat_sort_active
+                        and self.model().is_group_leader(entry.name)):
                     over = delegate._group_arrow_rect(rect).contains(pos)
                 elif (not entry.is_separator and not summary and idx.column() == COL_FLAGS
                         and callable(getattr(self, "on_flag_clicked", None))):
@@ -1395,7 +1433,8 @@ class ModListView(QTreeView):
                         cell = (idx.row(), idx.column())
                 elif (not entry.is_separator
                       and idx.column() == COL_PRIORITY
-                      and not entry.locked):
+                      and not entry.locked
+                      and not self.model().flat_sort_active):
                     over = delegate._hit_centered_text(pos, rect, idx)
                     if over:
                         cell = (idx.row(), idx.column())
@@ -1436,20 +1475,9 @@ class ModListView(QTreeView):
                     < self._DRAG_THRESHOLD:
                 return
             m = self.model()
-            key, _asc = m.sort_state()
-            if key and not m.reverse_mode_active:
-                # Tk parity: dragging under a non-priority sort clears the
-                # sort first (display snaps to natural order), then the drag
-                # proceeds normally. Re-anchor the press to the entry's new row
-                # (selection follows via the persistent-index remap).
-                pressed = m.entry(self._press_row)
-                self._apply_sort(-1, None, True)
-                row = next((r for r in range(m.rowCount())
-                            if m.entry(r) is pressed), -1)
-                if row < 0:
-                    self._press_row = -1
-                    return
-                self._press_row = row
+            if m.flat_sort_active:
+                self._press_row = -1
+                return
             block = self._drag_block_for(self._press_row)
             if block is None:
                 self._press_row = -1
@@ -1583,6 +1611,7 @@ class ModListView(QTreeView):
         Snaps to the gap nearest the cursor among visible rows."""
         m = self.model()
         n = m.rowCount()
+        self._drop_collapsed_sep = -1
         self._drop_group = None
         self._drop_group_end = None
         vis = self._visible_rows()
@@ -1610,8 +1639,7 @@ class ModListView(QTreeView):
             self._drop_slot = max(0, min(self._drop_slot, n))
             return
         dragged = [m.entry(r) for r in self._drag_rows]
-        can_join = (bool(dragged) and all(not e.is_separator and not e.locked
-                                        for e in dragged))
+        can_join = self._drag_can_join_group()
         dragged_names = {e.name for e in dragged}
         hit_row = None
         first_r, first_rect = onscreen[0]
@@ -1637,6 +1665,12 @@ class ModListView(QTreeView):
                             return
                         rect = rect.adjusted(0, 0, 0, -SEP_H)
                     slot = r if y < rect.center().y() else r + 1
+                    if (slot == r + 1 and can_join and not self._searching
+                            and self._is_real_separator(r)
+                            and m.entry(r).display_name in m._collapsed):
+                        self._drop_collapsed_sep = r
+                        self._drop_slot = slot
+                        return
                     break
             if slot is None:                 # defensive: treat as below last
                 slot = last_r + 1
@@ -1674,6 +1708,8 @@ class ModListView(QTreeView):
         self._drop_slot = slot
 
     def _commit_drop(self):
+        if self.model().flat_sort_active:
+            return
         if not self._drag_rows or self._drop_slot < 0:
             return
         dest = self._drop_slot
@@ -1682,12 +1718,16 @@ class ModListView(QTreeView):
         if m._mod_groups:
             hidden = {r for r in range(m.rowCount())
                       if self.isRowHidden(r, self.rootIndex())}
+            if self._drop_collapsed_sep >= 0:
+                hidden.discard(dest)
             m.move_group_drop(src, dest, self._drop_group, hidden)
         elif m.reverse_mode_active:
             # Reverse-priority drag: resolve the drop in display space with the
             # Tk inverted-mode semantics, then the model uninverts + saves.
             hidden = {r for r in range(m.rowCount())
                       if self.isRowHidden(r, self.rootIndex())}
+            if self._drop_collapsed_sep >= 0:
+                hidden.discard(dest)
             m.move_block_display(src, dest, hidden=hidden)
         else:
             m.move_block(src, dest)
@@ -1743,6 +1783,7 @@ class ModListView(QTreeView):
     def _end_extern_drop(self):
         self._extern_drop = False
         self._drop_slot = -1
+        self._drop_collapsed_sep = -1
         self._scroll_timer.stop()
         self.viewport().update()
 
@@ -1821,6 +1862,8 @@ class ModListView(QTreeView):
             row, inside = self._drop_group_end
             rect = self._group_end_rect(row)
             y = rect.top() if inside else rect.bottom() + 1
+        elif self._drop_collapsed_sep >= 0:
+            y = self.visualRect(m.index(self._drop_collapsed_sep, 0)).bottom() + 1
         elif (not on_boundary and self._drop_slot < n
                 and not self.isRowHidden(self._drop_slot, self.rootIndex())):
             y = self.visualRect(m.index(self._drop_slot, 0)).top()
@@ -1876,6 +1919,8 @@ class ModListView(QTreeView):
         name_to_col = {n: i for i, n in enumerate(COLUMNS)}
         for name, w in st["widths"].items():
             if name in name_to_col and name != "Mod Name":  # name stays stretch
+                if name in (COLUMNS[COL_INSTALLED], COLUMNS[COL_UPDATED]):
+                    w = max(w, COL_MINS[name_to_col[name]])
                 self.setColumnWidth(name_to_col[name], w)
         for name in st["hidden"]:
             if name in name_to_col:
@@ -1886,6 +1931,10 @@ class ModListView(QTreeView):
         for col in _FIRST_RUN_HIDDEN:
             if st["order"] and COLUMNS[col] not in st["order"]:
                 self.setColumnHidden(col, True)
+        if (COLUMNS[COL_UPDATED] not in st["order"]
+                and COLUMNS[COL_UPDATED] not in st["widths"]
+                and st["sort_col"] != COLUMNS[COL_UPDATED]):
+            self.setColumnHidden(COL_UPDATED, True)
         h = self.header()
         for visual, name in enumerate(st["order"]):
             if name in name_to_col:

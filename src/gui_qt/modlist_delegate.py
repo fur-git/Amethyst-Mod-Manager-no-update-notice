@@ -31,7 +31,7 @@ from gui_qt.modlist_data import (
     FLAG_UPDATE, FLAG_ENDORSED, FLAG_ROOT, FLAG_MODIFIED_MF, FLAG_MISSING_REQS,
     FLAG_COLLECTION_BUNDLED, FLAG_COLLECTION_PATCHED, FLAG_NOTE, FLAG_XEDIT,
     FLAG_BUNDLE, FLAG_MODIO_UPDATE, FLAG_PRERTX, FLAG_ROOT_RULE,
-    FLAG_RERUN_FOMOD, FLAG_THUNDERSTORE_UPDATE,
+    FLAG_RERUN_FOMOD, FLAG_THUNDERSTORE_UPDATE, FLAG_SKSE_INCOMPATIBLE,
 )
 
 # Flag bit → icon filename, painted left-to-right in the Flags column, in the
@@ -41,6 +41,7 @@ from gui_qt.modlist_data import (
 _FLAG_ICONS = [
     (FLAG_NOTE, "note.png"),
     (FLAG_BUNDLE, "bundle_settings.png"),
+    (FLAG_SKSE_INCOMPATIBLE, "error.png"),
     (FLAG_MISSING_REQS, "warning.png"),
     (FLAG_RERUN_FOMOD, "rerun_fomod.png"),
     (FLAG_UPDATE, "update.png"),
@@ -85,6 +86,7 @@ _FLAG_TIPS = {
     FLAG_NOTE: QT_TRANSLATE_NOOP("ModRowDelegate", "Note"),
     FLAG_BUNDLE: QT_TRANSLATE_NOOP("ModRowDelegate", "Click here to open bundle settings"),
     FLAG_MISSING_REQS: QT_TRANSLATE_NOOP("ModRowDelegate", "Missing requirements"),
+    FLAG_SKSE_INCOMPATIBLE: QT_TRANSLATE_NOOP("ModRowDelegate", "Contains an incompatible script extender plugin"),
     FLAG_RERUN_FOMOD: QT_TRANSLATE_NOOP("ModRowDelegate", "A FOMOD patch option's plugin is now installed - click to re-run the FOMOD installer"),
     FLAG_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on Nexus Mods"),
     FLAG_MODIO_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on mod.io"),
@@ -697,7 +699,7 @@ class ModRowDelegate(QStyledItemDelegate):
                                 model.sep_block_content(block))
 
     def _paint_name(self, p, r, e, index, text_color):
-        leader = index.model().group_leader(e.name)
+        leader = index.model().display_group_leader(e.name)
         x = r.left() + (24 if leader and leader != e.name else 0)
 
         # Checkbox (accent fill + white tick when enabled; hollow when not).
@@ -718,7 +720,7 @@ class ModRowDelegate(QStyledItemDelegate):
         tx = box.right() + 10
         if leader:
             if leader == e.name:
-                arrow = icon("right.png" if index.model().is_group_collapsed(e.name)
+                arrow = icon("right.png" if index.model().display_group_collapsed(e.name)
                              else "arrow.png", self.ARROW_SZ, color=self.c_arrow)
                 arrow.paint(p, self._group_arrow_rect(r))
             tx += 24
@@ -753,7 +755,7 @@ class ModRowDelegate(QStyledItemDelegate):
 
     def _checkbox_hit_rect(self, rect, index):
         name = index.data(EntryRole).name
-        leader = index.model().group_leader(name)
+        leader = index.model().display_group_leader(name)
         offset = 24 if leader and leader != name else 0
         return QRect(rect.left() + offset + 6, rect.top(), 26, rect.height())
 
@@ -875,6 +877,40 @@ class ModRowDelegate(QStyledItemDelegate):
         note text rendered from Markdown (Tk parity + rich text), the
         rerun-FOMOD flag names the plugins that triggered it; everything else
         uses the static _FLAG_TIPS."""
+        if hit == FLAG_SKSE_INCOMPATIBLE:
+            model = index.model()
+            entry = index.data(EntryRole)
+            issues = model.skse_issues_for(entry.name) if entry is not None else ()
+            lines = []
+            for issue in issues:
+                is_f4se = issue.extender == "F4SE"
+                heading = (self.tr("{0}: your profile uses Fallout 4 {1}.") if is_f4se
+                           else self.tr("{0}: your profile uses Skyrim {1}."))
+                lines.append(heading.format(issue.dll, issue.runtime))
+                if issue.reason == "runtime":
+                    if issue.versions:
+                        supported = (self.tr("Supported Fallout 4 versions: {0}.") if is_f4se
+                                     else self.tr("Supported Skyrim versions: {0}."))
+                        lines.append(supported.format(", ".join(issue.versions)))
+                    else:
+                        lines.append(self.tr("This plugin does not declare support for this Fallout 4 version.") if is_f4se
+                                     else self.tr("This plugin does not declare support for this Skyrim version."))
+                elif issue.reason == "pre629":
+                    lines.append(self.tr("This plugin requires Skyrim earlier than 1.6.629."))
+                elif issue.reason == "post629":
+                    lines.append(self.tr("This plugin requires Skyrim 1.6.629 or later."))
+                elif issue.reason == "32bit":
+                    lines.append(self.tr("This is a 32-bit plugin and cannot load in Fallout 4.") if is_f4se
+                                 else self.tr("This is a 32-bit plugin and cannot load in Skyrim Special Edition."))
+                elif issue.reason == "address_library":
+                    lines.append(self.tr("The Address Library file for this Fallout 4 version is missing or disabled.") if is_f4se
+                                 else self.tr("The Address Library file for this Skyrim version is missing or disabled."))
+                elif issue.reason == "extender":
+                    lines.append(self.tr("This plugin requires {0} {1} or later.").format(
+                        issue.extender, issue.versions[0]))
+                lines.append("")
+            if lines:
+                return "\n".join(lines).rstrip()
         if hit == FLAG_NOTE:
             try:
                 model = index.model()
@@ -916,7 +952,7 @@ class ModRowDelegate(QStyledItemDelegate):
         try:
             if event.type() == QEvent.ToolTip and index.isValid():
                 entry = index.data(EntryRole)
-                if (entry is not None and index.model().is_group_collapsed(entry.name)
+                if (entry is not None and index.model().display_group_collapsed(entry.name)
                         and index.column() in (COL_FLAGS, COL_CONFLICTS)):
                     if index.column() == COL_FLAGS:
                         hit = self._hit_flag_bit(event.pos(), opt.rect, index.data(FlagsRole) or 0)
@@ -1162,7 +1198,7 @@ class ModRowDelegate(QStyledItemDelegate):
             return False
         pos = event.position().toPoint()
         e = model.entry(index.row())
-        if (model.is_group_collapsed(e.name)
+        if (model.display_group_collapsed(e.name)
                 and index.column() in (COL_FLAGS, COL_CONFLICTS)):
             return False
 
@@ -1176,7 +1212,7 @@ class ModRowDelegate(QStyledItemDelegate):
 
         if index.column() == COL_PRIORITY:
             if (event.button() != Qt.LeftButton or e.is_separator
-                    or e.locked
+                    or e.locked or model.flat_sort_active
                     or not self._hit_centered_text(pos, opt.rect, index)):
                 return False
             from gui_qt.modlist_menu import _set_priority
