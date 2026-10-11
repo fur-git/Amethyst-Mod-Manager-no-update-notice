@@ -190,6 +190,7 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
             "max_extract_workers": int(cs.get("max_extract_workers", uc._DEFAULT_MAX_EXTRACT_WORKERS)),
             "check_download_locations": bool(cs.get("check_download_locations", True)),
             "clear_archive_after_install": bool(cs.get("clear_archive_after_install", False)),
+            "download_order": cs.get("download_order", uc._DEFAULT_DOWNLOAD_ORDER),
         }
 
         _card, outer = self._make_card(
@@ -1251,6 +1252,17 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
         self._slider(
             g, self.tr("Max concurrent downloads"), 1, uc._MAX_CONCURRENT_CEILING,
             self._cs["max_concurrent"], self._save_max_concurrent)
+        self._download_order_combo = self._combo(
+            g, self.tr("Download order"),
+            [(self.tr("Balanced"), "balanced"),
+             (self.tr("Smallest to largest"), "smallest"),
+             (self.tr("Largest to smallest"), "largest")],
+            self._cs["download_order"], self._save_download_order,
+            help=self.tr("Choose the download order for collections and Wabbajack, "
+                 "including browser prompts for free Nexus users. Balanced overlaps "
+                 "small and large downloads. Files with unknown sizes come last. "
+                 "Collection installation phases are preserved. Applies when "
+                 "starting or resuming an install."))
 
         # Download speed limit - global cap shared by all download threads.
         def _limit_text(v) -> str:
@@ -1364,12 +1376,6 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
 
     def _build_general(self):
         g = self._section(self.tr("General"))
-        self._checkbox(
-            g, self.tr("Discord Rich Presence"),
-            uc.load_discord_presence, uc.save_discord_presence,
-            help=self.tr("Show Amethyst and the game you are modding on your "
-                         "Discord profile while the Discord desktop app is running."),
-            on_changed=self._window._discord_presence.set_enabled)
         self._checkbox(
             g, self.tr("Normalise folder casing"),
             uc.load_normalize_folder_case, uc.save_normalize_folder_case,
@@ -1569,6 +1575,17 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
                  "launch it directly. Only needed for AppImage installs - leave "
                  "blank for Flatpak or native Faugus."))
         self._path_row(
+            g, self.tr("Bottles Data Location"),
+            uc.load_bottles_data_path, uc.save_bottles_data_path,
+            help=self.tr("Bottles data folder or custom bottles folder. "
+                         "Blank = auto-detect Flatpak, Cpak and AppImage locations."))
+        self._file_row(
+            g, self.tr("Bottles AppImage"),
+            uc.load_bottles_appimage_path, uc.save_bottles_appimage_path,
+            filters=[("AppImage", ["*.AppImage", "*.appimage"]), ("All files", ["*"])],
+            help=self.tr("Path to the Bottles AppImage, so Play can launch it "
+                         "directly. Leave blank for Flatpak or Cpak."))
+        self._path_row(
             g, self.tr("Steam libraryfolders.vdf"),
             uc.load_steam_libraries_vdf_path, uc.save_steam_libraries_vdf_path,
             help=self.tr("Path to libraryfolders.vdf (or its folder). Blank = auto-detect "
@@ -1754,7 +1771,8 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
             self._cs["max_concurrent"],
             self._cs["check_download_locations"],
             self._cs["clear_archive_after_install"],
-            self._cs["max_extract_workers"])
+            self._cs["max_extract_workers"],
+            self._cs["download_order"])
 
     def _save_max_concurrent(self, value: int):
         self._cs["max_concurrent"] = int(value)
@@ -1762,6 +1780,10 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
 
     def _save_max_extract(self, value: int):
         self._cs["max_extract_workers"] = int(value)
+        self._persist_collection()
+
+    def _save_download_order(self, value: str):
+        self._cs["download_order"] = value
         self._persist_collection()
 
     def _save_speed_limit(self, value: int):

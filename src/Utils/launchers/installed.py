@@ -9,7 +9,7 @@ them per game made the scan O(picker games x installed games) - minutes on
 slow media. Worst offender: the Heroic GOG fallback re-walked entire game
 installs recursively for every handler exe that didn't match.
 
-InstalledIndex touches each data source once and answers game_installed()
+InstalledIndex touches each data source once and answers game_launchers()
 from memory:
   - Steam: appmanifest_*.acf parsed once per library, plus a memoized
     directory-listing cache over steamapps/common - each directory is
@@ -71,7 +71,7 @@ def _tail_matches(stored_index: list[list[str]], exe_name: str) -> bool:
 
 
 class InstalledIndex:
-    """Build once (worker thread), then call game_installed(game) per game."""
+    """Build once (worker thread), then query detected launchers per game."""
 
     def __init__(self, log=None):
         self._log = log or (lambda msg: None)
@@ -84,6 +84,7 @@ class InstalledIndex:
         self._build_heroic()
         self._build_lutris()
         self._build_faugus()
+        self._build_bottles()
 
     # ------------------------------------------------------------------
     # Steam
@@ -335,57 +336,59 @@ class InstalledIndex:
         """True if any Faugus game's exe tail matches exe_name."""
         return _tail_matches(self._faugus_exes, exe_name)
 
+    def _build_bottles(self) -> None:
+        self._bottles_exes: list[list[str]] = []
+        try:
+            from Utils.launchers.bottles import build_installed_exe_index
+            self._bottles_exes = build_installed_exe_index()
+        except Exception as exc:
+            self._log(f"bottles index build failed, continuing with none: {exc}")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def game_installed(self, game) -> bool:
-        """True if *game* (a handler object) appears installed via Steam,
-        Heroic, Lutris or Faugus. Same detection order as the old per-game
-        finder calls."""
+        return bool(self.game_launchers(game))
+
+    def game_launchers(self, game) -> tuple[str, ...]:
+        """Return every matching launcher, with Steam shortcuts counted as Steam."""
+        launchers = []
         exe_name = getattr(game, "exe_name", "") or ""
         all_exe = [e for e in
                    ([exe_name] + list(getattr(game, "exe_name_alts", []) or []))
                    if e]
         steam_id = str(getattr(game, "steam_id", "") or "")
 
-        if steam_id and exe_name:
-            for game_dir in self._acf_dirs.get(steam_id, ()):
-                if self._exe_in_dir(game_dir, exe_name):
-                    return True
-
-        if steam_id:
-            for exe in all_exe:
-                for game_dir in self._steam_game_dirs:
-                    if self._exe_in_dir(game_dir, exe):
-                        return True
+        steam_found = bool(steam_id and exe_name and any(
+            self._exe_in_dir(game_dir, exe_name)
+            for game_dir in self._acf_dirs.get(steam_id, ())))
+        if not steam_found and steam_id:
+            steam_found = any(self._exe_in_dir(game_dir, exe)
+                              for exe in all_exe
+                              for game_dir in self._steam_game_dirs)
+        if steam_found or any(self._shortcuts_by_exe(exe) for exe in all_exe):
+            launchers.append("steam")
 
         # Declared app names are authoritative for Heroic - when set, the exe
         # scan is skipped: generic launcher names collide across games
         # (FalloutLauncher.exe = both Fallout 3 GOTY and classic Fallout).
         heroic_names = list(getattr(game, "heroic_app_names", []) or [])
         if heroic_names:
-            if self._heroic_by_app_names(heroic_names):
-                return True
+            heroic_found = self._heroic_by_app_names(heroic_names)
         else:
-            for exe in all_exe:
-                bare = exe.replace("\\", "/").rsplit("/", 1)[-1]
-                if bare and self._heroic_by_exe(bare):
-                    return True
+            heroic_found = any(self._heroic_by_exe(
+                exe.replace("\\", "/").rsplit("/", 1)[-1]) for exe in all_exe)
+        if heroic_found:
+            launchers.append("heroic")
 
-        for exe in all_exe:
-            if self._lutris_by_exe(exe):
-                return True
+        if any(self._lutris_by_exe(exe) for exe in all_exe):
+            launchers.append("lutris")
 
-        for exe in all_exe:
-            if self._faugus_by_exe(exe):
-                return True
+        if any(self._faugus_by_exe(exe) for exe in all_exe):
+            launchers.append("faugus")
 
-        # Last: a game the user added to Steam as a non-Steam shortcut. Checked
-        # after the real launchers because a shortcut often just points at an
-        # install one of them already owns.
-        for exe in all_exe:
-            if self._shortcuts_by_exe(exe):
-                return True
+        if any(_tail_matches(self._bottles_exes, exe) for exe in all_exe):
+            launchers.append("bottles")
 
-        return False
+        return tuple(launchers)

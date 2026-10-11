@@ -1108,11 +1108,10 @@ def _clamp(value: float) -> float:
 # ---------------------------------------------------------------------------
 _COLLECTIONS_SECTION = "collections"
 
-# Download order is no longer configurable. Up to two collection download lanes
-# take the largest remaining archives while the others run smallest-first.
 # Defaults are 8/8; more concurrency past this gives little practical benefit.
 _DEFAULT_MAX_CONCURRENT = 8
 _DEFAULT_MAX_EXTRACT_WORKERS = 8
+_DEFAULT_DOWNLOAD_ORDER = "balanced"
 
 # Upper clamps for the user-configurable concurrency (Settings ▸ Downloads).
 _MAX_CONCURRENT_CEILING = 12
@@ -1127,18 +1126,14 @@ _FIRST_RUN_HIDDEN_COLUMNS = [2, 5, 8]  # category, installed, size
 
 
 def load_collection_settings() -> dict:
-    """Return collection settings dict with keys: max_concurrent, max_extract_workers, check_download_locations, clear_archive_after_install, download_order.
-
-    NB *download_order* is retained ONLY for the legacy Tk settings dialog
-    (gui/status_bar.py) - the Qt download scheduler ignores it (downloads always
-    use the double-ended big-first + small-first policy)."""
+    """Return shared collection and Wabbajack download settings."""
     path = get_ui_config_path()
     defaults = {
         "max_concurrent": _DEFAULT_MAX_CONCURRENT,
         "max_extract_workers": _DEFAULT_MAX_EXTRACT_WORKERS,
         "check_download_locations": True,
         "clear_archive_after_install": False,
-        "download_order": "largest",   # legacy Tk key; unused by Qt
+        "download_order": _DEFAULT_DOWNLOAD_ORDER,
     }
     if not path.is_file():
         return defaults
@@ -1153,9 +1148,9 @@ def load_collection_settings() -> dict:
         max_extract_workers = max(1, min(_MAX_EXTRACT_WORKERS_CEILING, max_extract_workers))
         check_download_locations = s.getboolean("check_download_locations", True)
         clear_archive_after_install = s.getboolean("clear_archive_after_install", False)
-        download_order = s.get("download_order", "largest").strip().lower()
-        if download_order not in ("largest", "smallest"):
-            download_order = "largest"
+        download_order = s.get("download_order", _DEFAULT_DOWNLOAD_ORDER).strip().lower()
+        if download_order not in ("balanced", "largest", "smallest"):
+            download_order = _DEFAULT_DOWNLOAD_ORDER
         return {
             "max_concurrent": max_concurrent,
             "max_extract_workers": max_extract_workers,
@@ -1261,13 +1256,7 @@ def save_collection_settings(max_concurrent: int,
                               clear_archive_after_install: bool = False,
                               max_extract_workers: int = _DEFAULT_MAX_EXTRACT_WORKERS,
                               download_order: str | None = None) -> None:
-    """Persist collection settings to amethyst.ini.
-
-    *download_order* is accepted for backward-compatibility (the Tk settings
-    dialog still passes it) but the Qt download scheduler ignores it - downloads
-    always use the double-ended (big-first + small-first) policy. When given, it
-    is still written through so the Tk UI round-trips.
-    """
+    """Persist shared collection and Wabbajack download settings."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     parser = _new_parser()
@@ -1764,26 +1753,6 @@ def save_allow_prerelease(value: bool) -> None:
     if _UPDATES_SECTION not in parser:
         parser[_UPDATES_SECTION] = {}
     parser[_UPDATES_SECTION]["allow_prerelease"] = "true" if value else "false"
-    _write_ini(parser, path)
-
-
-def load_discord_presence() -> bool:
-    try:
-        return _read_ini(get_ui_config_path()).getboolean(
-            "discord", "rich_presence", fallback=False)
-    except Exception:
-        return False
-
-
-def save_discord_presence(value: bool) -> None:
-    path = get_ui_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
-    if "discord" not in parser:
-        parser["discord"] = {}
-    parser["discord"]["rich_presence"] = "true" if value else "false"
     _write_ini(parser, path)
 
 
@@ -2502,6 +2471,56 @@ def save_faugus_appimage_path(value: str) -> None:
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
     parser[_PATHS_SECTION]["faugus_appimage_path"] = value.strip()
+    _write_ini(parser, path)
+
+
+def load_bottles_data_path() -> str:
+    """Return the user-configured Bottles data directory path, or '' if unset."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return ""
+    try:
+        parser = _read_ini(path)
+        return parser.get(_PATHS_SECTION, "bottles_data_path", fallback="").strip()
+    except Exception:
+        return ""
+
+
+def save_bottles_data_path(value: str) -> None:
+    """Persist the Bottles data directory path to amethyst.ini. Pass '' to clear."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _PATHS_SECTION not in parser:
+        parser[_PATHS_SECTION] = {}
+    parser[_PATHS_SECTION]["bottles_data_path"] = value.strip()
+    _write_ini(parser, path)
+
+
+def load_bottles_appimage_path() -> str:
+    """Return the user-configured Bottles AppImage path, or '' if unset."""
+    path = get_ui_config_path()
+    if not path.is_file():
+        return ""
+    try:
+        parser = _read_ini(path)
+        return parser.get(_PATHS_SECTION, "bottles_appimage_path", fallback="").strip()
+    except Exception:
+        return ""
+
+
+def save_bottles_appimage_path(value: str) -> None:
+    """Persist the Bottles AppImage path to amethyst.ini. Pass '' to clear."""
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _PATHS_SECTION not in parser:
+        parser[_PATHS_SECTION] = {}
+    parser[_PATHS_SECTION]["bottles_appimage_path"] = value.strip()
     _write_ini(parser, path)
 
 

@@ -8,6 +8,8 @@ import time
 import zipfile
 from pathlib import Path
 
+from Utils.archives.identify import identify_archive, may_be_zip
+
 from .archive_build import check_archive_state
 from .archive_io import utf8_chunks
 from .games import matches_game, token
@@ -80,6 +82,14 @@ def _game_file_category(game, relative):
         return "creation_kit"
     if leaf in {"debug.log", "installscript.vdf", "scripts.zip"}:
         return "support"
+    if game_name in {"skyrimspecialedition", "skyrimse", "skyrimvr"} and leaf in {
+        "_resourcepack.bsa", "_resourcepack.esl",
+    }:
+        return "game_resources"
+    if game_name in {"skyrimspecialedition", "skyrimse"} and leaf in {
+        "ccbgssse037-curios.bsa", "ccbgssse037-curios.esl",
+    }:
+        return "rare_curios"
     if game_name in {"skyrimspecialedition", "skyrimvr", "fallout4", "fallout4vr"} and (
         (name.startswith("data/cc") and leaf.endswith((".bsa", ".ba2", ".esm", ".esl", ".esp")))
         or leaf.startswith("_resourcepack.")
@@ -119,7 +129,8 @@ def _emit_game_file_problems(package, problems, check, readme="", ignored=False)
             category = "creation_kit"
         grouped.setdefault((game, category), []).append((relative, present, archive))
     readme = str(package.metadata.get("Readme", "")).strip() or str(readme).strip()
-    for category in ("creation_kit", "game", "support", "creation_content"):
+    for category in ("creation_kit", "game", "game_resources", "support",
+                     "creation_content", "rare_curios"):
         for (game, group), entries in grouped.items():
             if group != category:
                 continue
@@ -161,7 +172,13 @@ def _emit_game_file_problems(package, problems, check, readme="", ignored=False)
                 detail += " Install the matching Creation Kit through Steam, select Proton for it if needed, launch it once, close it, and recheck."
             elif category == "creation_content":
                 name = "Creation content"
-                detail += " The package uses these as reconstruction sources even if its README does not mention them. Install the exact Creations or Creation Club variants required by the author. Rare Curios can have different Steam and in-game versions. Every affected file is listed below."
+                detail += " The package uses these as reconstruction sources even if its README does not mention them. Install the exact Creations or Creation Club variants required by the author. Every affected file is listed below."
+            elif category == "game_resources":
+                name = "Game resource files"
+                detail += " These resource files are supplied with Skyrim game updates and must match the game data required by the author. Follow the author's game-version or downgrade instructions for these files. Every affected file is listed below."
+            elif category == "rare_curios":
+                name = "Rare Curios"
+                detail += " Amethyst could not find the required files or prepare a supported version automatically. Steam and in-game Creations can provide different Rare Curios files. Every affected file is listed below."
             elif category == "support":
                 if ignored:
                     name = "Ignored supporting files"
@@ -629,6 +646,14 @@ def _preflight(request, stop, notify, log=None):
     vanilla = {p.casefold() for p in [*getattr(request.game, "vanilla_plugins", []),
                                      *getattr(request.game, "vanilla_dlc_plugins", [])]}
     provided_plugins = {d.path.rsplit("/", 1)[-1].casefold() for d in package.directives if d.path.casefold().endswith((".esm", ".esp", ".esl"))}
+    plugin_subpath = Path("Data")
+    game_path = request.game.get_game_path()
+    plugins_path = request.game.get_vanilla_plugins_path()
+    if game_path is not None and plugins_path is not None:
+        try:
+            plugin_subpath = plugins_path.relative_to(game_path)
+        except ValueError:
+            pass
     for (profile, kind), lines in profile_lists.items():
         if kind != "plugins.txt":
             continue
@@ -638,9 +663,10 @@ def _preflight(request, stop, notify, log=None):
             if not name or name.startswith("#") or (starred and not line.startswith("*")) or name.casefold() not in vanilla or name.casefold() in provided_plugins:
                 continue
             available = False
-            for game_root in request.game_roots.values():
+            for source_game, game_root in request.game_roots.items():
+                subpath = plugin_subpath if matches_game(request.game, source_game) else Path("Data")
                 try:
-                    available |= source_path(game_root, "Data/" + name).is_file()
+                    available |= source_path(game_root, (subpath / name).as_posix()).is_file()
                 except (OSError, WabbajackError) as exc:
                     emit(log, "preflight.game_plugin.probe_failed",
                          profile=profile, plugin=name, game_root=game_root,
@@ -903,20 +929,46 @@ def _preflight(request, stop, notify, log=None):
         archive = package.archives[key]
         estimate = max(outputs, archive.size * 3)
         cached = report.cached.get(key, report.game_files.get(key))
-        if cached and zipfile.is_zipfile(cached):
-            with zipfile.ZipFile(cached) as source:
-                selected = [i for i in source.infolist()
-                            if i.filename.replace("\\", "/").casefold() in selected_members[key]]
-                estimate = sum(i.file_size for i in selected)
+        try:
+            if cached and may_be_zip(cached, identify_archive(cached)):
+                with zipfile.ZipFile(cached) as source:
+                    selected = [i for i in source.infolist()
+                                if i.filename.replace("\\", "/").casefold() in selected_members[key]]
+                    estimate = sum(i.file_size for i in selected)
+                    if key in nested_outputs:
+                        packed = sum(i.file_size for i in selected
+                                     if i.filename.replace("\\", "/").casefold() in nested_members[key])
+                        estimate += max(nested_outputs[key], packed * 3)
+                    if any(i.flag_bits & 1 for i in source.infolist()):
+                        check("error", "Archive extraction", f"Password-protected source archive is unsupported: {archive.name}")
+                    if any(i.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA} for i in selected):
+                        if not any(shutil.which(n) for n in ("7zzs", "7zz", "7z", "7za")):
+                            check("error", "Archive extraction", f"Install 7-Zip to decode the ZIP compression used by {archive.name}")
+        except zipfile.BadZipFile as exc:
+            emit_exception(log, "preflight.space.archive_probe.failed", exc,
+                           archive=archive.name, path=cached,
+                           expected_bytes=archive.size, expected_hash=archive.key,
+                           fallback="7zip")
+            from .extraction import archive_entries
+            try:
+                entries = archive_entries(cached, stop)
+            except WabbajackError as fallback_exc:
+                check("error", "Archive extraction", f"Cannot inspect {archive.name}: {fallback_exc}")
+            else:
+                selected = [(name, size) for name, size, directory in entries
+                            if not directory and name.casefold() in selected_members[key]]
+                estimate = sum(size for _, size in selected)
                 if key in nested_outputs:
-                    packed = sum(i.file_size for i in selected
-                                 if i.filename.replace("\\", "/").casefold() in nested_members[key])
+                    packed = sum(size for name, size in selected
+                                 if name.casefold() in nested_members[key])
                     estimate += max(nested_outputs[key], packed * 3)
-                if any(i.flag_bits & 1 for i in source.infolist()):
-                    check("error", "Archive extraction", f"Password-protected source archive is unsupported: {archive.name}")
-                if any(i.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA} for i in selected):
-                    if not any(shutil.which(n) for n in ("7zzs", "7zz", "7z", "7za")):
-                        check("error", "Archive extraction", f"Install 7-Zip to decode the ZIP compression used by {archive.name}")
+                emit(log, "preflight.space.archive_probe.fallback", archive=archive.name,
+                     path=cached, backend="7zip", estimated_bytes=estimate)
+        except Exception as exc:
+            emit_exception(log, "preflight.space.archive_probe.failed", exc,
+                           archive=archive.name, path=cached,
+                           expected_bytes=archive.size, expected_hash=archive.key)
+            raise
         estimates.append(estimate)
     merge_bytes = max((sum(index.by_path[p.casefold()].size for p in index.dependencies[d.index])
                        for d in pending if d.kind == "MergedPatch"), default=0)

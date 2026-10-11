@@ -1,3 +1,32 @@
+- v2.5.4
+### Additions
+- Added support for games installed via Bottles
+- Added badges to each game in the add game menu showing which launchers they are detected from
+- Added a settings button to added games in the add game menu to open a games configure menu without needing to switch to it
+- Added an option to copy profiles in the profile settings menu
+- Added support for bg3le to Baldur's Gate 3 #636
+### Changes
+- Fomod choices can now be quickly changed in the view Fomod choices right click menu
+- Stardew valley Wabbajack lists now install the linux native version of SMAPI
+- Made the data tab more consistent between games
+- Wabbajack and collection download order can now be changed in the settings menu (Downloads tab)
+- Removed some added case alias folders causing open animation replacer to show duplicate entries.
+- Tweaked archive extraction to parse the archive headers instead of using file name #650
+- Removed the Discord rpc feature
+- Added the pgpatcher wizard for Skyrim VR
+### Bug Fixes
+- Fixed an issue where renaming a mod would remove the view Fomod choices menu entry
+- Fixed moving multiple mods with CTRL+Click when no mod groups are present in the mod list
+- Fixed an issue where some mods that are a only a few KB in size would not install for free Nexus users from the Nexus browser
+- Fixed some issues with the KCD1 and KCD2 handlers
+- Fixed game detection for Skyrim 1.5.97 not working correctly
+- Fixed an issue where the disk space check in the Wabbajack preflight screen did not calculate space for the configured install path
+- Fixed an issue where running via vfs would leave the game process running while closed
+- Fixed wizards that add folders to the modlist not working correctly for wabbajack installed lists
+- Fixed mod folders being left over when restoring Witcher 3
+
+---
+
 - v2.5.3
 ### Game Support
 - Added Voices Of The Void
@@ -21,11 +50,15 @@
 - Mods can no longer be moved when mod list columns are sorted
 - Separators and mod groups are now auto hidden when sorting mod list columns
 - The installed column now shows both date and time
+- Moved No Mans Sky as a built in handler to handle gcmodsettings.mxl #619
+- The TTW wizard now warns against game installs that are in another language and will cause the install to fail
 ### Bug Fixes
 - Fixed plugin sorting not refreshing the plugin panel flags
 - Fixed the Ignore missing requirements option not removing the missing requirments flag
 - Fixed loot sorting timing out and stalling after 3 minutes on large lists
 - Fixed some issues with wabbjack lists crashing due to long path names
+- Fixed fully conflicted mods sometimes showing the wrong conflict flag
+- Fixed Oblivion file timestamp handling causing loose files to not load
 
 ---
 

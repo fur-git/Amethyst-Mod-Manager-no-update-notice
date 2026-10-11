@@ -570,7 +570,10 @@ class DynDOLODView(QWidget):
                     # processes inherit this environment, so filtering the
                     # Vulkan devices here makes the selected discrete GPU DXVK
                     # adapter 0 for texconv's DirectCompute codec as well.
-                    from Utils.wizards.textures import apply_discrete_gpu_environment
+                    from Utils.wizards.textures import (
+                        apply_discrete_gpu_environment, apply_texture_dxvk_environment,
+                    )
+                    apply_texture_dxvk_environment(env)
                     gpu_selection = apply_discrete_gpu_environment(
                         env, prefer_discrete_gpu)
                     _wlog(f"GPU: {gpu_selection}")
@@ -581,8 +584,12 @@ class DynDOLODView(QWidget):
                     return
 
                 staging = game.get_effective_mod_staging_path()
+                profile_dir = getattr(game, "_active_profile_dir", None)
                 output = staging / output_dir
                 output.mkdir(parents=True, exist_ok=True)
+                from Utils.mods.install_as_mod import register_output_mod
+                register_output_mod(profile_dir, staging, output_dir,
+                                    log_fn=_wlog)
 
                 pfx = compat_data / "pfx"
                 data_arg = f'-d:{to_wine_path(game_path / "Data", pfx)}'

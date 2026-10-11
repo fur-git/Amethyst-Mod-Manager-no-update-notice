@@ -3,8 +3,8 @@ game with per-row management. Qt port of the Tk ``gui/profile_settings_overlay.p
 (``ProfileSettingsOverlay``), MINUS the "Steam Cmd" button.
 
 Each row: a lock toggle (disabled for the default profile), the profile name (with
-``(default)`` / ``★`` markers), a dropdown visibility checkbox, and Rename / Open /
-Remove buttons. Rename opens an inline bar under the row; Remove restores the game
+``(default)`` / ``★`` markers), a dropdown visibility checkbox, and Rename / Copy /
+Open / Remove buttons. Rename opens an inline bar under the row; Remove restores the game
 first if the profile is deployed, asks a second time if the profile has its own mods,
 then deletes the folder. All persistence reuses the neutral
 ``Utils.profiles.state`` helpers - no backend rewrite.
@@ -265,6 +265,14 @@ class ProfileSettingsView(QWidget):
                                self._show_rename(pr, rw))
         rl.addWidget(rename)
 
+        settings = read_profile_settings(self._get_profile_dir(profile), None)
+        if settings.get("profile_specific_mods") and not settings.get("is_group"):
+            copy = QPushButton(self.tr("Copy"))
+            copy.setObjectName("FormButton")
+            copy.setCursor(Qt.PointingHandCursor)
+            copy.clicked.connect(lambda _=False, pr=profile: self._on_copy(pr))
+            rl.addWidget(copy)
+
         openb = QPushButton(self.tr("Open"))
         openb.setObjectName("FormButton")
         openb.setCursor(Qt.PointingHandCursor)
@@ -375,6 +383,11 @@ class ProfileSettingsView(QWidget):
             self._notify(self.tr("Wait for the profile to finish loading."),
                          "info")
             return
+        gate = getattr(self._window, "_can_remove_installed_wabbajack", None)
+        if gate is not None and not gate():
+            self._notify(self.tr("Wait for the current operation to finish."),
+                         "warning")
+            return
         old_name = self._rename_target
         new_name = self._rename_edit.text().strip()
 
@@ -397,14 +410,36 @@ class ProfileSettingsView(QWidget):
         new_dir = profile_dir.parent / new_name
         was_original_default = (old_name == "default"
                                 or self._is_original_default_dir(profile_dir))
-        try:
-            profile_dir.rename(new_dir)
-        except OSError as e:
-            self._log(f"Rename failed: {e}")
+        from Utils.games.registry import _GAMES
+        from Utils.deployment.locking import game_mutation_lock
+        from Utils.profiles.groups import member_of_groups
+        game = _GAMES.get(self._game_name)
+        if game is None:
+            self._notify(self.tr("Select the game again before renaming its profiles."),
+                         "warning")
             return
-
-        if was_original_default:
-            self._mark_original_default(new_dir)
+        try:
+            with game_mutation_lock(game):
+                if game.get_deploy_active():
+                    affected = {old_name, *member_of_groups(game, old_name)}
+                    recovery = game.get_deployment_context()
+                    deployed = (Path(recovery["profile_dir"]).name
+                                if recovery.get("profile_dir")
+                                else game.get_last_deployed_profile())
+                    if deployed in affected:
+                        self._notify(self.tr(
+                            "Restore the deployed profile '{0}' before renaming "
+                            "it or any of its member profiles.").format(deployed),
+                            "warning")
+                        return
+                profile_dir.rename(new_dir)
+                if was_original_default:
+                    self._mark_original_default(new_dir)
+        except (OSError, RuntimeError, ValueError) as e:
+            message = self.tr("Rename failed: {0}").format(e)
+            self._log(message)
+            self._notify(message, "warning")
+            return
 
         self._log(f"Profile '{old_name}' renamed to '{new_name}'.")
         if old_name == self._current_profile:
@@ -423,6 +458,30 @@ class ProfileSettingsView(QWidget):
         if w is self or not w.isVisible():
             return self._window
         return w
+
+    def _on_copy(self, profile: str):
+        gate = getattr(self._window, "_can_remove_installed_wabbajack", None)
+        if gate is not None and not gate():
+            self._notify(self.tr("Wait for the current operation to finish."), "warning")
+            return
+        from Utils.games.registry import _GAMES
+        from gui_qt.copy_profile_overlay import CopyProfileOverlay
+        game = _GAMES.get(self._game_name)
+        if game is None:
+            return
+
+        def finished(name):
+            if name is None:
+                return
+            self._log(f"Profile '{profile}' copied to '{name}'.")
+            self._on_profiles_changed()
+            self._notify(self.tr("Profile '{0}' copied to '{1}'.").format(profile, name), "info")
+            from shiboken6 import isValid
+            if isValid(self):
+                self._populate_list()
+
+        CopyProfileOverlay(self._overlay_host(), self._window, game,
+                           self._get_profile_dir(profile), finished)
 
     # -- remove -------------------------------------------------------------
     def _on_remove(self, profile: str):

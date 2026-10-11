@@ -662,6 +662,7 @@ def deploy_custom_rules(
     claim_paths: set[str] | None = None,
     projected_data_prefix: str | None = None,
     projected_targets: tuple[str, ...] = ("game", "prefix"),
+    resolved_entries=None,
 ) -> set[str]:
     """Deploy filemap entries that match a CustomRule to their designated dirs.
 
@@ -690,7 +691,7 @@ def deploy_custom_rules(
     A log of placed absolute paths and the identities of their destination
     roots are written beside the filemap for use by restore_custom_rules().
     """
-    if not rules and projected_data_prefix is None:
+    if not rules and projected_data_prefix is None and resolved_entries is None:
         return set()
 
     _log = _safe_log(log_fn)
@@ -772,7 +773,7 @@ def deploy_custom_rules(
     if skipped:
         _log(f"  Skipping {len(skipped)} prefix-routed rule(s): no Proton prefix configured.")
     rules = [r for r in rules if not (r.to_prefix and prefix_root is None)]
-    if not rules and projected_data_prefix is None:
+    if not rules and projected_data_prefix is None and resolved_entries is None:
         return set()
     overwrite_dir = staging_root.parent / "overwrite"
     _overwrite_str = str(overwrite_dir)
@@ -822,15 +823,18 @@ def deploy_custom_rules(
     _filegraph_sources: dict[tuple[str, str], str] = {}
     _legacy_rows: list[tuple[str, str]] = []
     _source_roots: dict[str, str] = {}
-    for _entry in filegraph_entries():
+    projected_entries = (filegraph_entries(include_vortex=False)
+                         if resolved_entries is None else resolved_entries)
+    for _entry in projected_entries:
         if not _entry.legacy_rel or _entry.mod_name == "[Root_Folder]":
             continue
-        if projected_data_prefix is not None:
+        if projected_data_prefix is not None or resolved_entries is not None:
             if _entry.target not in projected_targets:
                 continue
             relative = _entry.destination.replace("\\", "/")
-            data_prefix = projected_data_prefix.strip("/").lower() + "/"
-            if _entry.target == "game" and relative.lower().startswith(data_prefix):
+            data_prefix = ((projected_data_prefix or "").strip("/").lower() + "/")
+            if (resolved_entries is None and _entry.target == "game"
+                    and relative.lower().startswith(data_prefix)):
                 continue
             if (_claim_paths is not None
                     and _entry.legacy_rel.lower() not in _claim_paths):
@@ -846,8 +850,8 @@ def deploy_custom_rules(
             if _entry.source_path is None:
                 raise RuntimeError(f"Missing source for {_entry.legacy_rel}")
             rule = CustomRule(dest="", to_prefix=prefix)
-            tasks.append((_entry.source_path,
-                          _resolve_destination(rule, base / relative), _entry.mod_name))
+            destination = _resolve_destination(rule, base / relative)
+            tasks.append((_entry.source_path, destination, _entry.mod_name))
             handled_lower.add(_entry.legacy_rel.lower())
             continue
         _legacy_rows.append((_entry.legacy_rel, _entry.mod_name))
@@ -1172,6 +1176,9 @@ def deploy_custom_rules(
     safe_tasks = [task for task in tasks if str(task[1]) not in blocked]
     if not safe_tasks:
         _remove_root_records(roots_path, _log)
+        if resolved_entries is not None:
+            raise RuntimeError(
+                "Vortex deployment could not place its resolved files; see the deployment log.")
         return handled_lower
 
     # Publish every destination before creating/replacing any of them.  The
@@ -1223,6 +1230,11 @@ def deploy_custom_rules(
         if progress_fn is not None and (done_count % 200 == 0 or done_count == total):
             progress_fn(done_count, total)
 
+    if resolved_entries is not None and len(placed_abs) != len(tasks):
+        raise RuntimeError(
+            "Vortex deployment was incomplete; recovery state was retained. "
+            "See the deployment log.")
+
     try:
         if placed_abs:
             write_atomic_text(
@@ -1241,58 +1253,15 @@ def deploy_custom_rules(
     return handled_lower
 
 
-def restore_custom_rules(
-    filemap_path: Path,
-    game_root: Path,
-    rules: list[CustomRule],
-    log_fn=None,
-    prefix_root: Path | None = None,
-) -> int:
-    """Remove files placed by deploy_custom_rules() and prune empty dest dirs.
-
-    Reads filemap_path.parent / "custom_rules_deployed.txt", deletes every
-    listed absolute path, then tries to rmdir each rule's destination directory
-    (silently ignored if non-empty). If a recorded root has moved, entries are
-    rebased only when its stored filesystem identity still matches. Returns the
-    number of files removed.
-
-    ``prefix_root`` allows removing files placed by prefix-routed rules
-    (``to_prefix=True``) and restoring their backups from
-    ``custom_rules_prefix_backup``.
-    """
-    del rules  # unused - log file is the source of truth for what was placed
-    _log = _safe_log(log_fn)
+def _custom_rules_restore_plan(
+    filemap_path: Path, game_root: Path, prefix_root: Path | None, _log,
+) -> tuple[list[tuple[str, Path]], set[Path]]:
     log_path = filemap_path.parent / _CUSTOM_RULES_LOG_NAME
-    backup_dir = filemap_path.parent / _CUSTOM_RULES_BACKUP_DIR
-    prefix_backup_dir = filemap_path.parent / _CUSTOM_RULES_PREFIX_BACKUP_DIR
     roots_path = filemap_path.parent / _CUSTOM_RULES_ROOTS_NAME
-
-    if not log_path.is_file():
-        # An interruption during the backup phase can leave a recoverable
-        # original before the pre-mutation destination journal exists.
-        restored = _restore_backup_dir(backup_dir, game_root, _log)
-        if prefix_root is not None:
-            restored += _restore_backup_dir(
-                prefix_backup_dir, prefix_root, _log)
-        elif prefix_backup_dir.is_dir():
-            raise RestoreIncompleteError(
-                "A prefix-routed original still needs restoring, but no "
-                "Wine/Proton prefix is configured. Reconfigure the original "
-                "prefix and run Restore again."
-            )
-        if restored:
-            _log(
-                "  Custom rules restore: recovered "
-                f"{restored} original file(s) from an interrupted deploy."
-            )
-        _remove_root_records(roots_path, _log)
-        return 0
-
     placed = list(dict.fromkeys(
         p for p in log_path.read_text(
             encoding="utf-8", errors="surrogateescape").splitlines() if p
     ))
-    removed = 0
     dirs_to_prune: set[Path] = set()
     retry_entries: list[str] = []
     _game_root_resolved = game_root.resolve()
@@ -1372,6 +1341,107 @@ def restore_custom_rules(
                 break
             dirs_to_prune.add(parent)
             parent = parent.parent
+
+    if retry_entries:
+        saved_game = root_records.get("game_root")
+        saved_prefix = root_records.get("prefix_root")
+        saved_game = saved_game.get("path") if isinstance(saved_game, dict) else None
+        saved_prefix = saved_prefix.get("path") if isinstance(saved_prefix, dict) else None
+        raise RestoreIncompleteError(
+            "Custom-route recovery paths do not match the configured installation. "
+            f"Journal: {log_path}. Game: {game_root}. "
+            f"Prefix: {prefix_root or '(not configured)'}. "
+            f"Recorded game: {saved_game or '(unknown)'}. "
+            f"Recorded prefix: {saved_prefix or '(unknown)'}. "
+            f"{len(retry_entries)} blocked path(s); first: {retry_entries[0]}. "
+            "Re-select the original game, prefix and staging folder and run Restore. "
+            "The journal and backups have been retained."
+        )
+    return safe_targets, dirs_to_prune
+
+
+def validate_custom_rules_restore(
+    filemap_path: Path, game_root: Path, prefix_root: Path | None = None,
+    log_fn=None,
+) -> None:
+    log_path = filemap_path.parent / _CUSTOM_RULES_LOG_NAME
+    if log_path.is_file():
+        _custom_rules_restore_plan(filemap_path, game_root, prefix_root, _safe_log(log_fn))
+        return
+    records = _load_root_records(filemap_path.parent / _CUSTOM_RULES_ROOTS_NAME)
+    for key, backup_name, current in (
+        ("game_root", _CUSTOM_RULES_BACKUP_DIR, game_root),
+        ("prefix_root", _CUSTOM_RULES_PREFIX_BACKUP_DIR, prefix_root),
+    ):
+        backup_dir = filemap_path.parent / backup_name
+        if not backup_dir.is_dir():
+            continue
+        record = records.get(key)
+        saved = record.get("path") if isinstance(record, dict) else None
+        if current is not None and (not saved or
+                Path(saved).resolve() == current.resolve() or
+                _root_identity_matches(record, current)):
+            continue
+        raise RestoreIncompleteError(
+            f"Original files in {backup_dir} need restoring to "
+            f"{saved or 'the original prefix'}, but the configured destination is "
+            f"{current or '(not configured)'}. Re-select the original installation "
+            "and run Restore. The backups have been retained."
+        )
+
+
+def restore_custom_rules(
+    filemap_path: Path,
+    game_root: Path,
+    rules: list[CustomRule],
+    log_fn=None,
+    prefix_root: Path | None = None,
+) -> int:
+    """Remove files placed by deploy_custom_rules() and prune empty dest dirs.
+
+    Reads filemap_path.parent / "custom_rules_deployed.txt", deletes every
+    listed absolute path, then tries to rmdir each rule's destination directory
+    (silently ignored if non-empty). If a recorded root has moved, entries are
+    rebased only when its stored filesystem identity still matches. Returns the
+    number of files removed.
+
+    ``prefix_root`` allows removing files placed by prefix-routed rules
+    (``to_prefix=True``) and restoring their backups from
+    ``custom_rules_prefix_backup``.
+    """
+    del rules  # unused - log file is the source of truth for what was placed
+    _log = _safe_log(log_fn)
+    log_path = filemap_path.parent / _CUSTOM_RULES_LOG_NAME
+    backup_dir = filemap_path.parent / _CUSTOM_RULES_BACKUP_DIR
+    prefix_backup_dir = filemap_path.parent / _CUSTOM_RULES_PREFIX_BACKUP_DIR
+    roots_path = filemap_path.parent / _CUSTOM_RULES_ROOTS_NAME
+
+    if not log_path.is_file():
+        validate_custom_rules_restore(filemap_path, game_root, prefix_root)
+        # An interruption during the backup phase can leave a recoverable
+        # original before the pre-mutation destination journal exists.
+        restored = _restore_backup_dir(backup_dir, game_root, _log)
+        if prefix_root is not None:
+            restored += _restore_backup_dir(
+                prefix_backup_dir, prefix_root, _log)
+        elif prefix_backup_dir.is_dir():
+            raise RestoreIncompleteError(
+                "A prefix-routed original still needs restoring, but no "
+                "Wine/Proton prefix is configured. Reconfigure the original "
+                "prefix and run Restore again."
+            )
+        if restored:
+            _log(
+                "  Custom rules restore: recovered "
+                f"{restored} original file(s) from an interrupted deploy."
+            )
+        _remove_root_records(roots_path, _log)
+        return 0
+
+    safe_targets, dirs_to_prune = _custom_rules_restore_plan(
+        filemap_path, game_root, prefix_root, _log)
+    removed = 0
+    retry_entries: list[str] = []
 
     import stat as _stat
 

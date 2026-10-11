@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from Utils.archives.budget import ArchiveProbe, probe_archive
+from Utils.archives.identify import TAR_TYPES, identify_archive, may_be_zip
 from Utils.downloads.resources import current_work, time_phase
 from Utils.archives.process import (
     failure_kind, run_extractor as _run_extractor_cancellable,
@@ -323,6 +324,11 @@ def _copy_file_list(file_list, src_root: str, dest_root: Path, log_fn,
     file_list = _merge_case_variant_dirs(file_list, game, log_fn)
 
     src_root_path = Path(src_root)
+    from Utils.deployment.vortex import metadata_paths, record_install_sources, SOURCE_MAP
+    track_vortex = bool(metadata_paths(src_root_path))
+    vortex_pairs = []
+    file_list = [item for item in file_list
+                 if str(item[1]).replace("\\", "/").rsplit("/", 1)[-1].lower() != SOURCE_MAP]
     checked: list[tuple[str, str, bool]] = []
     source_check_cache: dict = {}
     for src_rel, dst_rel, is_folder in file_list:
@@ -367,6 +373,11 @@ def _copy_file_list(file_list, src_root: str, dest_root: Path, log_fn,
                 dest_root, dst, label="install destination")
             if src.is_dir():
                 folder_copied += _copytree_case_insensitive(src, dst)
+                if track_vortex:
+                    for source in src.rglob("*"):
+                        if source.is_file():
+                            relative = source.relative_to(src).as_posix()
+                            vortex_pairs.append((source, _resolve_src_case(dst, relative, {})))
                 _dst_cache.pop(dst.parent, None)
         else:
             if not dst_rel:
@@ -413,6 +424,9 @@ def _copy_file_list(file_list, src_root: str, dest_root: Path, log_fn,
         with ThreadPoolExecutor(max_workers=8) as pool:
             for _ in pool.map(_copy_one, file_entries, chunksize=256):
                 pass
+    if track_vortex:
+        record_install_sources(src_root_path, dest_root,
+                               [*vortex_pairs, *file_entries], log_fn)
     copied = folder_copied + len(file_entries)
     log_fn(f"Copied {copied} item(s) to staging area.")
 
@@ -1130,8 +1144,6 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
     Only the 7z (``-bsp1``) and zipfile paths report; the rare fallbacks
     (bsdtar/py7zr/tarfile) never fire it, leaving the caller's indeterminate
     bar in place."""
-    ext = Path(archive_path).suffix.lower()
-
     def _note(err) -> None:
         if error_sink is not None:
             error_sink.append(str(err))
@@ -1171,9 +1183,15 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
 
     small_zip = False
     try:
-        if zipfile.is_zipfile(archive_path):
+        archive_type = identify_archive(archive_path)
+        log_fn(f"Archive header: {archive_type.value}; path: {archive_path}")
+        is_zip = may_be_zip(archive_path, archive_type)
+        if is_zip:
             small_zip = _small_zip_fast_path_eligible(archive_path)
-    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+    except zipfile.BadZipFile as exc:
+        is_zip = False
+        log_fn(f"Python ZIP inspection failed for {Path(archive_path).name}; trying native extractors ({exc}).")
+    except (OSError, ValueError) as exc:
         _note(exc)
         log_fn(f"Unsafe archive path rejected ({exc}).")
         return False
@@ -1201,9 +1219,7 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
             return False
         return True
 
-    # tar.* and plain .tar → tarfile directly.
-    if ext in (".tar", ".gz", ".bz2", ".xz", ".tgz") or \
-            archive_path.lower().endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
+    if archive_type in TAR_TYPES:
         try:
             if _low_prio:
                 code, error, killed = run_python_extractor(
@@ -1216,12 +1232,10 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
             else:
                 with tarfile.open(archive_path, "r:*") as tf:
                     tf.extractall(dest_dir, filter="data")
-            if finalize is not None:
-                finalize(dest_dir)
-            else:
-                _fix_perms_extracted_tree(dest_dir, log_fn)
+            if _cancelled():
+                return False
             log_fn("Extracted with tarfile.")
-            return True
+            return _ok()
         except Exception as exc:
             _note(exc)
             log_fn(f"tarfile failed ({exc}).")
@@ -1327,7 +1341,7 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
         log_fn(f"py7zr failed ({exc}).")
         if not _retry(exc):
             return False
-    if _cancelled():
+    if _cancelled() or not is_zip:
         return False
     try:
         if _low_prio:
@@ -1734,6 +1748,16 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
 def _run_additional_install_logic(game, dest_root: Path, mod_name: str,
                                   log_fn: LogFn, *, interactive: bool,
                                   cleanup_on_cancel: bool) -> bool:
+    from Utils.deployment.vortex import preserve_sources
+    with preserve_sources(dest_root):
+        return _run_additional_install_logic_inner(
+            game, dest_root, mod_name, log_fn, interactive=interactive,
+            cleanup_on_cancel=cleanup_on_cancel)
+
+
+def _run_additional_install_logic_inner(game, dest_root: Path, mod_name: str,
+                                  log_fn: LogFn, *, interactive: bool,
+                                  cleanup_on_cancel: bool) -> bool:
     """Run the game's post-install hooks; returns True on user cancel.
 
     Ported from the Tk installer (gui/install_mod.py) - the hooks (e.g. DAO's
@@ -1768,6 +1792,15 @@ def _run_additional_install_logic(game, dest_root: Path, mod_name: str,
 
 
 def wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
+                      signal_exts: "set[str]", structured_markers: "set[str]",
+                      subdir_name_fn=None) -> bool:
+    from Utils.deployment.vortex import preserve_sources
+    with preserve_sources(mod_dir):
+        return _wrap_flat_mod_dir(mod_dir, signal_names, signal_exts,
+                                  structured_markers, subdir_name_fn)
+
+
+def _wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
                       signal_exts: "set[str]",
                       structured_markers: "set[str]",
                       subdir_name_fn=None) -> bool:
@@ -1938,6 +1971,10 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
         log_fn(f"Preserved '{dest_root}' at '{backup_root / 'mod'}'.")
 
     try:
+        if prepared.is_fomod() and fomod_selections is None:
+            fomod_selections = _default_fomod_selections(
+                prepared.fomod_config, *prepared.fomod_context)
+            log_fn("FOMOD: using default/recommended options.")
         if change is not None:
             change.validate()
             if prepared.prebuilt_meta is not None:
@@ -1959,10 +1996,10 @@ def finish_install(prepared: "PreparedInstall", fomod_selections, *,
                 and fomod_selections is not None):
             _persist_fomod_selection(prepared.game, prepared.mod_name,
                                      fomod_selections,
-                                     profile_dir=prepared.profile_dir)
+                                     profile_dir=prepared.profile_dir, log_fn=log_fn)
             _write_profile_fomod_config(prepared.game, prepared.mod_name,
                                         prepared.fomod_config_path,
-                                        prepared.profile_dir)
+                                        prepared.profile_dir, log_fn=log_fn)
         if (result is not None and change is not None
                 and change.operation == "rollback"):
             result = _restore_rollback_name(prepared, result, log_fn)
@@ -2047,26 +2084,10 @@ def _restore_rollback_name(prepared, old_name, log_fn):
             _update_indexes(prepared.game, profile_dir, new_name, new_folder, log_fn)
     prepared.mod_name = new_name
     prepared._version_change_dest = new_folder
-    try:
-        from Utils.config_paths import (get_fomod_selections_path,
-                                        get_bain_selections_path)
-        paths = []
-        if prepared.is_fomod():
-            paths.extend((profile_dir / "fomod" / f"{old_name}{suffix}",
-                          profile_dir / "fomod" / f"{new_name}{suffix}")
-                         for suffix in (".json", ".xml"))
-            paths.append((get_fomod_selections_path(prepared.game.name, old_name),
-                          get_fomod_selections_path(prepared.game.name, new_name)))
-        if prepared.is_bain():
-            paths.append((profile_dir / "bain" / f"{old_name}.json",
-                          profile_dir / "bain" / f"{new_name}.json"))
-            paths.append((get_bain_selections_path(prepared.game.name, old_name),
-                          get_bain_selections_path(prepared.game.name, new_name)))
-        for source, target in paths:
-            if source.is_file():
-                shutil.copy2(source, target)
-    except OSError as exc:
-        log_fn(f"Rename: failed to copy installer selections: {exc}")
+    from Utils.mods.rename import rename_installer_choices
+    kinds = ("fomod",) if prepared.is_fomod() else ("bain",) if prepared.is_bain() else ()
+    rename_installer_choices(profile_dir, old_name, new_name, prepared.game.name, log_fn,
+                             kinds=kinds)
     log_fn(f"Restored mod name: '{old_name}' → '{new_name}'.")
     return new_name
 
@@ -2271,8 +2292,7 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
 
     # For FOMOD installs, record the fileDependency plugins on options the user
     # did NOT select - the modlist flags a rerun if any of them appears in the
-    # load order later. Computed against {} for headless-defaults installs
-    # (fomod_selections is None), where no options are explicitly selected.
+    # load order later.
     fomod_pending_deps = ""
     fomod_active_deps = ""
     if p.is_fomod() and p.fomod_config is not None:
@@ -2649,7 +2669,7 @@ def install_collection_archive(
             elif resolve_fomod is not None and has_steps:
                 log_fn("FOMOD installer detected - opening wizard...")
                 saved_sel = _read_saved_fomod_selections(
-                    game, prepared.mod_name, log_fn)
+                    game, prepared.mod_name, log_fn, prepared.profile_dir)
                 final_selections = resolve_fomod(
                     config, fomod_base, prepared.mod_name,
                     installed_files, active_files, loose_files, saved_sel)
@@ -2662,20 +2682,21 @@ def install_collection_archive(
                     # mirror is written below for every non-cancelled path).
                     _persist_fomod_selection(game, prepared.mod_name,
                                              final_selections, profile=False,
-                                             profile_dir=prepared.profile_dir)
+                                             profile_dir=prepared.profile_dir, log_fn=log_fn)
             else:
                 # No auto-selections and no resolver → FOMOD defaults (parity with
                 # the non-interactive single-mod fallback).
                 log_fn("FOMOD installer detected - using default/recommended options.")
-                final_selections = None
+                final_selections = _default_fomod_selections(
+                    config, installed_files, active_files, loose_files)
 
             if not cancelled:
                 _write_profile_fomod_selection(game, prepared.mod_name,
                                                final_selections,
-                                               prepared.profile_dir)
+                                               prepared.profile_dir, log_fn=log_fn)
                 _write_profile_fomod_config(game, prepared.mod_name,
                                             prepared.fomod_config_path,
-                                            prepared.profile_dir)
+                                            prepared.profile_dir, log_fn=log_fn)
                 try:
                     if final_selections is None:
                         file_list = _default_fomod_file_list(
@@ -2919,23 +2940,32 @@ def _fire_on_installed(cb, is_fomod: bool) -> None:
         pass
 
 
-def _default_fomod_file_list(config, installed_files, active_files, loose_files,
-                             log_fn: LogFn) -> "list[tuple[str, str, bool]]":
-    """Resolve a FOMOD's file list using its default/recommended selections
-    (threading flag state through steps), passing the collection context sets."""
+def _default_fomod_selections(config, installed_files, active_files, loose_files):
     from Utils.fomod.installer import (
-        resolve_files, get_default_selections, update_flags)
+        evaluate_dependency, get_default_selections, update_flags)
     selections: dict = {}
     flag_state: dict = {}
     for i, step in enumerate(getattr(config, "steps", []) or []):
-        sels = get_default_selections(step, flag_state, installed_files)
+        if step.visible_condition is not None and not evaluate_dependency(
+                step.visible_condition, flag_state, installed_files, active_files,
+                version_pass=True, loose_files=loose_files):
+            continue
+        sels = get_default_selections(step, flag_state, installed_files,
+                                      active_files, loose_files)
         selections[str(i)] = sels
         flag_state = update_flags(step, sels, flag_state)
+    return selections
+
+
+def _default_fomod_file_list(config, installed_files, active_files, loose_files,
+                             log_fn: LogFn) -> "list[tuple[str, str, bool]]":
+    from Utils.fomod.installer import resolve_files
+    selections = _default_fomod_selections(config, installed_files, active_files, loose_files)
     return resolve_files(config, selections, installed_files, active_files, loose_files)
 
 
 def _write_profile_fomod_config(game, mod_name: str, config_path,
-                                profile_dir=None) -> None:
+                                profile_dir=None, *, log_fn=None) -> None:
     """Copy the archive's ``ModuleConfig.xml`` to ``<profile>/fomod/<mod>.xml``.
 
     The saved selections only record step INDICES with group/option names, so
@@ -2951,17 +2981,14 @@ def _write_profile_fomod_config(game, mod_name: str, config_path,
         return
     try:
         src = Path(config_path)
-        if not src.is_file():
-            return
-        pfomod = Path(pdir) / "fomod"
-        pfomod.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, pfomod / f"{mod_name}.xml")
-    except OSError:
-        pass
+        from Utils.atomic_write import write_atomic
+        write_atomic(Path(pdir) / "fomod" / f"{mod_name}.xml", src.read_bytes())
+    except OSError as exc:
+        _log_fomod_save_error(log_fn, mod_name, pdir, exc)
 
 
 def _write_profile_fomod_selection(game, mod_name: str, selections,
-                                   profile_dir=None) -> None:
+                                   profile_dir=None, *, log_fn=None) -> None:
     """Mirror FOMOD selections into ``<profile>/fomod/<mod>.json`` (Tk parity -
     profile-scoped, never the global config, so collection choices don't clobber
     the user's manual selections). No-op when selections is None (defaults).
@@ -2980,12 +3007,17 @@ def _write_profile_fomod_selection(game, mod_name: str, selections,
         return
     try:
         import json
+        from Utils.atomic_write import write_atomic_text
         pfomod = Path(pdir) / "fomod"
-        pfomod.mkdir(parents=True, exist_ok=True)
-        with open(pfomod / f"{mod_name}.json", "w", encoding="utf-8") as f:
-            json.dump(selections, f, indent=2)
-    except OSError:
-        pass
+        write_atomic_text(pfomod / f"{mod_name}.json", json.dumps(selections, indent=2))
+    except OSError as exc:
+        _log_fomod_save_error(log_fn, mod_name, pdir, exc)
+
+
+def _log_fomod_save_error(log_fn, mod_name, location, exc):
+    import logging
+    log = log_fn or logging.getLogger(__name__).warning
+    log(f"WARNING: could not save FOMOD data for '{mod_name}' in '{location}': {exc}")
 
 
 def _write_profile_bain_selection(game, mod_name: str, result,
@@ -3062,7 +3094,7 @@ def _read_saved_fomod_selections(game, mod_name: str, log_fn: LogFn,
 
 
 def _persist_fomod_selection(game, mod_name: str, selections,
-                             profile: bool = True, profile_dir=None) -> None:
+                             profile: bool = True, profile_dir=None, *, log_fn=None) -> None:
     """Write the wizard's selections to the global per-game JSON (restored on
     the next install of this mod) and optionally mirror them into the profile
     (Tk parity: interactive installs write both; the collection orchestrator
@@ -3076,14 +3108,14 @@ def _persist_fomod_selection(game, mod_name: str, selections,
     if game_name:
         try:
             import json
+            from Utils.atomic_write import write_atomic_text
             from Utils.config_paths import get_fomod_selections_path
             sel_path = get_fomod_selections_path(game_name, mod_name)
-            with open(sel_path, "w", encoding="utf-8") as f:
-                json.dump(selections, f, indent=2)
-        except OSError:
-            pass
+            write_atomic_text(sel_path, json.dumps(selections, indent=2))
+        except OSError as exc:
+            _log_fomod_save_error(log_fn, mod_name, f"{game_name} saved choices", exc)
     if profile:
-        _write_profile_fomod_selection(game, mod_name, selections, profile_dir)
+        _write_profile_fomod_selection(game, mod_name, selections, profile_dir, log_fn=log_fn)
 
 
 def _read_saved_bain_selections(game, mod_name: str, log_fn: LogFn,
@@ -3279,22 +3311,14 @@ def _install_fomod(fomod_base: Path, config, dest_root: Path,
     src→dst and apply requiredInstallFiles + conditional installs. Returns
     False on failure; an empty resolved selection is a successful empty install."""
     try:
-        from Utils.fomod.installer import (
-            resolve_files, get_default_selections, update_flags)
+        from Utils.fomod.installer import resolve_files
     except Exception as exc:
         log_fn(f"FOMOD installer unavailable ({exc}).")
         return False
     installed, active, loose = context or (set(), set(), set())
 
     if selections is None:
-        # Build default selections per step, threading flag state through.
-        selections = {}
-        flag_state: dict = {}
-        for i, step in enumerate(getattr(config, "steps", []) or []):
-            sels = get_default_selections(step, flag_state, installed,
-                                          active, loose)
-            selections[str(i)] = sels
-            flag_state = update_flags(step, sels, flag_state)
+        selections = _default_fomod_selections(config, installed, active, loose)
         log_fn("FOMOD: using default/recommended options.")
 
     try:
