@@ -27,16 +27,15 @@ from __future__ import annotations
 
 import configparser
 import copy
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from Utils.app_log import app_log
+from Utils.app_log import app_log, dev_log
 from Utils.atomic_write import atomic_writer
-from Utils.mods.metadata import locked_meta_write
+from Utils.mods.metadata import locked_meta_write, meta_file_signature, read_meta_ini
 from Utils.mods.version_history import PreviousVersion, read_previous_version
 
 
@@ -97,7 +96,7 @@ class NexusModMeta:
 
     @property
     def nexus_page_url(self) -> str:
-        domain = normalise_game_domain(self.game_domain)
+        domain = normalise_game_domain(self.game_domain, preserve_case=True)
         if domain and self.mod_id:
             return f"https://www.nexusmods.com/{domain}/mods/{self.mod_id}"
         return self.nexus_url or ""
@@ -125,17 +124,19 @@ _MO2_DOMAIN_MAP: dict[str, str] = {
     "stardew valley":        "stardewvalley",
     "witcher3":              "witcher3",
     "the witcher 3":         "witcher3",
+    "thesims3":              "thesims3",
+    "the sims 3":            "thesims3",
     "thesims4":              "thesims4",
     "the sims 4":            "thesims4",
 }
 
 
-def normalise_game_domain(raw: str) -> str:
-    """Convert an MO2-style gameName or mixed-case domain to a Nexus URL domain."""
+def normalise_game_domain(raw: str, *, preserve_case: bool = False) -> str:
+    """Resolve MO2 aliases, optionally preserving domain casing for URLs."""
     if not raw:
         return ""
     key = raw.strip().lower()
-    return _MO2_DOMAIN_MAP.get(key, key)
+    return _MO2_DOMAIN_MAP.get(key, raw.strip() if preserve_case else key)
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +210,8 @@ _BOOL_FIELDS = {
 }
 
 
-# Parsed meta.ini cache, keyed by path with the file's mtime as validity.
-# Several hot paths parse the SAME metas back-to-back on every reload /
-# profile switch (the modlist meta worker, the filemap build's root-flag
-# collect, flag refreshes) - hundreds of configparser runs each. A write
-# bumps the mtime, so the entry self-invalidates. A COPY is returned/stored:
-# callers mutate the result before write_meta, which must never leak into
-# the cached instance (all fields are scalars, so a shallow copy is enough).
-_META_CACHE: dict[str, tuple[int, NexusModMeta]] = {}
+# File identity and timestamps invalidate cached metadata; callers receive a copy.
+_META_CACHE: dict[str, tuple[tuple, NexusModMeta]] = {}
 _META_CACHE_MAX = 8192
 
 
@@ -224,24 +219,16 @@ def read_meta(meta_ini_path: Path) -> NexusModMeta:
     """
     Parse a ``meta.ini`` file and return a :class:`NexusModMeta`.
 
-    Missing keys are silently defaulted. Results are cached by file mtime.
+    Missing keys are silently defaulted. Results are cached by file signature.
     """
     path_str = str(meta_ini_path)
-    try:
-        mtime_ns = os.stat(path_str).st_mtime_ns
-    except OSError:
-        mtime_ns = None   # missing file → parse to the defaults, don't cache
-    if mtime_ns is not None:
+    signature = meta_file_signature(path_str)
+    if signature is not None:
         entry = _META_CACHE.get(path_str)
-        if entry is not None and entry[0] == mtime_ns:
+        if entry is not None and entry[0] == signature:
             return copy.copy(entry[1])
 
-    # allow_no_value/strict=False tolerate MO2's meta.ini quirk
-    cp = configparser.ConfigParser(allow_no_value=True, strict=False)
-    try:
-        cp.read(path_str, encoding="utf-8")
-    except configparser.Error as e:
-        app_log(f"read_meta: tolerating malformed meta.ini {path_str}: {e}")
+    signature, cp, _ = read_meta_ini(path_str)
 
     meta = NexusModMeta()
     meta.mod_name = meta_ini_path.parent.name
@@ -263,11 +250,11 @@ def read_meta(meta_ini_path: Path) -> NexusModMeta:
 
     meta.previous_version = read_previous_version(cp)
 
-    if mtime_ns is not None:
+    if signature is not None:
         if len(_META_CACHE) >= _META_CACHE_MAX:
             for k in list(_META_CACHE.keys())[: _META_CACHE_MAX // 4]:
                 _META_CACHE.pop(k, None)
-        _META_CACHE[path_str] = (mtime_ns, copy.copy(meta))
+        _META_CACHE[path_str] = (signature, copy.copy(meta))
     return meta
 
 
@@ -347,7 +334,7 @@ def write_meta(meta_ini_path: Path, meta: NexusModMeta) -> None:
     with atomic_writer(meta_ini_path) as f:
         cp.write(f)
 
-    app_log(f"Wrote meta.ini: {meta_ini_path}")
+    dev_log(f"Wrote meta.ini: {meta_ini_path}")
 
 
 @locked_meta_write

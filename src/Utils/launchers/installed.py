@@ -20,11 +20,14 @@ from memory:
     handler exe) into a filename index.
   - Non-Steam shortcuts: every account's binary shortcuts.vdf parsed once
     into an exe index.
+  - Lutris: database and YAML read once, with cached installation searches
+    when its launch target differs from the real game executable.
 
 Detection semantics mirror the old per-game finder calls: games with a Steam
 ID use the manifest first and then an exe search across Steam libraries;
 non-Steam games skip Steam matching. Heroic app names and bare exe matching
-follow. All lookups are case-insensitive on names.
+follow. Launcher lookups are case-insensitive on names. Unmatched games can
+provide a bounded standalone-install lookup.
 
 No UI, no game-specific knowledge.
 """
@@ -300,21 +303,15 @@ class InstalledIndex:
     # ------------------------------------------------------------------
 
     def _build_lutris(self) -> None:
-        # Per installed Lutris game: lowercase path segments of its configured
-        # game.exe. Read from Lutris's database + YAML configs in a single
-        # pass (build_installed_exe_index), so per-handler lookups are O(1)
-        # against memory rather than re-reading Lutris's data each time.
-        self._lutris_exes: list[list[str]] = []
+        self._lutris_index = None
         try:
-            from Utils.launchers.lutris import build_installed_exe_index
-            self._lutris_exes = build_installed_exe_index()
+            from Utils.launchers.lutris import LutrisInstalledIndex
+            self._lutris_index = LutrisInstalledIndex()
         except Exception as exc:
             self._log(f"lutris index build failed, continuing with none: {exc}")
-            self._lutris_exes = []
 
     def _lutris_by_exe(self, exe_name: str) -> bool:
-        """True if any installed Lutris game's exe tail matches exe_name."""
-        return _tail_matches(self._lutris_exes, exe_name)
+        return bool(self._lutris_index and self._lutris_index.has_exe(exe_name))
 
     # ------------------------------------------------------------------
     # Faugus
@@ -322,8 +319,7 @@ class InstalledIndex:
 
     def _build_faugus(self) -> None:
         # Per Faugus game: lowercase path segments of its configured exe,
-        # read from games.json in a single pass (same shape as the Lutris
-        # index above).
+        # read from games.json in a single pass.
         self._faugus_exes: list[list[str]] = []
         try:
             from Utils.launchers.faugus import build_installed_exe_index
@@ -352,7 +348,7 @@ class InstalledIndex:
         return bool(self.game_launchers(game))
 
     def game_launchers(self, game) -> tuple[str, ...]:
-        """Return every matching launcher, with Steam shortcuts counted as Steam."""
+        """Return matching launchers, or 'standalone' for a validated local install."""
         launchers = []
         exe_name = getattr(game, "exe_name", "") or ""
         all_exe = [e for e in
@@ -390,5 +386,10 @@ class InstalledIndex:
 
         if any(_tail_matches(self._bottles_exes, exe) for exe in all_exe):
             launchers.append("bottles")
+
+        if not launchers:
+            detect = getattr(game, "detect_standalone_install", None)
+            if callable(detect) and detect() is not None:
+                launchers.append("standalone")
 
         return tuple(launchers)

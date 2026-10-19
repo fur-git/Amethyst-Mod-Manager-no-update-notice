@@ -14,11 +14,16 @@ when the caller supplies an expected size.
 
 from __future__ import annotations
 
+import math
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 from Utils.app_log import app_log
 
@@ -28,6 +33,10 @@ USER_AGENT = "Amethyst-Mod-Manager"
 
 _CHUNK = 256 * 1024
 _TIMEOUT = 60
+_API_INTERVAL = 0.5
+_API_RETRIES = 3
+_api_lock = threading.Lock()
+_api_next_request: dict[str, float] = {}
 
 
 @dataclass
@@ -49,15 +58,53 @@ def build_request(url: str) -> urllib.request.Request:
     return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
 
-def fetch_json(url: str, timeout: int = 30):
-    """GET *url* and decode JSON, or return None on any failure."""
-    import json
+def _wait_for_api(host: str) -> None:
+    while True:
+        with _api_lock:
+            now = time.monotonic()
+            delay = _api_next_request.get(host, 0) - now
+            if delay <= 0:
+                _api_next_request[host] = now + _API_INTERVAL
+                return
+        time.sleep(delay)
+
+
+def _retry_delay(value: str | None, attempt: int) -> float:
     try:
-        with urllib.request.urlopen(build_request(url), timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        app_log(f"thunderstore: fetch failed for {url}: {exc}")
-        return None
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            delay = 5 * (2 ** attempt)
+    return max(_API_INTERVAL, delay) if math.isfinite(delay) else 5 * (2 ** attempt)
+
+
+def fetch_json(url: str, timeout: int = 30):
+    """GET JSON with shared pacing and bounded rate-limit retries."""
+    import json
+    host = urlsplit(url).netloc.lower()
+    for attempt in range(_API_RETRIES + 1):
+        _wait_for_api(host)
+        try:
+            with urllib.request.urlopen(build_request(url), timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                delay = _retry_delay((exc.headers or {}).get("Retry-After"), attempt)
+                with _api_lock:
+                    _api_next_request[host] = max(
+                        _api_next_request.get(host, 0), time.monotonic() + delay)
+                if attempt < _API_RETRIES:
+                    app_log(f"thunderstore: rate limited; retrying in {delay:.1f}s")
+                    exc.close()
+                    continue
+            app_log(f"thunderstore: fetch failed for {url}: {exc}")
+            exc.close()
+            return None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            app_log(f"thunderstore: fetch failed for {url}: {exc}")
+            return None
 
 
 def fetch_version_info(link) -> dict | None:
@@ -132,6 +179,9 @@ def download_package(link, dest_dir: Path,
             if progress_cb:
                 progress_cb(0, total)
             with open(part_path, "wb") as fh:
+                from Utils.downloads import bandwidth
+                from Utils.downloads.resources import current_resources
+                resources = current_resources()
                 while True:
                     if wait_if_paused(cancel):
                         part_path.unlink(missing_ok=True)
@@ -142,8 +192,18 @@ def download_package(link, dest_dir: Path,
                     chunk = resp.read(_CHUNK)
                     if not chunk:
                         break
-                    fh.write(chunk)
+                    if resources is not None:
+                        resources.throttle_download(len(chunk), cancel)
+                        if wait_if_paused(cancel):
+                            part_path.unlink(missing_ok=True)
+                            result.error = "cancelled"
+                            result.cancelled = True
+                            return result
+                        resources.write_download(fh, chunk)
+                    else:
+                        fh.write(chunk)
                     done += len(chunk)
+                    bandwidth.throttle(len(chunk), cancel)
                     if progress_cb:
                         progress_cb(done, total)
     except urllib.error.HTTPError as exc:

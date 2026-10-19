@@ -2247,6 +2247,35 @@ _WIZARD_ALWAYS_USE_PREFIX = "__wizard_always_use_"
 _WIZARD_DISCRETE_GPU_PREFIX = "__wizard_discrete_gpu_"
 
 
+def prepare_prefix_tools_target(exe_path: Path, proton_name: str, game,
+                                prefix_mode: str, log_fn=_noop_log):
+    from Utils.wine.proton import PrefixToolsTarget, resolve_proton_env
+
+    if prefix_mode == PREFIX_MODE_GAME:
+        script, env = resolve_proton_env(game, log_fn, allow_fallback=False)
+        if script is None:
+            return None
+        prefix = Path(game.get_prefix_path())
+    else:
+        from Utils.launchers.steam import find_any_installed_proton
+        script = find_any_installed_proton(proton_name)
+        if script is None or script.parent.name != proton_name:
+            log_fn(f"Prefix tools: selected Proton '{proton_name}' is unavailable.")
+            return None
+        result = prepare_tool_prefix(exe_path, proton_name, game,
+                                     log_fn=log_fn, prefix_mode=prefix_mode)
+        if result is None:
+            return None
+        script, compat_data, env = result
+        prefix = compat_data / "pfx"
+    if not (prefix / "drive_c").is_dir():
+        log_fn(f"Prefix tools: prefix was not initialised: {prefix}")
+        return None
+    env = dict(env, WINEPREFIX=str(prefix))
+    log_fn(f"Prefix tools: {script} -> {prefix}")
+    return PrefixToolsTarget(exe_path.name, prefix, script, env)
+
+
 def shared_prefix_dir(proton_dir_name: str) -> Path:
     """Return the shared tool prefix dir for a Proton version (one per version).
 
@@ -2288,6 +2317,15 @@ def save_winetricks_style(game, exe_name: str, enabled: bool) -> None:
     """Persist the winetricks-style launch choice (off = remove key)."""
     _write_launch_mode_key(game, f"__winetricks_style_{exe_name}",
                            True if enabled else None)
+
+
+def load_wizard_output_name(game, wizard_id: str) -> str:
+    value = _read_launch_mode_data(game).get(f"__wizard_output_name_{wizard_id}")
+    return value if isinstance(value, str) else ""
+
+
+def save_wizard_output_name(game, wizard_id: str, name: str) -> None:
+    _write_launch_mode_key(game, f"__wizard_output_name_{wizard_id}", name or None)
 
 
 def load_wizard_always_use_settings(game, wizard_id: str) -> bool:
@@ -2828,6 +2866,7 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
     if extra:
         env.update(extra)
         log_fn("applying saved env var names: " + ", ".join(sorted(extra)))
+    env.update(steam_compat_mounts(game, exe, env=env))
     # Marker consumed by run_tool_logged: launch this tool winetricks-style
     # (plain wine, no proton session - see run_tool_winetricks_style). Set
     # here so every wizard honours the Proton-step checkbox without each
@@ -2838,14 +2877,15 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
 
 
 def wrap_tool_command(game, command: list[str], env: dict,
-                      log_fn=_noop_log, label: str = "Tool") -> list[str]:
+                      log_fn=_noop_log, label: str = "Tool", *,
+                      cwd: Path | None = None) -> list[str]:
     """Run a wizard command in its profile's published game view when present."""
     if game is None:
         return command
     from Utils.vfs import manifest_path, wrap_command
     if not manifest_path(game).is_file():
         return command
-    wrapped = wrap_command(game, command, env=env, log_fn=log_fn)
+    wrapped = wrap_command(game, command, env=env, log_fn=log_fn, cwd=cwd)
     log_fn(f"{label}: using the deployed profile VFS game view.")
     return wrapped
 
@@ -2935,7 +2975,8 @@ def run_tool_logged(
     # host process itself, and the Popen cwd below is ignored - without it a
     # tool writing files relative to its cwd (e.g. WitcherScriptMerger's
     # MergeInventory.xml) would land at Z:\\ (host "/", unwritable).
-    tool_cwd = str(cwd) if cwd is not None else str(exe.parent)
+    tool_cwd = Path(cwd) if cwd is not None else exe.parent
+    env.update(steam_compat_mounts(game, exe, cwd=tool_cwd, env=env))
     cmd = proton_run_command(proton_script, "runinprefix", str(exe), env=env,
                              host_cwd=tool_cwd)
     if extra_args:
@@ -2946,7 +2987,8 @@ def run_tool_logged(
     # Bind the published view over the configured game directory around the
     # *whole tool process* instead. Registry/config paths remain the ordinary
     # game paths and Wine tools see exactly the same resolved files as Skyrim.
-    cmd = wrap_tool_command(game, cmd, env, log_fn=log_fn, label=label)
+    cmd = wrap_tool_command(game, cmd, env, log_fn=log_fn, label=label,
+                            cwd=tool_cwd)
 
     try:
         proc = subprocess.Popen(
@@ -3560,6 +3602,9 @@ def is_game_launch_exe(game, exe_path: Path) -> bool:
     """
     if game is None:
         return False
+    from Utils.bethesda.skyrim_together import is_launcher
+    if is_launcher(game, exe_path):
+        return True
     if is_framework_launch_exe(game, exe_path.name):
         return True
     if getattr(game, "vfs_launch_enabled", False):
@@ -3604,7 +3649,7 @@ def _files_identical(left: Path, right: Path) -> bool:
 
 
 def swapped_framework_steam_id(game, exe_path: Path) -> str:
-    """Steam app ID when *exe_path* is already installed as the launcher.
+    """Steam app ID for a verified original or copied script-extender loader.
 
     Bethesda deploys normally replace the store launcher with a copy of the
     selected script-extender loader. When that exact, verified swap is active,
@@ -3616,7 +3661,7 @@ def swapped_framework_steam_id(game, exe_path: Path) -> str:
     a similarly named launcher is not enough to reroute a user's explicit Run
     selection through Steam.
     """
-    if game is None or not is_framework_launch_exe(game, exe_path.name):
+    if game is None:
         return ""
     try:
         if (not bool(getattr(game, "supports_script_extender_swap", True))
@@ -3630,6 +3675,17 @@ def swapped_framework_steam_id(game, exe_path: Path) -> str:
     game_path = game.get_game_path() if hasattr(game, "get_game_path") else None
     if game_path is None:
         return ""
+    launcher = resolve_game_exe(game)
+    if launcher is None:
+        return ""
+    launching_launcher = False
+    if not is_framework_launch_exe(game, exe_path.name):
+        try:
+            launching_launcher = launcher.samefile(exe_path)
+        except OSError:
+            return ""
+        if not launching_launcher:
+            return ""
     from Utils.games.frameworks import resolve_file_ci
     try:
         declared = getattr(game, "framework_launch_exes", None) or {}
@@ -3644,15 +3700,13 @@ def swapped_framework_steam_id(game, exe_path: Path) -> str:
             same = candidate.samefile(exe_path)
         except OSError:
             same = str(candidate).lower() == str(exe_path).lower()
-        if same:
+        if same or (launching_launcher
+                    and _files_identical(launcher, candidate)):
             selected = candidate
             break
     if selected is None:
         return ""
 
-    launcher = resolve_game_exe(game)
-    if launcher is None:
-        return ""
     try:
         if launcher.samefile(selected):
             return ""
@@ -3668,6 +3722,9 @@ def swapped_framework_steam_id(game, exe_path: Path) -> str:
 def _effective_launch_options(game, exe_name: str, log_fn=_noop_log) -> tuple:
     """Canonical (environment, command) for a direct game-like launch."""
     steam_options = steam_launch_options_for_game(game, log_fn)
+    remaining = _without_amethyst_steam_handoff(steam_options, game)
+    if remaining is not None:
+        steam_options = remaining
     direct_options = load_launch_options(game, exe_name) or steam_options
     marker = ["__AMETHYST_COMMAND__"]
     return (parse_launch_options(direct_options, marker),
@@ -3755,7 +3812,8 @@ def epic_args_for_game(game, log_fn=_noop_log) -> list:
         return []
 
 
-def steam_compat_mounts(game, exe_path: Path) -> dict:
+def steam_compat_mounts(game, exe_path: Path, *, cwd: Path | None = None,
+                        env: dict | None = None) -> dict:
     """Extra paths a Steam Linux Runtime launch must see, as env vars.
 
     pressure-vessel exposes $HOME, the game install and whatever Steam names
@@ -3764,7 +3822,9 @@ def steam_compat_mounts(game, exe_path: Path) -> dict:
     STEAM_COMPAT_MOUNTS is Steam's channel for that; a bare Proton call
     ignores it.
     """
-    paths: list[str] = []
+    paths = list(dict.fromkeys(
+        path for path in (env or {}).get("STEAM_COMPAT_MOUNTS", "").split(":")
+        if path))
 
     def _add(candidate) -> None:
         if candidate is None:
@@ -3782,6 +3842,15 @@ def steam_compat_mounts(game, exe_path: Path) -> dict:
             return
         paths.append(real)
 
+    for getter in ("get_game_path", "get_vfs_game_root",
+                   "get_effective_overwrite_path"):
+        fn = getattr(game, getter, None)
+        if callable(fn):
+            try:
+                _add(fn())
+            except Exception:
+                pass
+    _add(getattr(game, "_active_profile_dir", None))
     for getter in ("get_effective_mod_staging_path", "get_mod_staging_path"):
         fn = getattr(game, getter, None)
         if fn is None:
@@ -3796,6 +3865,7 @@ def steam_compat_mounts(game, exe_path: Path) -> dict:
         if staging is not None:
             _add(Path(staging).parent)
     _add(exe_path.parent)
+    _add(cwd)
     try:
         _add(exe_path.resolve().parent)
     except OSError:
@@ -3824,11 +3894,19 @@ def launch_exe_via_proton(
     # script extender, so its caller supplies the canonical Play-entry key.
     manager_play_launch = launch_settings_key is not None
     settings_key = launch_settings_key or exe_path.name
+    from Utils.bethesda import skyrim_together
+    together_launch = skyrim_together.is_launcher(game, exe_path)
+    if together_launch:
+        exe_path = skyrim_together.resolve_launcher(game, exe_path)
     from Utils.wabbajack.runtime import working_directory, launch_environment, uses_stock_game
     launch_cwd = working_directory(game, exe_path)
+    if together_launch:
+        launch_cwd = game.get_game_path()
     from Utils.wabbajack.runtime import configure_tool_output
     configure_tool_output(game, exe_path, log_fn)
-    framework_launch = is_framework_launch_exe(game, exe_path.name)
+    framework_launch = (
+        is_framework_launch_exe(game, exe_path.name)
+        or bool(swapped_framework_steam_id(game, exe_path)))
     vfs_game_launch = False
     if getattr(game, "vfs_launch_enabled", False):
         try:
@@ -3839,7 +3917,7 @@ def launch_exe_via_proton(
             selected is not None
             and str(Path(selected)).casefold() == str(exe_path).casefold()
         )
-    protected_game_launch = framework_launch or vfs_game_launch
+    protected_game_launch = framework_launch or vfs_game_launch or together_launch
     if protected_game_launch and not _require_direct_steam_client(game, log_fn):
         return
     if (framework_launch
@@ -3867,7 +3945,8 @@ def launch_exe_via_proton(
     # the picker for these, but an override saved before that gate existed (or
     # edited by hand) must not resurrect the isolated-prefix path.
     if proton_override_name and protected_game_launch:
-        launch_kind = "a script extender" if framework_launch else "the VFS game launcher"
+        launch_kind = ("Skyrim Together" if together_launch else
+                       "a script extender" if framework_launch else "the VFS game launcher")
         log_fn(f"Run EXE: {exe_path.name} is {launch_kind} - ignoring the "
                f"'{proton_override_name}' override and using the game's prefix "
                "(it launches the game, which needs the game's Steam app ID).")
@@ -4069,7 +4148,7 @@ def launch_exe_via_proton(
             env["SteamGameId"] = "0"
             env["SteamOverlayGameId"] = "0"
             env["STEAM_COMPAT_APP_ID"] = "0"
-        for key, value in steam_compat_mounts(game, exe_path).items():
+        for key, value in steam_compat_mounts(game, exe_path, env=env).items():
             env[key] = value
 
     if proton_override_name:
@@ -4101,7 +4180,7 @@ def launch_exe_via_proton(
         # the Steam/Proton session down to bare Wine, which makes Steam builds
         # of SKSE/NVSE/etc. fail DRM/SteamAPI initialisation. Keep a stale or
         # hand-edited setting from silently breaking a direct game launch.
-        log_fn(f"Run EXE: {exe_path.name} is a script extender - ignoring "
+        log_fn(f"Run EXE: {exe_path.name} launches the game - ignoring "
                "the plain-Wine override and using the game's normal runner.")
         winetricks_style = False
 
@@ -4196,6 +4275,11 @@ def launch_exe_via_proton(
             game, env, log_fn=log_fn, log_prefix="Run EXE")
 
     launch_environment(game, env)
+    if together_launch:
+        extra_args = skyrim_together.launch_args(game, extra_args)
+        skyrim_together.prepare_compatibility(
+            proton_script, env, exe_name=exe_path.name,
+            umu_bin=umu_bin, log_fn=log_fn)
     try:
         prepare_env = getattr(game, "prepare_launch_environment_for_exe", None)
         if callable(prepare_env):

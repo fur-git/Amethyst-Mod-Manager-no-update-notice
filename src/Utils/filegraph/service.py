@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import tempfile
@@ -30,6 +31,16 @@ from Utils.filegraph.native import pack, require_native, unpack
 
 
 def _native_error(exc: BaseException) -> BaseException:
+    if isinstance(exc, OSError):
+        if exc.errno in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return OSError(
+                exc.errno,
+                "The mod library's filesystem does not support required file "
+                "locking. Select a staging folder with file-locking support "
+                f"and direct filesystem access. {exc.strerror}",
+                exc.filename,
+            )
+        return exc
     text = str(exc)
     lowered = text.lower()
     if ("generation" in lowered
@@ -41,10 +52,13 @@ def _native_error(exc: BaseException) -> BaseException:
             "A previous deployment was interrupted. Run Deploy or Restore to "
             "recover its filesystem journal before changing this profile."
         )
-    if "writer lock" in lowered or "busy" in lowered:
+    if (lowered.startswith("filegraph library is busy:")
+            or "database is locked" in lowered
+            or "database is busy" in lowered):
         return FileGraphBusy(
             "This mod library is being changed by another Amethyst process. "
-            "Close the other process or wait for its Refresh/deployment to finish."
+            "Close the other process or wait for its Refresh/deployment to finish. "
+            f"Details: {text}"
         )
     if "cancelled" in text.lower():
         return FileGraphCancelled(text)
@@ -1029,6 +1043,10 @@ class LibrarySession:
         self.game = game
         self.root = Path(root)
         self.log = log_fn or (lambda _message: None)
+        from Utils.environment.sandbox import document_portal_path_hint
+        problem = document_portal_path_hint(self.root)
+        if problem:
+            raise RuntimeError(problem)
         native = require_native()
         try:
             self._native = native.LibrarySession.open(self.root)
@@ -1146,20 +1164,27 @@ class LibrarySession:
         cancel: CancellationToken | None = None,
     ) -> bool:
         """Replace one manifest only when its files or route variant changed."""
+        from Utils.filegraph.adapter import manifest_fingerprint
         token = cancel or CancellationToken()
         with self._refresh_lock:
-            session = self.open_profile(profile_dir)
-            batch = session.adapter.build_manifest(mod_name, cancel=token)
-            mod_key = str(batch["mod_key"])
+            if token.is_cancelled():
+                raise FileGraphCancelled("filegraph refresh cancelled")
+            adapter = self.open_profile(profile_dir).adapter
+            adapter.prepare_profile_rules()
+            root = {OVERWRITE_NAME: adapter.overwrite,
+                    ROOT_FOLDER_NAME: adapter.root_folder}.get(
+                        mod_name, adapter.staging / mod_name)
+            files = adapter._scan_root(root, cancel=token) if root.is_dir() else []
+            mod_key = mod_name.lower()
             fingerprints = {
                 name.lower(): fingerprint
                 for name, fingerprint in self.manifest_fingerprints().items()
             }
             variants = self.variant_keys().get(mod_key, frozenset())
-            if (fingerprints.get(mod_key)
-                    == bytes(batch["manifest_fingerprint"])
-                    and str(batch["variant_key"]) in variants):
+            if (fingerprints.get(mod_key) == manifest_fingerprint(files)
+                    and adapter.variant_key(mod_name) in variants):
                 return False
+            batch = adapter.build_manifest(mod_name, cancel=token, raw_files=files)
             self.replace_mod_manifest(batch, cancel=token)
             return True
 
@@ -1429,6 +1454,8 @@ class LibrarySession:
                 profile._invalidate_resolution_cache()
 
     def _invalidate_shared_catalogs(self, shared_batch=frozenset()):
+        from Utils.mods.links import invalidate_linked_catalogs
+        invalidate_linked_catalogs(self)
         if (self.root / "mods").is_symlink() or (self.root / "profile_state.json").is_file():
             from Utils.wabbajack.profiles import invalidate_shared_catalogs
             invalidate_shared_catalogs(self, shared_batch=shared_batch)

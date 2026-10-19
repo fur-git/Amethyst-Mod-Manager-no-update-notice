@@ -37,7 +37,7 @@ from pathlib import Path
 from Games.base_game import BaseGame
 from Utils.vfs import ProfileVFSGameMixin
 from Utils.deployment import LinkMode, cleanup_custom_deploy_dirs, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _resolve_root_path, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
-from Utils.mods.modlist import read_modlist
+from Utils.mods.modlist import ensure_mod_preserving_position, read_modlist
 from Utils.config_paths import get_profiles_dir
 from Utils.witcher3.menu_filelists import update_menu_filelists
 
@@ -113,6 +113,7 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
     profile_overridable_settings = (
         *BaseGame.profile_overridable_settings,
         *ProfileVFSGameMixin.vfs_profile_setting_keys,
+        "preserve_mod_load_order",
     )
 
     @staticmethod
@@ -483,6 +484,16 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         if (self.get_profile_root() / "wabbajack-settings-links.json").is_file():
             restore_settings(self, log_fn)
 
+    @property
+    def preserve_mod_load_order(self) -> bool:
+        return bool(self._load_settings().get("preserve_mod_load_order", True))
+
+    @preserve_mod_load_order.setter
+    def preserve_mod_load_order(self, value: bool) -> None:
+        data = self._load_settings()
+        data["preserve_mod_load_order"] = bool(value)
+        self._save_settings(data)
+
     def post_deploy(self, log_fn=None) -> None:
         from Utils.witcher3.load_order import sync_mod_settings
         sync_mod_settings(self, log_fn=log_fn)
@@ -641,6 +652,42 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         except Exception as exc:
             _log(f"WARN: could not re-index Merged_Mods: {exc}")
 
+    def _enable_merged_mods(self, *, preserve_existing_state: bool = False) -> None:
+        from Utils.deployment.shared import RestoreIncompleteError
+
+        profile = self._active_profile_dir or self.get_profile_root() / "profiles/default"
+        modlist = profile / "modlist.txt"
+        try:
+            ensure_mod_preserving_position(
+                modlist, "Merged_Mods", enabled=True,
+                preserve_existing_state=preserve_existing_state)
+        except OSError as exc:
+            raise RestoreIncompleteError(
+                f"Could not enable rescued Script Merger output in {modlist}: {exc}"
+            ) from exc
+
+    def prepare_mod_staging(self, staging: Path, log_fn=None) -> bool:
+        from Utils.profiles.state import profile_uses_specific_mods
+
+        profile = self._active_profile_dir
+        if profile is None or not profile_uses_specific_mods(profile):
+            return False
+        if any(entry.name == "Merged_Mods"
+               for entry in read_modlist(profile / "modlist.txt")):
+            return False
+        merged_dir = staging / "Merged_Mods" / "mods"
+        if not merged_dir.is_dir():
+            return False
+        if not any(path.is_file()
+                   for folder in merged_dir.iterdir()
+                   if folder.is_dir() and "_mergedfiles" in folder.name.casefold()
+                   for path in folder.rglob("*")):
+            return False
+        self._enable_merged_mods(preserve_existing_state=True)
+        if log_fn:
+            log_fn("Recovered unlisted Script Merger output as Merged_Mods.")
+        return True
+
     def _rescue_merged_files(self, game_root: Path, log_fn=None) -> int:
         """Merge Script Merger output into the staged Merged_Mods mod.
 
@@ -662,6 +709,8 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
                 continue
             dest = merged_dir / folder.name
             rescued = _merge_tree_into(folder, dest)
+            if not merged_changed:
+                self._enable_merged_mods()
             shutil.rmtree(folder)
             merged_changed = True
             rescued_total += rescued

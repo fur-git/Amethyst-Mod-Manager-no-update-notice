@@ -957,6 +957,15 @@ class ConfigureGameView(QWidget):
         add_check("archive_invalidation",
                   self.tr("Automatic archive invalidation (prefer loose files over BSAs)"),
                   hasattr(self._game, "archive_invalidation_enabled"), full=True)
+        add_check("disable_creations_menu",
+                  self.tr("Disable the in-game Creations menu"),
+                  getattr(self._game, "supports_creations_menu", False), full=True)
+        if "disable_creations_menu" in self._opt_checks:
+            self._opt_checks["disable_creations_menu"].parentWidget().setToolTip(
+                self.tr("Disable the Bethesda.net platform on deploy to prevent "
+                        "in-game load order changes. Turn this off to access Creations. "
+                        "Fallout 4 AE users can use Addictol's Load Order module "
+                        "to protect their load order. Redeploy to apply changes."))
         add_check("manage_archive_load_order",
                   self.tr("Use mod priority for archive load order"),
                   hasattr(self._game, "manage_archive_load_order"), full=True)
@@ -966,6 +975,23 @@ class ConfigureGameView(QWidget):
                         "Disabled by default to use archive filename order. "
                         "Existing custom modlist.txt files are preserved. "
                         "Redeploy to apply changes."))
+        add_check("preserve_mod_load_order",
+                  self.tr("Preserve Witcher 3 mod load order"),
+                  hasattr(self._game, "preserve_mod_load_order"), full=True)
+        if "preserve_mod_load_order" in self._opt_checks:
+            self._opt_checks["preserve_mod_load_order"].parentWidget().setToolTip(
+                self.tr("Preserve custom mods.settings priorities, or use the collection's "
+                        "load order when no custom priorities exist. Other mods keep "
+                        "their alphabetical order. Enabled by default. Turn this off "
+                        "to assign all priorities from the modlist. Redeploy to apply changes."))
+        add_check("manage_lml_load_order",
+                  self.tr("Use mod priority for LML load order"),
+                  hasattr(self._game, "manage_lml_load_order"), full=True)
+        if "manage_lml_load_order" in self._opt_checks:
+            self._opt_checks["manage_lml_load_order"].parentWidget().setToolTip(
+                self.tr("Generate lml/mods.xml on deploy so higher-priority mods "
+                        "load last. Enabled by default. Turn this off to manage "
+                        "LML load order yourself. Redeploy to apply changes."))
         add_check("case_alias_links",
                   self.tr("Create case-alias symlinks on deploy (Faster load times)"),
                   bool(getattr(self._game, "case_alias_dirs", None)), full=True)
@@ -1096,8 +1122,14 @@ class ConfigureGameView(QWidget):
                             getattr(g, "prefer_appimage", False))
             self._set_check("archive_invalidation",
                             getattr(g, "archive_invalidation", True))
+            self._set_check("disable_creations_menu",
+                            getattr(g, "disable_creations_menu", False))
             self._set_check("manage_archive_load_order",
                             getattr(g, "manage_archive_load_order", False))
+            self._set_check("preserve_mod_load_order",
+                            getattr(g, "preserve_mod_load_order", True))
+            self._set_check("manage_lml_load_order",
+                            getattr(g, "manage_lml_load_order", True))
             self._set_check("case_alias_links", getattr(g, "case_alias_links", True))
             self._set_check("profile_ini_files", getattr(g, "profile_ini_files", False))
             self._set_check("profile_saves", getattr(g, "profile_saves", False))
@@ -1140,7 +1172,11 @@ class ConfigureGameView(QWidget):
             self._set_check("prefer_appimage",
                             getattr(g, "prefer_appimage", False))
             self._set_check("archive_invalidation", True)
+            self._set_check("disable_creations_menu",
+                            getattr(g, "disable_creations_menu_default", False))
             self._set_check("manage_archive_load_order", False)
+            self._set_check("preserve_mod_load_order", True)
+            self._set_check("manage_lml_load_order", True)
             self._set_check("case_alias_links",
                             getattr(g, "case_alias_links_default", True))
             self._set_check("profile_ini_files", False)
@@ -1637,7 +1673,8 @@ class ConfigureGameView(QWidget):
     def _browse_staging(self):
         from Utils.ui.portal import pick_folder
         pick_folder("Select mod staging folder",
-                    lambda path: self._sig.staging_picked.emit(path))
+                    lambda path: self._sig.staging_picked.emit(path),
+                    direct_access=True)
 
     def _browse_saves(self):
         # Same worker-thread caveat as _browse_game - marshal via the signal.
@@ -1867,6 +1904,15 @@ class ConfigureGameView(QWidget):
             import traceback
             app_log(f"[Configure Game] Scan failed: {exc}\n{traceback.format_exc()}")
         if not candidates:
+            try:
+                detect = getattr(g, "detect_standalone_install", None)
+                found = detect() if callable(detect) else None
+                if found is not None:
+                    _add("standalone", found, None, None, g.exe_name)
+                    app_log(f"[Configure Game] Found standalone install: {found}")
+            except Exception as exc:
+                app_log(f"[Configure Game] Standalone detection failed: {exc}")
+        if not candidates:
             app_log(f"[Configure Game] Game location not auto-detected for: {game_name}")
             try:
                 from Utils.launchers.steam import steam_discovery_report
@@ -1887,8 +1933,6 @@ class ConfigureGameView(QWidget):
         if candidates:
             self._apply_install_choice(candidates[0])
         elif getattr(self._game, "auto_drive_scan", False):
-            # Store-less games (manual downloads) can never be found by the
-            # library scan - the drive scan IS their auto-detection.
             self._start_drive_scan()
         else:
             self._game_status.setText(
@@ -1952,7 +1996,8 @@ class ConfigureGameView(QWidget):
         # Launcher names are brands and stay untranslated; the shortcut entry
         # is a description, so it goes through tr().
         names = dict(_LAUNCHER_NAMES,
-                     shortcut=self.tr("Non-Steam Shortcut"))
+                     shortcut=self.tr("Non-Steam Shortcut"),
+                     standalone=self.tr("Standalone"))
         icon_names = {"steam": "steam.png", "shortcut": "steam.png",
                       "heroic": "heroic.png", "lutris": "lutris.png",
                       "faugus": "faugus.png", "bottles": "bottles.png"}
@@ -2489,6 +2534,8 @@ class ConfigureGameView(QWidget):
                     message = self.tr(
                         "The selected staging folder could not be read: {0}").format(
                             detail)
+                elif code == "portal":
+                    message = detail
                 else:
                     message = self.tr(
                         "This non-empty folder does not contain an Amethyst "
@@ -2660,8 +2707,14 @@ class ConfigureGameView(QWidget):
                 self._opt_checks["prefer_appimage"].isChecked())
         if "archive_invalidation" in self._opt_checks:
             g.archive_invalidation = self._opt_checks["archive_invalidation"].isChecked()
+        if "disable_creations_menu" in self._opt_checks:
+            g.disable_creations_menu = self._opt_checks["disable_creations_menu"].isChecked()
         if "manage_archive_load_order" in self._opt_checks:
             g.manage_archive_load_order = self._opt_checks["manage_archive_load_order"].isChecked()
+        if "preserve_mod_load_order" in self._opt_checks:
+            g.preserve_mod_load_order = self._opt_checks["preserve_mod_load_order"].isChecked()
+        if "manage_lml_load_order" in self._opt_checks:
+            g.manage_lml_load_order = self._opt_checks["manage_lml_load_order"].isChecked()
         if "case_alias_links" in self._opt_checks:
             g.case_alias_links = self._opt_checks["case_alias_links"].isChecked()
         if hasattr(g, "set_profile_ini_files") and "profile_ini_files" in self._opt_checks:

@@ -1,3 +1,40 @@
+- v2.5.5
+### Game Support
+- Added The Sims 3
+- Added Star Wars: Zero Comapny
+- Added Grim Dawn
+### Additions
+- Added an option in the settings to forward nxm links to other applications
+- Added an option in the UI settings to change default priority sort order
+- Added one-click Windows component installation from the Proton menu.
+- Added an option to open the modlist panel as a tab for cross panel mod sorting. Can be opened from the eye icon in the mod name column
+- Added an option to symlink mods to other profiles
+- Added an option to the Thunderstore dropdown to import a r2x manifest
+- Added an option to disable keybinds in the keybinds settings menu
+### Changes
+- Appimage updates now install via the zsync file intead of rerunning the install script
+- Bethesda profile specfic saves now use sLocalSavePath to separate them from the usual saves folder
+- Creation club disabling within Fallout 4 and Skyrim SE is now optional
+- Profile export now sets disabled mods to optional by default and highlights them
+- The application theme can now be changed in the onboarding menu. The onboarding menu now also shows a list of installed games
+- Skyrim together reborn is detected when pressing play
+### Bug Fixes
+- Fixed Thunderstore dependancy downloading when a mod contains 200+ dependancies
+- Fixed issues when dragging mods in the download tab to install them
+- Fixed Oblivion Remastered Wabbajack lists using the wrong folder as the root folder
+- Fixed automatic detection and path setup for Lutris games using shortcuts or launchers.
+- Potential fix for pandora black screen when run via the wizard
+- Fixed wizard installs continuing after restoring the game to vanilla failed. #522
+- Fixed custom deployments continuing when their recovery log could not be saved. #523
+- Fixed mod installs being reported as successful when game-specific post-install processing failed. #524
+- Fixed deployments being reported as successful after file transfer failures #525
+- Fixed Wabbajack installs failing on unexpected mip sizes in unused BA2 textures.
+- Potential fix for automatic dll overrides causing controller issues
+- Fixed Wicther 3 Script Merger output disappearing after deploy/restore
+- Fixed Witcher 3 load ordering causing Sharedutils compilation errors
+
+---
+
 - v2.5.4
 ### Additions
 - Added support for games installed via Bottles

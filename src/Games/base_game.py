@@ -215,7 +215,7 @@ class BaseGame(ABC):
     # Opt-in for the incremental redeploy fast path (Utils/deployment/incremental.py).
     # Only safe for handlers whose deploy() is the plain standard sequence
     # (move_to_core → deploy_filemap → deploy_core) with a single Data-style
-    # target and idempotent post-deploy steps.  See Fallout_3 for the first
+    # target and idempotent post-deploy steps.  See BethesdaBase for the first
     # opted-in family.
     supports_incremental_deploy: bool = False
 
@@ -335,6 +335,10 @@ class BaseGame(ABC):
         (e.g. Steam vs Epic/Heroic).  Checked after ``exe_name``.
         """
         return []
+
+    def detect_standalone_install(self) -> Path | None:
+        """Find a validated install using bounded local hints, without scanning drives."""
+        return None
 
     @property
     def auto_drive_scan(self) -> bool:
@@ -1504,20 +1508,21 @@ class BaseGame(ABC):
 
     @property
     def nexus_game_domains(self) -> tuple[str, ...]:
-        """Primary + additional Nexus domains, normalised and de-duplicated."""
+        """Primary + additional Nexus domains, preserving configured casing."""
         result: list[str] = []
         seen: set[str] = set()
         extras = self.additional_nexus_domains or []
         for raw in (self.nexus_game_domain, *extras):
-            domain = (raw or "").strip().lower()
-            if domain and domain not in seen:
-                seen.add(domain)
+            domain = (raw or "").strip()
+            if domain and domain.lower() not in seen:
+                seen.add(domain.lower())
                 result.append(domain)
         return tuple(result)
 
     def accepts_nexus_domain(self, domain: str) -> bool:
         """Whether *domain* is the game's primary or an additional domain."""
-        return (domain or "").strip().lower() in self.nexus_game_domains
+        return (domain or "").strip().lower() in {
+            value.lower() for value in self.nexus_game_domains}
 
     @property
     def wine_dll_overrides(self) -> dict[str, str]:
@@ -1818,6 +1823,12 @@ class BaseGame(ABC):
         """Return the configured game path before profile overrides."""
         raw = self._read_global_paths().get("game_path", "")
         return Path(raw) if isinstance(raw, str) and raw else None
+
+    def get_root_deploy_path(self, profile_dir: Path | None = None) -> Path | None:
+        return self.get_game_path()
+
+    def get_wabbajack_game_path(self) -> Path | None:
+        return self.get_game_path()
 
     # Subpath that game_data_subpath() should report when the deploy dir is
     # NOT inside the game root. Only handlers that deploy outside the install

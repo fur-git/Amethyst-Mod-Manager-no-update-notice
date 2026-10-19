@@ -65,20 +65,14 @@ def _root_identity(path: Path, rel_str: str, owner: "str | None" = None) \
     }
 
 
-def _write_root_identities(path: Path, records: "list[dict]", log_fn=None) -> None:
-    """Atomically persist the identities of successfully deployed root files."""
-    try:
-        if not records:
-            path.unlink(missing_ok=True)
-            return
-        payload = json.dumps(
-            {"version": 1, "files": records},
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ) + "\n"
-        write_atomic_text(path, payload, errors="surrogateescape")
-    except OSError as exc:
-        _safe_log(log_fn)(f"  WARN: could not write root deploy identities: {exc}")
+def _write_root_identities(path: Path, records: "list[dict]", game_root: Path) -> None:
+    """Persist the deployment root and the identities of placed files."""
+    payload = json.dumps(
+        {"version": 1, "root": str(game_root.resolve()), "files": records},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ) + "\n"
+    write_atomic_text(path, payload, errors="surrogateescape")
 
 
 def _load_root_identities(path: Path) -> "dict[str, dict]":
@@ -180,6 +174,8 @@ def deploy_root_folder(
     log_path   = artifacts_dir / _ROOT_LOG_NAME
     identity_path = artifacts_dir / _ROOT_IDENTITY_NAME
 
+    _write_root_identities(identity_path, [], game_root=game_root)
+
     # Resolve destinations case-insensitively against the game tree (shared
     # dir cache - one iterdir per directory instead of one per file) and
     # track which top-level directories we are creating so restore can wipe
@@ -244,21 +240,27 @@ def deploy_root_folder(
             allow_symlink=rel_posix.lower() not in no_symlink_files)
         return rel_posix, err
 
-    for rel_posix, err in _iter_map_batched(_do_root, tasks):
+    transfer_error = None
+    for rel_posix, err in _iter_map_batched(
+            _do_root, tasks, stop_on=lambda result: result[1] is not None):
         if err is None:
             placed.append(rel_posix)
-        else:
-            _log(f"  WARN: could not transfer root file {rel_posix}: {err}")
+        elif transfer_error is None:
+            _log(f"  ERROR: could not transfer root file {rel_posix}: "
+                 f"{err} - aborting deploy.")
+            transfer_error = err
 
-    # Re-write the log with what actually landed.
-    _write_log(placed)
+    # Drain in-flight transfers and persist their identities before raising.
     task_by_rel = {rel_posix: dst for _s, dst, _r, rel_posix in tasks}
     identities = [
         record
         for rel_posix in placed
         if (record := _root_identity(task_by_rel[rel_posix], rel_posix)) is not None
     ]
-    _write_root_identities(identity_path, identities, _log)
+    _write_root_identities(identity_path, identities, game_root)
+    if transfer_error is not None:
+        raise transfer_error
+    _write_log(placed)
 
     _timing_print(
         f"  [TIMER] deploy_root_folder: transferred {len(placed)} files")
@@ -333,6 +335,8 @@ def deploy_root_flagged_mods(
     existing_placed_set = set(existing_placed)
     created_dirs: set[str] = set(existing_dirs)
     existing_identities = _load_root_identities(identity_path)
+    _write_root_identities(identity_path, list(existing_identities.values()),
+                           game_root=game_root)
 
     # Build a quick dir-resolution cache for game_root lookups
     _dir_cache: dict = {}
@@ -416,14 +420,16 @@ def deploy_root_flagged_mods(
             allow_symlink=rel_posix.lower() not in no_symlink_files)
         return rel_posix, err
 
-    for rel_posix, err in _iter_map_batched(_do_flagged, tasks):
+    transfer_error = None
+    for rel_posix, err in _iter_map_batched(
+            _do_flagged, tasks, stop_on=lambda result: result[1] is not None):
         if err is None:
             placed.append(rel_posix)
-        else:
-            _log(f"  WARN: could not transfer root-flagged file {rel_posix}: {err}")
+        elif transfer_error is None:
+            _log(f"  ERROR: could not transfer root-flagged file "
+                 f"{rel_posix}: {err} - aborting deploy.")
+            transfer_error = err
 
-    # Re-write the log with what actually landed.
-    _write_log(placed)
     task_by_rel = {}
     for src, dst, rel_posix in tasks:
         try:
@@ -441,7 +447,10 @@ def deploy_root_flagged_mods(
         **existing_identities,
         **{r["path"].replace("\\", "/").lower(): r for r in new_identities},
     }
-    _write_root_identities(identity_path, list(merged_identities.values()), _log)
+    _write_root_identities(identity_path, list(merged_identities.values()), game_root)
+    if transfer_error is not None:
+        raise transfer_error
+    _write_log(placed)
 
     _log(f"  Root-flagged mods: {len(placed)} file(s) transferred to game root.")
     return len(placed)
@@ -486,6 +495,16 @@ def restore_root_folder(
 
     if not log_path.is_file():
         return 0
+
+    if identity_path.is_file():
+        state = json.loads(identity_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise RuntimeError("Invalid root deployment recovery state")
+        recorded_root = state.get("root")
+        if recorded_root is not None:
+            if not isinstance(recorded_root, str) or not Path(recorded_root).is_absolute():
+                raise RuntimeError("Invalid recorded root deployment path")
+            game_root = Path(recorded_root)
 
     # Parse log: files section and optional ---dirs--- section.
     content = log_path.read_text(encoding="utf-8", errors="surrogateescape")
@@ -668,7 +687,7 @@ def restore_root_folder_for_game(
         else game.get_effective_root_folder_path()
     )
     game_root = game_root if game_root is not None else game.get_game_path()
-    if not root_folder_dir.is_dir() or not game_root:
+    if not game_root:
         return 0
 
     return restore_root_folder(

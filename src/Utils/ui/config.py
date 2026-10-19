@@ -755,12 +755,36 @@ def display_date_pattern(*, with_time: bool = False) -> str:
     return pattern + " %H:%M" if with_time else pattern
 
 
+def load_default_priority_mode() -> str:
+    try:
+        value = _read_ini(get_ui_config_path()).get(
+            _INI_SECTION, "default_priority_mode", fallback="default").strip().lower()
+    except (configparser.Error, OSError):
+        value = "default"
+    return value if value in ("default", "reversed") else "default"
+
+
+def save_default_priority_mode(value: str) -> None:
+    if value not in ("default", "reversed"):
+        raise ValueError(f"Unsupported priority mode: {value}")
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _INI_SECTION not in parser:
+        parser[_INI_SECTION] = {}
+    parser[_INI_SECTION]["default_priority_mode"] = value
+    _write_ini(parser, path)
+
+
 # ---------------------------------------------------------------------------
 # Shortcut overrides. Defaults and validation live in the Qt module; this
 # layer only persists its portable keyboard and mouse binding strings.
 # ---------------------------------------------------------------------------
 _SHORTCUTS_SECTION = "shortcuts"
 _MOUSE_SHORTCUTS_SECTION = "mouse_shortcuts"
+_SHORTCUT_SETTINGS_SECTION = "shortcut_settings"
 
 
 def _load_shortcut_section(section: str) -> dict[str, str]:
@@ -788,6 +812,26 @@ def load_shortcut_overrides() -> dict[str, str]:
     overrides = _load_shortcut_section(_MOUSE_SHORTCUTS_SECTION)
     overrides.update(_load_shortcut_section(_SHORTCUTS_SECTION))
     return overrides
+
+
+def load_disabled_shortcut_inputs() -> set[str]:
+    values = _load_shortcut_section(_SHORTCUT_SETTINGS_SECTION)
+    return {kind for kind in ("keyboard", "mouse")
+            if values.get(f"disable_{kind}", "").lower()
+            in ("1", "true", "yes", "on")}
+
+
+def save_disabled_shortcut_inputs(disabled: set[str]) -> None:
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    parser[_SHORTCUT_SETTINGS_SECTION] = {
+        f"disable_{kind}": "1" if kind in disabled else "0"
+        for kind in ("keyboard", "mouse")
+    }
+    _write_ini(parser, path)
 
 
 def save_shortcut_overrides(overrides: dict[str, str]) -> None:
@@ -1223,6 +1267,26 @@ def save_nexus_download_server(value: str) -> None:
         parser[_DOWNLOADS_SECTION] = {}
     parser[_DOWNLOADS_SECTION]["nexus_server"] = (
         value if value in NEXUS_DOWNLOAD_SERVERS else "")
+    _write_ini(parser, path)
+
+
+def load_nexus_free_download_nxm() -> bool:
+    try:
+        return _read_ini(get_ui_config_path()).getboolean(
+            _DOWNLOADS_SECTION, "nexus_free_download_nxm", fallback=True)
+    except Exception:
+        return True
+
+
+def save_nexus_free_download_nxm(value: bool) -> None:
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    if _DOWNLOADS_SECTION not in parser:
+        parser[_DOWNLOADS_SECTION] = {}
+    parser[_DOWNLOADS_SECTION]["nexus_free_download_nxm"] = "true" if value else "false"
     _write_ini(parser, path)
 
 
@@ -2567,6 +2631,19 @@ def load_default_staging_path() -> str:
 
 def save_default_staging_path(value: str) -> None:
     """Persist the default mod staging folder to amethyst.ini. Pass '' to clear."""
+    value = value.strip()
+    if value:
+        from Utils.environment.sandbox import (
+            document_portal_path_hint, flatpak_blocked_path_hint,
+        )
+        problem = document_portal_path_hint(value)
+        if problem:
+            raise ValueError(problem)
+        command = flatpak_blocked_path_hint(value)
+        if command:
+            raise ValueError(
+                "Flatpak needs direct access to this staging folder. "
+                f"Run this command, restart Amethyst, then select it again: {command}")
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     parser = _new_parser()
@@ -3116,11 +3193,10 @@ def load_theme_colors() -> dict[str, str]:
 #
 # Valid values are theme IDs (filenames) under src/themes/ (e.g. "dark",
 # "light"). ui_config doesn't validate against that list to avoid importing
-# the gui package; theme.py handles unknown IDs by falling back to dark.
+# the gui package; the Qt theme loader falls back to amethyst for unknown IDs.
 # ---------------------------------------------------------------------------
 _APPEARANCE_OPTION = "appearance_mode"
 _APPEARANCE_DEFAULT = "amethyst"
-_APPEARANCE_LEGACY_DEFAULT = "dark"
 # Theme ids are lowercase word chars/digits/dashes/underscores; user-authored
 # JSON themes add a single "custom:" namespace prefix (see themes.custom),
 # so a colon is permitted between the prefix and the slug.
@@ -3225,8 +3301,7 @@ def ensure_ini_version(log_fn=None) -> None:
     file exists stamping the current version. amethyst.ini only - other config
     (last_game.json, games/, profiles, caches) is left untouched.
 
-    Also pins appearance_mode=dark into any surviving ini that doesn't set it,
-    so the newer 'amethyst' default only reaches brand-new installs.
+    Saves the default theme when no appearance mode is set.
 
     Call this ONCE at the very start of startup, before anything reads the ini.
     Best-effort: any error falls back to wiping + rewriting so a corrupt/locked
@@ -3277,6 +3352,7 @@ def ensure_ini_version(log_fn=None) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             parser = _new_parser()
             parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
+            parser[_INI_SECTION] = {_APPEARANCE_OPTION: _APPEARANCE_DEFAULT}
             _write_ini(parser, path)
             log_fn(f"Startup configuration: created schema {_APP_INI_VERSION} INI.")
         else:
@@ -3294,7 +3370,7 @@ def ensure_ini_version(log_fn=None) -> None:
             if not parser.has_option(_INI_SECTION, _APPEARANCE_OPTION):
                 if _INI_SECTION not in parser:
                     parser[_INI_SECTION] = {}
-                parser[_INI_SECTION][_APPEARANCE_OPTION] = _APPEARANCE_LEGACY_DEFAULT
+                parser[_INI_SECTION][_APPEARANCE_OPTION] = _APPEARANCE_DEFAULT
                 dirty = True
             if dirty:
                 _write_ini(parser, path)
@@ -3308,6 +3384,7 @@ def ensure_ini_version(log_fn=None) -> None:
         try:
             parser = _new_parser()
             parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
+            parser[_INI_SECTION] = {_APPEARANCE_OPTION: _APPEARANCE_DEFAULT}
             _write_ini(parser, path)
             log_fn("Startup configuration: clean rewrite succeeded.")
         except Exception as rewrite_exc:

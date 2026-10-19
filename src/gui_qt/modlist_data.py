@@ -29,6 +29,7 @@ FLAG_ROOT_RULE = 1 << 12   # owns files with a custom root-routing rule - filema
 FLAG_RERUN_FOMOD = 1 << 13  # a FOMOD option's fileDependency plugin is now in the load order - live overlay
 FLAG_THUNDERSTORE_UPDATE = 1 << 14  # Thunderstore update ([thunderstore] hasUpdate)
 FLAG_SKSE_INCOMPATIBLE = 1 << 15
+FLAG_SYMLINK = 1 << 16
 
 
 def _parse_missing_req_pairs(raw: str) -> list[tuple[int, str]]:
@@ -212,15 +213,14 @@ def read_meta_for_entries(entries: list[ModEntry], staging_dir: Path,
         # BG3 mod.io update (file-id or embedded-version comparison).
         if is_bg3:
             try:
-                import configparser as _cp_modio
-                cp = _cp_modio.ConfigParser(interpolation=None)
-                cp.read(str(meta_path), encoding="utf-8")
+                from Utils.mods.metadata import read_meta_ini
+                _, cp, _ = read_meta_ini(meta_path)
 
                 def _modio_value(key, legacy_key, fallback):
                     if cp.has_option("modio", key):
-                        return cp.get("modio", key, fallback=fallback)
+                        return cp.get("modio", key, fallback=fallback, raw=True)
                     return cp.get(
-                        "General", legacy_key, fallback=fallback)
+                        "General", legacy_key, fallback=fallback, raw=True)
 
                 _fid = int(_modio_value(
                     "fileId", "modioFileId", "0") or "0")

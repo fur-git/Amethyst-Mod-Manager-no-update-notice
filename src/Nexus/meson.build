@@ -1,5 +1,6 @@
 py.install_sources(
   '__init__.py',
+  'archive_lookup.py',
   'manual_download_watch.py',
   'nexus_api.py',
   'nexus_download.py',
@@ -9,6 +10,7 @@ py.install_sources(
   'nexus_requirements.py',
   'nexus_update_checker.py',
   'nxm_handler.py',
+  'nxm_routing.py',
   'updatefilter.txt',
   subdir: 'Nexus',
 )

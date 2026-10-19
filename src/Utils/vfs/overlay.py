@@ -715,31 +715,33 @@ def _links_into_root(view: Path, game_root: Path, *, relocated: bool = False) ->
     root_text = os.path.normpath(str(game_root.resolve(strict=False)))
     view_text = os.path.normpath(str(view.resolve(strict=False)))
     count = 0
-    for dirpath, dirnames, filenames in os.walk(view, followlinks=False):
-        base = Path(dirpath)
-        link_names = [
-            name for name in dirnames
-            if (base / name).is_symlink()
-        ]
-        for name in (*link_names, *filenames):
-            path = base / name
-            if not path.is_symlink():
-                continue
-            try:
-                raw_target = os.readlink(path)
-            except OSError:
-                continue
-            target = os.path.normpath(
-                raw_target if os.path.isabs(raw_target)
-                else os.path.join(dirpath, raw_target)
-            )
-            try:
-                if (os.path.commonpath((root_text, target)) == root_text
-                        or (relocated and not os.path.isabs(raw_target)
-                            and os.path.commonpath((view_text, target)) != view_text)):
-                    count += 1
-            except ValueError:
-                continue
+    stack = [str(view)]
+    while stack:
+        dirpath = stack.pop()
+        try:
+            with os.scandir(dirpath) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_symlink():
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            continue
+                        raw_target = os.readlink(entry.path)
+                    except OSError:
+                        continue
+                    target = os.path.normpath(
+                        raw_target if os.path.isabs(raw_target)
+                        else os.path.join(dirpath, raw_target)
+                    )
+                    try:
+                        if (os.path.commonpath((root_text, target)) == root_text
+                                or (relocated and not os.path.isabs(raw_target)
+                                    and os.path.commonpath((view_text, target)) != view_text)):
+                            count += 1
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
     return count
 
 
@@ -2033,19 +2035,21 @@ def _retarget_shadow_paths(command: list[str], game_root: Path,
     launch_cwd: Path | None = None
     resolved_root = game_root.resolve()
     for index, token in enumerate(direct):
-        candidate = Path(token)
+        wine_path = token[:3].lower() == "z:\\"
+        candidate = Path(token[2:].replace("\\", "/") if wine_path else token)
         if not candidate.is_absolute():
             continue
         try:
-            # Manifests deliberately store canonical paths. A launcher may
-            # still pass the user's saved spelling through a symlinked Steam
-            # library or custom install alias, so canonicalize the argument
-            # before deriving its position in the shadow tree. strict=False
-            # also handles mod-only executables that do not exist physically.
-            relative = candidate.resolve(strict=False).relative_to(
-                resolved_root)
-        except (OSError, ValueError):
-            continue
+            relative = Path(os.path.abspath(candidate)).relative_to(resolved_root)
+        except ValueError:
+            try:
+                relative = (candidate.parent.resolve(strict=False) / candidate.name
+                            ).relative_to(resolved_root)
+            except (OSError, ValueError):
+                try:
+                    relative = candidate.resolve(strict=False).relative_to(resolved_root)
+                except (OSError, ValueError):
+                    continue
         shadow_candidate = view / relative
         if not shadow_candidate.exists():
             # Wine paths are case-insensitive, while the materialized Linux
@@ -2054,7 +2058,8 @@ def _retarget_shadow_paths(command: list[str], game_root: Path,
             if resolved_shadow is None:
                 continue
             shadow_candidate = resolved_shadow
-        direct[index] = str(shadow_candidate)
+        direct[index] = ("Z:" + str(shadow_candidate).replace("/", "\\")
+                         if wine_path else str(shadow_candidate))
         replaced = True
         if launch_cwd is None and shadow_candidate.is_file():
             launch_cwd = shadow_candidate.parent
@@ -2069,7 +2074,8 @@ def _retarget_bound_paths(command: list[str], game_root: Path,
     resolved_root = game_root.resolve(strict=False)
     resolved_view = view.resolve(strict=False)
     for index, token in enumerate(direct):
-        candidate = Path(token)
+        wine_path = token[:3].lower() == "z:\\"
+        candidate = Path(token[2:].replace("\\", "/") if wine_path else token)
         if not candidate.is_absolute():
             continue
         # Preserve deployed symlinks at their game-visible location.
@@ -2077,9 +2083,13 @@ def _retarget_bound_paths(command: list[str], game_root: Path,
             relative = Path(os.path.abspath(candidate)).relative_to(resolved_root)
         except ValueError:
             try:
-                relative = candidate.resolve(strict=False).relative_to(resolved_root)
+                relative = (candidate.parent.resolve(strict=False) / candidate.name
+                            ).relative_to(resolved_root)
             except (OSError, ValueError):
-                continue
+                try:
+                    relative = candidate.resolve(strict=False).relative_to(resolved_root)
+                except (OSError, ValueError):
+                    continue
         shadow_candidate = resolved_view / relative
         if not shadow_candidate.exists():
             resolved_shadow = _resolve_nocase(view, relative.as_posix())
@@ -2087,7 +2097,8 @@ def _retarget_bound_paths(command: list[str], game_root: Path,
                 continue
             shadow_candidate = resolved_shadow
         shadow_relative = shadow_candidate.relative_to(resolved_view)
-        direct[index] = str(bind_root.joinpath(*shadow_relative.parts))
+        target = str(bind_root.joinpath(*shadow_relative.parts))
+        direct[index] = "Z:" + target.replace("/", "\\") if wine_path else target
         replaced = True
     return direct, replaced
 
@@ -2233,7 +2244,8 @@ def _steam_runtime_shadow_env(source: dict[str, str], game_root: Path,
 
 def _direct_shadow_steam_runtime_command(
         command: list[str], game_root: Path, view: Path,
-        env: dict[str, str] | None) -> list[str] | None:
+        env: dict[str, str] | None, *,
+        cwd: Path | None = None) -> list[str] | None:
     """Run pressure-vessel directly against the materialized shadow tree."""
     if not _uses_steam_linux_runtime(command):
         return None
@@ -2241,6 +2253,9 @@ def _direct_shadow_steam_runtime_command(
         command, game_root, view)
     if not replaced:
         return None
+    if cwd is not None:
+        mapped_cwd, _, _ = _retarget_shadow_paths([str(cwd)], game_root, view)
+        launch_cwd = Path(mapped_cwd[0])
 
     shadow_env = _steam_runtime_shadow_env(
         env if env is not None else os.environ, game_root, view)
@@ -2284,6 +2299,10 @@ def _bound_shadow_steam_runtime_command(
     if bind_root != game_root:
         bound_command, _replaced = _retarget_bound_paths(
             command, game_root, view, bind_root)
+        if launch_cwd is not None:
+            mapped_cwd, _ = _retarget_bound_paths(
+                [str(launch_cwd)], game_root, view, bind_root)
+            launch_cwd = Path(mapped_cwd[0])
 
     runtime_index = next(
         (index for index, token in enumerate(bound_command)
@@ -2438,7 +2457,7 @@ def _direct_shadow_opt_in_command(command: list[str], game_root: Path,
 
 
 def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
-                 log_fn=None) -> list[str]:
+                 log_fn=None, *, cwd: Path | None = None) -> list[str]:
     """Wrap *command* in the deployed profile's private game view."""
     if not command:
         raise RuntimeError("No launch command was supplied to the profile VFS.")
@@ -2508,7 +2527,7 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
             )
         if bind_at_game_root and bind_is_safe:
             bound_runtime = _bound_shadow_steam_runtime_command(
-                command, game_root, view, env, bind_root)
+                command, game_root, view, env, bind_root, launch_cwd=cwd)
             if bound_runtime is not None:
                 return routed("shadow Steam Runtime bind", bound_runtime)
         if not bind_at_game_root or not bind_is_safe:
@@ -2517,7 +2536,7 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
             if direct_umu is not None:
                 return routed("direct shadow UMU", direct_umu)
             direct_runtime = _direct_shadow_steam_runtime_command(
-                command, game_root, view, env)
+                command, game_root, view, env, cwd=cwd)
             if direct_runtime is not None:
                 return routed("direct shadow Steam Runtime", direct_runtime)
         if ((not bind_at_game_root

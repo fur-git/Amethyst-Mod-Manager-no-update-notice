@@ -509,6 +509,8 @@ def compute_routed_dest(
             # Include-siblings preserves the full mod-relative path under dest
             # (container = topmost folder, so tail == the whole rel_path).
             tail = rel_lower
+        elif rule.flatten_contents:
+            tail = rel_lower.rsplit("/", 1)[-1]
         elif rule.flatten:
             if strip_len >= 0:
                 tail = rel_lower[strip_len:].lstrip("/")
@@ -575,6 +577,8 @@ def compute_routed_destinations(
             strip_len, matched_extension = hit
             if rule.include_siblings and "/" in relative:
                 tail = relative
+            elif rule.flatten_contents:
+                tail = relative.rsplit("/", 1)[-1]
             elif rule.flatten:
                 tail = (
                     relative[strip_len:].lstrip("/")
@@ -627,7 +631,9 @@ def compute_routed_destinations(
                         and len(sibling_name) > len(extension)
                         for extension in companions):
                     continue
-                if rule.flatten:
+                if rule.flatten_contents:
+                    tail = sibling.rsplit("/", 1)[-1]
+                elif rule.flatten:
                     tail = (
                         sibling[strip_len:].lstrip("/")
                         if strip_len >= 0
@@ -952,6 +958,8 @@ def deploy_custom_rules(
             else:
                 rel_in_container = norm_rel
             tail = container_name + "/" + rel_in_container
+        elif rule.flatten_contents:
+            tail = src.name
         elif rule.flatten:
             if strip_len >= 0:
                 tail = rel_str[strip_len:].lstrip("/")
@@ -1074,7 +1082,9 @@ def deploy_custom_rules(
                     _log(f"  WARN: source not found - {sib_rel_str} ({sib_mod_name})")
                     continue
                 src = Path(src_str)
-                if rule.flatten:
+                if rule.flatten_contents:
+                    tail = src.name
+                elif rule.flatten:
                     if strip_len >= 0:
                         tail = sib_rel_str[strip_len:].lstrip("/")
                     else:
@@ -1220,13 +1230,17 @@ def deploy_custom_rules(
         return None, (dst_s, err)
 
     done_count = 0
-    for result, err in _iter_map_batched(_do_custom, transfer_tasks):
+    for result, err in _iter_map_batched(
+            _do_custom, transfer_tasks,
+            stop_on=lambda outcome: outcome[1] is not None):
         done_count += 1
         if result is not None:
             placed_abs.append(result)
         elif err is not None:
             dst_err, exc = err
-            _log(f"  WARN: could not transfer {dst_err}: {exc}")
+            _log(f"  ERROR: could not transfer {dst_err}: {exc} - "
+                 f"aborting deploy.")
+            raise exc
         if progress_fn is not None and (done_count % 200 == 0 or done_count == total):
             progress_fn(done_count, total)
 

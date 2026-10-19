@@ -74,10 +74,14 @@ def _value(value, key=""):
     return redact(value)
 
 
-def emit(log, event: str, **fields) -> None:
+def emit(log, event: str, *, dev_only: bool = False, **fields) -> None:
     if log is None:
         return
     try:
+        if dev_only:
+            from Utils.ui.config import load_dev_mode
+            if not load_dev_mode():
+                return
         record = {"schema": 1, "session": _SESSION, "sequence": next(_SEQUENCE),
                   "monotonic_seconds": round(time.monotonic(), 6),
                   "event": event, "pid": os.getpid(),
@@ -258,6 +262,7 @@ def _log_request(log, request, event) -> None:
         "MESA_LOADER_DRIVER_OVERRIDE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
         "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY",
         "ALL_PROXY", "NO_PROXY",
+        "AMM_WABBAJACK_SKIP_GAME_FILES",
     ) if os.environ.get(name)}
     emit(log, event + ".environment", system=system, cwd=Path.cwd(),
          executable=sys.executable, uid=os.getuid(), gid=os.getgid(),
@@ -292,6 +297,7 @@ def _log_request(log, request, event) -> None:
         selected_profiles=request.profiles,
         premium=request.premium,
         clear_archives=getattr(request, "clear_archives", False),
+        skip_game_files=getattr(request, "skip_game_files", False),
         nexus_api=bool(request.api),
         fixes=request.fixes,
         setup_options=request.setup_options,
