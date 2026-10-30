@@ -1,14 +1,4 @@
-"""Qt view: Install SMAPI (mod loader) for Stardew Valley.
-
-Downloads the latest SMAPI installer zip from GitHub, then installs it with no
-user input - the payload is unpacked natively and the launcher swap applied by
-``Utils.wizards.smapi`` (see that module for why we don't run SMAPI's own
-interactive .NET installer in a terminal).
-
-Like the script-extender wizard, the destination is selectable:
-game folder / Root_Folder (staging) / a managed root-flagged mod.
-Port of the Tk ``sdv_smapi`` plugin.
-"""
+"""Qt view for downloading and installing native SMAPI for Stardew Valley."""
 
 from __future__ import annotations
 
@@ -22,8 +12,8 @@ from PySide6.QtWidgets import (
     QRadioButton, QVBoxLayout, QWidget,
 )
 
-from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.runtime.safe_emit import safe_emit
+from gui_qt.appearance.theme import active_palette, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
 
 if TYPE_CHECKING:
@@ -85,7 +75,7 @@ class SmapiView(WizardViewBase):
                 ("mod", self.tr("As a managed mod (root-flagged)"))):
             rb = QRadioButton(label)
             rb.setProperty("mode", val)
-            if val == "game":
+            if val == "mod":
                 rb.setChecked(True)
             self._mode_group.addButton(rb)
             bv.addWidget(rb)
@@ -93,7 +83,7 @@ class SmapiView(WizardViewBase):
 
     def _selected_mode(self) -> str:
         btn = self._mode_group.checkedButton()
-        return btn.property("mode") if btn is not None else "game"
+        return btn.property("mode") if btn is not None else "mod"
 
     # ---- page 1: download -------------------------------------------------------
     def _build_download_page(self) -> QWidget:

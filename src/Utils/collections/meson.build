@@ -13,5 +13,7 @@ py.install_sources(
   'patches.py',
   'replicate.py',
   'reset.py',
+  'thunderstore.py',
+  'providers.py',
   subdir: 'Utils/collections',
 )

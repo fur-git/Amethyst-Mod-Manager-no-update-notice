@@ -2,6 +2,7 @@ subdir('archives')
 subdir('assets')
 subdir('ba2')
 subdir('bethesda')
+subdir('boundaries')
 subdir('bg3')
 subdir('bsa')
 subdir('collections')
@@ -46,6 +47,8 @@ py.install_sources(
   'config_paths.py',
   'fs_check.py',
   'hardlink_check.py',
+  'json_limits.py',
   'memory_cache.py',
+  'operations.py',
   subdir: 'Utils',
 )

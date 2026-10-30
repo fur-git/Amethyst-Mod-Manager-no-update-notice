@@ -312,7 +312,7 @@ struct CatalogPathIdentity {
     database: FileIdentity,
 }
 
-const PROJECTION_CACHE_FORMAT: u32 = 1;
+const PROJECTION_CACHE_FORMAT: u32 = 2;
 const PROJECTION_CACHE_NAME: &str = "filegraph.cache";
 
 type ProjectionSelection = Arc<Vec<(String, String)>>;
@@ -321,6 +321,7 @@ type RawFileCache = (u64, ProjectionSelection, CatalogRows<RawCatalogFile>);
 type SharedStringTable = (Vec<Arc<str>>, HashMap<Arc<str>, u32>);
 
 struct LoadedProjectionCache {
+    needs_upgrade: bool,
     generation: u64,
     selection: ProjectionSelection,
     candidates: CatalogRows<Candidate>,
@@ -629,6 +630,7 @@ fn decode_projection_cache(cache: ProjectionCacheRead) -> Result<LoadedProjectio
         });
     }
     Ok(LoadedProjectionCache {
+        needs_upgrade: cache.format != PROJECTION_CACHE_FORMAT,
         generation: cache.generation,
         selection: Arc::new(cache.selection),
         candidates: CatalogRows::from_rows(candidates, |candidate| candidate.mod_key.clone()),
@@ -648,7 +650,7 @@ fn read_projection_cache(
     };
     let started = Instant::now();
     let cache: ProjectionCacheRead = rmp_serde::from_read(BufReader::new(file))?;
-    if cache.format != PROJECTION_CACHE_FORMAT
+    if (cache.format != 1 && cache.format != PROJECTION_CACHE_FORMAT)
         || cache.schema_version != SCHEMA_VERSION
         || cache.database != database
     {
@@ -747,7 +749,10 @@ fn write_projection_cache(
             .open(&temporary)?;
         {
             let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-            rmp_serde::encode::write(&mut writer, &payload)?;
+            payload.serialize(
+                &mut rmp_serde::Serializer::new(&mut writer)
+                    .with_bytes(rmp_serde::config::BytesMode::ForceIterables),
+            )?;
             writer.flush()?;
         }
         if file_identity(database_path)? != database {
@@ -859,7 +864,8 @@ impl LibraryCore {
                 Some((cache.generation, cache.selection.clone(), cache.candidates));
             *self.raw_file_cache.write() =
                 Some((cache.generation, cache.selection.clone(), cache.raw_files));
-            *self.projection_cache_saved.lock() = Some((cache.generation, cache.selection));
+            *self.projection_cache_saved.lock() =
+                (!cache.needs_upgrade).then_some((cache.generation, cache.selection));
         } else {
             *self.candidate_cache.write() = None;
             *self.raw_file_cache.write() = None;
@@ -933,7 +939,8 @@ impl LibraryCore {
         };
         let (candidate_cache, raw_file_cache, projection_cache_saved) = match projection {
             Some(cache) => {
-                let saved = Some((cache.generation, cache.selection.clone()));
+                let saved =
+                    (!cache.needs_upgrade).then(|| (cache.generation, cache.selection.clone()));
                 (
                     Some((cache.generation, cache.selection.clone(), cache.candidates)),
                     Some((cache.generation, cache.selection, cache.raw_files)),
@@ -1285,7 +1292,7 @@ impl LibraryCore {
         }
         let mut candidate_statement = connection.prepare(
             "SELECT c.candidate_id, rf.source_rel, rf.source_display, t.target_key, \
-                    d.path_key, d.path_display, c.provider_kind, rf.size, rf.mtime_ns, \
+                    d.path_key, c.destination_display, c.provider_kind, rf.size, rf.mtime_ns, \
                     rf.ordinal, c.archive_key, c.plugin_key, c.deployable, c.legacy_root, \
                     c.legacy_rel, c.flags \
              FROM candidates c JOIN raw_files rf ON rf.file_id=c.file_id \
@@ -1851,8 +1858,8 @@ impl LibraryCore {
             )?;
             let mut insert_candidate = transaction.prepare_cached(
                 "INSERT INTO candidates(candidate_id, variant_id, file_id, destination_id, provider_kind, \
-                  archive_key, plugin_key, deployable, legacy_root, legacy_rel, flags) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  archive_key, plugin_key, deployable, legacy_root, legacy_rel, flags, destination_display) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             let mut insert_identity = transaction.prepare_cached(
                 "INSERT INTO candidate_identities(candidate_id, identity_kind, identity_key) \
@@ -2016,6 +2023,7 @@ impl LibraryCore {
                     record.legacy_root as i64,
                     &record.legacy_rel,
                     record.flags as i64,
+                    &record.destination_display,
                 ])?;
                 let candidate_id = transaction.last_insert_rowid();
                 if next_candidate_id.is_some() {
@@ -2237,7 +2245,7 @@ impl LibraryCore {
         }
         let query = format!(
             "SELECT c.candidate_id, m.mod_id, m.name_display, m.name_key, rv.variant_key, \
-                    t.target_key, d.path_key, d.path_display, c.provider_kind, c.archive_key, \
+                    t.target_key, d.path_key, c.destination_display, c.provider_kind, c.archive_key, \
                     c.plugin_key, c.deployable, c.legacy_root, c.legacy_rel, c.flags, \
                     c.destination_id, c.file_id \
              FROM candidates c \

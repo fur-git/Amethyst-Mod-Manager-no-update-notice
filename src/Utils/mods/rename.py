@@ -130,6 +130,12 @@ def migrate_mod_state(profile_dir: Path | None, old_name: str,
         with _lock_for(profile_dir):
             state = read_profile_state(profile_dir)
             changed = False
+            if "plugin_metadata" in state:
+                from amethyst_plugins.metadata import remap
+                metadata = remap(state["plugin_metadata"], {old_name: new_name})
+                if metadata != state["plugin_metadata"]:
+                    state["plugin_metadata"] = metadata
+                    changed = True
             groups = read_mod_groups(profile_dir, state)
             renamed = rename_group_mod(groups, old_name, new_name)
             if renamed != groups:
@@ -153,3 +159,8 @@ def migrate_mod_state(profile_dir: Path | None, old_name: str,
         if strict:
             raise
         log(f"Rename: failed to migrate mod state: {exc}")
+
+
+def migrate_mod_state_strict(profile_dir: Path, old_name: str,
+                             new_name: str) -> None:
+    migrate_mod_state(profile_dir, old_name, new_name, strict=True)

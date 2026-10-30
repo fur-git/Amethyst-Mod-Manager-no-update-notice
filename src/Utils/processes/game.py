@@ -192,12 +192,16 @@ class LaunchSession:
         self._launch_reports: list[object] = []
         self._lock = threading.Lock()
         self._state_callback: Callable[[bool], None] | None = None
+        self._identity_callback: Callable[[dict], None] | None = None
         self._active = False
         self._finished = False
         self._seen_process = False
         self._monitor_started = False
         self._stop_started = False
         self._deadline = time.monotonic() + START_TIMEOUT_SECONDS
+        self._finish_callbacks = []
+        self._completion = None
+        self._preparing = False
 
     @property
     def active(self) -> bool:
@@ -210,12 +214,60 @@ class LaunchSession:
             return self._stop_started and not self._finished
 
     @property
+    def preparing(self) -> bool:
+        with self._lock:
+            return self._preparing
+
+    @property
+    def finished(self) -> bool:
+        with self._lock:
+            return self._finished
+
+    def begin_preparation(self) -> None:
+        with self._lock:
+            if self._finished or self._stop_started:
+                raise RuntimeError("The launch was cancelled.")
+            self._preparing = True
+            self._active = True
+        self._emit_state(True)
+
+    def end_preparation(self) -> bool:
+        with self._lock:
+            self._preparing = False
+            cancelled = self._finished or self._stop_started
+        if cancelled:
+            self._finish(cancelled=True)
+        return not cancelled
+
+    def finish_dispatch(self) -> None:
+        with self._lock:
+            untracked = not self._monitor_started and not self._finished
+        if untracked:
+            self.cancel()
+
+    @property
     def markers(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(self._markers)
 
     def set_state_callback(self, callback: Callable[[bool], None]) -> None:
         self._state_callback = callback
+
+    def set_identity_callback(self, callback: Callable[[dict], None]) -> None:
+        self._identity_callback = callback
+        self._publish_identity()
+
+    def _publish_identity(self) -> None:
+        if self._identity_callback is None:
+            return
+        from .leases import process_identity
+        with self._lock:
+            roots = {str(pid): token for pid in self._roots
+                     if (token := process_identity(pid)) is not None}
+            identity = {'markers': sorted(self._markers), 'roots': roots,
+                        'startup_deadline': (0 if self._seen_process else
+                                             time.time() + max(0, self._deadline - time.monotonic()))}
+        self._identity_callback(identity)
 
     def _emit_state(self, active: bool) -> None:
         callback = self._state_callback
@@ -237,19 +289,44 @@ class LaunchSession:
             self._emit_state(True)
         self._ensure_monitor()
 
-    def _finish(self) -> None:
+    def _finish(self, *, cancelled=False) -> None:
         with self._lock:
             if self._finished:
                 return
             self._finished = True
             self._active = False
+            self._preparing = False
+            completion = {
+                "started": self._seen_process, "stopped": self._stop_started,
+                "cancelled": cancelled,
+                "returncodes": [code for proc in self._roots.values()
+                                if (code := proc.poll()) is not None],
+            }
+            self._completion = completion
+            callbacks, self._finish_callbacks = self._finish_callbacks, []
+        for callback in callbacks:
+            self._call_finish_callback(callback, completion)
         # Emit even when launch failed before a process appeared. The UI may
         # already hold this session as its pending attempt and must discard it.
         self._emit_state(False)
 
+    def _call_finish_callback(self, callback, completion):
+        try:
+            callback(dict(completion))
+        except Exception as exc:
+            self._log(f"Launch cleanup failed: {exc}")
+
+    def add_finish_callback(self, callback):
+        with self._lock:
+            completion = self._completion
+            if completion is None:
+                self._finish_callbacks.append(callback)
+                return
+        self._call_finish_callback(callback, completion)
+
     def cancel(self) -> None:
         """Forget the session without terminating anything (launch failed)."""
-        self._finish()
+        self._finish(cancelled=True)
 
     def attach_process(self, proc: subprocess.Popen) -> None:
         """Register the direct child; descendants are found by launch token."""
@@ -259,6 +336,7 @@ class LaunchSession:
             self._roots[proc.pid] = proc
             self._seen_process = True
         self._activate()
+        self._publish_identity()
 
     def attach_launch_report(self, report) -> None:
         """Associate the early-exit reporter with this stoppable session."""
@@ -279,6 +357,7 @@ class LaunchSession:
                 return
             self._markers.update(new_markers)
         self._activate()
+        self._publish_identity()
 
     def _ensure_monitor(self) -> None:
         with self._lock:
@@ -340,6 +419,7 @@ class LaunchSession:
                 return False
             self._stop_started = True
             reports = list(self._launch_reports)
+            preparing = self._preparing
         # Set this before the worker sends SIGTERM. A fast child can exit and
         # reach its watcher immediately after the first signal.
         for report in reports:
@@ -347,6 +427,8 @@ class LaunchSession:
                 report.mark_cancelled()
             except Exception:
                 pass
+        if preparing:
+            return True
         threading.Thread(
             target=self._stop_worker, daemon=True,
             name=f"game-stop-{self.token[:8]}").start()

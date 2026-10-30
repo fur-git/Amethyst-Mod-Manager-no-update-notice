@@ -1218,17 +1218,17 @@ class NexusAPI:
                 "filter": [{"languageName": [{"value": lang, "op": "EQUALS"}]}
                           for lang in extra.languages],
             })
-        if extra.min_file_size_kb:
+        if extra.min_file_size_kb is not None:
             clauses.append({"fileSize": [{"value": extra.min_file_size_kb, "op": "GTE"}]})
-        if extra.max_file_size_kb:
+        if extra.max_file_size_kb is not None:
             clauses.append({"fileSize": [{"value": extra.max_file_size_kb, "op": "LTE"}]})
-        if extra.min_downloads:
+        if extra.min_downloads is not None:
             clauses.append({"downloads": [{"value": extra.min_downloads, "op": "GTE"}]})
-        if extra.max_downloads:
+        if extra.max_downloads is not None:
             clauses.append({"downloads": [{"value": extra.max_downloads, "op": "LTE"}]})
-        if extra.min_endorsements:
+        if extra.min_endorsements is not None:
             clauses.append({"endorsements": [{"value": extra.min_endorsements, "op": "GTE"}]})
-        if extra.max_endorsements:
+        if extra.max_endorsements is not None:
             clauses.append({"endorsements": [{"value": extra.max_endorsements, "op": "LTE"}]})
         if extra.adult is not None:
             clauses.append({"adultContent": [{"value": extra.adult}]})
@@ -1342,6 +1342,7 @@ class NexusAPI:
         offset: int = 0,
         category_names: list[str] | None = None,
         filters: "NexusSearchFilters | None" = None,
+        query_text: str = "",
     ) -> list[NexusModInfo]:
         """
         Fetch trending mods via GraphQL: mods published in the last 7 days,
@@ -1352,6 +1353,21 @@ class NexusAPI:
         base_filter["filter"].append({
             "createdAt": [{"value": str(seven_days_ago), "op": "GTE"}],
         })
+        query_text = query_text.strip()
+        if query_text.isdigit():
+            game_id = self._resolve_game_id(game_domain)
+            if not game_id:
+                raise NexusAPIError(f"Could not resolve Nexus game: {game_domain}")
+            base_filter["filter"].append({
+                "gameId": [{"value": str(game_id), "op": "EQUALS"}],
+                "modId": [{"value": str(int(query_text)), "op": "EQUALS"}],
+            })
+        elif query_text:
+            if len(query_text) < 2:
+                return []
+            base_filter["filter"].append({
+                "name": [{"value": query_text, "op": "WILDCARD"}],
+            })
         query = """
         query TrendingMods($filter: ModsFilter, $count: Int, $offset: Int) {
             mods(
@@ -1724,15 +1740,10 @@ class NexusAPI:
         except Exception as exc:
             app_log(f"GraphQL abstain failed, falling back to REST: {exc}")
 
-        resp = self._session.post(
-            f"{API_BASE}/games/{game_domain}/mods/{mod_id}/abstain",
-            json={"Version": version},
-            timeout=self._timeout,
+        return self._post_v1(
+            f"/games/{game_domain}/mods/{mod_id}/abstain",
+            {"Version": version},
         )
-        self._update_rate_limits(resp)
-        self._log_response("POST", f"/games/{game_domain}/mods/{mod_id}/abstain", resp)
-        resp.raise_for_status()
-        return resp.json()
 
     def _abstain_mod_graphql(self, game_domain: str, mod_id: int) -> dict | None:
         """Abstain via GraphQL v2. Returns None if the uid cannot be resolved."""
@@ -2782,21 +2793,16 @@ class NexusAPI:
 
     def track_mod(self, game_domain: str, mod_id: int) -> dict:
         """Start tracking a mod."""
-        resp = self._session.post(
-            f"{API_BASE}/user/tracked_mods",
-            json={"domain_name": game_domain, "mod_id": mod_id},
-            timeout=self._timeout,
-        )
-        self._update_rate_limits(resp)
-        self._log_response("POST", "/user/tracked_mods", resp)
-        if resp.status_code == 422:
-            # Already tracked - not an error
-            return {"message": "Already tracked"}
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            return self._post_v1("/user/tracked_mods", {"domain_name": game_domain, "mod_id": mod_id})
+        except NexusAPIError as exc:
+            if exc.status_code == 422:
+                return {"message": "Already tracked"}
+            raise
 
     def untrack_mod(self, game_domain: str, mod_id: int) -> dict:
         """Stop tracking a mod."""
+        self._refresh_oauth_if_needed()
         resp = self._session.delete(
             f"{API_BASE}/user/tracked_mods",
             json={"domain_name": game_domain, "mod_id": mod_id},

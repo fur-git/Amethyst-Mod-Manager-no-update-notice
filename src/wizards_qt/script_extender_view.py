@@ -29,10 +29,10 @@ from PySide6.QtWidgets import (
     QRadioButton, QButtonGroup, QProgressBar, QFrame,
 )
 
-from gui_qt.theme_qt import (
+from gui_qt.appearance.theme import (
     active_palette, _c, button_qss, close_button, ok_text, err_text,
 )
-from gui_qt.safe_emit import safe_emit
+from gui_qt.runtime.safe_emit import safe_emit
 from Utils.wizards.archives import (
     fetch_latest_github_asset, find_archive, get_downloads_dir,
     install_archive_payload,
@@ -183,7 +183,7 @@ class ScriptExtenderView(QWidget):
                            ("mod", self.tr("As a managed mod (root-flagged)"))):
             rb = QRadioButton(label)
             rb.setProperty("mode", val)
-            if val == "game":
+            if val == "mod":
                 rb.setChecked(True)
             group.addButton(rb)
             bv.addWidget(rb)
@@ -195,7 +195,7 @@ class ScriptExtenderView(QWidget):
         # page inherits the manual page's choice).
         group = getattr(self, "_active_mode_group", None)
         btn = group.checkedButton() if group is not None else None
-        return btn.property("mode") if btn is not None else "game"
+        return btn.property("mode") if btn is not None else "mod"
 
     # ---- page 0: version select ----------------------------------------------
     def _build_page_versions(self) -> QWidget:

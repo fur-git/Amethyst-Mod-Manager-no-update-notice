@@ -66,6 +66,8 @@ _LAUNCHER_ID_SETTERS = {
     "faugus_gameid":   "set_faugus_gameid",
     "bottles_program": "set_bottles_program",
     "shortcut_appid":  "set_shortcut_appid",
+    "plugin_provider_id": "set_plugin_provider_id",
+    "plugin_entry_id": "set_plugin_entry_id",
 }
 
 
@@ -283,6 +285,8 @@ class BaseGame(ABC):
         "lutris_slug",
         "faugus_gameid",
         "bottles_program",
+        "plugin_provider_id",
+        "plugin_entry_id",
     )
 
     # User-set save folder, persisted in paths.json as "save_path_override".
@@ -807,9 +811,9 @@ class BaseGame(ABC):
     @property
     def filemap_casing(self) -> str:
         """
-        How to pick the canonical casing for folders/filenames in the filemap
-        when ``normalize_folder_case`` is True. Ignored when normalization is
-        off. One of:
+        How to pick filemap casing. Preserve bypasses normalization and pins;
+        other strategies normalize folders when ``normalize_folder_case`` is
+        True. One of:
 
           "upper"        - prefer the variant with more uppercase letters
                            (default; correct for most Windows-shipped mods).
@@ -823,13 +827,15 @@ class BaseGame(ABC):
           "force_upper"  - every folder segment is uppercased. Filenames
                            untouched. Mostly here for symmetry - rarely
                            useful in practice.
+          "preserve"     - keep original spelling, ignoring casing pins.
+                           Existing destination directories still merge.
         """
         return "upper"
 
     @property
     def filemap_casing_pins(self) -> "dict[str, str]":
         """
-        Per-folder casing overrides that win over ``filemap_casing``.
+        Per-folder casing overrides, ignored by Preserve.
 
         Some mods read their own data folders by a hardcoded, case-sensitive
         path string, so the merged deploy MUST use the exact casing that mod
@@ -1918,7 +1924,7 @@ class BaseGame(ABC):
         )
         return table.get(raw, self.deploy_mode_fallback)
 
-    def _apply_profile_path_overrides(self, paths_data: dict | None = None) -> None:
+    def _apply_profile_path_overrides(self, paths_data: dict | None = None, *, read_only: bool = False) -> None:
         """Overlay the active non-default profile's overrides on the loaded paths.
 
         No-op for the default profile. Overridden game_path/prefix_path/
@@ -1931,7 +1937,7 @@ class BaseGame(ABC):
             return
         try:
             from Utils.profiles.state import read_profile_settings
-            pset = read_profile_settings(self._active_profile_dir)
+            pset = read_profile_settings(self._active_profile_dir, read_only=read_only)
         except Exception:
             return
         if isinstance(pset.get("game_path"), str) and pset["game_path"]:
@@ -1977,7 +1983,7 @@ class BaseGame(ABC):
         if self._active_profile_dir is not None:
             try:
                 from Utils.profiles.state import profile_uses_specific_mods
-                if profile_uses_specific_mods(self._active_profile_dir):
+                if profile_uses_specific_mods(self._active_profile_dir, read_only=True):
                     return self._active_profile_dir / "mods"
             except Exception:
                 pass
@@ -2198,6 +2204,7 @@ class BaseGame(ABC):
         """Record recovery paths before deployment can modify the installation."""
         from Utils.atomic_write import write_atomic_text
         from Utils.deployment.custom_rules import _root_record
+        from Utils.profiles.state import read_profile_state
 
         self._deploy_state_file.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -2208,13 +2215,19 @@ class BaseGame(ABC):
         data["deploy_active"] = True
         if deploy_mode is not None:
             data["last_deploy_mode"] = deploy_mode
-        data["recovery_context"] = {
-            "profile_dir": str(self.get_profile_root() / "profiles" / profile_name),
+        profile_dir = self.get_profile_root() / "profiles" / profile_name
+        context = {
+            "profile_dir": str(profile_dir),
             "filemap_path": str(self.get_effective_filemap_path()),
             "staging_root": _root_record(self.get_profile_root()),
             "game_root": _root_record(self.get_game_path()),
             "prefix_root": _root_record(self.get_prefix_path()),
+            "profile_state": read_profile_state(profile_dir, read_only=True),
         }
+        modlist = profile_dir / "modlist.txt"
+        if modlist.is_file():
+            context["modlist"] = modlist.read_text(encoding="utf-8", errors="surrogateescape")
+        data["recovery_context"] = context
         write_atomic_text(self._deploy_state_file, json.dumps(data, indent=2))
 
     def clear_deploy_active(self) -> None:
@@ -2297,7 +2310,7 @@ class BaseGame(ABC):
         if not self._is_default_profile() and self.profile_overridable_settings:
             try:
                 from Utils.profiles.state import read_profile_settings
-                pset = read_profile_settings(self._active_profile_dir)
+                pset = read_profile_settings(self._active_profile_dir, read_only=True)
             except Exception:
                 pset = {}
             for key in self.profile_overridable_settings:
@@ -2483,14 +2496,16 @@ class BaseGame(ABC):
             pass
         return None
 
-    def load_paths(self) -> bool:
+    def load_paths(self, *, read_only: bool = False, prefix_fallback: bool = True) -> bool:
         """Load path configuration from the user config directory.
 
         Returns True if a valid ``game_path`` was loaded, False otherwise.
         Subclasses customise this via :meth:`_load_paths_extra` and
         :meth:`_find_prefix_for_load` rather than overriding this method.
+        Disable ``prefix_fallback`` to retain the saved prefix choice.
         """
-        self._migrate_old_config()
+        if not read_only:
+            self._migrate_old_config()
         if not self._paths_file.exists():
             self._game_path = None
             self._prefix_path = None
@@ -2498,7 +2513,7 @@ class BaseGame(ABC):
             self._staging_path = None
             # A non-default profile may still carry overrides even with no global
             # paths.json yet, so apply them before giving up.
-            self._apply_profile_path_overrides()
+            self._apply_profile_path_overrides(read_only=read_only)
             return bool(self._game_path)
         try:
             data = json.loads(self._paths_file.read_text(encoding="utf-8"))
@@ -2523,10 +2538,11 @@ class BaseGame(ABC):
             # Overlay any per-profile overrides on top of the default's values
             # before the prefix-autolocate check, so a profile-specific prefix is
             # respected and never overwritten by the default's auto-detection.
-            self._apply_profile_path_overrides(data)
+            self._apply_profile_path_overrides(data, read_only=read_only)
             if self.missing_configured_paths():
                 return bool(self._game_path)
-            if (not self._prefix_path_cleared
+            if (prefix_fallback and not self.get_saved_launcher_id("plugin_provider_id")
+                    and not self._prefix_path_cleared
                     and (not self._prefix_path or not self._prefix_path.is_dir())):
                 found = self._find_prefix_for_load()
                 if found:
@@ -2534,10 +2550,14 @@ class BaseGame(ABC):
                     # The auto-located prefix is a fallback for the default, not a
                     # deliberate per-profile choice, so persist it globally rather
                     # than as a spurious override on a non-default profile.
-                    self._save_global_prefix(found)
-            else:
-                self._heal_wrong_library_prefix()
-            _ensure_lutris_prefix_compat(self._prefix_path)
+                    if not read_only:
+                        self._save_global_prefix(found)
+            elif (prefix_fallback and not self.get_saved_launcher_id("plugin_provider_id")
+                  and self._prefix_path and self._prefix_path.is_dir()):
+                if not read_only:
+                    self._heal_wrong_library_prefix()
+            if not read_only:
+                _ensure_lutris_prefix_compat(self._prefix_path)
             return bool(self._game_path)
         except (json.JSONDecodeError, OSError):
             pass
@@ -2552,7 +2572,7 @@ class BaseGame(ABC):
             return False
         try:
             from Utils.profiles.state import read_profile_settings
-            pset = read_profile_settings(self._active_profile_dir)
+            pset = read_profile_settings(self._active_profile_dir, read_only=True)
         except Exception:
             return False
         return bool(
@@ -2633,7 +2653,7 @@ class BaseGame(ABC):
         if not self._is_default_profile():
             try:
                 from Utils.profiles.state import read_profile_settings
-                pset = read_profile_settings(self._active_profile_dir)
+                pset = read_profile_settings(self._active_profile_dir, read_only=True)
             except Exception:
                 pset = {}
             if key in pset:
@@ -2886,11 +2906,19 @@ class BaseGame(ABC):
             pass
         self._persist_paths_value("bottles_program", program_id or "")
 
+    def set_plugin_provider_id(self, value):
+        self._persist_paths_value("plugin_provider_id", value or "")
+
+    def set_plugin_entry_id(self, value):
+        self._persist_paths_value("plugin_entry_id", value or "")
+
     def set_launcher_ids(self, *, heroic_app_name: "str | None" = None,
                          lutris_slug: "str | None" = None,
                          faugus_gameid: "str | None" = None,
                          bottles_program: "str | None" = None,
-                         shortcut_appid: "str | None" = None) -> None:
+                         shortcut_appid: "str | None" = None,
+                         plugin_provider_id: "str | None" = None,
+                         plugin_entry_id: "str | None" = None) -> None:
         """Persist the whole launcher-identity set in one call.
 
         An install is reached through exactly one launcher, so the ones the
@@ -2903,7 +2931,9 @@ class BaseGame(ABC):
                            ("lutris_slug", lutris_slug),
                            ("faugus_gameid", faugus_gameid),
                            ("bottles_program", bottles_program),
-                           ("shortcut_appid", shortcut_appid)):
+                           ("shortcut_appid", shortcut_appid),
+                           ("plugin_provider_id", plugin_provider_id),
+                           ("plugin_entry_id", plugin_entry_id)):
             if value is None:
                 continue
             setter = getattr(self, _LAUNCHER_ID_SETTERS[key], None)

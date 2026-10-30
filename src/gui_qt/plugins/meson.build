@@ -1,0 +1,16 @@
+py.install_sources(
+  '__init__.py',
+  'cycle.py',
+  'groups.py',
+  'loot_report.py',
+  'menu.py',
+  'model.py',
+  'panel_controls.py',
+  'panel_tab.py',
+  'presentation.py',
+  'rules.py',
+  'sort.py',
+  'userlist_bars.py',
+  'view.py',
+  subdir: 'gui_qt/plugins',
+)

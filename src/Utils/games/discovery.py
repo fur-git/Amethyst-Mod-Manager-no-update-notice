@@ -56,6 +56,7 @@ _NON_HANDLER_FILES = {
     "Morrowind/mgexe_wizard_qt.py",
     "Morrowind/morrowind_ini.py",
     "Morrowind/openmw_cfg.py",
+    "Prey/_prey_selftest.py",
     "RE_Engine_Invalidation/re_engine_invalidation_base.py",
     "RE_Engine_LooseLoading/re_engine_loose_loading_base.py",
     "The Sims/sims_base.py",
@@ -398,4 +399,9 @@ def discover_games(timing=None) -> dict[str, BaseGame]:
     except Exception:
         pass
 
+    try:
+        from amethyst_plugins.game_handlers import load
+        _load_failures.extend(load(games))
+    except Exception as exc:
+        _load_failures.append(("manager plugin games", str(exc)))
     return games

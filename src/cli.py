@@ -11,6 +11,7 @@ Usage:
     python cli.py restore <game>
     python cli.py clear-credentials
     python cli.py export-filemap <game> <profile_name> [--output-dir DIR] [--refresh]
+    python cli.py headless --stdio
 
 <game> can be the game's game_id (e.g. 'skyrim_se'), its full display name
 (e.g. 'Skyrim Special Edition'), or a Steam app ID.  Matching is
@@ -102,7 +103,8 @@ def cmd_deploy(games: dict, key: str, profile: str):
         print(f"Error: profile '{profile}' does not exist at {profile_dir}", file=sys.stderr)
         sys.exit(1)
 
-    success = run_deploy_pipeline(game, profile, log_fn=_log)
+    success = run_deploy_pipeline(
+        game, profile, log_fn=_log, operation_owner="cli:deploy")
     if not success:
         sys.exit(1)
 
@@ -272,12 +274,23 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
     if deploy:
         from Utils.deployment.pipeline import run_deploy_pipeline
         _launch_log(f"Deploying {game.name} / {profile} ...")
-        if not run_deploy_pipeline(game, profile, log_fn=_launch_log):
+        if not run_deploy_pipeline(
+                game, profile, log_fn=_launch_log,
+                operation_owner="cli:launch"):
             print("Error: deploy failed - refusing to launch.", file=sys.stderr)
             sys.exit(1)
 
     cmd = None
+    plugin_launch = None
+
+    def _cancel_plugin_launch():
+        if plugin_launch is not None:
+            plugin_launch.finish({"started": False, "cancelled": True,
+                                  "stopped": False, "returncodes": []})
+
     try:
+        from amethyst_plugins.launch import prepare_launch
+        plugin_launch = prepare_launch(game, log_fn=_launch_log)
         vfs_builder = getattr(game, "get_vfs_passthrough_command", None)
         if not callable(vfs_builder):
             vfs_builder = getattr(game, "get_vfs_steam_command", None)
@@ -305,10 +318,12 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         else:
             cmd = game.get_launch_command()
     except Exception as exc:
+        _cancel_plugin_launch()
         print(f"Error: could not build the launch command: {exc}",
               file=sys.stderr)
         sys.exit(1)
     if not cmd:
+        _cancel_plugin_launch()
         reason = ""
         try:
             reason = game.native_launch_blocked_reason() or ""
@@ -321,6 +336,7 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
     try:
         cmd, launch_env = _frame_generation_command(cmd)
     except (OSError, RuntimeError) as exc:
+        _cancel_plugin_launch()
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -330,6 +346,7 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         # evaluated as shell source.  ``exec`` keeps Heroic/Steam/Lutris/Faugus
         # attached to the actual game process rather than the coordinator.
         _emit_sandbox_bridge(cmd, cwd=bridge_cwd, env=bridge_env)
+        plugin_launch.detach()
         return
 
     _launch_log("Launching: " + " ".join(cmd))
@@ -338,6 +355,7 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         # replacing it keeps their Stop button attached to the real game.
         os.execvpe(cmd[0], cmd, launch_env)
     except OSError as exc:
+        _cancel_plugin_launch()
         print(f"Error: could not run {cmd[0]}: {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -359,28 +377,18 @@ def cmd_restore(games: dict, key: str):
         print(f"Error: game '{game.name}' is not configured (game path not set).", file=sys.stderr)
         sys.exit(1)
 
-    from Utils.deployment import restore_root_folder_for_game
+    profile = (game.get_last_active_profile()
+               or game.get_last_deployed_profile() or "default")
+    profile_dir = game.get_profile_root() / "profiles" / profile
+    if not profile_dir.is_dir():
+        print(f"Error: profile '{profile}' does not exist at {profile_dir}",
+              file=sys.stderr)
+        sys.exit(1)
 
-    from Utils.deployment.pipeline import prepare_restore_profile
-    recovery_profile_dir = prepare_restore_profile(game, log_fn=_log)
-    game_root = game.get_game_path()
-
-    if hasattr(game, "restore"):
-        game.restore(log_fn=_log)
-    else:
-        print(f"Game '{game.name}' does not support restore.")
-
-    root_folder_dir = game.get_effective_root_folder_path()
-    if root_folder_dir.is_dir() and game_root:
-        restore_root_folder_for_game(
-            game, root_folder_dir=root_folder_dir,
-            game_root=game_root, log_fn=_log,
-        )
-
-    from Utils.deployment.pipeline import finalize_filegraph_recovery
-    finalize_filegraph_recovery(
-        game, recovery_profile_dir, log_fn=_log)
-    game.clear_deploy_active()
+    from Utils.deployment.pipeline import run_restore_pipeline
+    if not run_restore_pipeline(
+            game, profile, log_fn=_log, operation_owner="cli:restore"):
+        sys.exit(1)
 
     _log(f"Restore complete: {game.name}")
 
@@ -426,8 +434,6 @@ def cmd_export_filemap(games: dict, key: str, profile: str, *,
 
 
 def main():
-    _setup_path()
-
     parser = argparse.ArgumentParser(
         prog="amethyst",
         description="Amethyst Mod Manager - CLI",
@@ -467,6 +473,16 @@ def main():
 
     subparsers.add_parser("clear-credentials", help="Remove stored Nexus Mods API key and OAuth tokens")
 
+    vp = subparsers.add_parser("plugin-validate", help="Validate a plugin without importing its code")
+    vp.add_argument("path", help="Plugin directory or plugin.json file")
+
+    hp = subparsers.add_parser(
+        "headless", aliases=["rpc"],
+        help="Run the versioned headless JSON-RPC service")
+    hp.add_argument(
+        "--stdio", action="store_true", required=True,
+        help="Exchange newline-delimited JSON-RPC messages over stdin/stdout")
+
     # Launcher wrappers append the vanilla launch command after ``--`` (Steam
     # gets it from %command%; Heroic/Lutris/Faugus append it implicitly).
     # Retain that command for VFS handlers; external loaders simply ignore it.
@@ -478,6 +494,23 @@ def main():
         argv = argv[:separator]
     args = parser.parse_args(argv)
 
+    if args.command == "plugin-validate":
+        from amethyst_plugins.diagnostics import validate_path
+        from Utils import json_limits as json
+        result = validate_path(args.path)
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0 if result["ok"] else 1)
+
+    protocol_stdout = None
+    if args.command in ("headless", "rpc"):
+        # Keep incidental backend prints away from the protocol stream.
+        protocol_stdout = sys.stdout
+        sys.stdout = sys.stderr
+
+    _setup_path()
+    if protocol_stdout is not None:
+        sys.stdout = sys.stderr
+
     if args.command == "clear-credentials":
         cmd_clear_credentials()
         return
@@ -485,7 +518,12 @@ def main():
     from Utils.games.discovery import discover_games
     games = discover_games()
 
-    if args.command == "list-games":
+    if args.command in ("headless", "rpc"):
+        from amethyst_backend import AmethystService
+        from amethyst_backend.rpc import run_stdio
+        raise SystemExit(run_stdio(
+            service=AmethystService(games), output_stream=protocol_stdout))
+    elif args.command == "list-games":
         cmd_list_games(games)
     elif args.command == "list-profiles":
         cmd_list_profiles(games, args.game)

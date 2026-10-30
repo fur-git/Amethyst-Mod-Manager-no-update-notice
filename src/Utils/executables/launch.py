@@ -25,6 +25,7 @@ must be called from a worker thread; they only report through log_fn.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 import json
 import os
 import shlex
@@ -46,6 +47,7 @@ from Utils.processes import report as launch_report
 from Utils.wine.protontricks import strip_appimage_env
 from Utils.processes.sleep import inhibit_sleep
 from Utils.environment.xdg import spawn_watched
+from amethyst_plugins.launch import launch_hook
 
 _LAUNCH_MODE_FILE = "exe_launch_mode.json"
 _CUSTOM_EXES_FILE = "custom_exes.json"
@@ -414,23 +416,46 @@ def _read_launch_mode_data(game) -> dict:
         return {}
 
 
+@contextmanager
+def launch_settings_file_lock(path: Path):
+    from Utils.operations import acquire_resource_operation
+
+    resource = f"launch-settings:{path.expanduser().resolve(strict=False)}"
+    with acquire_resource_operation(resource, "launch.settings.write"):
+        yield
+
+
+@contextmanager
+def launch_settings_edit(game):
+    paths = {_launch_mode_path(game), exe_args_file(game), get_exe_args_path()}
+    paths.discard(None)
+    with ExitStack() as stack:
+        for path in sorted(paths, key=lambda path: str(path.resolve(strict=False))):
+            stack.enter_context(launch_settings_file_lock(path))
+        yield
+
+
 def _write_launch_mode_key(game, key: str, value) -> None:
     """Set (or, when value is falsy-and-poppable, remove) one key."""
     p = _launch_mode_path(game)
     if p is None:
         return
-    p.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_launch_mode_data(game)
-    if value is None:
-        data.pop(key, None)
-    else:
-        data[key] = value
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    from Utils.atomic_write import write_atomic_text
+    with launch_settings_file_lock(p):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = _read_launch_mode_data(game)
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+        write_atomic_text(p, json.dumps(data, indent=2))
 
 
 def load_launch_mode(game, exe_name: str) -> str:
     """Saved launch mode for exe_name: 'auto' | 'steam' | 'heroic' |
     'lutris' | 'faugus' | 'bottles' | 'none'."""
+    if getattr(game, "_plugin_launcher_entry", None) is not None:
+        return "none"
     return _read_launch_mode_data(game).get(exe_name, "auto")
 
 
@@ -461,7 +486,8 @@ def save_deploy_before_launch(game, enabled: bool) -> None:
 
 def load_launch_with_wayland(game) -> bool:
     """Whether the game's Play entry should request a Wayland backend."""
-    return bool(_read_launch_mode_data(game).get("__launch_with_wayland", False))
+    entry = getattr(game, "_plugin_launcher_entry", None)
+    return entry["wayland"] if entry is not None else bool(_read_launch_mode_data(game).get("__launch_with_wayland", False))
 
 
 def save_launch_with_wayland(game, enabled: bool) -> None:
@@ -558,6 +584,9 @@ def _normalize_lsfg_settings(settings) -> dict:
 
 
 def load_lsfg_settings(game) -> dict:
+    entry = getattr(game, "_plugin_launcher_entry", None)
+    if entry is not None:
+        return _normalize_lsfg_settings(entry["lsfg"])
     return _normalize_lsfg_settings(
         _read_launch_mode_data(game).get("__lsfg_vk", {}))
 
@@ -600,6 +629,9 @@ def _normalize_mangohud_settings(settings) -> dict:
 
 
 def load_mangohud_settings(game) -> dict:
+    entry = getattr(game, "_plugin_launcher_entry", None)
+    if entry is not None:
+        return _normalize_mangohud_settings(entry["mangohud"])
     return _normalize_mangohud_settings(
         _read_launch_mode_data(game).get("__mangohud", {}))
 
@@ -705,6 +737,9 @@ def save_proton_override(game, exe_name: str, proton_name: str) -> None:
 
 
 def load_launch_options(game, exe_name: str) -> str:
+    entry = getattr(game, "_plugin_launcher_entry", None)
+    if entry is not None:
+        return entry["launch_options"]
     return _read_launch_mode_data(game).get(f"__launch_options_{exe_name}", "")
 
 
@@ -760,6 +795,9 @@ def exe_args_file(game) -> Path:
 
 def load_exe_args(game, exe_name: str) -> str:
     """Saved args for an exe, profile-local file first, then the global file."""
+    entry = getattr(game, "_plugin_launcher_entry", None)
+    if entry is not None:
+        return entry["arguments"]
     try:
         profile_file = exe_args_file(game)
         if profile_file.is_file():
@@ -777,14 +815,16 @@ def load_exe_args(game, exe_name: str) -> str:
 
 def save_exe_args(game, exe_name: str, args_str: str) -> None:
     p = exe_args_file(game)
+    from Utils.atomic_write import write_atomic_text
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    data[exe_name] = args_str
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        with launch_settings_file_lock(p):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            data[exe_name] = args_str
+            p.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic_text(p, json.dumps(data, indent=2))
     except OSError:
         pass
 
@@ -961,8 +1001,8 @@ def apply_wayland_launch_setting(
 
 
 def apply_lsfg_launch_setting(game, env: dict, *, log_fn=_noop_log,
-                              log_prefix: str = "Play") -> None:
-    settings = load_lsfg_settings(game)
+                              log_prefix: str = "Play", settings=None) -> None:
+    settings = load_lsfg_settings(game) if settings is None else _normalize_lsfg_settings(settings)
     env["AMM_MAKO_LAUNCH"] = "0"
     if not settings["enabled"]:
         return
@@ -1039,8 +1079,8 @@ def apply_lsfg_launch_setting(game, env: dict, *, log_fn=_noop_log,
 
 
 def apply_mangohud_launch_setting(game, env: dict, *, log_fn=_noop_log,
-                                  log_prefix: str = "Play") -> None:
-    settings = load_mangohud_settings(game)
+                                  log_prefix: str = "Play", settings=None) -> None:
+    settings = load_mangohud_settings(game) if settings is None else _normalize_mangohud_settings(settings)
     if not settings["enabled"]:
         return
 
@@ -1095,11 +1135,15 @@ def forward_manager_env_through_flatpak_spawn(
         command: list[str], env: dict) -> list[str]:
     """Carry manager-owned game settings across a native host portal."""
     from Utils.executables.mako import ENV_KEYS
+    overlay_keys = ()
+    if (env.get("LD_PRELOAD")
+            and env.get("_AMM_STEAM_OVERLAY_PRELOAD") == env["LD_PRELOAD"]):
+        overlay_keys = ("LD_PRELOAD", "ENABLE_VK_LAYER_VALVE_steam_overlay_1")
     return _forward_env_through_flatpak_spawn(
         command, env, (*_WAYLAND_ENV_KEYS, *_LSFG_ENV_KEYS, *ENV_KEYS,
                        "DISABLE_LSFG", "DISABLE_LSFGVK",
                        "MANGOHUD", "MANGOHUD_CONFIG",
-                       "MANGOHUD_CONFIGFILE", "MANGOHUD_DLSYM"))
+                       "MANGOHUD_CONFIGFILE", "MANGOHUD_DLSYM", *overlay_keys))
 
 
 # ---------------------------------------------------------------------------
@@ -1333,6 +1377,10 @@ def _prepare_native_game_launch(game, exe_path: Path, env: dict,
         return None
     command = apply_wayland_launch_setting(
         game, env, command, native=True, exe_path=exe_path, log_fn=log_fn)
+    from Utils.launchers.steam_overlay import apply_steam_overlay
+    apply_steam_overlay(
+        env, steam_game=bool(is_steam_install and steam_id),
+        explicit_preload="LD_PRELOAD" in env_updates, log_fn=log_fn)
     from Utils.executables.mako import wrap_command
     try:
         apply_lsfg_launch_setting(game, env, log_fn=log_fn)
@@ -1394,6 +1442,9 @@ def path_is_steam_install(game_path) -> bool:
 
 def game_is_steam_install(game) -> bool:
     """True if the active game folder lives inside a Steam library."""
+    from amethyst_plugins.launchers import identity
+    if identity(game):
+        return False
     game_path = game.get_game_path() if hasattr(game, "get_game_path") else None
     return path_is_steam_install(game_path)
 
@@ -2110,7 +2161,7 @@ def enable_show_dotfiles(proton_script: Path, env: dict,
 
 def get_tool_prefix_env(
     exe_path: Path, proton_name: str, prefix_dir: Path | None = None,
-    steam_id: str | None = None,
+    steam_id: str | None = None, *, game=None,
 ) -> tuple[Path, Path, dict] | None:
     """Resolve (proton_script, prefix_dir, env) for a tool's isolated prefix.
 
@@ -2142,7 +2193,7 @@ def get_tool_prefix_env(
         return None
 
     if prefix_dir is None:
-        prefix_dir = exe_path.parent / f"prefix_{proton_script.parent.name}"
+        prefix_dir = isolated_tool_prefix_dir(exe_path, proton_script.parent.name, game)
     is_new = not (prefix_dir / "pfx").is_dir()
     prefix_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2206,7 +2257,7 @@ def prepare_tool_prefix(exe_path: Path, proton_name: str, game,
             prefix_dir = tool_prefix_dir(exe_path, proton_script, prefix_mode)
     result = get_tool_prefix_env(
         exe_path, proton_name, prefix_dir=prefix_dir,
-        steam_id=effective_steam_id(game),
+        steam_id=effective_steam_id(game), game=game,
     )
     if result is None:
         from Utils.launchers.steam import steamless_launch_error
@@ -2236,7 +2287,7 @@ def prepare_tool_prefix(exe_path: Path, proton_name: str, game,
 # ---------------------------------------------------------------------------
 
 # Prefix-placement modes persisted per-exe alongside the Proton override.
-PREFIX_MODE_ISOLATED = "isolated"  # prefix_<Proton>/ next to the exe (default)
+PREFIX_MODE_ISOLATED = "isolated"  # per-tool prefix_<Proton>/ (default)
 PREFIX_MODE_SHARED = "shared"      # wine_prefixes/shared_<Proton>/, one per Proton
 PREFIX_MODE_GAME = "game"          # reuse the game's own prefix
 
@@ -2286,11 +2337,27 @@ def shared_prefix_dir(proton_dir_name: str) -> Path:
     return get_wine_prefixes_dir() / f"shared_{proton_dir_name}"
 
 
+def isolated_tool_prefix_dir(exe_path: Path, proton_name: str, game=None) -> Path:
+    app_dir = {
+        "bodyslide.exe": "BodySlide",
+        "bodyslide x64.exe": "BodySlide",
+        "outfitstudio.exe": "BodySlide",
+        "outfitstudio x64.exe": "BodySlide",
+        "pandora behaviour engine+.exe": "Pandora",
+    }.get(exe_path.name.lower())
+    if app_dir is not None and game is not None:
+        from Utils.bethesda.xedit import applications_dir
+        root = applications_dir(game, app_dir)
+    else:
+        root = exe_path.parent
+    return root / f"prefix_{proton_name}"
+
+
 def tool_prefix_dir(exe_path: Path, proton_script: Path,
-                    prefix_mode: str) -> Path:
+                    prefix_mode: str, game=None) -> Path:
     if prefix_mode == PREFIX_MODE_SHARED:
         return shared_prefix_dir(proton_script.parent.name)
-    return exe_path.parent / f"prefix_{proton_script.parent.name}"
+    return isolated_tool_prefix_dir(exe_path, proton_script.parent.name, game)
 
 
 def load_prefix_mode(game, exe_name: str) -> str:
@@ -2629,7 +2696,7 @@ def reap_live_tools(owner=None, log_fn=None, timeout: float = 4.0, *,
 
 
 def shutdown_prefix_wineserver(proton_script: Path, compat_data: Path,
-                               log_fn=None) -> None:
+                               log_fn=None, *, wait=False) -> None:
     """Kill leftover wine processes still attached to a tool prefix.
 
     Proton sidecars (xalia.exe, services.exe, explorer.exe) can keep the
@@ -2659,6 +2726,12 @@ def shutdown_prefix_wineserver(proton_script: Path, compat_data: Path,
             env=env, timeout=15,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        if wait:
+            subprocess.run(
+                [str(bin_dir / "wineserver"), "-w"],
+                env=env, timeout=15,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
         if log_fn is not None:
             log_fn("tool prefix wineserver shut down")
     except Exception:
@@ -2666,7 +2739,8 @@ def shutdown_prefix_wineserver(proton_script: Path, compat_data: Path,
 
 
 def get_game_prefix_env(game, log_fn=_noop_log, *,
-                        allow_runner_fallback: bool = False):
+                        allow_runner_fallback: bool = False,
+                        read_only: bool = False):
     """Resolve (proton_script, compat_data, env) for the game's OWN prefix.
 
     Reuses the existing game prefix (already initialised by the game), so no
@@ -2675,7 +2749,13 @@ def get_game_prefix_env(game, log_fn=_noop_log, *,
     runner / any installed Proton when there is no Steam mapping (Heroic and
     GOG installs - mirrors the Tk downgrade/Morrowind wizards' resolver).
     Returns None on failure (after logging why).
+    read_only skips UMU setup and registry edits.
     """
+    from amethyst_plugins.launchers import selected_entry
+    entry = selected_entry(game, log=log_fn)
+    if entry is not None:
+        from amethyst_plugins.launcher_runtime import prefix_environment
+        return prefix_environment(entry, log_fn, read_only=read_only)
     from Utils.launchers.steam import (
         find_proton_for_game, find_steam_root_for_proton_script,
     )
@@ -2694,12 +2774,14 @@ def get_game_prefix_env(game, log_fn=_noop_log, *,
     # it, and before anything is launched into the prefix (a live wineserver
     # would rewrite user.reg from memory on shutdown and drop the edit).
     from Utils.deployment.wine_dll import set_show_dot_files
-    set_show_dot_files(Path(pfx), log_fn=log_fn)
+    if not read_only:
+        set_show_dot_files(Path(pfx), log_fn=log_fn)
 
     from Utils.launchers.bottles import is_bottles_prefix
     if is_bottles_prefix(pfx):
         from Utils.wine.proton import resolve_proton_env
-        runner, env = resolve_proton_env(game, log_fn, allow_fallback=False)
+        runner, env = resolve_proton_env(
+            game, log_fn, allow_fallback=False, read_only=read_only)
         return (runner, Path(pfx), env) if runner is not None else None
 
     # Classic lutris-wine prefixes run tools with the Lutris runner's own
@@ -2711,7 +2793,8 @@ def get_game_prefix_env(game, log_fn=_noop_log, *,
         log_fn(f"using Lutris wine binary: {wine_bin}")
         return wine_bin, Path(pfx), wenv
 
-    ensure_umu_run(log_fn)
+    if not read_only:
+        ensure_umu_run(log_fn)
     from Utils.wine.prefix import resolve_compat_data
     steam_id = effective_steam_id(game)
     proton_script = find_proton_for_game(steam_id) if steam_id else None
@@ -2794,11 +2877,14 @@ def get_game_prefix_env(game, log_fn=_noop_log, *,
 
 def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
                         log_fn=_noop_log, *,
-                        isolated_prefix_dir: "Path | None" = None):
+                        isolated_prefix_dir: "Path | None" = None,
+                        launch_env: "str | None" = None,
+                        winetricks_style: "bool | None" = None):
     """Resolve (proton_script, compat_data, env) for a wizard tool's prefix.
 
     Honours the chosen placement mode:
-      * isolated - creates/initialises prefix_<ProtonName>/ next to the exe,
+      * isolated - creates/initialises prefix_<ProtonName>/ next to the exe
+                   (BodySlide/Outfit Studio and Pandora use Applications/),
                    or *isolated_prefix_dir* when given (tools whose exe sits
                    somewhere a prefix shouldn't go, e.g. Creation Kit in the
                    game root, relocate it)
@@ -2846,7 +2932,7 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
             target = shared_prefix_dir(proton_script.parent.name)
         result = get_tool_prefix_env(
             exe, proton_name, prefix_dir=target,
-            steam_id=effective_steam_id(game),
+            steam_id=effective_steam_id(game), game=game,
         )
     if result is None:
         # A Steam-less box with no umu-run has no viable launcher at all; say
@@ -2862,7 +2948,7 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
     # build, from which install root, against which prefix.
     log_fn(f"resolved Proton {Path(proton_script).parent.name} -> "
            f"{proton_script} (prefix: {compat_data})")
-    extra = parse_env_overrides(load_tool_launch_env(exe))
+    extra = parse_env_overrides(load_tool_launch_env(exe) if launch_env is None else launch_env)
     if extra:
         env.update(extra)
         log_fn("applying saved env var names: " + ", ".join(sorted(extra)))
@@ -2871,8 +2957,11 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
     # (plain wine, no proton session - see run_tool_winetricks_style). Set
     # here so every wizard honours the Proton-step checkbox without each
     # run call having to look the setting up itself.
-    if load_winetricks_style(game, exe.name):
+    style = load_winetricks_style(game, exe.name) if winetricks_style is None else winetricks_style
+    if style:
         env["AMM_WINETRICKS_STYLE"] = "1"
+    elif winetricks_style is False:
+        env.pop("AMM_WINETRICKS_STYLE", None)
     return proton_script, compat_data, env
 
 
@@ -3200,10 +3289,13 @@ def launch_wine_tool_in_prefix(proton_script: Path, prefix_dir: Path, env: dict,
 # Launch entry points
 # ---------------------------------------------------------------------------
 
+@launch_hook(0)
 def launch_game(game, log_fn=_noop_log) -> None:
     """Launch the game itself: native command / Steam / Heroic / Proton,
     honouring the saved launch mode. Call from a worker thread."""
     from Utils.environment.xdg import host_env
+    from amethyst_plugins.launchers import selected_entry
+    entry = selected_entry(game, log=log_fn)
 
     # Launcher Settings belongs to the Play entry, not necessarily to the
     # executable that ultimately starts.  A VFS profile may replace a stock
@@ -3321,6 +3413,11 @@ def launch_game(game, log_fn=_noop_log) -> None:
         cmd = apply_wayland_launch_setting(
             game, env, cmd, native=True, exe_path=resolve_game_exe(game),
             log_fn=log_fn)
+        from Utils.launchers.steam_overlay import apply_steam_overlay
+        apply_steam_overlay(
+            env, steam_game=game_is_steam_install(game),
+            explicit_preload=bool(launch_opts and "LD_PRELOAD" in env_updates),
+            log_fn=log_fn)
         from Utils.executables.mako import wrap_command
         try:
             apply_lsfg_launch_setting(game, env, log_fn=log_fn)
@@ -3357,6 +3454,11 @@ def launch_game(game, log_fn=_noop_log) -> None:
             "would start the game with no mods.")
         log_fn(f"Play: refusing to launch - {reason}")
         launch_report.mark_failed(launch_report.actionable(reason))
+        return
+
+    if entry is not None:
+        from amethyst_plugins.launcher_runtime import launch_entry
+        launch_entry(entry, game=game, log=log_fn)
         return
 
     from Utils.wabbajack.runtime import uses_stock_game
@@ -3873,6 +3975,7 @@ def steam_compat_mounts(game, exe_path: Path, *, cwd: Path | None = None,
     return {"STEAM_COMPAT_MOUNTS": ":".join(paths)} if paths else {}
 
 
+@launch_hook(1)
 def launch_exe_via_proton(
         exe_path: Path, game, log_fn=_noop_log, *,
         launch_settings_key: "str | None" = None) -> None:
@@ -3893,6 +3996,12 @@ def launch_exe_via_proton(
     # can intentionally resolve to another executable, notably a VFS-only
     # script extender, so its caller supplies the canonical Play-entry key.
     manager_play_launch = launch_settings_key is not None
+    from amethyst_plugins.launchers import selected_entry
+    entry = selected_entry(game, log=log_fn)
+    if entry is not None and is_game_launch_exe(game, exe_path):
+        from amethyst_plugins.launcher_runtime import launch_entry
+        launch_entry(entry, game=game, executable=exe_path, log=log_fn)
+        return
     settings_key = launch_settings_key or exe_path.name
     from Utils.bethesda import skyrim_together
     together_launch = skyrim_together.is_launcher(game, exe_path)
@@ -3968,7 +4077,7 @@ def launch_exe_via_proton(
         if proton_script is None:
             log_fn(f"Run EXE: Proton override '{proton_override_name}' not found.")
             return
-        compat_data = tool_prefix_dir(exe_path, proton_script, prefix_mode)
+        compat_data = tool_prefix_dir(exe_path, proton_script, prefix_mode, game)
         compat_data.mkdir(parents=True, exist_ok=True)
         log_fn(f"Run EXE: using {proton_script.parent.name} with "
                f"{prefix_mode} prefix at {compat_data}.")
@@ -4289,6 +4398,14 @@ def launch_exe_via_proton(
         log_fn(f"Run EXE: {reason}")
         launch_report.mark_failed(launch_report.actionable(reason))
         return
+    if launches_game:
+        from Utils.launchers.steam_overlay import apply_steam_overlay
+        apply_steam_overlay(
+            env, steam_game=bool(
+                env.get("STEAM_COMPAT_CLIENT_INSTALL_PATH")
+                and env.get("SteamAppId") not in (None, "", "0")),
+            proton_script=proton_script,
+            explicit_preload="LD_PRELOAD" in env_updates, log_fn=log_fn)
     if umu_bin is not None:
         from Utils.launchers.lutris import umu_run_command
         base_cmd = umu_run_command(
@@ -4352,6 +4469,8 @@ def launch_exe_via_proton(
     log_fn(f"Run EXE:   cmd: {' '.join(redact_epic_args(final_cmd))}")
     _env_keys = (
         "WINE_D3D_CONFIG", "PROTON_USE_WINED3D", "WINEDLLOVERRIDES",
+        "LD_PRELOAD", "ENABLE_VK_LAYER_VALVE_steam_overlay_1",
+        "DISABLE_VK_LAYER_VALVE_steam_overlay_1",
         "STEAM_COMPAT_DATA_PATH", "WINEDEBUG", "DXVK_HUD", "PROTON_LOG",
         "WINEPREFIX", "PROTONPATH", "GAMEID",
         "PROTONFIXES_DISABLE",
@@ -4409,6 +4528,7 @@ def resolve_jar_prefix_env(jar_path: Path, game, log_fn=_noop_log):
     return result
 
 
+@launch_hook(1)
 def launch_shell_script(sh_path: Path, game, log_fn=_noop_log) -> None:
     """Run a .sh entry natively on the host. Call from a worker thread.
 
@@ -4453,7 +4573,18 @@ def launch_shell_script(sh_path: Path, game, log_fn=_noop_log) -> None:
     # A wrapper from Launch Options (gamemoderun, mangohud) that isn't
     # installed would otherwise fail as a bare Popen error.
     launcher = cmd[0]
-    if os.sep not in launcher and shutil.which(launcher) is None:
+    if os.path.exists("/.flatpak-info"):
+        if not shutil.which("flatpak-spawn"):
+            log_fn("Run SH error: flatpak-spawn is unavailable.")
+            launch_report.mark_failed("Flatpak host spawning is unavailable")
+            return
+        from Utils.flatpak.env import flatpak_forward_env_args
+        forwarded_env = dict(env)
+        if "_AMM_ENV_KEYS" in os.environ:
+            forwarded_env["_AMM_ENV_KEYS"] = os.environ["_AMM_ENV_KEYS"]
+        cmd = ["flatpak-spawn", "--host", f"--directory={sh_path.parent}",
+               *flatpak_forward_env_args(forwarded_env), "/usr/bin/env", *cmd]
+    elif os.sep not in launcher and shutil.which(launcher) is None:
         log_fn(f"Run SH error: '{launcher}' not found - check Launch Options.")
         launch_report.mark_failed(f"'{launcher}' not found")
         return
@@ -4464,6 +4595,7 @@ def launch_shell_script(sh_path: Path, game, log_fn=_noop_log) -> None:
                           label=f"Run SH ({sh_path.name})", log_fn=log_fn)
 
 
+@launch_hook(1)
 def launch_jar(jar_path: Path, game, log_fn=_noop_log) -> None:
     """Launch a .jar via a user-supplied Java command. Call from a worker thread.
 

@@ -30,6 +30,8 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
     log = log_fn or (lambda _m: None)
     if game is None or not mod_names:
         return
+    from amethyst_plugins.guards import validate_operation
+    validate_operation(game, profile_dir, "mods.remove", mods=list(mod_names))
     try:
         staging_root = (Path(staging_root) if staging_root is not None
                         else game.get_effective_mod_staging_path())
@@ -58,7 +60,8 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
     if deploy_active:
         try:
             undeploy_catalog_mods(
-                game, profile, Path(staging_root), mod_names, log_fn=log)
+                game, profile, Path(staging_root), mod_names, log_fn=log,
+                strict=strict)
         except Exception as exc:
             log(f"undeploy during remove failed: {exc}")
             if strict:
@@ -130,9 +133,30 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
             if strict:
                 raise
 
+    removed = [name for name in mod_names if not (Path(staging_root) / name).exists()
+               and not (Path(staging_root) / name).is_symlink()]
+    if removed:
+        try:
+            from amethyst_plugins.metadata import update_mods
+            from Utils.mods.copy import resolve_target_staging
+            profiles = {Path(profile_dir)}
+            root = getattr(game, "get_profile_root", lambda: None)()
+            if root is not None and (Path(root) / "profiles").is_dir():
+                for candidate in (Path(root) / "profiles").iterdir():
+                    if (candidate.is_dir() and not candidate.is_symlink()
+                            and Path(resolve_target_staging(game, candidate)).resolve() == Path(staging_root).resolve()):
+                        profiles.add(candidate)
+            for affected in profiles:
+                update_mods(affected, drops=removed)
+        except Exception as exc:
+            log(f"plugin metadata cleanup during remove failed: {exc}")
+            if strict:
+                raise
+
 
 def undeploy_catalog_mods(game, profile, staging_root: Path,
-                          mod_names: list[str], log_fn=None) -> int:
+                          mod_names: list[str], log_fn=None, *,
+                          strict: bool = False) -> int:
     """Safely unlink committed deployment entries owned by *mod_names*.
 
     The source tree must still exist. Copies are accepted only when size and
@@ -178,6 +202,8 @@ def undeploy_catalog_mods(game, profile, staging_root: Path,
                         stop_dirs.add(root)
         except OSError as exc:
             log(f"could not undeploy {destination}: {exc}")
+            if strict:
+                raise
     _prune_empty_dirs(dirs_to_prune, stop_dirs=stop_dirs)
     if removed:
         log(f"undeployed {removed} file(s) owned by removed mod(s).")
@@ -228,9 +254,9 @@ def _remove_plugins_for_mods(game, profile_dir: Path, staging_root: Path,
             for child in folder.iterdir():
                 if child.is_file() and child.suffix.lower() in plugin_exts:
                     to_remove.discard(child.name.lower())
-            from Utils.games.registry import routed_mod_plugin_names
-            for name in routed_mod_plugin_names(game, folder):
-                to_remove.discard(name.lower())
+            from Utils.games.registry import routed_mod_plugin_names as routed_names
+            for plugin_name in routed_names(game, folder):
+                to_remove.discard(plugin_name.lower())
     if not to_remove:
         return
     from Utils.plugins import (

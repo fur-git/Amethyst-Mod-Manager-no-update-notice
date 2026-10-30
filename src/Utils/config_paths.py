@@ -19,15 +19,16 @@ from pathlib import Path
 APP_NAME = "AmethystModManager"
 
 
-def get_config_dir() -> Path:
-    """Return the app config directory, creating it if it doesn't exist.
+def get_config_dir(*, create: bool = True) -> Path:
+    """Return the app config directory, optionally creating it.
 
     Respects $XDG_CONFIG_HOME; falls back to ~/.config/AmethystModManager.
     """
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     config_dir = base / APP_NAME
-    config_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
 
@@ -658,10 +659,7 @@ def list_all_cache_dirs(active_game_name: str | None = None) -> list[Path]:
 
 
 def get_plugins_dir() -> Path:
-    """Return the directory where external wizard plugin scripts are stored.
-
-    Users drop Python scripts here to add custom wizard tools without modifying
-    the application source.
+    """Return the directory for manager plugin folders and wizard scripts.
 
     Result: ~/.config/AmethystModManager/Plugins/
     """

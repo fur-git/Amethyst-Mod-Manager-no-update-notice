@@ -113,16 +113,20 @@ struct CasingState {
 
 impl CasingState {
     fn from_intent(intent: &ProfileIntent) -> Self {
+        let preserve = intent.casing_strategy == "preserve";
         Self {
-            normalize: intent.normalize_folder_case,
+            normalize: intent.normalize_folder_case && !preserve,
             strategy: match intent.casing_strategy.as_str() {
-                "lower" | "force_lower" | "force_upper" => intent.casing_strategy.clone(),
+                "lower" | "force_lower" | "force_upper" | "preserve" => {
+                    intent.casing_strategy.clone()
+                }
                 _ => "upper".to_owned(),
             },
             pins: Arc::new(
                 intent
                     .casing_pins
                     .iter()
+                    .filter(|_| !preserve)
                     .map(|(key, value)| (key.to_lowercase(), value.clone()))
                     .collect(),
             ),
@@ -2897,20 +2901,16 @@ fn rebuild_casing(snapshot: &mut GraphSnapshot, intent: &ProfileIntent) {
     // mutable standard maps once and convert them to persistent structures at
     // publication; CasingState::add intentionally copy-on-writes each context
     // and posting set, which is ideal for small deltas but quadratic here.
-    let winners: Vec<_> = snapshot
-        .winners
-        .iter()
-        .filter_map(|(key, candidate_id)| {
-            (key.namespace != Namespace::Archive)
-                .then(|| snapshot.candidate(*candidate_id))
-                .flatten()
-                .map(|candidate| (key.clone(), candidate.clone()))
-        })
-        .collect();
     let mut variants: HashMap<CasingContext, BTreeMap<String, CasingVariant>> = HashMap::new();
     let mut postings: HashMap<CasingContext, HashSet<PathKey>> = HashMap::new();
-    for (key, candidate) in winners {
-        for (context, spelling) in CasingState::candidate_contexts(&candidate) {
+    for (key, candidate_id) in snapshot.winners.iter() {
+        if key.namespace == Namespace::Archive {
+            continue;
+        }
+        let Some(candidate) = snapshot.candidate(*candidate_id) else {
+            continue;
+        };
+        for (context, spelling) in CasingState::candidate_contexts(candidate) {
             let value = variants
                 .entry(context.clone())
                 .or_default()

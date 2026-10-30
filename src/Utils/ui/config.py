@@ -5,6 +5,9 @@ Set scale=auto to use automatic scaling based on screen size.
 """
 
 import configparser
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 import io
 import os
 import re as _re
@@ -18,10 +21,7 @@ from Utils.config_paths import get_config_dir
 
 _INI_SECTION = "ui"
 
-# Bumped when amethyst.ini's schema changes incompatibly. On startup,
-# ensure_ini_version() wipes a file whose [meta] version differs (or is absent)
-# so the Qt build starts from a clean ini - this clears Tk-era ini files when
-# users move over.
+# Incompatible INIs are backed up before startup creates current defaults.
 _META_SECTION = "meta"
 _APP_INI_VERSION = 2
 # Last-used game + profile (restored at startup).
@@ -125,9 +125,7 @@ def save_global_restore_whitelist(files, folders) -> None:
 
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _RESTORE_SECTION not in parser:
         parser[_RESTORE_SECTION] = {}
     section = parser[_RESTORE_SECTION]
@@ -186,15 +184,87 @@ def _read_ini(path: Path) -> "configparser.ConfigParser":
 
 def _write_ini(parser: "configparser.ConfigParser", path: Path) -> None:
     """Serialize *parser* to *path* atomically and refresh the read cache."""
+    edit = _settings_edit.get()
+    if edit is not None and path == edit["path"]:
+        edit["parser"] = deepcopy(parser)
+        edit["changed"] = True
+        return
     buf = io.StringIO()
     parser.write(buf)
     write_atomic_text(path, buf.getvalue())
+    if parser.optionxform("A") == "A":
+        parser = _new_parser()
+        parser.read_string(buf.getvalue())
     path_str = str(path)
     with _ini_cache_lock:
         try:
             _ini_cache[path_str] = (_ini_stat_key(path), parser)
         except OSError:
             _ini_cache.pop(path_str, None)
+
+
+_settings_edit = ContextVar("ui_settings_edit", default=None)
+
+
+class UiSettingsChangedError(ValueError):
+    pass
+
+
+def _read_for_write(path):
+    edit = _settings_edit.get()
+    if edit is not None and path == edit["path"]:
+        return deepcopy(edit["parser"])
+    parser = _new_parser()
+    if path.is_file():
+        parser.read(path)
+    return parser
+
+
+@contextmanager
+def edit_ui_settings():
+    """Stage existing save helpers and publish their changes in one write."""
+    global _language, _ui_scale, _date_format, _date_format_loaded
+    from Utils.operations import acquire_resource_operation
+
+    path = get_ui_config_path()
+    if _settings_edit.get() is not None:
+        raise RuntimeError("Nested settings edits are not supported.")
+    with acquire_resource_operation(
+            "ui.settings:" + str(path.absolute()), "settings.set",
+            owner="headless:settings.set"):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError("The settings file must be a regular file.")
+        original = path.read_bytes() if path.exists() else None
+        parser = _new_parser()
+        parser.optionxform = str
+        if original is not None:
+            parser.read_string(original.decode("utf-8"))
+        state = (_language, _ui_scale, _date_format, _date_format_loaded)
+        edit = {"path": path, "parser": parser, "changed": False}
+        token = _settings_edit.set(edit)
+        try:
+            yield
+            if edit["changed"]:
+                latest = path.read_bytes() if path.exists() else None
+                if path.is_symlink() or latest != original:
+                    raise UiSettingsChangedError("Settings changed during the edit; read them again.")
+                parser = edit["parser"]
+                if _META_SECTION not in parser:
+                    parser[_META_SECTION] = {}
+                parser[_META_SECTION]["version"] = str(_APP_INI_VERSION)
+                if not parser.has_option(_INI_SECTION, _APPEARANCE_OPTION):
+                    if _INI_SECTION not in parser:
+                        parser[_INI_SECTION] = {}
+                    parser[_INI_SECTION][_APPEARANCE_OPTION] = _APPEARANCE_DEFAULT
+                _settings_edit.reset(token)
+                token = None
+                _write_ini(parser, path)
+        except BaseException:
+            _language, _ui_scale, _date_format, _date_format_loaded = state
+            raise
+        finally:
+            if token is not None:
+                _settings_edit.reset(token)
 
 
 def _get_portal_scale() -> float:
@@ -594,9 +664,7 @@ def load_ui_scale(timing=None) -> float:
 def _write_scale_ini(path: Path, scale_str: str) -> None:
     """Write the [ui] scale to amethyst.ini."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION][_INI_OPTION] = scale_str
@@ -704,9 +772,7 @@ def save_language(code: str) -> None:
     _language = (code or "").strip()
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION][_INI_LANGUAGE_OPTION] = _language
@@ -737,9 +803,7 @@ def save_date_format(value: str) -> None:
         raise ValueError(f"Unsupported date format: {value}")
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION][_INI_DATE_FORMAT_OPTION] = value
@@ -769,9 +833,7 @@ def save_default_priority_mode(value: str) -> None:
         raise ValueError(f"Unsupported priority mode: {value}")
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _INI_SECTION not in parser:
         parser[_INI_SECTION] = {}
     parser[_INI_SECTION]["default_priority_mode"] = value
@@ -824,9 +886,7 @@ def load_disabled_shortcut_inputs() -> set[str]:
 def save_disabled_shortcut_inputs(disabled: set[str]) -> None:
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     parser[_SHORTCUT_SETTINGS_SECTION] = {
         f"disable_{kind}": "1" if kind in disabled else "0"
         for kind in ("keyboard", "mouse")
@@ -836,19 +896,18 @@ def save_disabled_shortcut_inputs(disabled: set[str]) -> None:
 
 def save_shortcut_overrides(overrides: dict[str, str]) -> None:
     """Replace all saved keyboard and mouse shortcut overrides."""
+    from Utils.ui.shortcut_bindings import plugin_shortcut_id
     cleaned = {}
     for key, value in overrides.items():
         key = str(key).strip().lower()
         value = str(value).strip()
-        if _re.fullmatch(r"[a-z0-9_]+", key) and value:
+        if (_re.fullmatch(r"[a-z0-9_]+", key) or plugin_shortcut_id(key)) and value:
             # BasicInterpolation requires literal percent keys to be escaped.
             cleaned[key] = value.replace("%", "%%")
 
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     parser.remove_section(_SHORTCUTS_SECTION)
     parser.remove_section(_MOUSE_SHORTCUTS_SECTION)
     if cleaned:
@@ -1232,9 +1291,7 @@ def save_download_speed_limit(mbps: float) -> None:
     """Persist the download speed limit (MB/s, 0 = unlimited) to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _COLLECTIONS_SECTION not in parser:
         parser[_COLLECTIONS_SECTION] = {}
     value = max(0.0, min(_DL_SPEED_LIMIT_CEILING, float(mbps or 0)))
@@ -1260,9 +1317,7 @@ def load_nexus_download_server() -> str:
 def save_nexus_download_server(value: str) -> None:
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _DOWNLOADS_SECTION not in parser:
         parser[_DOWNLOADS_SECTION] = {}
     parser[_DOWNLOADS_SECTION]["nexus_server"] = (
@@ -1281,9 +1336,7 @@ def load_nexus_free_download_nxm() -> bool:
 def save_nexus_free_download_nxm(value: bool) -> None:
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _DOWNLOADS_SECTION not in parser:
         parser[_DOWNLOADS_SECTION] = {}
     parser[_DOWNLOADS_SECTION]["nexus_free_download_nxm"] = "true" if value else "false"
@@ -1306,9 +1359,7 @@ def save_download_only(value: bool) -> None:
     """Persist download_only to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _DOWNLOADS_SECTION not in parser:
         parser[_DOWNLOADS_SECTION] = {}
     parser[_DOWNLOADS_SECTION]["download_only"] = "true" if value else "false"
@@ -1323,9 +1374,7 @@ def save_collection_settings(max_concurrent: int,
     """Persist shared collection and Wabbajack download settings."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _COLLECTIONS_SECTION not in parser:
         parser[_COLLECTIONS_SECTION] = {}
     if download_order is not None:
@@ -1389,9 +1438,7 @@ def load_extraction_settings() -> dict:
 def _save_extraction_option(key: str, value: str) -> None:
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _EXTRACTION_SECTION not in parser:
         parser[_EXTRACTION_SECTION] = {}
     parser[_EXTRACTION_SECTION][key] = value
@@ -1780,9 +1827,7 @@ def save_normalize_folder_case(value: bool) -> None:
     """Persist the normalize_folder_case setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["normalize_folder_case"] = "true" if value else "false"
@@ -1811,9 +1856,7 @@ def save_allow_prerelease(value: bool) -> None:
     """Persist the allow_prerelease setting to amethyst.ini under [updates]."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _UPDATES_SECTION not in parser:
         parser[_UPDATES_SECTION] = {}
     parser[_UPDATES_SECTION]["allow_prerelease"] = "true" if value else "false"
@@ -1837,9 +1880,7 @@ def save_update_notifications(value: bool) -> None:
     """Persist the update_notifications setting under [updates]."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _UPDATES_SECTION not in parser:
         parser[_UPDATES_SECTION] = {}
     parser[_UPDATES_SECTION]["update_notifications"] = ("true" if value
@@ -1901,9 +1942,7 @@ def save_clear_archive_after_install(value: bool) -> None:
     """Persist the clear_archive_after_install setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["clear_archive_after_install"] = "true" if value else "false"
@@ -1928,9 +1967,7 @@ def save_install_mods_disabled(value: bool) -> None:
     """Persist the install_mods_disabled setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["install_mods_disabled"] = "true" if value else "false"
@@ -1957,9 +1994,7 @@ def save_keep_fomod_archives(value: bool) -> None:
     """Persist the keep_fomod_archives setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["keep_fomod_archives"] = "true" if value else "false"
@@ -1982,9 +2017,7 @@ def save_show_summary_tooltips(value: bool) -> None:
     """Persist the show_summary_tooltips setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["show_summary_tooltips"] = "true" if value else "false"
@@ -2011,9 +2044,7 @@ def save_hide_bsa_conflicts(value: bool) -> None:
     """Persist the hide_bsa_conflicts setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["hide_bsa_conflicts"] = "true" if value else "false"
@@ -2037,9 +2068,7 @@ def save_hide_endorsed_flag(value: bool) -> None:
     """Persist the hide_endorsed_flag setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["hide_endorsed_flag"] = \
@@ -2063,9 +2092,7 @@ def save_hide_kofi_button(value: bool) -> None:
     """Persist the hide_kofi_button setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["hide_kofi_button"] = "true" if value else "false"
@@ -2088,9 +2115,7 @@ def save_hide_endorse_button(value: bool) -> None:
     """Persist the hide_endorse_button setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["hide_endorse_button"] = "true" if value else "false"
@@ -2121,9 +2146,7 @@ def save_header_position(value: str) -> None:
         value = "top"
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["header_position"] = value
@@ -2158,9 +2181,7 @@ def save_hidden_header_buttons(value) -> None:
                    & set(_HIDEABLE_HEADER_BUTTONS))
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["hidden_header_buttons"] = ",".join(names)
@@ -2184,9 +2205,7 @@ def save_header_force_compact(value: bool) -> None:
     """Persist the header_force_compact setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["header_force_compact"] = (
@@ -2213,9 +2232,7 @@ def save_rename_mod_after_install(value: bool) -> None:
     """Persist the rename_mod_after_install setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["rename_mod_after_install"] = "true" if value else "false"
@@ -2242,9 +2259,7 @@ def save_restore_on_close(value: bool) -> None:
     """Persist the restore_on_close setting to amethyst.ini."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _FILEMAP_SECTION not in parser:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["restore_on_close"] = "true" if value else "false"
@@ -2379,12 +2394,10 @@ def save_custom_proton_path(value: str) -> None:
     """Persist an additional Proton build directory. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["custom_proton_path"] = value.strip()
+    parser[_PATHS_SECTION]["custom_proton_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2429,12 +2442,10 @@ def save_heroic_config_path(value: str) -> None:
     """Persist the Heroic config directory path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["heroic_config_path"] = value.strip()
+    parser[_PATHS_SECTION]["heroic_config_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2454,12 +2465,10 @@ def save_lutris_data_path(value: str) -> None:
     """Persist the Lutris data directory path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["lutris_data_path"] = value.strip()
+    parser[_PATHS_SECTION]["lutris_data_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2479,12 +2488,10 @@ def save_lutris_appimage_path(value: str) -> None:
     """Persist the Lutris AppImage path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["lutris_appimage_path"] = value.strip()
+    parser[_PATHS_SECTION]["lutris_appimage_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2504,12 +2511,10 @@ def save_faugus_data_path(value: str) -> None:
     """Persist the Faugus data directory path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["faugus_data_path"] = value.strip()
+    parser[_PATHS_SECTION]["faugus_data_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2529,12 +2534,10 @@ def save_faugus_appimage_path(value: str) -> None:
     """Persist the Faugus AppImage path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["faugus_appimage_path"] = value.strip()
+    parser[_PATHS_SECTION]["faugus_appimage_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2554,12 +2557,10 @@ def save_bottles_data_path(value: str) -> None:
     """Persist the Bottles data directory path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["bottles_data_path"] = value.strip()
+    parser[_PATHS_SECTION]["bottles_data_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2579,12 +2580,10 @@ def save_bottles_appimage_path(value: str) -> None:
     """Persist the Bottles AppImage path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["bottles_appimage_path"] = value.strip()
+    parser[_PATHS_SECTION]["bottles_appimage_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2604,12 +2603,10 @@ def save_steam_libraries_vdf_path(value: str) -> None:
     """Persist the Steam libraryfolders.vdf path to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["steam_libraries_vdf"] = value.strip()
+    parser[_PATHS_SECTION]["steam_libraries_vdf"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2646,12 +2643,10 @@ def save_default_staging_path(value: str) -> None:
                 f"Run this command, restart Amethyst, then select it again: {command}")
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["default_staging_path"] = value.strip()
+    parser[_PATHS_SECTION]["default_staging_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2676,12 +2671,10 @@ def save_download_cache_path(value: str) -> None:
     """Persist the download cache root to amethyst.ini. Pass '' to clear."""
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _PATHS_SECTION not in parser:
         parser[_PATHS_SECTION] = {}
-    parser[_PATHS_SECTION]["download_cache_path"] = value.strip()
+    parser[_PATHS_SECTION]["download_cache_path"] = value.strip().replace("%", "%%")
     _write_ini(parser, path)
 
 
@@ -2780,9 +2773,8 @@ def reset_dismissed_notices() -> int:
     path = get_ui_config_path()
     if not path.is_file():
         return 0
-    parser = _new_parser()
     try:
-        parser.read(path)
+        parser = _read_for_write(path)
     except Exception:
         return 0
     cleared = _count_notice_flags(parser)
@@ -2857,7 +2849,7 @@ def _read_install_name_patterns_raw(parser) -> list[dict] | None:
     return rules
 
 
-def load_install_name_patterns() -> list[dict]:
+def load_install_name_patterns(*, persist: bool = True) -> list[dict]:
     """Return the install-name rules (built-in defaults + user rules), in order.
 
     Each item is ``{"search", "replace", "enabled"[, "id", "label"]}``. On the
@@ -2887,7 +2879,8 @@ def load_install_name_patterns() -> list[dict]:
         if rules is None and not already_seeded:
             # First run: seed the built-in defaults and persist them so they show
             # (editable) in the editor and run at install time.
-            save_install_name_patterns(defaults)
+            if persist:
+                save_install_name_patterns(defaults)
             return defaults
         rules = rules or []
         # Migration: inject any default rule NOT yet introduced to this config
@@ -2904,7 +2897,8 @@ def load_install_name_patterns() -> list[dict]:
                         if d.get("id") and d["id"] not in introduced]
         if new_defaults:
             merged = _merge_new_defaults(rules, defaults, new_defaults)
-            save_install_name_patterns(merged)
+            if persist:
+                save_install_name_patterns(merged)
             return merged
         return rules
     except Exception:
@@ -2971,12 +2965,10 @@ def save_install_name_patterns(rules: list[dict]) -> None:
         cleaned.append(item)
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _NAME_PATTERNS_SECTION not in parser:
         parser[_NAME_PATTERNS_SECTION] = {}
-    parser[_NAME_PATTERNS_SECTION][_NAME_PATTERNS_OPTION] = json.dumps(cleaned)
+    parser[_NAME_PATTERNS_SECTION][_NAME_PATTERNS_OPTION] = json.dumps(cleaned).replace("%", "%%")
     parser[_NAME_PATTERNS_SECTION][_NAME_PATTERNS_SEEDED_OPTION] = "true"
     # Record every shipped default id as "introduced" (union with what's already
     # there), so a default remains introduced even after the user deletes it -
@@ -3073,9 +3065,7 @@ def save_app_env_vars(entries: list[dict]) -> None:
             cleaned.append(item)
     path = get_ui_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    parser = _new_parser()
-    if path.is_file():
-        parser.read(path)
+    parser = _read_for_write(path)
     if _APP_ENV_SECTION not in parser:
         parser[_APP_ENV_SECTION] = {}
     parser[_APP_ENV_SECTION][_APP_ENV_OPTION] = json.dumps(cleaned).replace("%", "%%")
@@ -3197,10 +3187,8 @@ def load_theme_colors() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 _APPEARANCE_OPTION = "appearance_mode"
 _APPEARANCE_DEFAULT = "amethyst"
-# Theme ids are lowercase word chars/digits/dashes/underscores; user-authored
-# JSON themes add a single "custom:" namespace prefix (see themes.custom),
-# so a colon is permitted between the prefix and the slug.
-_APPEARANCE_ID_RE = _re.compile(r"^[a-z0-9_][a-z0-9_:-]*$")
+# Theme IDs include custom:<slug> and plugin:<plugin_id>:<theme_id>.
+_APPEARANCE_ID_RE = _re.compile(r"^[a-z0-9_][a-z0-9_.:-]*$")
 
 
 def get_appearance_mode() -> str:
@@ -3219,7 +3207,7 @@ def get_appearance_mode() -> str:
 def save_appearance_mode(mode: str) -> None:
     """Persist the appearance mode. Values are normalised to lowercase; any
     string that doesn't match the theme-id regex (lowercase word chars, digits,
-    dashes, underscores) is silently rejected."""
+    dots, colons, dashes, underscores) is silently rejected."""
     mode = mode.strip().lower()
     if not _APPEARANCE_ID_RE.match(mode):
         return
@@ -3290,22 +3278,36 @@ def save_install_mod_directory(value: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# amethyst.ini schema version gate (migration wipe)
+# amethyst.ini schema version gate
 # ---------------------------------------------------------------------------
 
+def _backup_ini(path: Path) -> Path:
+    data = path.read_bytes()
+    number = 0
+    while True:
+        suffix = ".bak" if number == 0 else f".bak.{number}"
+        backup = path.with_name(path.name + suffix)
+        try:
+            stream = backup.open("xb")
+        except FileExistsError:
+            number += 1
+            continue
+        try:
+            with stream:
+                stream.write(data)
+        except BaseException:
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+            raise
+        return backup
+
+
 def ensure_ini_version(log_fn=None) -> None:
-    """Ensure amethyst.ini matches the current schema version.
+    """Validate the INI at startup, backing up existing data before any reset.
 
-    If the file exists but its ``[meta] version`` is missing or != _APP_INI_VERSION
-    (an old Tk-era ini), DELETE it so the Qt build starts fresh. Then make sure a
-    file exists stamping the current version. amethyst.ini only - other config
-    (last_game.json, games/, profiles, caches) is left untouched.
-
-    Saves the default theme when no appearance mode is set.
-
-    Call this ONCE at the very start of startup, before anything reads the ini.
-    Best-effort: any error falls back to wiping + rewriting so a corrupt/locked
-    ini can never block startup.
+    Leave the original untouched if its backup cannot be saved.
     """
     if log_fn is None:
         try:
@@ -3324,8 +3326,28 @@ def ensure_ini_version(log_fn=None) -> None:
 
     path = get_ui_config_path()
     log_fn(f"Startup configuration: path={path}, expected schema={_APP_INI_VERSION}.")
+
+    def reset_ini():
+        try:
+            if path.exists() or path.is_symlink():
+                backup = _backup_ini(path)
+                log_fn(f"Startup configuration: backed up existing INI to {backup}.")
+        except Exception as exc:
+            log_fn(f"Startup configuration: could not back up existing INI; "
+                   f"leaving it untouched ({type(exc).__name__}: {exc}).")
+            return
+        try:
+            parser = _new_parser()
+            parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
+            parser[_INI_SECTION] = {_APPEARANCE_OPTION: _APPEARANCE_DEFAULT}
+            _write_ini(parser, path)
+            log_fn(f"Startup configuration: created schema {_APP_INI_VERSION} INI.")
+        except Exception as exc:
+            log_fn(f"Startup configuration: clean rewrite failed: "
+                   f"{type(exc).__name__}: {exc}")
+
     try:
-        needs_wipe = False
+        needs_reset = False
         if path.is_file():
             try:
                 parser = _new_parser()
@@ -3336,25 +3358,12 @@ def ensure_ini_version(log_fn=None) -> None:
                 log_fn(f"Startup configuration: could not parse existing INI; "
                        f"resetting it ({type(exc).__name__}: {exc}).")
             if ver != _APP_INI_VERSION:
-                needs_wipe = True
+                needs_reset = True
                 if ver >= 0:
                     log_fn(f"Startup configuration: schema {ver} does not match "
                            f"{_APP_INI_VERSION}; resetting application UI settings.")
-        if needs_wipe:
-            try:
-                path.unlink()
-                log_fn("Startup configuration: removed the incompatible INI.")
-            except OSError as exc:
-                log_fn(f"Startup configuration: could not remove incompatible INI: "
-                       f"{exc}.")
-        if not path.is_file():
-            # Fresh stamp (brand-new install or just-wiped).
-            path.parent.mkdir(parents=True, exist_ok=True)
-            parser = _new_parser()
-            parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
-            parser[_INI_SECTION] = {_APPEARANCE_OPTION: _APPEARANCE_DEFAULT}
-            _write_ini(parser, path)
-            log_fn(f"Startup configuration: created schema {_APP_INI_VERSION} INI.")
+        if needs_reset or not path.is_file():
+            reset_ini()
         else:
             # File is current but make sure the version key is present/correct.
             parser = _new_parser()
@@ -3380,13 +3389,4 @@ def ensure_ini_version(log_fn=None) -> None:
     except Exception as exc:
         log_fn(f"Startup configuration: validation failed; attempting a clean "
                f"rewrite ({type(exc).__name__}: {exc}).")
-        # Last resort: try a clean rewrite; swallow anything so startup proceeds.
-        try:
-            parser = _new_parser()
-            parser[_META_SECTION] = {"version": str(_APP_INI_VERSION)}
-            parser[_INI_SECTION] = {_APPEARANCE_OPTION: _APPEARANCE_DEFAULT}
-            _write_ini(parser, path)
-            log_fn("Startup configuration: clean rewrite succeeded.")
-        except Exception as rewrite_exc:
-            log_fn(f"Startup configuration: clean rewrite failed: "
-                   f"{type(rewrite_exc).__name__}: {rewrite_exc}")
+        reset_ini()

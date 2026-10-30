@@ -549,7 +549,7 @@ def _wrap_in_steam_runtime(cmd: list[str], proton_script: "Path",
     return [_host_tool_path(entry), "--verb=waitforexitandrun", "--", *cmd]
 
 
-def _host_python() -> str:
+def _host_python(env: "dict | None" = None) -> str:
     """Return a *host* python3 to run the Proton script with.
 
     Inside our AppImage, ``python3`` on PATH resolves to the bundle's
@@ -561,12 +561,22 @@ def _host_python() -> str:
     enough - the bundled interpreter re-pollutes itself on startup - so the
     interpreter itself must be a real host one.
 
-    Prefer ``/usr/bin/python3`` (present on every target host); otherwise take
+    Prefer ``/usr/bin/python3`` when available; otherwise take
     the first ``python3`` on PATH that is NOT under ``$APPDIR`` or a
     ``/tmp/.mount_*`` FUSE mount. Falls back to plain ``"python3"`` when no
-    host interpreter can be located (native/flatpak installs, where ``python3``
-    is already the host one).
+    host interpreter can be located. Flatpak resolves it through the host portal.
     """
+    if _in_flatpak_sandbox():
+        from Utils.launchers.host import find_host_program
+        python = find_host_program("python3", env=env)
+        if python is None:
+            raise RuntimeError(
+                "Python 3 is required on the host to run the selected Proton runner. "
+                "Install Python 3 and make python3 available on the desktop "
+                "session's PATH, then restart Amethyst. Python inside the "
+                "Amethyst Flatpak cannot run host Proton commands.")
+        return python
+
     appdir = os.environ.get("APPDIR")
     appimage = os.environ.get("APPIMAGE")
     if not appdir and not appimage:
@@ -654,7 +664,7 @@ def proton_run_command(
                    *fwd, *cmd]
         return cmd
 
-    if not steam_client_installed():
+    if not steam_client_installed() or (env or {}).get("_AMM_PLUGIN_PREFIX"):
         # Steam-less system (Heroic/Lutris-only, GH#320): a raw
         # ``python3 proton <verb>`` needs a Steam client for its compat
         # plumbing and runtime, which doesn't exist here. Route the launch
@@ -689,9 +699,10 @@ def proton_run_command(
                                    host_cwd=directory)
         _maybe_log_steamless_no_umu()
 
-    base = [_host_python(), _host_tool_path(proton_script), *map(str, args)]
     if not (_proton_script_in_steam_flatpak(proton_script)
             and not _own_process_in_steam_flatpak()):
+        python = "python3" if _in_flatpak_sandbox() else _host_python(env)
+        base = [python, _host_tool_path(proton_script), *map(str, args)]
         # Game launches go through Steam's own runtime container (see
         # _wrap_in_steam_runtime). Done before the flatpak-spawn wrap so the
         # entry point runs on the host and the env diff below still sees the
@@ -699,6 +710,8 @@ def proton_run_command(
         # left bare: that Proton already runs inside Steam's own sandbox,
         # where its runtime and libraries are the ones it expects.
         base = _wrap_in_steam_runtime(base, proton_script, args, env)
+        if _in_flatpak_sandbox() and base[0] == "python3":
+            base[0] = _host_python(env)
         base = wrap_nixos_command(base, env=env)
         if _in_flatpak_sandbox() and shutil.which("flatpak-spawn"):
             from Utils.flatpak.env import flatpak_forward_env_args
@@ -710,10 +723,17 @@ def proton_run_command(
     # the sandbox's own interpreter (not our host resolver) - that's correct.
     # --filesystem=host so the sandbox can reach the staging/game/tool paths
     # that live outside Steam's own data dir.
+    overlay_env = []
+    if (env and env.get("LD_PRELOAD")
+            and env.get("_AMM_STEAM_OVERLAY_PRELOAD") == env["LD_PRELOAD"]):
+        for key in ("LD_PRELOAD", "ENABLE_VK_LAYER_VALVE_steam_overlay_1"):
+            if key in env:
+                overlay_env.append(f"--env={key}={env[key]}")
     cmd = [
         "flatpak", "run",
         "--command=python3",
         "--filesystem=host",
+        *overlay_env,
         _STEAM_FLATPAK_ID,
         str(proton_script), *map(str, args),
     ]

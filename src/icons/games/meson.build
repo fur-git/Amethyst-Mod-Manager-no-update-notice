@@ -68,5 +68,7 @@ py.install_sources(
   'Valheim.png',
   'Voices_Of_The_Void.png',
   'witcher_3.png',
+  'nivalis_nights.png',
+  'Prey_2017.png',
   subdir: 'icons' / 'games',
 )

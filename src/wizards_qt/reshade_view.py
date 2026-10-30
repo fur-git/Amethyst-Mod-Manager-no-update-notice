@@ -28,10 +28,10 @@ from PySide6.QtWidgets import (
     QLineEdit, QProgressBar, QGridLayout,
 )
 
-from gui_qt.theme_qt import (
+from gui_qt.appearance.theme import (
     active_palette, _c, button_qss, close_button, ok_text, err_text,
 )
-from gui_qt.safe_emit import safe_emit
+from gui_qt.runtime.safe_emit import safe_emit
 from Utils.wizards.reshade import (
     API_CHOICES, OPTIONAL_SHADER_PACKS, OBSOLETE_PRESET_EFFECTS,
     download_and_extract_reshade_dll, download_and_extract_shaders,
@@ -409,7 +409,8 @@ class ReShadeView(QWidget):
                         sh_res.append(download_and_extract_shaders(
                             tmp, packs, cache_dir=cache, allow_partial=preset is not None,
                             warnings=self._download_warnings,
-                            progress=lambda message: safe_emit(self._dl_status_sig, message, "")))
+                            progress=lambda done, total: safe_emit(
+                                self._dl_status_sig, self.tr("Shader packs: {0}/{1}").format(done, total), "")))
                     except Exception as e:
                         sh_exc.append(e)
 

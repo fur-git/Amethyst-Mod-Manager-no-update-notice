@@ -395,7 +395,7 @@ class SortResult:
     # plugin name (original case) -> {
     #   "messages":        list[{"type","text"}],
     #   "requirements":    list[{"name","display_name","detail"}],
-    #   "incompatibilities": list[{"name","display_name","detail"}],
+    #   "incompatibilities": list[{"name","display_name","detail","file_present"?}],
     #   "locations":       list[{"name","url"}],
     #   "dirty":           list[{"crc","itm","udr","nav","utility","detail"}],
     #   "clean":           list[{"crc","itm","udr","nav","utility","detail"}],
@@ -413,6 +413,30 @@ _MESSAGE_TYPE_NAMES = {
     1: "warn",
     2: "error",
 }
+
+
+class LootError(RuntimeError):
+    pass
+
+
+class LootUnavailableError(LootError):
+    pass
+
+
+class LootConfigurationError(LootError):
+    pass
+
+
+class LootMasterlistError(LootError):
+    pass
+
+
+class LootCycleError(LootError):
+    pass
+
+
+class LootPluginError(LootError):
+    pass
 
 
 def _msg_type_name(mt) -> str:
@@ -459,11 +483,10 @@ def _render_messages(msgs, language: str = "en") -> list[dict]:
     return rendered
 
 
-def _render_file_list(files) -> list[dict]:
-    """Render a libloot File list (requirements / incompatibilities)."""
+def _render_file_list(files, db=None) -> list[dict]:
+    """Render requirements, or resolve file incompatibilities when db is given."""
     out: list[dict] = []
     for f in files or []:
-        # File.name is a Filename type; str() gives the plugin/file string.
         name = str(getattr(f, "name", "") or "")
         display = getattr(f, "display_name", "") or ""
         detail_msgs = getattr(f, "detail", None)
@@ -478,11 +501,19 @@ def _render_file_list(files) -> list[dict]:
                 picked = list(detail_msgs)[0]
             if picked is not None:
                 detail_text = getattr(picked, "text", "") or ""
-        out.append({
+        info = {
             "name": name,
             "display_name": display or name,
             "detail": detail_text,
-        })
+        }
+        if db is not None:
+            filename = f.name.as_str().replace("\\", "/")
+            if not filename.lower().endswith(
+                    (".esp", ".esm", ".esl", ".omwaddon", ".omwgame", ".omwscripts")):
+                if not db.evaluate(f"file({json.dumps(filename, ensure_ascii=False)})"):
+                    continue
+                info["file_present"] = True
+        out.append(info)
     return out
 
 
@@ -592,7 +623,7 @@ def _collect_plugin_info(
 
         messages = _render_messages(meta.messages, language)
         requirements = _render_file_list(meta.requirements)
-        incompatibilities = _render_file_list(meta.incompatibilities)
+        incompatibilities = _render_file_list(meta.incompatibilities, db=db)
         locations = _render_locations(meta.locations)
         # dirty_info / clean_info are CRC-filtered by libloot when conditions
         # are evaluated, so they reflect the plugin's installed version.
@@ -881,7 +912,7 @@ def sort_plugins(
     if cancelled is not None and cancelled():
         raise RuntimeError("LOOT cancelled.")
     if not _AVAILABLE:
-        raise RuntimeError(
+        raise LootUnavailableError(
             "libloot is not available. "
             "Rebuild it with: ./LOOT/rebuild_libloot.sh"
         )
@@ -899,14 +930,14 @@ def sort_plugins(
     plugin_names = deduped
 
     if not game_type_attr:
-        raise RuntimeError(
+        raise LootConfigurationError(
             f"No LOOT game type configured for '{game_name}'. "
             "Set loot_game_type in the game's Python handler."
         )
 
     game_type = getattr(loot.GameType, game_type_attr, None)
     if game_type is None:
-        raise RuntimeError(
+        raise LootConfigurationError(
             f"Unknown libloot GameType '{game_type_attr}' for '{game_name}'."
         )
 
@@ -931,7 +962,7 @@ def sort_plugins(
         url_hint = (f"\nDownload from: {effective_masterlist_url}"
                     if effective_masterlist_url
                     else "\nDownload it from the LOOT GitHub repository.")
-        raise RuntimeError(
+        raise LootMasterlistError(
             f"Masterlist not found: {masterlist_path}{url_hint}"
         )
 
@@ -962,9 +993,14 @@ def sort_plugins(
             warnings.append("Prelude file not found - sorting may be less accurate.")
         effective_userlist = None
         if userlist_path is not None and userlist_path.is_file():
-            view.track_source(userlist_path)
-            if userlist_path.read_text(encoding="utf-8").strip():
-                effective_userlist = str(userlist_path)
+            try:
+                view.track_source(userlist_path)
+                if userlist_path.read_text(encoding="utf-8").strip():
+                    effective_userlist = str(userlist_path)
+            except (ValueError, OSError) as e:
+                raise LootConfigurationError(
+                    f"Could not load userlist: {e}"
+                ) from e
         _log("Initializing LOOT and loading metadata...")
         prepared = worker.call(
             "prepare", game_type=game_type_attr, game_root=str(view.root),
@@ -977,14 +1013,16 @@ def sort_plugins(
         result = SortResult(**worker.call(
             "sort", plugin_names=plugin_names, sortable=sortable,
             paths=[str(view.data / Path(path).name) for path in plugin_paths],
-            locked_positions=locked_positions, refresh_only=refresh_only))
+            locked_positions=locked_positions, refresh_only=refresh_only,
+            enabled_set=sorted(enabled_set)))
         view.check_sources()
         result.warnings[:0] = warnings
         _log(f"LOOT complete. {result.moved_count} plugin(s) changed position.")
         return result
 
 
-def _load_plugins(game, paths, log_fn=None, progress_fn=None):
+def _load_plugins(game, paths, log_fn=None, progress_fn=None, enabled_set=None):
+    skipped = []
     if game.game_type() in (loot.GameType.Morrowind, loot.GameType.OpenMW,
                             loot.GameType.Starfield):
         from graphlib import CycleError, TopologicalSorter
@@ -997,15 +1035,32 @@ def _load_plugins(game, paths, log_fn=None, progress_fn=None):
                 plugin = game.plugin(name)
                 if plugin is None:
                     raise RuntimeError(f"LOOT could not load: {Path(path).name}")
-                dependencies[name] = [m.lower() for m in plugin.masters()
-                                      if m.lower() in by_name]
+                dependencies[name] = [m.lower() for m in plugin.masters()]
                 if progress_fn:
                     progress_fn(f"Loaded header {index} of {len(by_name)} plugins...")
-            paths = [by_name[name] for name in TopologicalSorter(dependencies).static_order()]
+            ordered = list(TopologicalSorter(dependencies).static_order())
         except CycleError as exc:
             raise RuntimeError("LOOT found a cyclic master dependency.") from exc
         finally:
             game.clear_loaded_plugins()
+
+        enabled = None if enabled_set is None else {name.lower() for name in enabled_set}
+        unavailable = set()
+        paths = []
+        for name in ordered:
+            if name not in by_name:
+                unavailable.add(name)
+                continue
+            missing = [master for master in dependencies[name] if master in unavailable]
+            if missing:
+                filename = Path(by_name[name]).name
+                if enabled is None or name in enabled:
+                    raise RuntimeError(
+                        f"Cannot sort {filename}: unavailable masters: {', '.join(missing)}.")
+                unavailable.add(name)
+                skipped.append(filename)
+            else:
+                paths.append(by_name[name])
 
     # Batch error logging can deadlock libloot's native threads on the Python GIL.
     for index, path in enumerate(paths, 1):
@@ -1016,17 +1071,26 @@ def _load_plugins(game, paths, log_fn=None, progress_fn=None):
             progress_fn(f"Loaded plugin {index} of {len(paths)}...")
         if log_fn and index % 50 == 0:
             log_fn(f"Loaded {index} of {len(paths)} plugins...")
+    return skipped
 
 
 def _sort_game(game, plugin_names, sortable, paths, locked_positions=None,
-               refresh_only=False, log_fn=None, progress_fn=None) -> SortResult:
+               refresh_only=False, log_fn=None, progress_fn=None,
+               enabled_set=None) -> SortResult:
     _log = log_fn or (lambda _: None)
     warnings = []
     db = game.database()
     game.load_current_load_order_state()
     if paths:
         _log(f"Loading {len(paths)} plugins and their archives...")
-        _load_plugins(game, paths, _log, progress_fn)
+        skipped = _load_plugins(game, paths, _log, progress_fn, enabled_set)
+        if skipped:
+            skipped_lower = {name.lower() for name in skipped}
+            sortable = [name for name in sortable if name.lower() not in skipped_lower]
+            warning = ("Disabled plugins with unavailable masters were left in their saved "
+                       "positions: " + ", ".join(skipped))
+            warnings.append(warning)
+            _log(warning)
     unloaded = [name for name in sortable if game.plugin(name) is None]
     if unloaded:
         raise RuntimeError(f"LOOT could not load: {', '.join(unloaded[:5])}")
@@ -1118,18 +1182,18 @@ def find_overlapping_plugins(
     _log = log_fn or (lambda _: None)
 
     if not _AVAILABLE:
-        raise RuntimeError(
+        raise LootUnavailableError(
             "libloot is not available. "
             "Rebuild it with: ./LOOT/rebuild_libloot.sh"
         )
     if not game_type_attr:
-        raise RuntimeError(
+        raise LootConfigurationError(
             f"No LOOT game type configured for '{game_name}'. "
             "Set loot_game_type in the game's Python handler."
         )
     game_type = getattr(loot.GameType, game_type_attr, None)
     if game_type is None:
-        raise RuntimeError(
+        raise LootConfigurationError(
             f"Unknown libloot GameType '{game_type_attr}' for '{game_name}'."
         )
 

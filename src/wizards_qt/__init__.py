@@ -98,6 +98,7 @@ class QtWizardContext:
     wizard_tool_id: str = ""
     wizard_tool_label: str = ""
     wizard_tool_label_args: tuple = ()
+    plugin_context_factory: Callable | None = None
 
 
 # Deliberately dropped from the Qt app (not even shown greyed out).
@@ -189,8 +190,6 @@ def _param(module: str, cls: str, **fixed):
 # which is per-game suffixed like "run_skygen_skyrimse") so one entry serves
 # every game that registers the tool.
 REGISTRY: dict[str, QtWizardSpec] = {
-    "wizards.workshop.WorkshopWizard": QtWizardSpec(
-        _simple("wizards_qt.workshop_view", "WorkshopView"), panel="full"),
     "wizards.re_pak_restore.RePakRestoreWizard": QtWizardSpec(_re_pak_restore),
     "wizards.pandora.PandoraWizard": QtWizardSpec(_pandora),
     "wizards.reshade.ReShadeWizard": QtWizardSpec(_reshade),
@@ -347,4 +346,7 @@ REGISTRY: dict[str, QtWizardSpec] = {
 
 
 def get_spec(dialog_class_path: str) -> QtWizardSpec | None:
+    if dialog_class_path.startswith("manager_plugin:"):
+        from amethyst_plugins.wizards import specification
+        return specification(dialog_class_path)
     return REGISTRY.get(dialog_class_path)
