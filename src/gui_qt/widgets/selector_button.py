@@ -10,8 +10,10 @@ never become the selection.
 from __future__ import annotations
 
 from typing import Callable
-from PySide6.QtWidgets import QToolButton, QMenu, QListWidget
-from PySide6.QtGui import QActionGroup
+from PySide6.QtWidgets import (QToolButton, QMenu, QListWidget, QStyle,
+                               QStyleOptionButton, QStyleOptionToolButton,
+                               QStylePainter)
+from PySide6.QtGui import QActionGroup, QIcon
 from PySide6.QtCore import Qt, QSize, QEvent, QObject, QTimer, Signal
 
 _QWIDGETSIZE_MAX = (1 << 24) - 1
@@ -475,12 +477,20 @@ class SelectorButton(QToolButton):
                 self.setToolTip(full)
             self._pin_minimum()
             return
-        # The current item's icon is drawn ourselves in paintEvent (to the left
-        # of the still-centred text). Keep the QToolButton in text-only mode so
-        # Qt centres the label; its built-in icon slot would left-align the
-        # icon+text group instead.
-        if self.toolButtonStyle() != Qt.ToolButtonTextOnly:
-            self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        item_icon = self._item_icons.get(self._current)
+        text_icon = item_icon if item_icon is not None else QIcon()
+        text_style = (Qt.ToolButtonTextBesideIcon if not text_icon.isNull()
+                      else Qt.ToolButtonTextOnly)
+        icon_size = QSize(self._item_icon_px, self._item_icon_px)
+        if self.icon().cacheKey() != text_icon.cacheKey():
+            self.setIcon(text_icon)
+            self._chrome_dirty = True
+        if self.iconSize() != icon_size:
+            self.setIconSize(icon_size)
+            self._chrome_dirty = True
+        if self.toolButtonStyle() != text_style:
+            self.setToolButtonStyle(text_style)
+            self._chrome_dirty = True
         compact_changed = self.property("compact") is not False
         if compact_changed:
             self.setProperty("compact", False)
@@ -526,6 +536,31 @@ class SelectorButton(QToolButton):
 
     def _repolish(self) -> None:
         self.style().unpolish(self); self.style().polish(self)
+
+    def paintEvent(self, event):                # noqa: N802
+        if self.toolButtonStyle() != Qt.ToolButtonTextBesideIcon:
+            super().paintEvent(event)
+            return
+        option = QStyleOptionToolButton()
+        self.initStyleOption(option)
+        label = QStyleOptionButton()
+        label.initFrom(self)
+        label.state = option.state
+        label.text = option.text
+        label.icon = option.icon
+        label.iconSize = option.iconSize
+        label.rect = self.style().subElementRect(
+            QStyle.SE_PushButtonContents, label, self)
+        icon_width = label.icon.actualSize(label.iconSize).width()
+        label.text = label.fontMetrics.elidedText(
+            label.text, Qt.ElideRight, max(0, label.rect.width() - icon_width - 4))
+        option.text = ""
+        option.icon = QIcon()
+        painter = QStylePainter(self)
+        painter.drawComplexControl(QStyle.CC_ToolButton, option)
+        painter.setClipRect(label.rect)
+        # Qt's push-button label centers the icon and text together.
+        painter.drawControl(QStyle.CE_PushButtonLabel, label)
 
     def changeEvent(self, e):               # noqa: N802
         # Font or theme change → the cached widths no longer describe the
@@ -725,34 +760,6 @@ class SelectorButton(QToolButton):
                 a.setEnabled(False)
             if opts.get("separator_after"):
                 menu.addSeparator()
-
-    def paintEvent(self, event):
-        # Let the base class paint the (centred) text + chrome, then draw the
-        # current item's icon ourselves just LEFT of the centred label - the
-        # label stays centred (QToolButton's own icon slot would left-align
-        # the icon+text group together instead). Anchoring to the text (not
-        # the button edge) keeps the icon clear of the rounded corner, and it
-        # is skipped when a long label leaves no room, instead of clipping.
-        super().paintEvent(event)
-        if self._icon is not None or self._icon_only:
-            return      # icon-only modes: Qt already painted the icon itself
-        face = self._item_icons.get(self._current)
-        if face is None:
-            return
-        from PySide6.QtGui import QPainter
-        from PySide6.QtCore import QRect
-        px = self._item_icon_px
-        # 28px = the split arrow section (QSS padding); the label centres in
-        # the remaining body, so mirror that when locating its left edge.
-        body_w = self.width() - (28 if self.property("split") else 0)
-        text_w = self.fontMetrics().horizontalAdvance(self.text())
-        x = (body_w - text_w) // 2 - px - 6
-        if x < 4:
-            return   # no room - draw nothing rather than a clipped icon
-        y = (self.height() - px) // 2
-        p = QPainter(self)
-        face.paint(p, QRect(x, y, px, px))
-        p.end()
 
     def _choose(self, label):
         changed = label != self._current

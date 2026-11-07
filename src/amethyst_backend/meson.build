@@ -1,5 +1,6 @@
 py.install_sources(
   '__init__.py',
+  'install_rules.py',
   'appearance.py',
   'application_install.py',
   'application_settings.py',
@@ -16,6 +17,7 @@ py.install_sources(
   'download_settings.py',
   'fomod.py',
   'game_configuration.py',
+  'game_instances.py',
   'game_launcher.py',
   'game_options.py',
   'game_registry.py',
@@ -25,6 +27,7 @@ py.install_sources(
   'installer_requests.py',
   'install_options.py',
   'history.py',
+  'hexium.py',
   'jobs.py',
   'methods.py',
   'launch.py',

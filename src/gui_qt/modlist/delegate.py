@@ -35,7 +35,7 @@ from gui_qt.modlist.data import (
     FLAG_UPDATE, FLAG_ENDORSED, FLAG_ROOT, FLAG_MODIFIED_MF, FLAG_MISSING_REQS,
     FLAG_COLLECTION_BUNDLED, FLAG_COLLECTION_PATCHED, FLAG_NOTE, FLAG_XEDIT,
     FLAG_BUNDLE, FLAG_MODIO_UPDATE, FLAG_PRERTX, FLAG_ROOT_RULE,
-    FLAG_RERUN_FOMOD, FLAG_THUNDERSTORE_UPDATE, FLAG_SKSE_INCOMPATIBLE, FLAG_SYMLINK, FLAG_PROVIDER_UPDATE,
+    FLAG_RERUN_FOMOD, FLAG_THUNDERSTORE_UPDATE, FLAG_HEXIUM_UPDATE, FLAG_SKSE_INCOMPATIBLE, FLAG_SYMLINK, FLAG_PROVIDER_UPDATE,
 )
 
 # Flag bit → icon filename, painted left-to-right in the Flags column, in the
@@ -52,6 +52,7 @@ _FLAG_ICONS = [
     (FLAG_UPDATE, "update.png"),
     (FLAG_MODIO_UPDATE, "update_modio.png"),
     (FLAG_THUNDERSTORE_UPDATE, "update_thunderstore.png"),
+    (FLAG_HEXIUM_UPDATE, "update_hexium.png"),
     (FLAG_PROVIDER_UPDATE, "update.png"),
     (FLAG_ENDORSED, "endorsed.png"),
     # info.png: pre-RTX OR collection bundled/patched - only ONE ever paints (see
@@ -80,6 +81,7 @@ _CLICKABLE_FLAG_BITS = frozenset({
     FLAG_UPDATE,
     FLAG_MODIO_UPDATE,
     FLAG_THUNDERSTORE_UPDATE,
+    FLAG_HEXIUM_UPDATE,
     FLAG_PROVIDER_UPDATE,
 })
 _ALIGN_CENTER = Qt.AlignVCenter | Qt.AlignHCenter
@@ -98,6 +100,7 @@ _FLAG_TIPS = {
     FLAG_RERUN_FOMOD: QT_TRANSLATE_NOOP("ModRowDelegate", "A FOMOD patch option's plugin is now installed - click to re-run the FOMOD installer"),
     FLAG_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on Nexus Mods"),
     FLAG_MODIO_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on mod.io"),
+    FLAG_HEXIUM_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on Hexium"),
     FLAG_THUNDERSTORE_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available on Thunderstore"),
     FLAG_PROVIDER_UPDATE: QT_TRANSLATE_NOOP("ModRowDelegate", "Update available from mod provider"),
     FLAG_ENDORSED: QT_TRANSLATE_NOOP("ModRowDelegate", "Endorsed"),
@@ -709,13 +712,13 @@ class ModRowDelegate(QStyledItemDelegate):
 
     def _paint_name(self, p, r, e, index, text_color):
         from gui_qt.modlist.external import external
-        if external(e):
+        if external(e) and not e.checkable:
             p.setPen(text_color)
             p.setFont(self.f_row)
             rect = r.adjusted(12, 0, -6, 0)
             p.drawText(rect, Qt.AlignVCenter, p.fontMetrics().elidedText(e.display_name, Qt.ElideRight, rect.width()))
             return
-        leader = index.model().display_group_leader(e.name)
+        leader = None if external(e) else index.model().display_group_leader(e.name)
         x = r.left() + (24 if leader and leader != e.name else 0)
 
         # Checkbox (accent fill + white tick when enabled; hollow when not).
@@ -742,7 +745,7 @@ class ModRowDelegate(QStyledItemDelegate):
             tx += 24
 
         # Lock glyph.
-        if e.locked:
+        if e.locked and not external(e):
             p.setPen(self.c_lock)
             p.drawText(QRect(tx, r.top(), 16, r.height()),
                        Qt.AlignVCenter, "\U0001F512")
@@ -1272,6 +1275,13 @@ class ModRowDelegate(QStyledItemDelegate):
     def editorEvent(self, event, model, opt, index):
         from gui_qt.modlist.external import external
         if index.isValid() and external(model.entry(index.row())):
+            entry = model.entry(index.row())
+            if (entry.checkable and not entry.is_separator and index.column() == COL_NAME
+                    and event.type() == QEvent.MouseButtonRelease
+                    and event.button() == Qt.LeftButton
+                    and self._checkbox_hit_rect(opt.rect, index).contains(event.position().toPoint())):
+                model.toggle(index.row())
+                return True
             return False
         if event.type() != QEvent.MouseButtonRelease:
             return False

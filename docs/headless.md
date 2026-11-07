@@ -300,6 +300,7 @@ The response describes the protocol and available features:
         "catalog": true,
         "installed_highlights": true,
         "name_matched_recommendations": true,
+        "update_group_recommendations": true,
         "revision_checked": true,
         "owner_resolution": true,
         "cached_archives": true,
@@ -776,7 +777,7 @@ Result schemas allow additional properties for compatible additions.
 | --- | --- | --- |
 | `system.handshake` | `protocol_version` integer (optional), `client` object (optional) | Negotiate and inspect the protocol. |
 | `system.ping` | None | Check that the service is responsive. |
-| `games.list` | `configured_only` boolean (optional) | List discovered game handlers. |
+| `games.list` | `configured_only` boolean (optional) | List game handlers and saved independent instances. |
 | `games.get` | `game` string | Return one game and its current state. |
 | `games.version.get.start` | `game` string, `profile` string | Read the selected installation's game executable version using the Configure menu's detector. Returns `version:null` when no version can be detected. |
 | `games.installations.list.start` | `game` string | Scan built-in launchers and enabled plugin launcher providers for candidate installations. Plugin results include `provider_id`, `provider_label` and `provider_icon` (resolved manifest path or null). |
@@ -787,6 +788,7 @@ Result schemas allow additional properties for compatible additions.
 | `launchers.entry.set.start` | `provider_id`, `launcher_id`, `changes`, `revision` | Save shared settings through a writable provider while its prefix is idle. |
 | `launchers.entry.run.start` | `provider_id`, `launcher_id`; optional `executable`, `arguments` | Start a tracked application, automatically using its managed deployed VFS profile when matched, or a temporary installer/tool in its prefix; use `launch.get` and `launch.stop` for its lifecycle. |
 | `games.launcher.set.start` | `game`, `profile`, `source`, and `revision` from `games.launcher.get`; `launcher_id` for external launchers, plus `provider_id` for plugins | Save one launcher identity and clear the alternatives for that profile. Sources include built-in launchers, `manual`, and `plugin`. |
+| `games.instances.create.start` | `game`, `name`, `game_path`; optional `prefix_path`, `staging_path`, `save_path_override`, `appimage_path`, `openmw_cfg_path`, `deploy_mode`, `runtime_mode` | Create an empty independent instance using the source game's handler. |
 | `games.configure.start` | `game` string, `game_path` absolute path, `prefix_path`, `staging_path`, `save_path_override`, or OpenMW `appimage_path` absolute paths (optional), `deploy_mode` hardlink, symlink, copy, or `vfs` where supported (optional), `runtime_mode` native or proton for BG3 (optional) | Configure a game that has no saved paths and create its default profile. |
 | `games.reconfigure.plan` | `game`, `profile`, and at least one of `game_path`, `prefix_path`, `staging_path`, `save_path_override`, `appimage_path`, `deploy_mode`, or `runtime_mode` | Preview a configured game's path changes and staging migration; `deploy_mode` accepts hardlink, symlink, copy, or `vfs` where supported. |
 | `games.reconfigure.start` | Same target fields plus `revision` from the plan and `confirm` true; `migrate_staging` boolean when existing files would move | Apply the plan only while its source and destination state still match. |
@@ -794,8 +796,10 @@ Result schemas allow additional properties for compatible additions.
 | `games.options.set.start` | `game` string, `profile` string, `key` string, `value`, `expected_value` | Change one available option if its current value still matches. |
 | `games.routing.get` | `game` string | Read ordered per-game custom routing rules and their revision. |
 | `games.routing.set.start` | `game`, `revision`, full `rules` array, `confirm` true; `profile` (optional) | Save validated rule edits and optionally reconcile one profile. |
-| `games.blacklist.get` | `game` string | Read built-in, custom, disabled, and effective per-game conflict exclusions with a revision. |
-| `games.blacklist.set.start` | `game`, `revision`, full `overrides` object, `confirm` true; `profile` (optional) | Save filename and folder exclusions and optionally reconcile one profile. |
+| `games.install_rules.get` | `game` string | Read ordered plain-archive install rules and their revision. |
+| `games.install_rules.set.start` | `game`, `revision`, complete `rules` array, `confirm:true` | Save rules for future plain-archive installs and reinstalls across all profiles. |
+| `games.blacklist.get` | `game` string | Read built-in, custom, disabled, and effective per-game deployment exclusions and conflict-only rules with a revision. |
+| `games.blacklist.set.start` | `game`, `revision`, full `overrides` object, `confirm` true; `profile` (optional) | Save filename and folder deployment exclusions and conflict-only rules, and optionally reconcile one profile. |
 | `tools.list` | `game`; `profile` (optional) | Discover built-in game tools, categories, related headless methods, and declared script-extender version/download choices without importing wizard views or external plugins. |
 | `tools.synthesis.acquire.start` | `game`, `profile`, `tool_id`, catalogue `revision` | Download the declared Synthesis ZIP release to the managed cache. |
 | `tools.synthesis.inspect.start` | Acquisition parameters plus absolute `archive_path` | Inspect application files, source identity, destination writes and installation revision. |
@@ -810,8 +814,8 @@ Result schemas allow additional properties for compatible additions.
 | `tools.lod.acquire.start` | `game`, `profile`, `tool_id`, catalogue `revision` | Acquire the declared xLODGen GitHub release into the managed cache, or return the manual DynDOLOD standalone download link. |
 | `tools.lod.inspect.start` | Acquisition parameters plus absolute `archive_path` | Inspect the selected 64-bit LOD application, archive identity, destination writes and plan revision without installing it. |
 | `tools.lod.install.start` | Inspection parameters plus `plan_revision`, `confirm:true`; `allow_unverified_source:true` for a manual archive | Recheck and install xLODGen, TexGen or DynDOLOD through the shared recoverable application installer. |
-| `tools.lod.run.plan.start` | Installation choice parameters; optional run settings, `output_path`, `mod_name`, `replace_output` | Plan generation, prefix, source identities, output replacement and dedicated work folder without changing files. |
-| `tools.lod.run.start` | The same run parameters plus the returned `output_path`, `plan_revision`, `confirm:true` | Run the tool, recover deployment and import its generated files as an enabled data mod. |
+| `tools.lod.run.plan.start` | Installation choice parameters; optional run settings, `output_path`, `mod_name` | Plan generation, prefix, source identities and a new disabled output mod in staging without changing files. |
+| `tools.lod.run.start` | The same run parameters plus the returned `output_path`, `plan_revision`, `confirm:true` | Run the tool, recover deployment and enable its validated generated output mod. |
 | `tools.archive_packing.scan.start` | `game`, `profile` | Refresh the archive inventory and assess enabled or tracked mods for BSA/BA2 packing and unpacking. |
 | `tools.archive_packing.plan.start` | `game`, `profile`, `action` (`pack` or `unpack`), `mods`; packing `options` or unpack `archives` (optional) | Inspect archive names, mod ownership, affected profiles and deployment restrictions; return an apply revision. |
 | `tools.archive_packing.apply.start` | Identical planning parameters plus `revision`, `confirm:true` | Recheck the plan, run the shared desktop batch, and refresh affected profiles and plugin lists under the operation lock. |
@@ -931,7 +935,7 @@ Result schemas allow additional properties for compatible additions.
 | `mods.properties.set.start` | `game`, `profile`, `mod`, `revision`, non-empty `changes` object | Save supported metadata fields atomically and refresh affected routing when requested. |
 | `mods.versions.get.start` | `game`, `profile`, `mod`; `source` (optional, `nexus`, `thunderstore`, `modio`, or `plugin:<plugin-id>/<provider-id>`) | Read installed source identity, the version catalogue, recommendations, ownership, and revision. |
 | `mods.version.change.start` | `game`, `profile`, `mod`, `revision`, `confirm:true`; Nexus/mod.io `file_id` or Thunderstore `version`; `source`, archive/download options, installer choices, and Thunderstore `dependency_policy` (optional) | Replace an installed mod with a selected source version and refresh affected profile routing and plugins. |
-| `mods.quick_update.plan.start` | `game`, `profile`; `mods` array and `source` (`nexus` or `plugins`, optional) | Plan Nexus filename-family updates or plugin repository recommendations, with owner resolution and a revision. |
+| `mods.quick_update.plan.start` | `game`, `profile`; `mods` array and `source` (`nexus` or `plugins`, optional) | Plan confirmed Nexus successors or plugin repository recommendations, with owner resolution and a revision. |
 | `mods.quick_update.start` | `game`, `profile`, plan `revision`, `confirm:true`; matching `mods`, `download_only`, `installer_policy`, and `per_mod` options (optional) | Acquire archives in parallel and optionally replace mods sequentially, with per-mod rollback and partial-result reporting. |
 | `mods.notes.get` | `game`, `profile`; `mods` array (optional) | Read profile-local notes for real mods and the current revision. |
 | `mods.notes.set.start` | `game`, `profile`, `revision`, `changes` object; `append` boolean (optional) | Replace, append, or remove selected notes atomically. |
@@ -1015,11 +1019,60 @@ Result schemas allow additional properties for compatible additions.
 | `saves.remove.batch.start` | `game`, `profile`, `items` array of `saves.remove.start` parameters without game/profile; `on_error` (optional) | Run selected items in one tracked batch with individual results. |
 | `games.options.set.batch.start` | `game`, `profile`, `items` array of `games.options.set.start` parameters without game/profile; `on_error` (optional) | Run selected items in one tracked batch with individual results. |
 
-The `game` parameter accepts the canonical `game_id`, display name, primary
+The `game` parameter accepts the canonical instance `id`, display name, primary
 Steam app ID, or an alternate Steam app ID. Clients should retain the canonical
 `id` returned by Amethyst and use it for later requests. If a Steam app ID
 belongs to multiple handlers, Amethyst selects it only when exactly one handler
 is configured; otherwise it returns `ambiguous_game` with the candidates.
+
+### Independent game instances
+
+`games.instances.create.start` reuses a handler with a new name and generated,
+lowercase filesystem-safe ID. It copies no settings, mods, profiles, launcher
+identities, or deployment records. Supply the new installation and an empty
+staging folder; the staging default is a separate folder named for the instance.
+New instances share the original handler's download cache through a relative
+directory symlink. Removing an instance removes its link and keeps the shared
+archives. Cache management lists the shared folder once; clearing it affects
+all instances using it. Existing instance cache directories are preserved.
+Select its launcher using `games.launcher.set.start` after creation. Names and
+IDs are fixed and must not collide with existing games or retained storage.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"games.instances.create.start","params":{"game":"skyrim_se","name":"Skyrim SE GOG","game_path":"/games/GOG/Skyrim Special Edition","prefix_path":"/games/prefixes/skyrim-gog","staging_path":"/games/Amethyst/Skyrim SE GOG","deploy_mode":"symlink"}}
+```
+
+Poll the returned job through `jobs.get`. Its result includes `id`, `name`,
+`handler_id`, `is_instance`, and the saved configuration. `games.list` and
+`games.get` expose the same identity fields. Use the returned `id` for subsequent
+requests; `handler_id` remains the source game's ID. Existing games retain their
+original IDs, paths, and configuration layout. Steam IDs matching multiple
+configured instances return `ambiguous_game`.
+
+Creation, path changes, and deployment reject conflicting installation, prefix,
+and declared external write targets among the original handler and its instances.
+Unrelated games and leftover configuration from removed handlers do not reserve
+installation or prefix paths. Staging folders must remain separate across games
+and retained instance storage. Checks include inactive profiles, symlink/portal
+aliases, normalized prefixes, and retained recovery targets for the same handler.
+`instance_path_conflict` details identify the other instance, profile, and paths.
+Restoration remains available for recovery. Separate installations can stay
+deployed together; operations retain serialization. Game saves and cloud
+synchronization are not automatically isolated.
+
+OpenMW instances require an existing independent `openmw.cfg` supplied with
+`openmw_cfg_path`. Play launches the engine directly with `--replace config
+--config <directory>`; it does not open the launcher. The AppImage route needs
+the companion engine image. Native handlers with shared user directories remain
+blocked until their targets are independent (for example, DFU portable data).
+See [OpenMW configuration directories](https://openmw.readthedocs.io/en/latest/reference/modding/paths.html#launcher-scripts-and-shortcuts).
+`openmw_cfg_path` is also accepted by first-time configuration and reconfiguration.
+
+Missing or disabled handlers leave instances unavailable while preserving their
+configuration and recovery data. Shared custom-handler edits and source changes
+require all affected instances to be restored first. Removing an instance keeps
+mods, profiles, overwrite, and applications; retained storage reserves its name
+and ID until that storage is removed.
 
 ### Previous-version rollback
 
@@ -1436,6 +1489,42 @@ existing staging/profile location. Per-game routing overrides are retained;
 `custom_routing_rules` in the definition edits handler defaults, while
 `games.routing.*` edits Data-tab overrides for any game.
 
+Definitions can set `"excluded_loose_filenames":["*.txt"]` to exclude matching
+files only at the top level of a mod. Matching filenames inside folders remain
+deployable. Patterns are case-insensitive. The custom-game editor exposes this
+as **Exclude Loose Filenames** for standard, root and UE5 handlers; the default
+is an empty list.
+
+Definitions can set `"conflict_detection_ignore_filenames":["readme*.txt"]`
+to suppress conflict reporting for matching destination filenames while keeping
+normal deployment priority. Patterns are case-insensitive and apply at any
+folder depth. The custom-game editor exposes this as **Ignore Conflicts Only —
+Filenames** for standard, root and UE5 handlers. Existing
+`conflict_ignore_filenames` and blacklist rules still exclude files from deployment.
+
+The matching folder option is
+`"conflict_detection_ignore_foldernames":["docs","*_info"]`, exposed as
+**Ignore Conflicts Only — Folders**. It matches destination folder names at any
+depth, case-insensitively, and suppresses conflicts for all descendants while
+preserving deployment. Both conflict-only options default to empty lists.
+
+Definitions can opt into Hexium with `"hexium_community":"<community-slug>"`,
+alongside the independent `thunderstore_community` field. The custom-game editor
+exposes both fields. An empty or omitted Hexium community disables integration.
+The field applies to standard, root, and UE5 custom handlers, including definitions
+loaded from handler repositories. Built-in and Python plugin handlers opt in by
+overriding `BaseGame.hexium_community`:
+
+```python
+@property
+def hexium_community(self) -> str:
+    return "my-game"
+```
+
+Use the slug of a game actually hosted by Hexium. Declaring a community enables
+its browser, install links, identification, updates, and Headless capability;
+the handler still controls how the game's mods are installed and deployed.
+
 Previous definitions and source-selection metadata are retained under
 `handler_store/backups/<game_id>/<backup_id>/`; the job returns `backup`.
 Removing a handler backs up every available source candidate. Profiles and game
@@ -1475,11 +1564,68 @@ A stale revision fails with `stale_routing_rules`. If the rules save but the
 selected profile cannot refresh, the job reports `routing_sync_failed` with
 `saved: true` and the saved snapshot.
 
+`games.install_rules.get` returns an `install_rules` snapshot with `revision`
+and ordered `rules`, using the same row structure and editing conventions as
+routing rules. Submit the complete array, `revision`, `game`, and `confirm:true`
+to `games.install_rules.set.start`. New rows use `id:null`; keep built-ins in
+the list and disable them with `enabled:false`. A stale revision fails with
+`stale_install_rules`. Saving does not modify installed mods or reconcile profiles.
+Untouched built-in rules follow the handler's current order after updates;
+custom and explicitly reordered entries retain their saved positions.
+
+Each rule's `values` contains `dest`, `extensions`, `folders`, `filenames`,
+`loose_only`, `flatten`, and `include_siblings`. The match lists are alternatives;
+matching is case-insensitive and filenames support glob patterns. Loose-only
+matches files at the mod root or matched folders beginning at the root. Paths
+are preserved below `dest` by default. Flatten removes parents above a matched
+folder, or uses the basename for file matches. Include siblings overrides
+flatten: it brings the top-level containing folder, or the entire installable
+mod contents for a root-level match. Earlier claims, including siblings, win.
+
+Rules run after both prefix-stripping stages and other plain-archive tuning,
+before copying files. They apply to desktop, Headless, and ordinary collection
+plain-archive installs, including reinstalls of mods marked for the game root.
+The root flag still controls deployment location and bypasses the game's prefix
+stripping and automatic install prefix. Explicit install rules still apply.
+FOMOD, BAIN, plugin installers, exact-layout replication, and Wabbajack
+reconstruction bypass them.
+Existing game post-install hooks retain their normal sequence. Amethyst metadata
+is excluded, and unsafe paths
+fail before copying. If rules produce conflicting destinations or a file/folder
+conflict, all install rules are skipped for that mod and the install continues
+with its layout from before install rules. The reason is recorded in the log.
+
+Destinations are relative to the installed mod's staging root, rather than the
+game root. Literal relative paths may contain `<modname>` (the final installation
+folder name) and `<random>` (one saved 12-character alphanumeric value shared
+across a mod's rules, reinstalls, updates, and rollback). New-install inspection
+may show a provisional random value, indicated by `layout.random_is_provisional`.
+Custom definitions store defaults in `custom_install_rules`, whose rows contain
+the same fields plus an optional stable `rule_id`. Both standard and UE5 custom
+handlers support them. Per-game edits live in `install_rules.json` alongside
+routing overrides. The GUI editor is available beside Routing Rules and beneath
+**Strip Prefixes (post-install)** in custom-game **Mod Install Tuning**.
+
+For DebugConsolePlus in Probably Stolen, whose deployment data directory is
+already `Mods`, use this rule to keep the DLL, manifest, and UI assets together:
+
+```json
+{"dest":"<modname>","extensions":[".dll"],"folders":[],"filenames":[],"loose_only":true,"flatten":false,"include_siblings":true}
+```
+
+Reinstall the mod after saving to produce `Mods/DebugConsolePlus/DebugConsole.dll`
+alongside its manifest and `ui/` assets. Its Amethyst `meta.ini` remains at the
+staging mod root.
+
 `games.blacklist.get` returns built-in filename and folder patterns under
 `defaults`, saved custom and disabled patterns under `overrides`, and the
 resulting `effective` patterns. To change them, send the complete `overrides`
-object and its `revision` to `games.blacklist.set.start`. The object must have
-four arrays: `files`, `folders`, `disabled_files`, and `disabled_folders`.
+object and its `revision` to `games.blacklist.set.start`. The object contains
+eight arrays: `files`, `folders`, `disabled_files`, `disabled_folders`,
+`conflict_only_files`, `conflict_only_folders`, `disabled_conflict_only_files`,
+and `disabled_conflict_only_folders`. The conflict-only arrays suppress conflict
+reporting while preserving deployment. Requests containing only the original
+four arrays remain supported and preserve saved conflict-only settings.
 Only built-in patterns or previously saved disabled patterns may appear in the
 disabled arrays. To restore one, remove it from the disabled array. Patterns
 are case-insensitive filename or folder globs without path separators.
@@ -1489,7 +1635,10 @@ reconciles that profile's Filegraph immediately; other profiles refresh on their
 next use. A later deploy applies the exclusions to game files. A stale revision
 fails with `stale_blacklist`. If the rules save but the selected profile cannot
 refresh, the job reports `blacklist_sync_failed` with `saved: true` and the
-saved snapshot.
+saved snapshot. The desktop Data tab's **Blacklist** editor exposes all four
+rule types: **Exclude Files**, **Exclude Folders**, **Ignore File Conflicts**
+and **Ignore Folder Conflicts**, including disabling and restoring handler
+defaults. Deployment exclusions take precedence over conflict-only rules.
 
 List profiles:
 
@@ -2314,21 +2463,36 @@ and the game flag; overriding these or the managed INI/plugin paths in
 `prefix_mode`, rather than conflicting environment variables.
 
 The default `mod_name` is `xLODGen_Output`, `TexGen_Output` or
-`DynDOLOD_Output`. Disable or remove the previous output before planning.
-Enabled previous output returns `lod_previous_output_enabled`; a locked
-replacement returns `lod_output_locked`. `replace_output:true` explicitly
-permits replacing an existing disabled output. The previous mod stays in
-place until generation and deployment recovery succeed.
+`DynDOLOD_Output`. Disable previous outputs of the same type, including
+numbered copies, before planning. Enabled previous output returns
+`lod_previous_output_enabled`. Each successful run creates a new mod; occupied
+names gain ` (2)`, ` (3)`, etc. Both staging entries and modlist entries reserve
+names, ignoring case. Previous outputs stay in place for manual removal.
+`replace_output` is still accepted for compatibility but never permits replacement.
 
 The plan returns its `revision`, runner/prefix details, arguments,
-`output_mod` and an absolute `output_path`. When no path is supplied, the
-manager chooses a new folder under `$XDG_DATA_HOME/AmethystModManager/lod-runs`
-(or `~/.local/share/AmethystModManager/lod-runs`). No work folder is created by
-planning. Custom paths must be new and outside game, profile, staging,
-application and prefix folders. Generation writes into its `files` subfolder,
-then imports those files as a mod, as required by the
+`output_mod`, `direct_output` and an absolute `output_path`. By default the
+output path is the new numbered mod folder in staging, and `direct_output` is
+true. Planning creates no folder or modlist entry. Execution reserves that
+folder exclusively, registers it disabled and generates files directly into
+it. After generation and Restore succeed, validated output is indexed and
+its mod is enabled. No output copy is required. Failed or cancelled runs keep
+their new folder disabled for inspection and manual recovery.
+
+Before launch, saved TexGen/DynDOLOD presets for the selected game have their
+`OutputPath` synchronized with this run, preserving other options. Keep the
+selected output path when manually loading presets from other locations.
+Choose Exit or Save & Exit without zipping:
+the tool's Zip & Exit option clears the loose output folder, as described in
+the [DynDOLOD generation instructions](https://dyndolod.info/Generation-Instructions).
+See also the
 [upstream output guidance](https://github.com/sheson/xLODGen/blob/main/README.md).
 Profile groups must select a concrete profile to own the new output.
+
+Custom external `output_path` values remain supported for compatibility:
+they must be new and outside game, profile, staging, application and prefix
+folders. These runs report `direct_output:false`, generate into a `files`
+subfolder and import the result as a new numbered staging mod after success.
 
 ```json
 {"jsonrpc":"2.0","id":"run-lod","method":"tools.lod.run.start","params":{"game":"skyrim_se","profile":"default","tool_id":"run_xlodgen_skyrimse","revision":"revision-from-tools.list","output_path":"/absolute/work/folder/from-plan","plan_revision":"revision-from-run-plan","confirm":true}}
@@ -2344,18 +2508,29 @@ leases remain held through preparation, the complete tool process, deployment
 recovery and output registration. Cancellation stops the managed tool and
 performs recovery before reporting a terminal job state.
 
-A zero exit code and nonempty validated output are required for import. Links,
-special files and case collisions are rejected. Import replaces the entire
-selected output mod, registers it at highest priority as an enabled data mod,
-indexes its files and synchronizes generated plugins. The result reports
+Source scans exclude Wine runtime folders (`prefix_*`, `pfx`, `drive_c` and
+`dosdevices`) before resolving their contents, while retaining legitimate mod
+and deployed-file links. Planning logs identify each source root, scan counts,
+elapsed time and the current directory during long scans. Filesystem failures include `reason`,
+`exception_type`, `errno`, `filename` and inspection `notes` when available.
+The desktop wizard also logs the chained traceback and displays the underlying
+reason alongside the launch error.
+
+A zero exit code and nonempty validated output are required for completion. Links,
+special files and case collisions are rejected. The output mod is registered
+at highest priority as a data mod and enabled only after successful validation,
+indexing and plugin synchronization. The result reports
 `output_mod`, `file_count`, `restored`, `output_retained` and
-`needs_deployment:true`. Deploy again to use the generated output. Successful
-imports remove their work folder; failed or cancelled runs retain it for
-inspection or manual recovery and report its path. Registration rollback
-preserves external edits and identifies the retained original backup when
-recovery cannot safely finish. Index/plugin synchronization failures report
-`lod_output_sync_failed` with the installed mod and `state_persisted:true`.
-The desktop wizard uses the same run, import and recovery paths.
+`needs_deployment:true`. A direct output folder that becomes occupied before
+execution is rejected; existing mods are never replaced. Deploy again to use
+the generated output. Direct outputs remain in staging and report
+`output_retained:true`. Successful external-folder imports remove their work
+folder; failed or cancelled runs retain it and report its path.
+Index/plugin synchronization failures report
+`lod_output_sync_failed` with the retained mod and `state_persisted:true`.
+The desktop wizard uses the same run, registration and recovery paths.
+It refreshes the modlist and plugins automatically after successful generation
+or a failed run that retains a new staging mod.
 
 ### Install an xEdit application
 
@@ -2984,9 +3159,10 @@ Poll the job for `result.version_catalog` and `rate_limits`. The catalogue
 includes the installed domain/mod/file identity, version, requested mod,
 resolved owner, affected profiles, and `revision`. Files include descriptions,
 categories, sizes, upload times, and `installed`, `recommended`, and
-`older_match` flags. Name matching and category ordering use the same helpers
-as the desktop Change Version window. A recommendation is a filename-family
-match; it does not establish compatibility with the other installed mods.
+`older_match` flags. Recommendations use the same update-group resolver and
+category fallback as the desktop Change Version window. `update_source`
+explains the selection; `update_error` reports an incomplete check. A
+recommendation does not establish compatibility with other installed mods.
 
 Choose an exact `file_id` from that catalogue:
 
@@ -3060,10 +3236,11 @@ live file catalogues. Other sources are unsupported by Quick Update.
 
 Omitting `mods` considers only Nexus mods with a saved pending-update flag.
 An explicit selection also checks unflagged mods. Both respect update ignores
-and ignored versions. The newest file in the installed file's display-name
-family is selected using the desktop matcher; renamed local folders retain
-that family when the installed file is still listed. A mod without a suitable
-name match is skipped and can use Change Version instead.
+and ignored versions. Nexus v3 update groups identify later active releases,
+including renamed files and replacement uploads with unchanged version strings.
+When group data is unavailable, the shared desktop resolver uses saved file
+categories and matching names. Unconfirmed successors are skipped and can use
+Change Version instead. Failed checks appear in `failed`.
 
 Execute with the same selection and the returned revision:
 
@@ -3107,6 +3284,96 @@ replacement completes its atomic operation before pausing or cancelling.
 Cancellation after acquisition starts reports the same partial summary under
 `error.details.quick_update`; cancellation while replanning can stop before
 that summary exists. The planning job itself is not cancellable.
+
+### Hexium
+
+Handlers expose `hexium_community` and the `hexium` capability when enabled.
+Valheim currently opts in with `hexium_community:"valheim"`. Other built-in,
+plugin, and custom handlers can declare their own Hexium community without
+changes to the repository integration. Community slugs are carried through
+catalogues, versions, updates, downloads, metadata, and profile imports.
+Thunderstore fallback dependencies use the handler's separate Thunderstore
+community and are unavailable when that integration is disabled.
+Hexium reads and downloads require no login. The following jobs mirror the
+Thunderstore package workflows:
+
+- `hexium.packages.search.start`: `game`, optional `query`, `page`, `sort`,
+  `included_categories`, `excluded_categories`, `include_adult`, and
+  `include_deprecated`. Pages are zero-based, with 20 packages per page.
+- `hexium.packages.filters.start`: `game`; returns category names as IDs and
+  an empty sections list.
+- `hexium.packages.versions.start`: `game`, `namespace`, `package`.
+- `hexium.download.start`: `game`, `namespace`, `package`, `version`;
+  supports pause, resume, and cancellation.
+- `hexium.install.plan.start`: `game`, `profile`, `namespace`, `package`,
+  `version`; returns a revision-checked dependency-first installation plan.
+- `hexium.install.start`: `game`, `profile`, `plan_id`, `revision`,
+  `confirm:true`; accepts the existing dependency selection, replacement,
+  and installer options.
+
+For example:
+
+```json
+{"jsonrpc":"2.0","id":"hex-plan","method":"hexium.install.plan.start","params":{"game":"Valheim","profile":"default","namespace":"ExampleTeam","package":"ExampleMod","version":"1.2.3"}}
+```
+
+The plan identifies each package's `source`, `source_switch`, `fallback`,
+installed identity, and affected profiles. Missing Hexium dependencies may be
+proposed from Thunderstore. Applying a plan with those dependencies requires
+`allow_thunderstore_fallback:true`. Replacing a package from the other store
+requires `allow_source_switch:true` and `if_exists:"replace"`. These approvals
+apply to the selected members of the reviewed plan; new library changes require
+a new plan. Skipping a dependency is explicit and appears in the result.
+
+```json
+{"jsonrpc":"2.0","id":"hex-install","method":"hexium.install.start","params":{"game":"Valheim","profile":"default","plan_id":"<plan id>","revision":"<plan revision>","confirm":true,"if_exists":"replace","allow_source_switch":true,"allow_thunderstore_fallback":true}}
+```
+
+Installed Hexium mods use `source:"hexium"` in `mods.versions.get.start`,
+`mods.version.change.start`, and their shared batch workflows. Select a
+`version`, rather than a Nexus `file_id`. Rollback retains the previous store's
+identity and consumes the saved target after a successful rollback. Update
+checks accept `sources:["hexium"]` and return `hexium_updates` and
+`hexium_unknown` separately from Thunderstore results. The default update
+check includes Hexium for handlers declaring a Hexium community. Installed
+inventory exposes `sources.hexium`.
+
+Stable releases are recommended by default. The persisted
+`hexium_include_prereleases` setting, available through `settings.get` and
+`settings.set.start`, also controls the desktop browser and update checks.
+Exact version selections and profile imports can pin supported
+`-alpha.N`, `-beta.N`, and `-rc.N` versions. Automatic recommendations never
+downgrade an installed version.
+
+Managed archives have source-specific `hexium-namespace-package-version.zip`
+names and `.hexium.json` sidecars. `downloads.list` exposes the identity as
+`hexium`; archive movement and removal include the sidecar. Download and install
+validate the declared size, ZIP contents, and manifest identity. A retained
+archive can be installed through the shared Downloads APIs. An ordinary retained
+archive installation cannot silently change an installed package's store; review
+that replacement through the dependency-plan APIs. Thunderstore plans also accept
+`allow_source_switch:true` for an explicitly reviewed switch back to Thunderstore.
+Hexium does not provide a
+published checksum through this integration.
+
+`hexium.mods.identify.start` accepts `game`, `profile`, optional `confirm`, and
+optional `identities`, an object mapping installed folder names to publishing
+team names. The default previews matching candidates without stamping metadata.
+With `confirm:true`, unambiguous matches and explicitly selected candidates are
+saved. Existing store-owned mods are left unchanged.
+
+`hexium.profiles.share.download.start` accepts `game` and a UUID `code`. It
+retrieves the profile from Hexium, trying Thunderstore only if Hexium returns
+404, and returns a local `.r2z` `path` and manifest preview. The desktop share-code
+menus likewise try their selected server first, then the other server on 404.
+Each mod retains its declared repository source. Pass that path to
+`collections.import.start` for installation into a
+new profile. `.r2x`, `.txt`, `.r2z`, Amethyst profile archives, and Amethyst share
+manifests preserve Hexium and Thunderstore sources per entry. Missing legacy
+source fields mean Thunderstore. Imports preserve exact pins, order and enabled
+state, and `.r2z` imports restore supported bundled configurations into the
+isolated profile. A legacy version object containing only major/minor/patch
+cannot recover a prerelease qualifier absent from the file.
 
 ### Thunderstore versions and downloads
 
@@ -3414,6 +3681,9 @@ nonfatal `source_errors`, and current Nexus rate-limit
 information when Nexus was queried. The checkers persist their update state in
 the existing `meta.ini` files, so a later `mods.list` reflects the refreshed
 state. The job does not download, install, reorder, enable, or deploy anything.
+Nexus checks use batched v3 update-group positions when available, retaining
+saved file categories as a fallback. Incomplete checks contribute per-mod
+`source_errors` with the domain and reason and preserve previous update flags.
 For Nexus updates, use the returned exact IDs with the normal Nexus download
 and archive-install methods, or query `nexus.mods.files.start` when no latest
 file ID is available.

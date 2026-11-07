@@ -47,12 +47,12 @@ def _context(game, profile, mod, revision=None, source="nexus", *, ignore_downlo
         if modio is None or modio.mod_id <= 0:
             raise JobError("mod_version_source_unavailable", "This mod has no Baldur's Gate 3 mod.io identity.")
         return context
-    if source == "thunderstore":
+    if source in {"thunderstore", "hexium"}:
         from .thunderstore import package_link
-        community = getattr(game, "thunderstore_community", "") or ""
-        if not thunderstore.package_id or not community:
+        community = getattr(game, f"{source}_community", "") or ""
+        if not thunderstore.package_id or thunderstore.source != source or not community:
             raise JobError("mod_version_source_unavailable", "This mod has no Thunderstore identity for the selected game.")
-        package_link(thunderstore.namespace, thunderstore.name, "0.0.0", community)
+        package_link(thunderstore.namespace, thunderstore.name, "0.0.0", community, source=source)
         context["community"] = community
         return context
     domains = getattr(game, "nexus_game_domains", ()) or ()
@@ -79,9 +79,9 @@ def _binding(context):
         modio = context["modio_meta"]
         identity = {"source": "modio", "game_id": GAME_ID, "mod_id": modio.mod_id,
                     "installed_file_id": modio.file_id or None, "installed_version": modio.version or None}
-    elif context.get("source", "nexus") == "thunderstore":
+    elif context.get("source", "nexus") in {"thunderstore", "hexium"}:
         ts = context["thunderstore_meta"]
-        identity = {"source": "thunderstore", "community": context["community"],
+        identity = {"source": context["source"], "community": context["community"],
                     "namespace": ts.namespace, "package": ts.name,
                     "installed_version": ts.version or None, "installed_full_name": ts.full_name or None}
     else:
@@ -106,10 +106,12 @@ def _selected_target(game, context):
     return selected
 
 
-def versions_runner(session, game, profile, mod, source="nexus", *, operation_locked=False, ignore_download_history=False):
+def versions_runner(session, game, profile, mod, source="nexus", *, operation_locked=False,
+                    ignore_download_history=False, update_resolver=None):
     def run(_log, progress):
         from Utils.operations import acquire_game_operation
-        from Utils.mods.versions import resolve_latest_name_match, sort_key
+        from Utils.mods.versions import sort_key
+        from Nexus.nexus_updates import NexusUpdateResolver
 
         def operation():
             with (nullcontext() if operation_locked else acquire_game_operation(game, "mods.versions.get")):
@@ -127,7 +129,7 @@ def versions_runner(session, game, profile, mod, source="nexus", *, operation_lo
                     _selected_target(game, context)
                     progress(1, 1, "Mod versions ready")
                     return {"version_catalog": {**_binding(context), "revision": context["properties"]["revision"], **catalog}}
-                if source == "thunderstore":
+                if source in {"thunderstore", "hexium"}:
                     from .thunderstore import version_catalog
                     catalog = version_catalog(context)
                     _context(game, profile, mod, context["properties"]["revision"], source)
@@ -139,9 +141,14 @@ def versions_runner(session, game, profile, mod, source="nexus", *, operation_lo
                 listing = cached_read(("nexus.files", context["domain"], context["nexus_meta"].mod_id),
                                       lambda: api.get_mod_files(context["domain"], context["nexus_meta"].mod_id))
                 installed = context["nexus_meta"].file_id
-                match, old = resolve_latest_name_match(listing.files, installed, context["target_mod"])
+                resolver = update_resolver or NexusUpdateResolver(api, _log)
+                resolver.prepare(context["domain"], [(context["nexus_meta"], listing.files)], history=True)
+                resolution = resolver.resolve(context["domain"], context["nexus_meta"], listing.files)
+                match, old = resolution.match_id, resolution.old_ids
+                recommended = (match if resolution.has_update and resolution.automatic
+                               and match > 0 and match != installed else None)
                 files = [{**_file(file), "installed": file.file_id == installed,
-                          "recommended": file.file_id == match and match != installed,
+                          "recommended": file.file_id == recommended,
                           "older_match": file.file_id in old}
                          for file in sorted(listing.files, key=sort_key)]
                 _context(game, profile, mod, context["properties"]["revision"],
@@ -149,7 +156,9 @@ def versions_runner(session, game, profile, mod, source="nexus", *, operation_lo
                 _selected_target(game, context)
                 progress(1, 1, "Mod versions ready")
                 return {"version_catalog": {**_binding(context), "revision": context["properties"]["revision"],
-                                            "recommended_file_id": match if match > 0 and match != installed else None,
+                                            "recommended_file_id": recommended,
+                                            "update_source": resolution.source,
+                                            "update_error": resolution.error or None,
                                             "files": files},
                         "rate_limits": _rate_limits(api)}
         return _call(operation)
@@ -356,13 +365,13 @@ def _refresh(game, context, log, progress, *, materialize, plugins=None):
     return synced, failures
 
 
-def _stamp_sources(context, path, thunderstore_meta=None, modio_meta=None):
+def _stamp_sources(context, path, thunderstore_meta=None, modio_meta=None, *, replace_source=False):
     from dataclasses import fields
     from Thunderstore.thunderstore_meta import read_meta, write_meta
 
     expected = thunderstore_meta or context.get("thunderstore_meta")
     if expected is not None:
-        write_meta(path, expected)
+        write_meta(path, expected, replace_source=replace_source or context.get("operation") == "rollback")
         actual = read_meta(path)
         if any(getattr(actual, field.name) != getattr(expected, field.name)
                for field in fields(expected) if field.name != "mod_name"):
@@ -405,7 +414,7 @@ def _apply_change(game, profile, mod, revision, options, context, metadata, arch
         _selected_target(selected, context)
         if verify_dependencies is not None:
             verify_dependencies()
-        if context.get("source", "nexus") in {"nexus", "thunderstore"}:
+        if context.get("source", "nexus") in {"nexus", "thunderstore", "hexium"}:
             from Utils.mods.version_history import VersionChangeContext
             history = VersionChangeContext.capture(
                 selected, context["target_profile"], context["target_mod"],
@@ -417,6 +426,7 @@ def _apply_change(game, profile, mod, revision, options, context, metadata, arch
         from Utils.mods.modlist import read_modlist
         _stamp_sources(context, context["staging"] / name / "meta.ini", thunderstore_meta, modio_meta)
         if history is not None:
+            history.target_thunderstore = thunderstore_meta
             history.commit(context["staging"] / name / "meta.ini")
         actual = read_meta(context["staging"] / name / "meta.ini")
         verify_source(actual)
@@ -500,13 +510,16 @@ def change_runner(session, game, profile, mod, revision, file_id, options, nxm_l
                         game, profile, mod, revision, options, context, metadata, archive,
                         lambda archive_id: retained_archive(game, profile, mod_id, file, archive_id),
                         lambda _actual: None, {"file_id": file_id}, log, progress, modio_meta=fresh)
-                if source == "thunderstore":
+                if source in {"thunderstore", "hexium"}:
                     from .thunderstore import (
                         download, dependency_report, package_link, retained_archive,
                         version_catalog, version_metadata,
                     )
                     ts = context["thunderstore_meta"]
-                    link = package_link(ts.namespace, ts.name, version, context["community"])
+                    if source == "hexium":
+                        from Thunderstore.repositories import catalogue
+                        catalogue(context["community"], force=True)
+                    link = package_link(ts.namespace, ts.name, version, context["community"], source=source)
                     catalog = version_catalog(context)
                     if not any(item["version"] == version for item in catalog["versions"]):
                         raise JobError("mod_version_not_found", "The selected Thunderstore version is not in the current catalogue.")

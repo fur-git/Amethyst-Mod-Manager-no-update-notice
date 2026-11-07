@@ -152,6 +152,8 @@ def _specs():
         add(key, "downloads" if key == "nexus_download_server" else "appearance",
             getattr(uc, "load_" + key), getattr(uc, "save_" + key),
             {"type": "string", "enum": choices}, restart=key == "language")
+    add("nexus_install_name", "archives", uc.load_nexus_install_name, uc.save_nexus_install_name,
+        {"type": "string", "enum": list(uc.NEXUS_INSTALL_NAME_MODES)})
     add("ui_scale", "appearance", _scale, _save_scale,
         {"oneOf": [{"const": "auto"}, {"type": "number", "minimum": 0.5, "maximum": 2}]},
         validate=_validate_scale, restart=True)
@@ -171,6 +173,10 @@ def _specs():
                         "low_priority": {"type": "boolean"}}.items():
         add("extraction_" + key, "extraction", lambda key=key: uc.load_extraction_settings()[key],
             getattr(uc, "save_extraction_" + key), schema)
+    add("hexium_include_prereleases", "appearance",
+        lambda: uc.load_thunderstore_flag("hexium_include_prereleases"),
+        lambda value: uc.save_thunderstore_flag("hexium_include_prereleases", value),
+        {"type": "boolean"})
     add("hidden_header_buttons", "appearance", lambda: sorted(uc.load_hidden_header_buttons()),
         uc.save_hidden_header_buttons, {"type": "array", "items": {"enum": list(uc._HIDEABLE_HEADER_BUTTONS)},
                                       "uniqueItems": True, "maxItems": len(uc._HIDEABLE_HEADER_BUTTONS)},

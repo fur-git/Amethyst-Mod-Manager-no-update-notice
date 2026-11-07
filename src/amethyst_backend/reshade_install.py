@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from Utils.games.instances import instance_id
+
 import hashlib
 import json
 import re
@@ -167,18 +169,17 @@ def _materialize(root, dll, bundle, dll_name, mode, metadata, cancel):
 @contextmanager
 def _prepared(game, profile, dll_path, shader_path, dll_name, mode, cancel):
     from Utils.wizards.payload import PreparedPayload, archive_token
-    from Utils.wizards.reshade import API_CHOICES
+    from Utils.wizards.reshade import API_CHOICES, resolve_install_subdir
 
     if dll_name not in {name for _label, name in API_CHOICES}:
         raise JobError("invalid_reshade_dll", "Choose a ReShade proxy DLL from the options API.")
     selected = _selected_game(game, profile)
     if not selected.is_configured():
         raise JobError("game_not_configured", "Configure the game before installing ReShade.")
-    game_path = selected.get_game_path()
-    subdir = selected.reshade_install_subdir(game_path)
-    subdir = Path(subdir) if subdir is not None else Path(".")
-    if subdir.is_absolute() or any(part in ("..", "") for part in subdir.parts):
-        raise JobError("invalid_reshade_destination", "The game's ReShade install folder is unsafe.")
+    try:
+        subdir = resolve_install_subdir(selected, "root_folder" if mode == "root" else mode)
+    except (ValueError, RuntimeError) as exc:
+        raise JobError("invalid_reshade_destination", str(exc)) from exc
     dll, dll_meta, dll_state = _source(dll_path, "reshade_dll", cancel)
     bundle, shader_meta, shader_state = _source(shader_path, "reshade_shaders", cancel)
     with tempfile.TemporaryDirectory(prefix="amethyst-reshade-install-") as raw:
@@ -210,7 +211,7 @@ def _plan(selected, payload, bundle, dll_meta, shader_meta, dll_state, shader_st
                           "sha256": shader_meta["sha256"],
                           "missing_effects": shader_meta.get("missing_effects", [])}}
     snapshot = {
-        "game": str(selected.game_id), "profile": profile.name, "mode": mode,
+        "game": str(instance_id(selected)), "profile": profile.name, "mode": mode,
         "mod_name": name, "dll_name": dll_name, "preset_name": preset_name,
         "source": source, "destination": str(target), "files": [str(p) for p in payload.files],
         "replace_trees": [str(path) for path in payload.replace_trees],
@@ -226,7 +227,7 @@ def _plan(selected, payload, bundle, dll_meta, shader_meta, dll_state, shader_st
     }
     revision = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     return {
-        "revision": revision, "game": str(selected.game_id), "profile": profile.name,
+        "revision": revision, "game": str(instance_id(selected)), "profile": profile.name,
         "mode": mode, "dll_name": dll_name, "preset_name": preset_name,
         "sources": source,
         "destination": {"path": str(target), "label": label, "mod_name": name,
@@ -354,7 +355,7 @@ def install_runner(game, profile, dll_path, shader_path, dll_name, mode,
                            {"reason": str(exc), "restore_attempted": restore_started,
                             "state_persisted": restore_started}) from exc
         progress(1, 1, "install_reshade")
-        return {"ok": True, "game": str(game.game_id), "profile": profile.name,
+        return {"ok": True, "game": str(instance_id(game)), "profile": profile.name,
                 "destination": {"path": current["destination"]["path"],
                                 "label": label, "mod_name": name,
                                 "replaced_trees": current["destination"]["replaces_trees"],

@@ -1129,7 +1129,8 @@ def run_collection_install(
                     seen.add(_xp)
         return dirs
     # Re-reading every sidecar for every mod makes large collections quadratic.
-    _automatic_scan_dirs = _scan_dirs() if not manual_mode else []
+    _automatic_scan_dirs = (_scan_dirs(include_all=manual_mode)
+                            if manual_archive_paths is None else [])
     _archive_index = ArchiveLookupIndex(_automatic_scan_dirs)
     _PIPELINE_QUEUE_SIZE = max(
         _DL_WORKERS + _INSTALL_POOL_SIZE + 8, 32, len(to_download))
@@ -1913,7 +1914,7 @@ def run_collection_install(
         _manual_real_file[mod.file_id] = (real_name, real_size)
         return real_name, real_size
 
-    def _wait_for_manual_file(mod, request_id: int) -> "Path | None":
+    def _wait_for_manual_file(mod, request_id: int, prompt: dict) -> "Path | None":
         """Poll download folders until the mod's archive appears, or the user
         picks a file / skips / pauses / cancels."""
         if manual_archive_paths is not None:
@@ -1948,6 +1949,7 @@ def run_collection_install(
                            Path(_real_name).stem,
                            str(_eff_mod_id) if _eff_mod_id else "")
                        if _real_name else (mod.file_name or mod.mod_name or ""))
+        prompted = False
         while not _col_stop.is_set():
             try:
                 item = ctl.manual_queue.get_nowait()
@@ -1982,6 +1984,9 @@ def run_collection_install(
                     expected_md5=_exp_md5)
                 if found and is_complete:
                     return found
+            if not prompted:
+                cb.on_manual_mod(prompt)
+                prompted = True
             _col_stop.wait(2.0)
         return None  # paused / cancelled
 
@@ -1991,6 +1996,18 @@ def run_collection_install(
             if (manual_archive_paths is None
                     and getattr(pending_mod, "_policy_exact_unavailable", False)):
                 _use_prefer_fallback(pending_mod)
+        cached_results = {}
+        if manual_archive_paths is None:
+            _set_status("Checking downloaded archives…")
+            cached, _missing = _plan_cached_archives(mods_seq)
+            cached_results = {mod.file_id: result for mod, result in cached}
+            ordered = []
+            for _phase, phase_mods in _itertools.groupby(
+                    mods_seq, key=lambda m: schema_file_id_to_phase.get(m.file_id, 0)):
+                ordered.extend(sorted(phase_mods, key=lambda m:
+                    (0, *_install_priority(m, cached_results[m.file_id]))
+                    if m.file_id in cached_results else (1, 0, 0)))
+            mods_seq = ordered
         _current_phase: "int | None" = None
         for i, mod in enumerate(mods_seq):
             mod_domain = _effective_mod_domain(mod)
@@ -2010,12 +2027,16 @@ def run_collection_install(
                     f"phase {_current_phase} → {_this_phase}")
             _current_phase = _this_phase
 
+            if mod.file_id in cached_results:
+                _download_one(mod, ("cached", cached_results[mod.file_id]))
+                continue
+
             if manual_archive_paths is not None:
                 _supplied = manual_archive_paths[mod.file_id]
                 _real_name, _real_size = _supplied.name, _supplied.stat().st_size
             else:
                 _real_name, _real_size = _resolve_manual_file(mod)
-            cb.on_manual_mod({
+            prompt = {
                 "request_id": i + 1,
                 "file_id": mod.file_id,
                 "idx": _pre_done + i + 1,
@@ -2030,9 +2051,9 @@ def run_collection_install(
                 "url": _manual_url(mod),
                 "upcoming": [(m.mod_name or f"Mod {m.mod_id}", _manual_url(m))
                              for m in mods_seq[i + 1:i + 5]],
-            })
+            }
 
-            archive = _wait_for_manual_file(mod, i + 1)
+            archive = _wait_for_manual_file(mod, i + 1, prompt)
             cb.on_manual_resolved(i + 1)
             if _col_stop.is_set():
                 with _dl_lock:
@@ -2830,7 +2851,7 @@ def _apply_schema_disabled_mods(modlist_path, collection_schema,
         if m.get("enabled") is not False:
             continue
         folder = ""
-        if (m.get("source") or {}).get("type") == "thunderstore":
+        if (m.get("source") or {}).get("type") in {"thunderstore", "hexium"}:
             folder = preinstalled_by_index.get(index, "")
         fid = (m.get("source") or {}).get("fileId")
         if fid is not None:

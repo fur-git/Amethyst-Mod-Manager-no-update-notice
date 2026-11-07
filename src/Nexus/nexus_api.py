@@ -1883,7 +1883,29 @@ class NexusAPI:
             app_log(f"GraphQL requirements query error: {exc}")
             return []
 
-    # -- File-level requirements (REST v3, experimental) ---------------------
+    # -- File versions and requirements (REST v3, experimental) --------------
+
+    def get_mod_file_versions_batch(self, version_uids: list[int]) -> dict[int, dict]:
+        """Resolve file versions to their update groups and ordered positions."""
+        out: dict[int, dict] = {}
+        version_uids = list(dict.fromkeys(version_uids))
+        for start in range(0, len(version_uids), 2000):
+            chunk = version_uids[start:start + 2000]
+            wanted = set(chunk)
+            try:
+                data = self._post_v3(
+                    "/mod-file-versions/batch",
+                    {"version_ids": [str(uid) for uid in chunk]})
+                for row in (data.get("data") or {}).get("versions") or []:
+                    try:
+                        uid = int(row.get("id") or 0)
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    if uid in wanted:
+                        out[uid] = row
+            except (NexusAPIError, AttributeError, TypeError, ValueError) as exc:
+                app_log(f"v3 file version batch failed: {exc}")
+        return out
 
     def get_file_dependency_candidates_batch(
         self,
@@ -3194,6 +3216,53 @@ class NexusAPI:
         except Exception as exc:
             app_log(f"GraphQL get_collection_detail error: {exc}")
             return ("", 0, 0, [], "", [], {})
+
+    def get_wabbajack_collection_download(self, slug: str, revision: int | None = None) -> dict:
+        from urllib.parse import urljoin, urlsplit
+
+        self._refresh_oauth_if_needed()
+        headers = dict(self._session.headers)
+        query = """
+        query WabbajackCollectionRevision($slug: String!, $revision: Int) {
+            collectionRevision(slug: $slug, revision: $revision) {
+                revisionNumber collectionSchemaId downloadLink
+                collection { name game { domainName } }
+            }
+        }
+        """
+        response = requests.post(
+            GRAPHQL_BASE, json={"query": query, "variables": {
+                "slug": slug, "revision": revision}}, headers=headers,
+            timeout=self._timeout, verify=self._session.verify)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("errors"):
+            raise ValueError("Nexus could not retrieve this Wabbajack collection revision.")
+        item = (payload.get("data") or {}).get("collectionRevision") or {}
+        if int(item.get("collectionSchemaId") or 0) != 2:
+            raise ValueError("This revision is not a Wabbajack collection.")
+        actual_revision = int(item.get("revisionNumber") or 0)
+        if actual_revision <= 0 or revision is not None and revision != actual_revision:
+            raise ValueError("Nexus did not return the requested collection revision.")
+        collection = item.get("collection") or {}
+        domain = (collection.get("game") or {}).get("domainName") or ""
+        link = item.get("downloadLink") or ""
+        if not domain or not link:
+            raise ValueError("This Wabbajack revision has no game or package download.")
+        api_url = urljoin("https://api.nexusmods.com/", link)
+        parsed = urlsplit(api_url)
+        if (parsed.scheme != "https" or parsed.netloc != "api.nexusmods.com"):
+            raise ValueError("Nexus returned an invalid collection download link.")
+        response = requests.get(api_url, headers=headers, timeout=self._timeout,
+                                verify=self._session.verify, allow_redirects=False)
+        response.raise_for_status()
+        urls = [entry["URI"] for entry in response.json().get("download_links", [])
+                if isinstance(entry, dict) and isinstance(entry.get("URI"), str)
+                and urlsplit(entry["URI"]).scheme == "https"]
+        if not urls:
+            raise ValueError("Nexus returned no download for this Wabbajack revision.")
+        return {"slug": slug, "revision": actual_revision, "game_domain": domain,
+                "name": collection.get("name") or slug, "download_urls": urls}
 
     def get_collection_archive_json(
         self, download_link_path: str,

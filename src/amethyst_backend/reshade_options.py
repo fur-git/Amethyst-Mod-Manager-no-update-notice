@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from Utils.games.instances import instance_id
+
 from pathlib import Path
 
 from .jobs import JobError
@@ -14,6 +16,7 @@ def options(game, profile):
     from Utils.wine.registry import normalize_pfx
     from Utils.wizards.reshade import (
         API_CHOICES, OPTIONAL_SHADER_PACKS, RESHADE_HOME_URL, SHADER_BASE_URL,
+        resolve_install_subdir,
     )
 
     with read_only_profile_state():
@@ -23,10 +26,11 @@ def options(game, profile):
         game_path = selected.get_game_path()
         if game_path is None:
             raise JobError("game_not_configured", "The game path is not configured.")
-        subdir = selected.reshade_install_subdir(game_path)
-        subdir = Path(subdir) if subdir is not None else Path(".")
-        if subdir.is_absolute() or ".." in subdir.parts:
-            raise JobError("invalid_reshade_destination", "The game's ReShade install folder is unsafe.")
+        try:
+            subdir = resolve_install_subdir(selected, "game")
+            root_subdir = resolve_install_subdir(selected, "root_folder")
+        except (ValueError, RuntimeError) as exc:
+            raise JobError("invalid_reshade_destination", str(exc)) from exc
 
         dll_choices = {dll for _, dll in API_CHOICES}
         default_dll = selected.reshade_dll
@@ -44,7 +48,7 @@ def options(game, profile):
         mod_staging = selected.get_effective_mod_staging_path()
         group = is_group(profile)
         return {
-            "game": {"id": str(selected.game_id), "name": str(selected.name)},
+            "game": {"id": str(instance_id(selected)), "name": str(selected.name)},
             "profile": profile.name,
             "source_page": RESHADE_HOME_URL,
             "shader_base_url": SHADER_BASE_URL,
@@ -61,7 +65,7 @@ def options(game, profile):
             "install_subdir": "" if subdir == Path(".") else str(subdir),
             "install_modes": [
                 {"mode": "game", "path": str(game_path / subdir), "available": True},
-                {"mode": "root_folder", "path": str(selected.get_effective_root_folder_path() / subdir),
+                {"mode": "root_folder", "path": str(selected.get_effective_root_folder_path() / root_subdir),
                  "available": True},
                 {"mode": "mod", "staging_path": str(mod_staging) if mod_staging else None,
                  "requires_mod_name": True, "available": bool(mod_staging) and not group},

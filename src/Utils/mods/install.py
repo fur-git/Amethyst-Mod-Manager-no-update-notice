@@ -619,7 +619,8 @@ def try_auto_strip_for_file_types(
 
 
 def stage_file_list(game, extract_dir: str, *, is_root_install: bool = False,
-                    mod_name: str = "", on_need_prefix=None,
+                    mod_name: str = "", on_need_prefix=None, install_state=None,
+                    install_rules_enabled: bool = True,
                     log_fn: LogFn = lambda _m: None
                     ) -> list[tuple[str, str, bool]] | None:
     """Build + normalise the (src, dst, is_folder) list for a non-FOMOD mod under
@@ -628,7 +629,7 @@ def stage_file_list(game, extract_dir: str, *, is_root_install: bool = False,
 
       strip_prefixes → mod_install_prefix → required-top-level check →
       auto-strip folders → auto-strip to a required file type →
-      (unrecognised, not install-as-is) on_need_prefix() → post-strip.
+      (unrecognised, not install-as-is) on_need_prefix() → post-strip → install rules.
 
     *on_need_prefix(required, file_list, mod_name) -> str | None* supplies the
     prefix interactively (the toolkit shows a dialog); returning None cancels the
@@ -736,6 +737,21 @@ def stage_file_list(game, extract_dir: str, *, is_root_install: bool = False,
                 if d.replace("\\", "/").strip("/").lower() != "meta.ini"]
     if len(filtered) != len(file_list):
         log_fn("Skipped bundled meta.ini from archive (Amethyst writes its own).")
+    from Utils.games.install_rules import get_rules
+    rules = get_rules(game) if install_rules_enabled else []
+    if rules:
+        from Utils.mods.install_rules import InstallRuleConflict, apply_install_rules
+        state = dict(install_state) if install_state is not None else {}
+        try:
+            mapped = apply_install_rules(filtered, rules, mod_name, state)
+        except InstallRuleConflict as exc:
+            log_fn(f"Skipped all install rules for '{mod_name}': {exc}. "
+                   "Installing with the layout from before install rules.")
+        else:
+            filtered = mapped
+            if install_state is not None:
+                install_state.update(state)
+            log_fn("Applied plain-archive install rules.")
     return filtered
 
 
@@ -1337,6 +1353,21 @@ def _extract_archive(archive_path: str, dest_dir: str, log_fn: LogFn,
             return False
     if _cancelled():
         return False
+    unrar = shutil.which("unrar") if archive_type.value == "rar" else None
+    if unrar:
+        rc, err, killed = _run_extractor_cancellable(
+            [unrar, "x", "-p-", "-o+", "--", archive_path, str(destination) + os.sep],
+            cancel, low_priority=_low_prio, priority_path=dest_dir)
+        if killed:
+            log_fn("Extraction cancelled (unrar terminated).")
+            return False
+        if rc == 0:
+            log_fn("Extracted with unrar.")
+            return _ok()
+        _note(err)
+        log_fn(f"unrar failed ({err.strip()}).")
+        if not _retry(err, rc, unrar):
+            return False
     if shutil.which("bsdtar"):
         rc, err, killed = _run_extractor_cancellable(
             ["bsdtar", "-xf", archive_path, "-C", dest_dir], cancel,
@@ -1550,7 +1581,7 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
                     archive_probe: "ArchiveProbe | None" = None,
                     load_fomod_context: bool = True,
                     detect_installers: bool = True,
-                    version_change=None,
+                    version_change=None, allow_repository_switch=False,
                     ) -> PreparedInstall | None:
     """Extract *archive_path* to a kept temp dir and detect FOMOD. The caller
     either runs the wizard (is_fomod) then `finish_install(prepared, selections)`,
@@ -1567,7 +1598,7 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
     plugin_source = read_source(archive, verify=True, cancel=cancel)
     if plugin_source is not None:
         if any(archive.with_suffix(archive.suffix + suffix).exists() for suffix in (
-                ".fileid", ".nexus.json", ".thunderstore.json", ".modio.json", ".tool.json")):
+                ".fileid", ".nexus.json", ".thunderstore.json", ".hexium.json", ".modio.json", ".tool.json")):
             raise ValueError("The archive has conflicting download-source sidecars.")
         if prebuilt_meta is None:
             from Nexus.nexus_meta import NexusModMeta
@@ -1584,23 +1615,52 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
         if prebuilt_meta.workshop_app_id != workshop_app_id(game):
             log_fn("Install: this Workshop mod belongs to a different game.")
             return None
+    repository_record = None
+    repository_sources = [source for source in ("thunderstore", "hexium")
+                          if archive.with_suffix(archive.suffix + f".{source}.json").exists()]
+    if repository_sources:
+        if len(repository_sources) != 1 or any(archive.with_suffix(archive.suffix + suffix).exists() for suffix in (".modio.json", ".nexus.json", ".plugin.json")):
+            raise ValueError("The archive has conflicting repository sidecars")
+        from amethyst_backend.thunderstore import downloaded_metadata
+        repository_record = downloaded_metadata(archive, game, source=repository_sources[0])
+        if prebuilt_meta is None:
+            prebuilt_meta = repository_record[0]
+
+    def with_repository(prepared):
+        if repository_record is not None:
+            if prepared.is_multi_mod() or prepared.is_bundle():
+                prepared.cleanup()
+                raise ValueError("A managed package must install as one mod")
+            prepared.repository_record = repository_record
+            prepared.allow_repository_switch = allow_repository_switch
+        return prepared
+
     # Resolve staging from the TARGET profile dir, not the game's mutable
     # active-profile state: installs into a non-active profile (Profile Group
     # member picker) land in that profile's own mods folder.
     from Utils.mods.copy import resolve_target_staging
     staging_root = resolve_target_staging(game, profile_dir)
+    if repository_record is not None and staging_root is not None:
+        from Thunderstore.thunderstore_meta import read_meta as read_repository_meta
+        incoming = repository_record[1]
+        matches = [(folder, read_repository_meta(folder / "meta.ini")) for folder in Path(staging_root).iterdir()
+                   if folder.is_dir() and read_repository_meta(folder / "meta.ini").package_id == incoming.package_id] if Path(staging_root).is_dir() else []
+        if len(matches) > 1:
+            raise ValueError("Several installed mods identify this package")
+        if matches:
+            folder, existing = matches[0]
+            if existing.source != incoming.source and version_change is None and not allow_repository_switch:
+                raise ValueError("Changing stores requires reviewing the source change in its repository browser")
+            if not preferred_name:
+                preferred_name = folder.name
+            if version_change is None and not allow_repository_switch:
+                from Utils.mods.version_history import VersionChangeContext
+                version_change = VersionChangeContext.capture(game, profile_dir, folder.name, existing.source)
+                version_change.target_thunderstore = incoming
     if staging_root is None:
         log_fn("Install: no staging folder configured.")
         return None
-    # Name the mod folder. Priority:
-    #   1. preferred_name  - the caller forces it (Nexus browser, collections).
-    #   2. prebuilt_meta   - the caller already resolved the Nexus file → use its
-    #                        per-file display name if it has one.
-    #   3. Nexus MD5/filename lookup - when logged in, name the folder after the
-    #                        file's Nexus display name (e.g. "Engine Fixes - Main
-    #                        File") and reuse the resolved meta as prebuilt_meta so
-    #                        finish_install doesn't look it up a second time.
-    #   4. _clean_mod_name - strip the archive stem (offline / not on Nexus).
+    # Explicit names win over provider defaults and the archive-name fallback.
     if preferred_name:
         mod_name = preferred_name
     else:
@@ -1618,14 +1678,14 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
         if workshop_title:
             from Utils.mods.names import sanitize_mod_folder_name
             workshop_title = sanitize_mod_folder_name(workshop_title)[:120]
-        nexus_name = provider_title or ts_name or workshop_title or _nexus_file_display_name(prebuilt_meta, game)
+        nexus_name = provider_title or ts_name or workshop_title or _nexus_install_name(prebuilt_meta, archive)
         if not nexus_name and prebuilt_meta is None:
             from Nexus.nexus_meta import NexusModMeta
             resolved = _resolve_nexus_meta_for_naming(archive, game, log_fn)
             # Carry failed lookups too so finish_install does not repeat them.
             prebuilt_meta = resolved if resolved is not None else NexusModMeta()
             if resolved is not None:
-                nexus_name = _nexus_file_display_name(resolved, game)
+                nexus_name = _nexus_install_name(resolved, archive)
         mod_name = nexus_name or _clean_mod_name(archive.stem, game)
         if provider_title:
             log_fn(f"Naming mod folder from plugin provider: '{mod_name}'.")
@@ -1680,7 +1740,7 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
         prepared.force_replace = bool(preferred_name)
         prepared.plugin_source = plugin_source
         prepared._tmp_reserved = tmp_reserved
-        return prepared
+        return with_repository(prepared)
 
     # A `.fomod`-wrapper archive needs a second extraction pass before FOMOD
     # detection can find fomod/ModuleConfig.xml (Tk parity).
@@ -1751,7 +1811,7 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
             from amethyst_plugins.installers import prepare_installer
             prepared.plugin_install = prepare_installer(prepared, log_fn, progress_fn, cancel,
                                                        kind=prepared.installer_kind)
-            return prepared
+            return with_repository(prepared)
     except BaseException:
         prepared.cleanup()
         raise
@@ -1830,7 +1890,7 @@ def prepare_archive(archive_path: str, game, profile_dir: Path, *,
         except BaseException:
             prepared.cleanup()
             raise
-    return prepared
+    return with_repository(prepared)
 
 
 def _run_additional_install_logic(game, dest_root: Path, mod_name: str,
@@ -1884,17 +1944,20 @@ def _run_additional_install_logic_inner(game, dest_root: Path, mod_name: str,
 
 def wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
                       signal_exts: "set[str]", structured_markers: "set[str]",
-                      subdir_name_fn=None) -> bool:
+                      subdir_name_fn=None, *,
+                      signal_dirs: "set[str] | None" = None) -> bool:
     from Utils.deployment.vortex import preserve_sources
     with preserve_sources(mod_dir):
         return _wrap_flat_mod_dir(mod_dir, signal_names, signal_exts,
-                                  structured_markers, subdir_name_fn)
+                                  structured_markers, subdir_name_fn,
+                                  signal_dirs=signal_dirs)
 
 
 def _wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
                       signal_exts: "set[str]",
                       structured_markers: "set[str]",
-                      subdir_name_fn=None) -> bool:
+                      subdir_name_fn=None, *,
+                      signal_dirs: "set[str] | None" = None) -> bool:
     """Wrap a flat mod folder's files one level deeper; True if restructured.
 
     Some games (e.g. Stardew/SMAPI ``Mods/<Name>/manifest.json``, JA3
@@ -1906,6 +1969,8 @@ def _wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
     *structured_markers* inside any immediate subdirectory means the mod is
     already correctly structured and must not be touched (a loose root file
     alongside it is part of a multi-destination mod).
+
+    *signal_dirs* adds lowercase directory names to the flat signals.
     """
     from Utils.filegraph.paths import EXCLUDE_NAMES
     if not mod_dir.is_dir():
@@ -1931,10 +1996,16 @@ def _wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
         for sub in children
     ):
         return False
-    has_signal = any(has_marker(mod_dir, marker) for marker in signal_names) or any(
-        c.is_file()
-        and (c.name.lower() in signal_names or c.suffix.lower() in signal_exts)
-        for c in children
+    signal_dir_names = {d.lower() for d in (signal_dirs or set())}
+    has_signal = (
+        any(has_marker(mod_dir, marker) for marker in signal_names)
+        or any(c.is_dir() and c.name.lower() in signal_dir_names
+               for c in children)
+        or any(
+            c.is_file()
+            and (c.name.lower() in signal_names or c.suffix.lower() in signal_exts)
+            for c in children
+        )
     )
     if not has_signal:
         return False
@@ -1948,23 +2019,39 @@ def _wrap_flat_mod_dir(mod_dir: Path, signal_names: "set[str]",
     # manager's own metadata (meta.ini etc.) must stay at the staging root,
     # or the mod can no longer be matched to its meta.ini after wrapping.
     sub = mod_dir / subdir_name
-    if sub.exists():
-        return False
-    sub.mkdir()
-    for child in children:
-        if child.is_file() and child.name.lower() in EXCLUDE_NAMES:
-            continue
-        shutil.move(str(child), str(sub / child.name))
+    if sub.exists() or sub.is_symlink():
+        if (sub.is_symlink() or not sub.is_dir()
+                or sub.name.lower() not in signal_dir_names
+                or any(child.is_dir()
+                       and child.name.casefold() == subdir_name.casefold()
+                       for child in sub.iterdir())):
+            return False
+    wrapper = Path(tempfile.mkdtemp(prefix=".amethyst-wrap-", dir=mod_dir))
+    moved = []
+    try:
+        for child in children:
+            if child.is_file() and child.name.lower() in EXCLUDE_NAMES:
+                continue
+            shutil.move(str(child), str(wrapper / child.name))
+            moved.append(child)
+        wrapper.rename(sub)
+    except BaseException:
+        for child in reversed(moved):
+            shutil.move(str(wrapper / child.name), str(child))
+        wrapper.rmdir()
+        raise
     return True
 
 
-def _game_wrap_signals(game) -> "tuple[set[str], set[str], set[str]]":
-    """Lowercased (names, extensions, structured-markers) wrap signals."""
+def _game_wrap_signals(game) -> "tuple[set[str], set[str], set[str], set[str]]":
+    """Lowercased (names, extensions, directory names, structured markers)."""
     names, exts = getattr(game, "mod_staging_wrap_signals",
                           ({"manifest.json"}, set()))
+    dir_names = getattr(game, "mod_staging_wrap_dir_names", set())
     guard = getattr(game, "mod_staging_already_structured_markers", set())
     return ({n.lower() for n in (names or {"manifest.json"})},
             {e.lower() for e in (exts or set())},
+            {d.lower() for d in (dir_names or set())},
             {g.lower() for g in (guard or set())})
 
 
@@ -1973,11 +2060,12 @@ def _wrap_flat_if_needed(game, dest_root: Path, log_fn: LogFn) -> None:
     if not getattr(game, "mod_staging_requires_subdir", False):
         return
     try:
-        names, exts, guard = _game_wrap_signals(game)
+        names, exts, dir_names, guard = _game_wrap_signals(game)
         name_fn = getattr(game, "mod_staging_wrap_subdir_name", None)
         wrapped_name = name_fn(dest_root) if callable(name_fn) else dest_root.name
         fixed_name = (lambda _mod_dir: wrapped_name) if callable(name_fn) else None
-        if wrap_flat_mod_dir(dest_root, names, exts, guard, fixed_name):
+        if wrap_flat_mod_dir(dest_root, names, exts, guard, fixed_name,
+                             signal_dirs=dir_names):
             log_fn(f"Auto-fixed flat staging structure: wrapped files into "
                    f"'{dest_root.name}/{wrapped_name}/'.")
     except OSError as exc:
@@ -1990,6 +2078,8 @@ def fix_flat_staging_folders(
     signal_extensions: "set[str] | None" = None,
     already_structured_markers: "set[str] | None" = None,
     subdir_name_fn=None,
+    *,
+    signal_dirs: "set[str] | None" = None,
 ) -> list[str]:
     """Wrap every flat mod staging folder; returns the names restructured.
 
@@ -2001,6 +2091,7 @@ def fix_flat_staging_folders(
     names = {n.lower() for n in (signal_filenames or {"manifest.json"})}
     exts = {e.lower() for e in (signal_extensions or set())}
     guard = {n.lower() for n in (already_structured_markers or set())}
+    dirs = {d.lower() for d in (signal_dirs or set())}
     fixed: list[str] = []
     if not staging_root.is_dir():
         return fixed
@@ -2011,7 +2102,8 @@ def fix_flat_staging_folders(
             continue
         if (mod_dir.is_dir()
                 and wrap_flat_mod_dir(
-                    mod_dir, names, exts, guard, subdir_name_fn)):
+                    mod_dir, names, exts, guard, subdir_name_fn,
+                    signal_dirs=dirs)):
             fixed.append(mod_dir.name)
     return fixed
 
@@ -2258,6 +2350,7 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
     # (and order) onto the freshly detected spec before the folder is wiped -
     # captured only on replace, a rename installs as a NEW mod (Tk parity).
     old_bundle_spec = None
+    p._install_rule_state = {}
 
     # Existing same-named folder: ask the caller what to do (replace / rename /
     # cancel), or - with no callback - silently replace (collection installs).
@@ -2334,6 +2427,8 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
                 # Unknown action → treat as cancel (safe default).
                 return None
 
+    previous_meta = getattr(p, "_collection_previous_meta", None)
+    p._install_rule_state["random"] = getattr(previous_meta, "install_random", "")
     if p.version_change is not None:
         p._version_change_dest = dest_root
     if not dest_root.exists():
@@ -2435,7 +2530,13 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
         stage_root = str(p.extract_dir)
         file_list = stage_file_list(
             p.game, stage_root, is_root_install=is_root,
-            mod_name=p.mod_name, on_need_prefix=p.on_need_prefix, log_fn=log_fn)
+            mod_name=(p.version_change.rollback_name
+                      if p.version_change is not None and p.version_change.operation == "rollback"
+                      else p.mod_name), on_need_prefix=p.on_need_prefix,
+            install_state=p._install_rule_state,
+            install_rules_enabled=not (getattr(p, "fomod_parse_failed", False)
+                                       or getattr(p, "scripted_fomod", False)),
+            log_fn=log_fn)
         if file_list is None:
             cancelled = True
         else:
@@ -2480,6 +2581,7 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
 
     _write_install_meta(dest_root, p.archive, p.game, log_fn,
                         plugin_source=p.plugin_source,
+                        install_random=p._install_rule_state.get("random", ""),
                         prebuilt_meta=getattr(p, "prebuilt_meta", None),
                         endorsed=getattr(p, "_preserved_endorsed", False),
                         ignored_reqs=getattr(p, "_preserved_ignored_reqs", ""),
@@ -2488,7 +2590,7 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
                         is_bain=bain_selected is not None,
                         fomod_pending_deps=fomod_pending_deps,
                         fomod_active_deps=fomod_active_deps,
-                        required=bool(p.version_change or (
+                        required=bool(p._install_rule_state.get("random") or p.version_change or (
                             getattr(p, "_collection_previous_meta", None)
                             and (p._collection_previous_meta.updated
                                  or p._collection_previous_meta.previous_version))))
@@ -2519,6 +2621,16 @@ def _finish_install(prepared, fomod_selections, *, log_fn,
             parser.set("General", "multiModSource", p._multi_source_name)
             with atomic_writer(meta_path) as stream:
                 parser.write(stream)
+    if getattr(p, "repository_record", None) is not None:
+        from amethyst_backend.download_archives import _token
+        from Thunderstore.thunderstore_meta import write_meta as write_repository_meta
+        _, repository_meta, sidecar, tokens = p.repository_record
+        if [_token(path, required=True) for path in (p.archive, sidecar)] != tokens:
+            raise ValueError("The package archive or its metadata changed during installation")
+        if p.version_change is not None:
+            p.version_change.target_thunderstore = repository_meta
+        else:
+            write_repository_meta(dest_root / "meta.ini", repository_meta, replace_source=p.allow_repository_switch)
     if p.version_change is not None:
         p.version_change.commit(dest_root / "meta.ini")
     else:
@@ -3003,6 +3115,20 @@ def install_collection_archive(
                 _preserved_endorsed = False
             if prepared.is_bundle():
                 old_bundle_spec = _read_old_bundle_spec(dest_root)
+        install_state = {"random": getattr(_collection_previous_meta, "install_random", "")}
+        plain_staged = None
+        if file_list is None and not prepared.is_bundle():
+            plain_staged = stage_file_list(
+                game, stage_src_root,
+                is_root_install=bool(getattr(prebuilt_meta, "root_folder", False)),
+                mod_name=prepared.mod_name, on_need_prefix=resolve_layout,
+                install_state=install_state,
+                install_rules_enabled=not (prepared.is_fomod() or prepared.is_bain()
+                                           or prepared.fomod_parse_failed or prepared.scripted_fomod),
+                log_fn=log_fn)
+            if plain_staged is None:
+                return None
+        if dest_root.exists():
             record_download_install(
                 profile_dir, dest_root, log_fn=log_fn)
             log_fn(f"Replacing existing mod folder: {prepared.mod_name}")
@@ -3047,41 +3173,8 @@ def install_collection_archive(
             log_fn(f"Bundle: {len(spec.selected_folders())} of "
                    f"{layout.variant_count} option(s) active.")
         else:
-            # Plain (non-FOMOD/BAIN) mod: normalise structure like the Tk direct
-            # path. dinput mods (prebuilt_meta.root_folder) install verbatim.
-            is_root = bool(getattr(prebuilt_meta, "root_folder", False))
-            staged = stage_file_list(
-                game, stage_src_root, is_root_install=is_root,
-                mod_name=prepared.mod_name, on_need_prefix=resolve_layout, log_fn=log_fn)
-            if staged is None:
-                # stage_file_list only returns None when a prefix was required
-                # but no resolver was supplied - for a collection mod that means
-                # the structure wasn't recognised. Log the extract contents so a
-                # live re-run pinpoints why (the "missing mods" investigation).
-                try:
-                    _preview = []
-                    for _r, _ds, _fs in os.walk(stage_src_root):
-                        for _f in _fs:
-                            _preview.append(os.path.relpath(
-                                os.path.join(_r, _f), stage_src_root))
-                            if len(_preview) >= 12:
-                                break
-                        if len(_preview) >= 12:
-                            break
-                    log_fn(f"Collection install: '{prepared.mod_name}' - "
-                           f"stage_file_list returned None (structure not "
-                           f"recognised). Extract root={stage_src_root}; "
-                           f"first files: {_preview}")
-                except Exception:
-                    pass
-                cancelled = True
-            else:
-                dest_root.mkdir(parents=True, exist_ok=True)
-                if not staged:
-                    log_fn(f"Collection install: '{prepared.mod_name}' - "
-                           f"stage_file_list produced an EMPTY file list "
-                           f"(0 files to copy).")
-                _copy_file_list(staged, stage_src_root, dest_root, log_fn, game=game)
+            dest_root.mkdir(parents=True, exist_ok=True)
+            _copy_file_list(plain_staged, stage_src_root, dest_root, log_fn, game=game)
     finally:
         prepared.cleanup()
 
@@ -3101,6 +3194,8 @@ def install_collection_archive(
     _write_install_meta(dest_root, archive, game, log_fn,
                         plugin_source=prepared.plugin_source,
                         prebuilt_meta=prebuilt_meta, endorsed=_preserved_endorsed,
+                        install_random=install_state.get("random", ""),
+                        required=bool(install_state.get("random")),
                         previous_meta=_collection_previous_meta,
                         is_fomod=is_fomod_install,
                         fomod_pending_deps=fomod_pending_deps,
@@ -3375,26 +3470,27 @@ def _nexus_domains_for(game) -> tuple[str, ...]:
     return domains or tuple(d for d in (_nexus_domain_for(game),) if d)
 
 
-def _nexus_file_display_name(meta, game) -> str:
-    """The sanitized per-file Nexus display name from *meta*, or "" if absent.
-
-    Uses ``file_details.name`` (NexusModMeta.nexus_file_name, e.g. "Engine Fixes
-    - Main File") - the label shown against the download on the mod's Files tab -
-    to name the staging folder. Sanitized to a valid folder name; returns "" so
-    the caller falls back to the archive-stem name when the meta has no file name.
-    """
-    if meta is None:
+def _nexus_install_name(meta, archive: Path) -> str:
+    if meta is None or not (getattr(meta, "mod_id", 0)
+                           or getattr(meta, "nexus_file_name", "")
+                           or getattr(meta, "nexus_name", "")):
         return ""
-    raw = (getattr(meta, "nexus_file_name", "") or "").strip()
-    if not raw:
-        return ""
-    try:
-        from Utils.mods.names import sanitize_mod_folder_name
-        cleaned = sanitize_mod_folder_name(raw) or raw
-    except Exception:
-        import re
-        cleaned = re.sub(r'[<>:"/\\|?*]', "_", raw).rstrip(". ")
-    return cleaned.strip()
+    from Utils.mods.names import (
+        name_suggestions, SRC_NEXUS_FILE, SRC_NEXUS_MOD,
+        SRC_NEXUS_MOD_FILE, SRC_ORIGINAL,
+    )
+    from Utils.ui.config import load_nexus_install_name
+    source = {
+        "file_name": SRC_NEXUS_FILE,
+        "mod_name": SRC_NEXUS_MOD,
+        "mod_and_file_name": SRC_NEXUS_MOD_FILE,
+        "original_file_name": SRC_ORIGINAL,
+    }[load_nexus_install_name()]
+    suggestions = name_suggestions(meta, installation_file=archive.name, source=source)
+    if not suggestions and source != SRC_NEXUS_FILE:
+        suggestions = name_suggestions(meta, installation_file=archive.name,
+                                       source=SRC_NEXUS_FILE)
+    return suggestions[0][0] if suggestions else ""
 
 
 def _thunderstore_display_name(archive: Path) -> str:
@@ -3619,7 +3715,8 @@ def _write_install_meta(dest_root: Path, archive: Path, game, log_fn: LogFn,
                         is_bain: bool = False,
                         fomod_pending_deps: str = "",
                         fomod_active_deps: str = "",
-                        required: bool = False, plugin_source=None) -> None:
+                        required: bool = False, plugin_source=None,
+                        install_random: str = "") -> None:
     try:
         from Utils.bsa.packing_meta import clear_packing_state
         clear_packing_state(dest_root)
@@ -3660,6 +3757,9 @@ def _write_install_meta(dest_root: Path, archive: Path, game, log_fn: LogFn,
             from Utils.collections.ownership import carry_ownership
             meta.collection_ownership = carry_ownership(previous_meta, meta)
             meta.mmb_custom_url = previous_meta.mmb_custom_url
+            meta.install_random = previous_meta.install_random
+        if install_random:
+            meta.install_random = install_random
         if not getattr(meta, "installed", ""):
             meta.installed = datetime.now().isoformat(timespec="seconds")
         # Carry the endorsed flag from a replaced install (Tk parity).

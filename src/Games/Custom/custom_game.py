@@ -14,6 +14,7 @@ JSON format (~/.config/AmethystModManager/custom_games/<game_id>.json):
   "nexus_game_domain": "",           // optional Nexus domain slug
   "additional_nexus_domains": [],     // optional extra Nexus domain slugs
   "thunderstore_community": "",      // optional Thunderstore community slug
+  "hexium_community": "",           // optional Hexium community slug
   "image_url":         "",           // optional banner image URL
   "auto_install_deps": ["vcredist", "dotnet6"], // optional prefix dependencies
   "vortex_mod_types": {"mygame-loader": {"dest": "bin/plugins"}},
@@ -210,9 +211,13 @@ BUILTIN_GAME_TEMPLATES: list[dict] = [
         "nexus_game_domain": "",
         "additional_nexus_domains": [],
         "thunderstore_community": "",
+        "hexium_community": "",
         "image_url": "",
         "mod_folder_strip_prefixes": ["BepInEx", "plugins"],
         "conflict_ignore_filenames": [],
+        "excluded_loose_filenames": [],
+        "conflict_detection_ignore_filenames": [],
+        "conflict_detection_ignore_foldernames": [],
         "conflict_ignore_foldernames": [],
         "mod_folder_strip_prefixes_post": [],
         "mod_install_prefix": "",
@@ -253,6 +258,9 @@ BUILTIN_GAME_TEMPLATES: list[dict] = [
             "GAMEID", "Content", "Paks", "~mods", "Binaries", "Win64",
         ],
         "conflict_ignore_filenames": ["LICENSE", "*.md"],
+        "excluded_loose_filenames": [],
+        "conflict_detection_ignore_filenames": [],
+        "conflict_detection_ignore_foldernames": [],
         "conflict_ignore_foldernames": [],
         "mod_folder_strip_prefixes_post": [],
         "mod_install_prefix": "",
@@ -472,6 +480,10 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
         return self._defn.get("thunderstore_community", "")
 
     @property
+    def hexium_community(self) -> str:
+        return self._defn.get("hexium_community", "")
+
+    @property
     def image_url(self) -> str:
         return self._defn.get("image_url", "")
 
@@ -494,6 +506,18 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
     @property
     def conflict_ignore_filenames(self) -> set[str]:
         return _defn_to_set(self._defn, "conflict_ignore_filenames")
+
+    @property
+    def excluded_loose_filenames(self) -> set[str]:
+        return _defn_to_set(self._defn, "excluded_loose_filenames")
+
+    @property
+    def conflict_detection_ignore_filenames(self) -> set[str]:
+        return _defn_to_set(self._defn, "conflict_detection_ignore_filenames")
+
+    @property
+    def conflict_detection_ignore_foldernames(self) -> set[str]:
+        return _defn_to_set(self._defn, "conflict_detection_ignore_foldernames")
 
     @property
     def conflict_ignore_foldernames(self) -> set[str]:
@@ -563,6 +587,17 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
     @property
     def vortex_mod_types(self) -> dict:
         return self._defn.get("vortex_mod_types", {})
+
+    @property
+    def custom_install_rules(self) -> list:
+        from Utils.games.install_rules import definition_rule_ids, validate_rule
+        rows = self._defn.get("custom_install_rules", [])
+        result = []
+        for row, key in zip(rows, definition_rule_ids(rows)):
+            rule = validate_rule({k: v for k, v in row.items() if k != "rule_id"})
+            rule.rule_id = key
+            result.append(rule)
+        return result
 
     @property
     def custom_routing_rules(self) -> list[CustomRule]:
@@ -952,6 +987,10 @@ class Ue5CustomGame(UE5Game):
         return self._defn.get("thunderstore_community", "")
 
     @property
+    def hexium_community(self) -> str:
+        return self._defn.get("hexium_community", "")
+
+    @property
     def image_url(self) -> str:
         return self._defn.get("image_url", "")
 
@@ -1007,6 +1046,18 @@ class Ue5CustomGame(UE5Game):
     @property
     def conflict_ignore_filenames(self) -> set[str]:
         return _defn_to_set(self._defn, "conflict_ignore_filenames")
+
+    @property
+    def excluded_loose_filenames(self) -> set[str]:
+        return _defn_to_set(self._defn, "excluded_loose_filenames")
+
+    @property
+    def conflict_detection_ignore_filenames(self) -> set[str]:
+        return _defn_to_set(self._defn, "conflict_detection_ignore_filenames")
+
+    @property
+    def conflict_detection_ignore_foldernames(self) -> set[str]:
+        return _defn_to_set(self._defn, "conflict_detection_ignore_foldernames")
 
     @property
     def conflict_ignore_foldernames(self) -> set[str]:
@@ -1076,6 +1127,17 @@ class Ue5CustomGame(UE5Game):
     @property
     def vortex_mod_types(self) -> dict:
         return self._defn.get("vortex_mod_types", {})
+
+    @property
+    def custom_install_rules(self) -> list:
+        from Utils.games.install_rules import definition_rule_ids, validate_rule
+        rows = self._defn.get("custom_install_rules", [])
+        result = []
+        for row, key in zip(rows, definition_rule_ids(rows)):
+            rule = validate_rule({k: v for k, v in row.items() if k != "rule_id"})
+            rule.rule_id = key
+            result.append(rule)
+        return result
 
     @property
     def custom_routing_rules(self) -> list[CustomRule]:

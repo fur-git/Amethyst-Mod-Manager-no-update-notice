@@ -794,6 +794,7 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
         ("wizard", QT_TRANSLATE_NOOP("SettingsView", "Wizard")),
         ("nexus", QT_TRANSLATE_NOOP("SettingsView", "Nexus")),
         ("thunderstore", QT_TRANSLATE_NOOP("SettingsView", "Thunderstore")),
+        ("hexium", QT_TRANSLATE_NOOP("SettingsView", "Hexium")),
         ("wabbajack", QT_TRANSLATE_NOOP("SettingsView", "Wabbajack")),
     )
 
@@ -1258,6 +1259,20 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
             g, self.tr("Rename mod after install"),
             uc.load_rename_mod_after_install, uc.save_rename_mod_after_install,
             help=self.tr("Show a rename prompt after installing a mod."))
+        name_combo = self._combo(
+            g, self.tr("Default Nexus install name"),
+            [(self.tr("File name"), "file_name"),
+             (self.tr("Nexus mod name"), "mod_name"),
+             (self.tr("Nexus mod name and file name"), "mod_and_file_name"),
+             (self.tr("Original file name"), "original_file_name")],
+            uc.load_nexus_install_name(), uc.save_nexus_install_name,
+            help=self.tr("Choose the default folder name for Nexus mod installs. "
+                         "File name uses the Nexus file's display name; original "
+                         "file name uses the archive name without its extension. "
+                         "Missing Nexus names fall back to the file name or "
+                         "cleaned archive name. Explicit update and collection "
+                         "names take priority."))
+        name_combo.setFixedWidth(max(self.COMBO_W, name_combo.sizeHint().width()))
         self._finish_section(g)
 
     def _build_downloads(self):
@@ -1824,7 +1839,7 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
         """Relabel Install/Download on any tab open alongside Settings."""
         # _checkbox persists before calling here, so the views re-read the new value.
         w = self._window
-        for attr in ("_nexus_view", "_thunderstore_view", "_change_version_view",
+        for attr in ("_nexus_view", "_thunderstore_view", "_hexium_view", "_change_version_view",
                      "_missing_reqs_view"):
             view = getattr(w, attr, None)
             if view is None:

@@ -307,6 +307,24 @@ class NoMansSky(StandardCustomGame):
         # "Edit custom game" or "Force update handler" actions.
         return False
 
+    _MOD_TREE_DIRS = frozenset({
+        "audio", "fonts", "globals", "input", "language", "materials",
+        "metadata", "models", "music", "pipelines", "scenes", "shaders",
+        "textures", "tpfsdict", "ui",
+    })
+
+    @property
+    def mod_staging_requires_subdir(self) -> bool:
+        return True
+
+    @property
+    def mod_staging_wrap_signals(self) -> tuple[set[str], set[str]]:
+        return (set(), {".exml", ".mbin", ".mxml", ".dds"})
+
+    @property
+    def mod_staging_wrap_dir_names(self) -> set[str]:
+        return set(self._MOD_TREE_DIRS)
+
     @property
     def launch_toggles(self) -> list[LaunchToggle]:
         # NMS has no in-game switch for GCMODSETTINGS' DisableAllMods.

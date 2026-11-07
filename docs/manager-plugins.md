@@ -874,7 +874,7 @@ code; live code replacement is not supported. Persistent widgets use their own
 module namespace, separate from each modal `create_view` session. As with Qt
 panels, install only plugins you trust.
 
-## Read-only modlist sections
+## External modlist sections
 
 Qt services and widgets can publish display-only rows beneath their own
 separator at the bottom of the modlist, including detached presentations.
@@ -912,10 +912,20 @@ tooltips are strings up to 8000 characters. Optional `values` may contain
 `category`, `version`, `author`, `size`, `installed`, and `updated`, each a
 display string of at most 4000 characters.
 
-Rows have no checkbox or priority and cannot be moved, renamed, removed, or
+Rows have no priority and cannot be moved, renamed, removed, or
 used as archive-drop targets. They are separate from the natural mod entries:
 they are never written to `modlist.txt`, included in managed-mod inventories,
 or passed into deployment. Column sorting keeps each external section together.
+
+When `context.get("modlist_checkboxes")` is true, rows may include an `enabled`
+boolean. Pass `on_toggle=handle_toggle` to `set_modlist_rows` to show their
+checkboxes. The callback receives `action_id: "set_enabled"`, `section_id`,
+`ids`, `game_id`, `profile`, and the requested `enabled` boolean. The host
+checks the owner, target and manager lock before calling it. The plugin owns
+the operation and republishes the resulting state; the host never saves these
+toggles to `modlist.txt` or sends them through deployment. Omit `enabled` for
+rows that cannot currently be toggled. Managers without this capability still
+accept the original read-only rows and `on_action` callback.
 
 Right-click actions belong to the declaring plugin. `selection: "items"`
 (the default) operates on selected rows from that section; `"section"` also
@@ -2594,10 +2604,78 @@ Disabling or removing a plugin removes its games from discovery after restart;
 saved paths, profiles and mods are retained. JSON `games.custom.*` APIs remain
 available for definitions that do not need Python behaviour.
 
+Handlers can override `BaseGame.conflict_detection_ignore_filenames` with a set
+of case-insensitive filename globs, or set the same JSON field to an array in a
+custom definition. Matching destination filenames still deploy with normal
+priority but do not contribute conflict counts, icons or file highlighting.
+For example, `{"conflict_detection_ignore_filenames": ["readme*.txt"]}` keeps
+required README files deployable. Existing `conflict_ignore_filenames` and
+blacklist rules continue to exclude matching files from deployment.
+
+Custom definitions also support `"excluded_loose_filenames": ["*.txt"]`,
+matching `BaseGame.excluded_loose_filenames`. These case-insensitive filename
+globs exclude only files at the mod's top level; matching files inside folders
+remain deployable. The field defaults to an empty array and is available in
+the custom-game editor for standard, root and UE5 handlers.
+
+`BaseGame.conflict_detection_ignore_foldernames` provides the same behaviour for
+folder-name globs, with the matching JSON array field available to custom
+handlers. For example, `{"conflict_detection_ignore_foldernames": ["docs", "*_info"]}`
+suppresses conflicts inside matching destination folders and all subfolders,
+at any depth and regardless of case. Files still deploy normally. Both
+conflict-only properties default to empty sets.
+
+All four filename and folder rule properties supply defaults to **Data →
+Blacklist**. Users can add patterns or disable and restore defaults there;
+overrides persist per game across profiles. Deployment exclusions take
+precedence when a file also matches a conflict-only rule.
+
 These handler classes use Amethyst's Python game API, which may change between
 manager versions. Set `min_manager_version` and validate the packaged plugin
 against the manager versions you support. Modules execute as trusted Python with
 the manager's privileges, like other executable plugin contributions.
+
+### Independent instances
+
+A handler's `game_id` remains its game-type identity. `instance_id` identifies
+an individual configured installation and defaults to `game_id` for the original
+instance. `name` is the instance's display/storage name; use `handler_name` when
+a game-specific path needs its original title (for example, a Documents folder).
+Constructors must load configuration through the handler's path properties so
+identity can be bound before initialization. Instances follow their original
+handler source and plugin; missing handlers preserve saved state as unavailable.
+
+Plugin handlers must explicitly opt in and declare every manager write target:
+
+```python
+class ExampleGame(StandardCustomGame):
+    supports_game_instances = True
+
+    def get_instance_write_targets(self):
+        return [*super().get_instance_write_targets(),
+                ("External configuration", self.external_config_path())]
+```
+
+For handlers writing only to the standard game/prefix/staging targets, override
+the method and return `super().get_instance_write_targets()`. Include external
+configuration directories, custom destinations, and paths reached through
+symlinks. Targets may be files or directories. Do not include shared read-only
+engine binaries or resources. Incomplete declarations cannot provide isolation.
+Installation, prefix, and external-target isolation checks apply to instances
+of the same handler and owning plugin; staging storage remains separate across
+games.
+
+Keep target declarations available when an installation or external file is
+missing. Optional `validate_instance_configuration()` can reject incomplete
+configuration during save and deployment without blocking inspection of peers.
+
+Plugin contexts add `instance_id` while existing `game_id` fields and manifest
+`game_ids` filters keep their handler meaning. Use `instance_id` for Headless
+requests and per-installation caches. Captured GUI/stdio API calls using the
+current handler ID are translated to the captured instance for compatibility.
+Event `game_id` fields identify the instance, so subscriptions, notifications,
+selections, and operation results remain separate across copies. Original
+instances retain their previous values.
 
 ## Current boundaries
 

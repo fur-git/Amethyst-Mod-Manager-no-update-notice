@@ -2157,7 +2157,7 @@ def save_header_position(value: str) -> None:
 # Restore, notifications and Settings are deliberately absent - hiding those
 # would leave the bar unable to do its job.
 _HIDEABLE_HEADER_BUTTONS = (
-    "install", "proton", "wizard", "nexus", "thunderstore", "wabbajack")
+    "install", "proton", "wizard", "nexus", "thunderstore", "hexium", "wabbajack")
 
 
 def load_hidden_header_buttons() -> set[str]:
@@ -2210,6 +2210,30 @@ def save_header_force_compact(value: bool) -> None:
         parser[_FILEMAP_SECTION] = {}
     parser[_FILEMAP_SECTION]["header_force_compact"] = (
         "true" if value else "false")
+    _write_ini(parser, path)
+
+
+NEXUS_INSTALL_NAME_MODES = ("file_name", "mod_name", "mod_and_file_name", "original_file_name")
+
+
+def load_nexus_install_name() -> str:
+    try:
+        value = _read_ini(get_ui_config_path()).get(
+            _FILEMAP_SECTION, "nexus_install_name", fallback="file_name")
+    except (configparser.Error, OSError):
+        value = "file_name"
+    return value if value in NEXUS_INSTALL_NAME_MODES else "file_name"
+
+
+def save_nexus_install_name(value: str) -> None:
+    if value not in NEXUS_INSTALL_NAME_MODES:
+        raise ValueError(f"Unsupported Nexus install name: {value}")
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _read_for_write(path)
+    if _FILEMAP_SECTION not in parser:
+        parser[_FILEMAP_SECTION] = {}
+    parser[_FILEMAP_SECTION]["nexus_install_name"] = value
     _write_ini(parser, path)
 
 
@@ -2368,6 +2392,40 @@ def save_nexus_page_size(value: int) -> None:
     if _NEXUS_SECTION not in parser:
         parser[_NEXUS_SECTION] = {}
     parser[_NEXUS_SECTION]["page_size"] = str(int(value))
+    _write_ini(parser, path)
+
+
+def load_nexus_tag_excludes(domain: str) -> list[str]:
+    import json
+
+    domain = domain.strip().lower()
+    path = get_ui_config_path()
+    if not domain or not path.is_file():
+        return []
+    try:
+        parser = _read_ini(path)
+        tags = json.loads(parser.get(
+            _NEXUS_SECTION, f"tag_excludes.{domain}", fallback="[]"))
+        if not isinstance(tags, list):
+            return []
+        return list(dict.fromkeys(
+            tag.strip() for tag in tags if isinstance(tag, str) and tag.strip()))
+    except Exception:
+        return []
+
+
+def save_nexus_tag_excludes(domain: str, tags: list[str]) -> None:
+    import json
+
+    domain = domain.strip().lower()
+    if not domain:
+        return
+    path = get_ui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parser = _read_for_write(path)
+    if _NEXUS_SECTION not in parser:
+        parser[_NEXUS_SECTION] = {}
+    parser[_NEXUS_SECTION][f"tag_excludes.{domain}"] = json.dumps(tags).replace("%", "%%")
     _write_ini(parser, path)
 
 
