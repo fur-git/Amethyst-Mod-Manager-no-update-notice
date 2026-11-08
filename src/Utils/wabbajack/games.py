@@ -16,6 +16,10 @@ _DOMAINS = {
     "enderalse": "enderalspecialedition", "baldursgate3": "baldursgate3",
     "oblivionremastered": "oblivionremastered",
     "sevendaystodie": "7daystodie",
+    "dragonageorigins": "dragonage",
+    "sims4": "thesims4",
+    "stalker2": "stalker2heartofchornobyl",
+    "vtmb": "vampirebloodlines", "vtmb2": "vtmbloodlines2",
 }
 
 
