@@ -485,6 +485,16 @@ def save_deploy_before_launch(game, enabled: bool) -> None:
     _write_launch_mode_key(game, "__deploy_before_launch", bool(enabled))
 
 
+def load_capture_logs(game, exe_name: str | None = None) -> bool:
+    key = f"__capture_logs_{exe_name}" if exe_name else "__capture_logs"
+    return bool(_read_launch_mode_data(game).get(key, False))
+
+
+def save_capture_logs(game, enabled: bool, exe_name: str | None = None) -> None:
+    key = f"__capture_logs_{exe_name}" if exe_name else "__capture_logs"
+    _write_launch_mode_key(game, key, True if enabled else None)
+
+
 def load_launch_with_wayland(game) -> bool:
     """Whether the game's Play entry should request a Wayland backend."""
     entry = getattr(game, "_plugin_launcher_entry", None)
@@ -502,6 +512,8 @@ _LSFG_DEFAULTS = {
     "backend": "lsfg",
     "mako_dll_path": "",
     "mako_frame_generation": True,
+    "mako_frame_generation_model": "mako-fg",
+    "mako_fg_mode": "balanced",
     "mako_multiplier": 2,
     "mako_adaptive": True,
     "mako_target_fps": 60,
@@ -542,6 +554,12 @@ def _normalize_lsfg_settings(settings) -> dict:
         result[key] = value if isinstance(value, bool) else str(value).lower() \
             in ("1", "true", "yes", "on")
     result["backend"] = "mako" if raw.get("backend") == "mako" else "lsfg"
+    model = raw.get("mako_frame_generation_model")
+    if model in ("mako-fg", "lossless-scaling"):
+        result["mako_frame_generation_model"] = model
+    mode = raw.get("mako_fg_mode")
+    if mode in ("quality", "balanced", "performance", "extra-performance"):
+        result["mako_fg_mode"] = mode
     priority = raw.get("mako_real_frame_priority", "auto")
     if priority in ("auto", "low", "medium", "high", "very-high"):
         result["mako_real_frame_priority"] = priority
@@ -893,6 +911,7 @@ def parse_launch_options(opts: str, command: list,
     If ``%command%`` is present it is replaced by the actual *command* list
     (wrappers before it are prepended; tokens after it are appended).
     If ``%command%`` is absent the remaining tokens are appended as a suffix.
+    An existing Flatpak host portal stays outside the wrapped command.
 
     *split_fn* tokenises each side; pass ``split_preserving_backslash`` when the
     options carry Windows paths (jar launches) so backslashes aren't eaten.
@@ -900,6 +919,19 @@ def parse_launch_options(opts: str, command: list,
     opts = (opts or "").strip()
     if not opts:
         return {}, list(command)
+
+    if (len(command) >= 2
+            and Path(command[0]).name == "flatpak-spawn"
+            and command[1] == "--host"):
+        index = 2
+        while index < len(command) and command[index].startswith("--"):
+            token = command[index]
+            index += 1
+            if token == "--":
+                break
+        env_vars, wrapped = parse_launch_options(
+            opts, command[index:], split_fn=split_fn)
+        return env_vars, [*command[:index], *wrapped]
 
     env_vars: dict = {}
 
@@ -1386,6 +1418,16 @@ def _prepare_native_game_launch(game, exe_path: Path, env: dict,
     try:
         apply_lsfg_launch_setting(game, env, log_fn=log_fn)
         apply_mangohud_launch_setting(game, env, log_fn=log_fn)
+        runtime_appid = getattr(game, "native_steam_runtime_appid", "")
+        if runtime_appid:
+            from Utils.launchers.steam import native_steam_runtime_command
+            env.update(steam_compat_mounts(game, exe_path, env=env))
+            game_path = game.get_game_path()
+            if game_path is not None:
+                env["STEAM_COMPAT_INSTALL_PATH"] = str(game_path)
+            command = native_steam_runtime_command(
+                runtime_appid, command, env=env, cwd=exe_path.parent)
+            log_fn(f"Play: prepared native Steam Linux Runtime (app ID {runtime_appid}).")
         command = wrap_command(command, env, log_fn=log_fn)
     except (OSError, RuntimeError) as exc:
         log_fn(f"Play: {exc}")

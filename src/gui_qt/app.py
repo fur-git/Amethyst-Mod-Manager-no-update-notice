@@ -57,6 +57,7 @@ from gui_qt.i18n import (profile_display, is_reserved_profile_name,
                          DEFAULT_PROFILE)
 from gui_qt.plugins.panel_controls import PluginPanelControls
 from gui_qt.widgets.flow_layout import FlowLayout
+from gui_qt.widgets.panel_splitter import PanelSplitter
 from gui_qt.game_state import GameState
 from gui_qt.widgets.detachable_tabs import DetachableTabWidget
 from gui_qt.support.notification_center import (
@@ -1486,15 +1487,7 @@ class MainWindow(QMainWindow, PluginPanelControls):
             self._build_modlist_area(startup_timing=startup_timing))
 
         phase_started = _startup_time.perf_counter()
-        split = QSplitter(Qt.Horizontal)
-        split.addWidget(self._modlist_panel_stack)
-        split.addWidget(right_col)
-        split.setStretchFactor(0, 5)
-        split.setStretchFactor(1, 4)
-        # Wider handle so a panel collapsed to one edge still has an easy-to-grab
-        # grip (the default 1px line is nearly invisible / hard to click).
-        split.setHandleWidth(8)
-        split.setChildrenCollapsible(True)
+        split = PanelSplitter(self._modlist_panel_stack, right_col)
         # Last-session splitter position, else the default split. Saved sizes
         # are absolute pixels at the saved window size; QSplitter rescales them
         # proportionally when the restored window size differs.
@@ -1504,7 +1497,7 @@ class MainWindow(QMainWindow, PluginPanelControls):
             saved_sizes = load_qt_window_state().get("body_split")
         except Exception:
             saved_sizes = None
-        split.setSizes(saved_sizes or [620, 480])
+        split.setSizes(saved_sizes or PanelSplitter.DEFAULT_SIZES)
         split.splitterMoved.connect(
             lambda *_: self._schedule_window_state_save())
         self._body_split = split
@@ -11029,8 +11022,12 @@ class MainWindow(QMainWindow, PluginPanelControls):
         self._missing_reqs_view = view
         view.prune_installed({key for key, providers in requirement_index.providers.items()
                               if providers})
-        view.destroyed.connect(
-            lambda *_: setattr(self, "_missing_reqs_view", None))
+
+        def forget_view(*_):
+            if self._missing_reqs_view is view:
+                self._missing_reqs_view = None
+
+        view.destroyed.connect(forget_view)
         self._tabs.open_scoped_tab(
             view, self.tr("Missing Requirements"), self._plugins_panel_stack,
             key="missing_reqs")
@@ -12635,6 +12632,19 @@ class MainWindow(QMainWindow, PluginPanelControls):
                         self._tool_busy_label()), "warning")
                     return
                 self._on_add_game_add(name)
+
+            if game.get_deploy_active():
+                ConfirmOverlay.show_over(
+                    self, self.tr("Game unavailable"),
+                    self.tr(
+                        "{0} is unavailable and still has an active deployment. "
+                        "Reconnect its drive if it is disconnected. To change its "
+                        "location or remove it, open Reconfigure game and select "
+                        "Restore previous deployment."
+                    ).format(name),
+                    lambda ok: _reconfigure() if ok else None,
+                    confirm_label=self.tr("Reconfigure game"), danger=False)
+                return
 
             ConfirmOverlay.show_over(
                 self, self.tr("Game unavailable"),
@@ -14242,11 +14252,12 @@ class MainWindow(QMainWindow, PluginPanelControls):
         toggles = list(getattr(game, "launch_toggles", []) or [])
 
         def _done(mode, deploy, args, options, wayland, lsfg, mangohud,
-                  toggle_states):
+                  toggle_states, capture_logs):
             if mode is None:
                 return
             exe_launch.save_launch_mode(game, exe_key, mode)
             exe_launch.save_deploy_before_launch(game, deploy)
+            exe_launch.save_capture_logs(game, capture_logs)
             exe_launch.save_launch_with_wayland(game, wayland)
             exe_launch.save_lsfg_settings(game, lsfg)
             exe_launch.save_mangohud_settings(game, mangohud)
@@ -14282,6 +14293,7 @@ class MainWindow(QMainWindow, PluginPanelControls):
             game_name=game.name,
             mode=exe_launch.load_launch_mode(game, exe_key),
             deploy=exe_launch.load_deploy_before_launch(game),
+            capture_logs=exe_launch.load_capture_logs(game),
             args=exe_launch.load_exe_args(game, exe_key),
             options=exe_launch.load_launch_options(game, exe_key),
             wayland=exe_launch.load_launch_with_wayland(game),
@@ -14798,7 +14810,7 @@ class MainWindow(QMainWindow, PluginPanelControls):
 
     def _on_restore(self, *, recovery_profile_dir=None):
         game = self._gs.game
-        if game is None or not game.is_configured():
+        if game is None:
             self._notify(self.tr("No configured game selected."), "warning")
             return
         if self._deploy_running:
@@ -14813,6 +14825,13 @@ class MainWindow(QMainWindow, PluginPanelControls):
             self._notify(self.tr("{0} is running - restore again when it "
                                  "finishes.").format(self._tool_busy_label()),
                          "warning")
+            return
+        if not game.is_configured():
+            from Utils.deployment.pipeline import missing_restore_game_path
+            if missing_restore_game_path(game) is not None:
+                self._open_configure_game_tab(game)
+            else:
+                self._notify(self.tr("No configured game selected."), "warning")
             return
         # Defer behind a detached-wizard staging job (shared game mutation) - it
         # re-runs once the staged queue drains (_on_wizard_finish_done). Coalesce

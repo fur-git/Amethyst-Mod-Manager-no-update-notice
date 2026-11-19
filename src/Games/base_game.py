@@ -72,6 +72,13 @@ _LAUNCHER_ID_SETTERS = {
 }
 
 
+def _is_available_directory(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _ensure_lutris_prefix_compat(prefix_path: "Path | None") -> None:
     """When the game's prefix is Lutris-managed, make sure a ``steamuser``
     account exists (classic lutris-wine prefixes only have the real user;
@@ -260,6 +267,7 @@ class BaseGame(ABC):
     # The direct native Play path uses this opt-in to start/wait for Steam
     # without asking Steam to launch the physical game outside a profile VFS.
     native_steam_client_required: bool = False
+    native_steam_runtime_appid: str = ""
 
     # A preferred executable which the store launcher does not invoke itself.
     preferred_launch_requires_direct: bool = False
@@ -2213,6 +2221,10 @@ class BaseGame(ABC):
         snap = self.get_effective_filemap_path().parent / _FILEMAP_SNAPSHOT_NAME
         if not (gp and snap.is_file()):
             return 0
+        from Utils.deployment.missing_installation import archive_if_missing
+
+        if archive_if_missing(gp, snap):
+            return 0
         if exclude_dirs is None:
             exclude_dirs = self.runtime_snapshot_exclude_dirs()
         moved = _move_runtime_files(
@@ -2296,11 +2308,13 @@ class BaseGame(ABC):
         if deploy_mode is not None:
             data["last_deploy_mode"] = deploy_mode
         profile_dir = self.get_profile_root() / "profiles" / profile_name
+        configured_game_path = getattr(self, "_game_path", None)
         context = {
             "profile_dir": str(profile_dir),
             "filemap_path": str(self.get_effective_filemap_path()),
             "staging_root": _root_record(self.get_profile_root()),
             "game_root": _root_record(self.get_game_path()),
+            "configured_game_path": str(configured_game_path) if configured_game_path else None,
             "prefix_root": _root_record(self.get_prefix_path()),
             "profile_state": read_profile_state(profile_dir, read_only=True),
             "instance_write_targets": self.get_instance_write_targets(),
@@ -3033,11 +3047,11 @@ class BaseGame(ABC):
         if not isinstance(raw_game, str) or not raw_game:
             return []
         game_path = Path(raw_game)
-        missing = [] if game_path.is_dir() else [game_path]
+        missing = [] if _is_available_directory(game_path) else [game_path]
         raw_staging = data.get("staging_path")
         if isinstance(raw_staging, str) and raw_staging:
             staging = Path(raw_staging)
-            if not (staging / "profiles").is_dir():
+            if not _is_available_directory(staging / "profiles"):
                 missing.append(staging)
         return missing
 
@@ -3048,9 +3062,9 @@ class BaseGame(ABC):
     def is_configured(self) -> bool:
         """Return whether the saved game and staging paths are available."""
         p = self.get_game_path()
-        return (p is not None and p.is_dir()
+        return (p is not None and _is_available_directory(p)
                 and (self._staging_path is None
-                     or (self._staging_path / "profiles").is_dir()))
+                     or _is_available_directory(self._staging_path / "profiles")))
 
     def validate_install(self) -> list[str]:
         """
